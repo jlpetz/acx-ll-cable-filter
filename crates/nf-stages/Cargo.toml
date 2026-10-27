@@ -1,0 +1,21 @@
+[package]
+name = "nf-stages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+nf-core.workspace = true
+nnnoiseless.workspace = true
+sonora.workspace = true
+hound.workspace = true
+# synth::convolve (test signals only, never on the audio path).
+realfft.workspace = true
+
+[dev-dependencies]
+# tests/rt_pool.rs: nf-mem's real-time allocator as that test binary's global allocator (RT-1).
+nf-mem.workspace = true
+# tests/sonora_patch.rs: the vendored biquad (vendor/README.md), pinned like sonora.
+sonora-common-audio = "=0.2.0"

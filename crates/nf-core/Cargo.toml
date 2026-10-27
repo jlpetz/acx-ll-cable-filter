@@ -1,0 +1,12 @@
+[package]
+name = "nf-core"
+description = "noise-filter's pure-Rust core: the stage interface, chain, controls, config and telemetry types, DSP and latency analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+realfft.workspace = true
+serde.workspace = true

@@ -1,0 +1,108 @@
+# GUI spec (nf-gui, v0)
+
+A windows-reactor 0.100.0 window (patterns: `TMR-APP/crates/tmr-gui`, and
+`doc/dev/api/windows-reactor.md`). Single process for v0: closing the window exits. The owner said
+minimise for now; the tray comes later (TODO #15, #16).
+
+## Layout (top to bottom, one column, about 520×760 by default, scrollable)
+1. **Header:**
+   - title "noise-filter";
+   - a status line (state, plus the engine's status message). A fault the engine retries by
+     itself reads "Waiting to retry", not "Stopped";
+   - a Start/Stop button (one button that toggles). While the engine retries it offers Stop,
+     which disarms the retry.
+   - Two InfoBars under it:
+     - **the notice:** errors and results (a start that failed, a fault that stopped a run, once
+       per fault with what happens next, the large-page setup's result, a settings file that
+       couldn't be read);
+     - **the warnings bar:** the engine's standing warnings while it runs, one per line (a mic on
+       the output cable, the output being the default playback device, a lost echo reference,
+       MMCSS). It closes by itself when they clear.
+2. **Devices** (each a ComboBox with a header):
+   - **Microphone:** capture endpoints, plus "Default microphone".
+   - **Output (virtual cable):** render endpoints; no default. The placeholder reads "Pick the
+     cable your apps use as their mic".
+   - **Echo reference (speakers):** render endpoints minus the chosen output, plus "Default
+     speakers".
+   - A "Refresh devices" button.
+3. **Processing:**
+   - CheckBox "Noise filter (RNNoise)".
+   - CheckBox "Echo cancellation (using speakers)", with a hint: "Leave off with headphones".
+   - Slider "Max suppression": -60..0 dB. The label shows "unlimited" at -60.
+   - **Gate:**
+     - ComboBox Off / Static / Auto;
+     - Slider "Threshold (dBFS)", -80..-10 (Static), or "Margin above noise (dB)", 0..20 (Auto);
+     - Sliders for Attack (0.5..50 ms), Release (20..1000 ms) and Hold (0..500 ms);
+     - Slider "Range (dB)", -80..0;
+     - CheckBox "Hold open on speech (VAD)", off by default: RNNoise's VAD fires on most noise-only
+       blocks, which held the Auto gate open (verify 2026-10-26).
+4. **Meters** (ToggleSwitch "Show meters"; updated at 20 Hz when on):
+   - **Input:** a horizontal bar of Borders. The RMS fill colours green / yellow (> -12 dBFS) /
+     red (> -3); a thin peak marker; the numbers alongside; a "CLIP" badge that latches red. Click
+     the badge to call `engine.reset_clip()`. A "near clip" hint.
+   - **Output:** the same bar, plus "Reduction: -x dB · Speech: 0.xx". The reduction is what the
+     noise stage took off, its floor and gate included; both read "—" while the stage isn't
+     reporting (off, or in passthrough).
+5. **Latency** (ToggleSwitch "Live readout"):
+   - Line 1: "Pipeline: 12.3 ms (p95 14.1)", or "—" when invalid, plus "Drift out/ref: +12/-40 ppm ·
+     Fill out/ref: 15.0/12.0 ms (target 15.5/12.0)".
+   - Line 2: "CPU per block: p50 45 µs, p99 80 µs (AEC p99 x, noise p99 y)"; then "Dropouts:
+     capture n, output n, reference gaps n, mic stalls n · Coarse drops out/ref: n/n · Tap
+     overflows: n" (a coarse drop is one correction that dropped whole blocks); then "RT heap
+     allocations: n (must stay 0) · Pool allocations: n/s" (`rt_heap_allocations`,
+     `rt_pool_allocations_per_s`).
+   - Note: "Excludes the cable's own buffer and the receiving app".
+6. **Measure latency** (an Expander or section):
+   - ComboBox Mode: "Virtual cables" / "Speakers and mic".
+   - ComboBox "Play probe on": render endpoints.
+   - ComboBox "Capture app output from": capture endpoints.
+   - NumberBox Repetitions (1..20, default 5).
+   - Button "Run test": disabled unless the engine is running. While running it reads "Cancel",
+     with a ProgressBar.
+   - The result: app (input tap → cable out) median ± spread; input path; end to end; chain;
+     confidence; warnings; conditions. A "Copy" button is optional (skip if Reactor has no
+     clipboard).
+   - **Help text, virtual mode:** "Set Microphone to CABLE-A Output. Play the probe on CABLE-A
+     Input. Capture CABLE Output (the cable set as Output above). Needs two virtual cables
+     (e.g. VB-CABLE plus CABLE-A, or two Voicemeeter inputs)."
+   - **Help text, acoustic mode:** "Play the probe on your speakers, with the mic as Microphone.
+     Quiet room, normal volume."
+7. **Diagnostics** (collapsed by default):
+   - memory (`status.memory`), MMCSS, RAW mic in effect;
+   - each stream's format and period; chain latency;
+   - ToggleSwitches "Low-latency periods (IAudioClient3)", "RAW mic" and "Keep reference alive";
+   - Slider "Output margin (ms)", 0..20;
+   - a Button "Enable large pages…", which runs `noise-filter.exe setup-large-pages` elevated
+     through `nf_mem::privilege::run_elevated` and then says "Sign out and back in to apply".
+
+## Behaviour
+- **One window:** a second launch brings the running window forward instead of opening another
+  (Windows may only flash its taskbar button when the launch comes from a terminal).
+- **Window size:** the remembered size is fitted to the primary monitor's work area at start-up.
+  A side that fills the work area (maximised, snapped, or the start-up height cut to the screen)
+  isn't remembered; the other side is.
+- **Settings file:** `%APPDATA%\noise-filter\settings.json`, holding `EngineConfig` and the UI's own
+  fields (latency-test devices and mode, repetitions, meter and readout toggles, window size).
+  - Load at start; on error, back the file up as `.bad` and use the defaults. A file that can't be
+    read nor backed up (locked, or on a share or drive that isn't there yet) is left alone, and
+    the session doesn't save (a warning says so; restart once it's readable). A missing folder is
+    a first run only if AppData itself is there.
+  - Save on every change, debounced to 500 ms, through a background save. Never block the UI
+    thread on disk if Reactor makes that awkward; small synchronous writes are acceptable.
+- **Applying:** every control change calls `engine.apply(&config)` (cheap). Device and I/O changes
+  restart the streams inside the engine.
+- **Start:** Start calls `engine.start(&config)`, which can block up to a few seconds, so run it in
+  `spawn_background` and show "Starting…". On error, show the message in an InfoBar.
+- **Data feed:** the telemetry and status refresh comes from a re-armed background waiter at 20 Hz
+  (meters or readout visible) or 2 Hz (neither visible), as tmr-gui does it. Its messages carry
+  `TelemetrySnapshot` and `EngineStatus` (`Clone`).
+- **Latency test:** polled with the same waiter while it runs.
+- **Device lists:** loaded at start and on "Refresh" (`nf_engine::list_devices`, in the
+  background). Show the friendly name, and keep the id in a parallel Vec.
+- **Missing device:** a selected device that's missing from the list shows as "(missing) <id>"
+  and is kept in the config.
+- **Errors:** never panic on engine errors. Show them in the InfoBar.
+
+## Not in v0
+Tray, close-to-tray, start with Windows, the Lab page, the model picker (only RNNoise exists),
+localisation.

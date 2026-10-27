@@ -1,0 +1,63 @@
+# noise-filter: a low-latency mic noise filter and echo canceller for Windows 11.
+# Crates: nf-core (pure DSP and the stage interface, no Windows deps), nf-mem (locked and large-page
+# memory, the real-time allocator), nf-stages (RNNoise, AEC3), nf-engine (WASAPI, threads, clocks,
+# latency), nf-gui (the Reactor window), nf-app (the exe: window by default, CLI subcommands).
+[workspace]
+resolver = "3"
+members = [
+    "crates/nf-core",
+    "crates/nf-mem",
+    "crates/nf-stages",
+    "crates/nf-engine",
+    "crates/nf-gui",
+    "crates/nf-app",
+]
+default-members = ["crates/nf-app"]
+# The vendored crates are patches, not members: excluded, so cargo runs inside them (their own
+# tests) instead of refusing ("believes it's in a workspace").
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+nf-core = { path = "crates/nf-core" }
+nf-mem = { path = "crates/nf-mem" }
+nf-stages = { path = "crates/nf-stages" }
+nf-engine = { path = "crates/nf-engine" }
+nf-gui = { path = "crates/nf-gui" }
+# Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
+nnnoiseless = { version = "=0.5.2", default-features = false }
+sonora = "=0.2.0"
+wasapi = "=0.26.0"
+windows-reactor = "=0.100.0"
+windows = "0.62.2"
+rtrb = "=0.4.1"
+rlsf = "=0.2.3"
+realfft = "3.5"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = { version = "0.4", features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+# nnnoiseless and sonora must stay real-time in debug builds (a debug nnnoiseless took ~36% of a core).
+[profile.dev.package."*"]
+opt-level = 3
+
+# sonora 0.2.0 with f32::mul_add made FMA-only: at our x86-64-v2 baseline each one is a call to the
+# C runtime's fmaf, about 36 µs of AEC3's 90 µs a block. Drop both entries (and vendor/) once
+# upstream ships sonora PR #37. vendor/README.md has the details.
+[patch.crates-io]
+sonora = { path = "vendor/sonora-0.2.0" }
+sonora-common-audio = { path = "vendor/sonora-common-audio-0.2.0" }

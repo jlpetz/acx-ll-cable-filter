@@ -1,0 +1,4 @@
+# Build output, at the root and wherever a crate was built on its own
+target/
+.claude/settings.local.json
+.claude/*.lock

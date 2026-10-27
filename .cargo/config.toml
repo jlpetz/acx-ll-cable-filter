@@ -1,0 +1,4 @@
+# Windows 11 24H2 requires SSE4.2 and POPCNT, so x86-64-v2 is the safe baseline for every supported PC.
+# Hot DSP that wants AVX2 dispatches at run time (nnnoiseless/rustfft and sonora already do).
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

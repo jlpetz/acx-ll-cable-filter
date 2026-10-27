@@ -1,0 +1,19 @@
+[package]
+name = "nf-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+nf-engine.workspace = true
+# The "Enable large pages..." button: the user's SID and the elevated `setup-large-pages` helper.
+nf-mem.workspace = true
+windows-reactor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+# The primary monitor's work area and DPI, to fit the remembered window size at start-up (screen.rs),
+# and the Win32 error codes that tell a missing settings file from an unreachable one (settings.rs).
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }

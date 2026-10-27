@@ -1,0 +1,209 @@
+# noise-filter TODO
+
+Active work for the noise-filter app (a Rust, Windows 11 mic noise filter and echo canceller). Each
+entry holds status, decisions and the next step. The reasoning lives in `doc/todo/NN-slug.md`, and
+verified research numbers in `doc/research-2026-10.md`. `python todo_check.py` checks entry sizes and
+gives the next free number.
+
+Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3 GUI and tray.
+
+---
+
+## Active Tasks
+
+---
+
+### 1. [project] Repo, workspace and crate layout
+**Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; no commit yet, no code yet.
+- Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile (#17; the AEC and noise filter in the same format is our proposal, awaiting the owner); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
+- Owner's wish (tentative, 'should probably publish the spec'): a standard stage interface, published so others can add stages such as a voice changer (#3, #17).
+- Proposed crates: `engine` (WASAPI, clocks, threads), `dsp` (STFT, resampler, gate, meter), `stages` (AEC, noise filter, CLAP-shaped), `models` (model packs), `lab` (latency, quality), `gui` (Reactor settings window), plus the tray/engine binary.
+- Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `ort =2.0.0-rc.15`; `sonora` as a vendored fork (#10).
+- The old copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` is stale (edited before the move; no `CLAUDE.md`). Removing it waits for the owner's OK.
+**Next**: the initial commit (the owner's OK; ask whether TMR-APP's commit rules carry over); retire the old copy (owner's OK); start future sessions in the new folder.
+**Detail**: this entry; project rules in `CLAUDE.md`
+
+---
+
+### 2. [dsp] Offline harness: WAV in, WAV out, through the whole chain
+**Priority**: High (phase 0) | **Status**: not started.
+- Runs the same chain the live app runs (AEC → noise stage with its floor/gate), through the same stage interface (#17), on WAV files, faster than real time, with no audio devices. It's the base for #3's conformance test, #13 layer 0 and #14's batch scoring.
+- Checks: the measured stream offset equals each model's declared `latency_samples − hop` to the sample (the hop of buffering only shows live, #13); output matches each model's reference; CPU per frame (p50/p99/max).
+- Runs under `cargo test`, which the project rules allow on the dev box. `cargo bench` isn't on that list: ask the owner, or time frames in an ignored test.
+**Next**: build it with RNNoise (#4) first, then the echo canceller on recorded mic+reference pairs.
+**Detail**: `doc/todo/2-offline-harness.md`
+
+---
+
+### 3. [models] Model packs: the published format for ONNX noise models
+**Priority**: High (phase 0) | **Status**: design, fact-checked 2026-10-26; spec v0 not written.
+- Effects are CLAP plugins (owner). Making the AEC and noise filter CLAP-shaped stages too is our proposal, awaiting the owner (#17). A model pack is data the noise stage loads: manifest + ONNX + licences + checksums, no code; `spectral` or `waveform`; explicit cache pairs, layout, output kind, latency; separate code/weights/data licences and patent notes; sherpa-onnx key names; the manifest wins over embedded metadata; reject custom ops and outside paths.
+- Models needing custom DSP (RNNoise, DFN3) are built into the noise stage in Rust.
+- Always output full band at 48 kHz; 16 kHz models via a 1536/768 STFT (bins 0-256, ×1/3) plus a pluggable high-band policy, A/B'd in #14.
+**Next**: write spec v0 and the noise stage's internal model trait; the conformance test in #2.
+**Detail**: `doc/todo/3-model-spec.md`
+
+---
+
+### 4. [models] RNNoise baseline (`nnnoiseless`)
+**Priority**: High (phase 0) | **Status**: chosen as the baseline (owner, 2026-10-26).
+- Pure Rust, BSD-3 code and weights, 48 kHz, 10 ms frames (matches AEC3 and WASAPI), 20 ms algorithmic latency, ~0.4% of a core. Weakest quality, so it's the bring-up model and later the eco mode. Its VAD output can drive the gate (#11).
+- Gotchas: `default-features = false`; warm up the state before streaming (first-call and reset allocations); dev-profile `opt-level` for dependencies. It can't load RNNoise 0.2 models.
+**Next**: first model through #2, then the first live model in phase 1.
+**Detail**: `doc/research-2026-10.md` (Noise models)
+
+---
+
+### 5. [models] Candidate models: FastEnhancer, UL-UNAS, DeepFilterNet3
+**Priority**: Medium | **Status**: shortlisted, not integrated; weights licences fact-checked 2026-10-26 (#7). GTCRN dropped (owner, 2026-10-26).
+- FastEnhancer-B 48k: 21.3 ms, full band, no resampler, the best paper fit. Its published weights can't ship without the author's grant (no weights licence; AI-Hub and non-commercial training data); our own retrain at a 10 ms hop is the alternative (#7). Asking the author waits until we get there (owner).
+- UL-UNAS: 32 ms, 16 kHz, MIT weights in the repo (probably fine to ship); a China-only patent filing probably covers it (CN119673187, unconfirmed), to be listed in the NOTICE (#18). Run it through `ort`; tract mis-carries its GRU state (tract #2629).
+- DeepFilterNet3: standard weights plausibly open; _ll is a bigger model (9.7M params) with weaker evidence. Opt-in only.
+- Open (owner): does dropping GTCRN over its patent filings also cover UL-UNAS, which probably shares the family? Until answered, UL-UNAS stays the next integration.
+- RNNoise (#4) is the fallback. Choose by #13 and #14 on the owner's own mic, not by paper scores.
+**Next**: after #2/#3, integrate UL-UNAS; FastEnhancer when its weights or our retrain allow.
+**Detail**: `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
+
+---
+
+### 6. [models] Inference memory: large pages by default, and hand-written ports
+**Priority**: Medium | **Status**: decided (owner, 2026-10-26): large pages by default; requiring `SeLockMemoryPrivilege` is fine.
+- The privilege is granted once, elevated (the installer, or a `--setup-large-pages` step as in TMR), and takes effect at the next sign-in. Running without admin afterwards is unconfirmed: XMRig says yes for Windows 10+, but an admin account's UAC-filtered token may drop the right. Test both account types.
+- One large-page block, allocated at start-up, holds weights, state, scratch and audio buffers (TMR's direct `VirtualAlloc2` path, never placeholder-replace). Without the privilege, or without contiguous memory: 4 KB pages pinned with `VirtualLock` (which needs no privilege), plus a warning (our proposal; refusing to start is the alternative). Size the block at start-up; a model switch that doesn't fit restarts the engine.
+- Also: a hard working-set minimum (keeps code and heaps resident), pre-faulted buffers, MMCSS threads (#8). ORT path: preallocated outputs, a kept arena, optionally a pinned env allocator. Hand ports: zero allocations per frame.
+- Answered 2026-10-25: no INT8 or GPU inference; FP32 on the CPU, one thread.
+**Next**: measure ORT's per-`Run` allocations for UL-UNAS (WPR/ETW); then the port order.
+**Detail**: `doc/todo/6-inference-memory.md`
+
+---
+
+### 7. [models] Retraining route: clean-licence data, a 10 ms hop, lower latency
+**Priority**: Low | **Status**: fact-checked 2026-10-26.
+- Re-implementing every candidate in Rust is unblocked (MIT, or MIT/Apache for DFN). Only shipping some published weights is in question: UL-UNAS probably fine; DFN3 plausible; FastEnhancer-48k not without a grant. UL-UNAS's probable China-only patent goes in the notices. GTCRN, the best-licensed, was dropped by the owner (the least attractive of the set).
+- FastEnhancer-48k retrains easily: `hop 480`, `n_fft 960` gives 20 ms and matches WASAPI; 1 GPU; clean data from DNS5 fullband, VCTK, Freesound CC0, FSD50K CC0/BY. ShareAlike sources mean the result may be CC BY-SA. Independent retrains have under-performed, so budget for iteration.
+**Next**: read wall-clock time from FastEnhancer's TensorBoard logs and estimate the cost; decide after #14 compares the published models.
+**Detail**: `doc/todo/7-retraining.md`
+
+---
+
+### 8. [engine] Audio I/O: mic capture, cable render, loopback reference
+**Priority**: High (phase 1) | **Status**: built in v0 (nf-engine) and reviewed 2026-10-26; live test pending (VB-CABLE).
+- `wasapi` crate, event-driven shared mode; IAudioClient3 small periods where the driver allows, else 10 ms; exclusive mic as an advanced option.
+- Mic in RAW mode where supported. The reference is a loopback of the chosen speakers, zero-filled through silence. `SetDuckingPreference(TRUE)` on our sessions.
+- **Requirement:** every audio thread (capture, DSP, render, inference worker) registers with MMCSS "Pro Audio" (`AvSetMmThreadCharacteristicsW`). MMCSS gives it priority 23-26 (High category; `SystemResponsiveness` keeps 20% for others) and tags it Deadline QoS. Without the tag, a minimised or occluded window puts the process at Low QoS. MMCSS priority also weighs foreground state, so check dropouts with the window minimised in phase 1.
+- Threads are joined by SPSC rings; no allocation or locks on audio threads; device-change rebuilds on a control thread.
+- The output target (one period + one block + margin, before each write) holds a block more than one period of wake jitter needs: measuring whether period + margin is enough would take 10 ms off the latency.
+**Next**: live on VB-CABLE: dropouts with the window minimised, the readout, then the smaller output target.
+**Detail**: `doc/todo/8-audio-io.md`
+
+---
+
+### 9. [engine] Clock drift and buffer control
+**Priority**: High (phase 1-2) | **Status**: built in v0; simulated against stepped device clocks (nf-engine `pipeline/tests/events.rs`).
+- Mic, speakers and cable run on three clocks. A PI controller (nf-core `DriftController`) on each FIFO's fill drives a ±1-sample-per-block slip (`SlipResampler`); a small target fill, not a big safety margin. The output fill is interpolated from the device clock and calibrated to the padding, so the latency holds still as clocks beat; coarse corrections handle stalls and late wakes.
+- Small IAudioClient3 periods rule out RATEADJUST, so drift is corrected in the app.
+**Next**: with #8; measure real drift (ppm over 30+ minutes) on the owner's device pairs.
+**Detail**: `doc/todo/8-audio-io.md`
+
+---
+
+### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
+**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`); live test pending.
+- `sonora` 0.2.0 is vendored (`vendor/`) with its AEC-path `mul_add`s as plain arithmetic (sonora #37's fix; AEC3 91 → 55 µs a block); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. Drop the vendoring when a release has sonora #37; #38/#40 (allocations) and #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
+- Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
+- Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
+- Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
+- Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
+**Next**: offline on recorded mic+loopback pairs in #2, then live in phase 2.
+**Detail**: `doc/todo/10-aec.md`
+
+---
+
+### 11. [dsp] Noise floor and gate
+**Priority**: Medium (phase 1) | **Status**: built in v0 (`NoisePost`: floor mix + gate); gate redesigned 2026-10-26.
+- Floor = maximum attenuation: mix delay-matched dry signal into the model's output, in the same frames, with no added latency. It also hides model artifacts.
+- Gate: static or auto threshold, hold, linear-in-dB attack/release, no lookahead. Auto follows a smoothed level of the model's output.
+- Our call (2026-10-26, not the owner's): "hold open on speech (VAD)" defaults to off. RNNoise's VAD fires on 87-100% of pure-noise blocks, which held the Auto gate open.
+- Open: at the default 6 dB margin, RNNoise's residual bursts sometimes open the gate (9-12 dB measured better, speech effect at those margins not measured); some gaps take 0.7-2 s to close after a talk spurt.
+**Next**: tune the margin and rise rates on real recordings in the Lab (#14).
+**Detail**: `doc/todo/11-floor-gate-meter.md`
+
+---
+
+### 12. [dsp] Input level meter
+**Priority**: Medium (phase 1) | **Status**: designed (owner's request).
+- Raw-input peak and RMS in dBFS with peak hold, before any processing; a clip light that latches at about −0.1 dBFS or on flat-topped runs.
+- Toggle on/off, about 20 Hz; auto-pause when the window closes (minimise detection is still open, #15). Later: output level and gain reduction.
+**Next**: phase 1: a console readout (peak/RMS dBFS, clip latch) from the atomics, so the owner can check levels during live runs; the GUI meter in phase 3.
+**Detail**: `doc/todo/11-floor-gate-meter.md`
+
+---
+
+### 13. [lab] Latency measurement
+**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0; needs two cables to run.
+- Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
+- Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
+- Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
+**Next**: run layer 2 once cables are installed; layer 3 in phase 2.
+**Detail**: `doc/todo/13-latency-measurement.md`
+
+---
+
+### 14. [lab] Quality analyser: the Lab mode (MOS)
+**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26.
+- Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
+- Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
+- Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
+**Next**: phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
+**Detail**: `doc/todo/14-quality-lab.md`
+
+---
+
+### 15. [gui] Settings window (Reactor)
+**Priority**: Medium (phase 3) | **Status**: designed.
+- Device pickers (mic, output cable, echo reference), AEC and noise-filter checkboxes, floor/gate controls, model picker, meter, latency readout, the Lab page.
+- A separate process that talks to the engine over a named pipe. Owner: minimise for now; once #16's tray exists, the window closes freely and the tray reopens or starts it.
+- Noise filter off means bypassed: the model isn't run and its delay is removed (a brief jump on toggle is fine).
+**Next**: after phase 2.
+**Detail**: `doc/todo/15-gui-tray.md`
+
+---
+
+### 16. [engine] Tray, engine process, settings and autostart
+**Priority**: Medium (phase 3) | **Status**: designed.
+- The always-on engine owns the tray icon (Shell_NotifyIcon): open settings, pause, quit. Settings persist; start with Windows via HKCU Run.
+**Next**: with #15.
+**Detail**: `doc/todo/15-gui-tray.md`
+
+---
+
+### 17. [plugins] Stage format: CLAP for effects (owner); AEC and noise filter too (proposed)
+**Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26). The owner asked whether the noise filter and AEC should use it too; proposal yes (below), awaiting the owner's OK.
+- Every stage is CLAP-shaped. The AEC takes the mic on its main input and the speaker reference on a second input port (CLAP allows one main input plus non-main ones, the sidechain convention). The noise filter is a stage that loads model packs (#3), with the floor and gate inside it and a namespaced extension publishing its speech probability. Effects (a voice changer) come after.
+- Our own stages run in-process through the same Rust interface (no FFI). They can also be exported as `.clap` files (and VST3 via clap-wrapper) for other hosts. Third-party plugins run in an fx-host process (shared memory, a watchdog that passes clean audio through on a miss, editors as its own windows).
+- The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
+**Next**: the owner's OK; then the stage interface in phase 0 (#2 runs stages through it).
+**Detail**: `doc/todo/17-post-effects.md`
+
+---
+
+### 18. [release] Packaging, signing, licences and the user setup guide
+**Priority**: Low | **Status**: notes.
+- Windows 11 plus the Windows App Runtime (per-user, `--quiet`). Signing: Artifact Signing takes only individuals in the US or Canada; otherwise an organisation or an OV certificate. Unsigned builds get SmartScreen/Defender trouble.
+- Large-page setup: the installer runs elevated once and grants `SeLockMemoryPrivilege` to the user (as TMR's `--setup-large-pages` does); it takes effect at the next sign-in (#6).
+- A NOTICE file for every model's code and weights licence, and known patents (#7).
+- User guide: VB-Cable latency ~1440-1536 samples, cable format 48 kHz; Sound → Communications "Do nothing"; turn off Discord/Teams NS and AEC; avoid Bluetooth headsets.
+- Open: ship the console launcher `noise-filter-cli.exe` as `noise-filter.com` too? A plain `noise-filter ...` then works in terminals, but Win+R and Start search pick the .com and flash a console.
+**Next**: when a release nears.
+**Detail**: `doc/todo/18-release.md`
+
+---
+
+### 19. [driver] Our own virtual mic
+**Priority**: High (after v0 live testing) | **Status**: option A (our UDE driver) chosen by the owner 2026-10-26; the owner added that if B (usbip-win2) tests as good and as low-latency as VB-CABLE, maybe use B. VB-CABLE (C) stays the v0 path and the A/B baseline. Research reported 2026-10-26.
+- Owner's criteria: latency and quality at least VB-CABLE's; controllable from inside the app; open source others can reuse.
+- Research: UDE alone lacks QueryBusTime, so USB audio over UDE needs a filter on every USB 3 root hub (as usbip-win2 does). usbip-win2 has an open capture bug on its latest release (usbip-win2 #200) and a past bugcheck in this exact path (usbip-win2 #181), and USB adds 1 ms framing plus class-driver queueing. So neither A nor B is expected to beat VB-CABLE.
+- Proposed (ours, awaiting the owner): D, our own root-enumerated virtual audio driver (C++ from Microsoft's MS-PL ACX or WaveRT samples; app in Rust), as the goal in place of A; B as a lab comparison only.
+- Signing (A or D): attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
+**Next**: the owner's call on D; then an EBS snapshot, test signing and a timed reboot; then a D spike measured against VB-CABLE with #13.
+**Detail**: `doc/todo/19-virtual-mic-ude.md`
