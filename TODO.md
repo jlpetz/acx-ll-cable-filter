@@ -200,10 +200,20 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 19. [driver] Our own virtual mic
-**Priority**: High (after v0 live testing) | **Status**: option A (our UDE driver) chosen by the owner 2026-10-26; the owner added that if B (usbip-win2) tests as good and as low-latency as VB-CABLE, maybe use B. VB-CABLE (C) stays the v0 path and the A/B baseline. Research reported 2026-10-26.
+**Priority**: High (after v0 live testing) | **Status**: option D chosen by the owner 2026-10-28 as the main goal: our own root-enumerated virtual audio driver, based on an existing open-source one and cut down to what we need. VB-CABLE (C) stays the v0 path and the latency/CPU benchmark; usbip-win2 (B) is a lab comparison at most.
 - Owner's criteria: latency and quality at least VB-CABLE's; controllable from inside the app; open source others can reuse.
-- Research: UDE alone lacks QueryBusTime, so USB audio over UDE needs a filter on every USB 3 root hub (as usbip-win2 does). usbip-win2 has an open capture bug on its latest release (usbip-win2 #200) and a past bugcheck in this exact path (usbip-win2 #181), and USB adds 1 ms framing plus class-driver queueing. So neither A nor B is expected to beat VB-CABLE.
-- Proposed (ours, awaiting the owner): D, our own root-enumerated virtual audio driver (C++ from Microsoft's MS-PL ACX or WaveRT samples; app in Rust), as the goal in place of A; B as a lab comparison only.
-- Signing (A or D): attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
-**Next**: the owner's call on D; then an EBS snapshot, test signing and a timed reboot; then a D spike measured against VB-CABLE with #13.
+- Why not A/B (research 2026-10-26): USB audio over UDE needs a filter on every USB 3 root hub, as usbip-win2 has; usbip-win2 has an open capture bug (usbip-win2 #200) and a past bugcheck in this path (usbip-win2 #181); USB adds 1 ms framing plus class-driver queueing.
+- Candidate bases: Microsoft's ACX AudioCodec sample (MS-PL, root-enumerated, simulated stream engine), SimpleAudioSample/SYSVAD (WaveRT); microsoft/low-latency-audio (MIT, open source, unreleased) for its ACX low-latency streaming, its ASIO driver's user-kernel interface and its control panel. Its USB half doesn't apply. In-box usbaudio2.sys is closed (Thesycon).
+- Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
+**Next**: a research pass choosing the base and what to take from low-latency-audio; then an EBS snapshot, test signing and a timed reboot; then a spike measured against VB-CABLE with #13.
 **Detail**: `doc/todo/19-virtual-mic-ude.md`
+
+---
+### 20. [chore] Clean up the review's build caches and scratch data
+**Priority**: Low | **Status**: kept for now (owner, 2026-10-28: they may be wanted again; keep them a little while).
+- `target/` is 41 GB, mostly the workflow agents' own build folders (`agent-*`, `review-*`, `fix-*`, `fix-verify-*`); `target/main` is the one in use.
+- A stray `crates/nf-stages/target/` (an agent's build; ignored by git since the initial commit).
+- Scratch in `%TEMP%` (`C:\Users\Administrator\AppData\Local\Temp` and its `2` subfolder): `nf-verify-*`, `nf-review-*`, `nf-gate-scratch`, `nf-fix-app`, `nf-dsp6`, `nf-core-edit`, `nfscripts`, and `nf-*.txt`/`.md` reports. The verifiers' event sims are now in the repo (`crates/nf-engine/src/pipeline/tests/events.rs`).
+- The stale pre-move copy `C:\Users\Administrator\Downloads\TMR\noise-filter` (awaiting the owner's OK).
+**Next**: delete them once v0's live tests are done, asking first.
+**Detail**: none (this entry is the list).

@@ -6,8 +6,12 @@ Status:
   maybe use B instead.
 - VB-CABLE (option C) stays the v0 path and the A/B baseline.
 - The research workflow reported on 2026-10-26 (below). It argues for a fourth option, D (our own
-  virtual audio driver), over A and B. **Proposed (ours, awaiting the owner): make D the goal and
-  keep B as a lab comparison only.**
+  virtual audio driver), over A and B.
+- **The owner chose D on 2026-10-28** as the main goal, built from an existing open-source driver
+  and simplified to what we need, with VB-CABLE the comparison for latency and CPU. The owner asked
+  whether Windows' UAC2 driver was open source: in-box `usbaudio2.sys` is closed (Thesycon's);
+  microsoft/low-latency-audio, the new ACX UAC2 driver plus ASIO, is open (MIT) and still public,
+  but unreleased and written around a real USB device.
 
 ## The owner's criteria (2026-10-26)
 1. Latency and quality at least as good as VB-CABLE.
@@ -53,7 +57,7 @@ Status:
 - RDP mic redirection gives a real capture endpoint for functional tests (client: "Record from this computer", `audiocapturemode:i:1`; the VM allows it). Its timing goes through RDP, so it's no use for latency or drift numbers.
 
 ## Plan (proposed, awaiting the owner)
-1. Owner's call: D as the goal (replacing A), and B as a lab comparison.
+1. Done: D is the goal (owner, 2026-10-28). Next, a research pass on the base: what the ACX AudioCodec sample, SimpleAudioSample and SYSVAD give, and what to take from low-latency-audio (ACX low-latency streaming, the ASIO driver's user-kernel interface, the format handling).
 2. **Dev box preparation, with the owner:** EBS snapshot, then `bcdedit /set testsigning on`, then a reboot at an agreed time (it ends the Claude session and any running workflows).
 3. **D spike:** build the ACX AudioCodec sample (or SimpleAudioSample) as one capture endpoint, "noise-filter Microphone", fed from a shared-memory ring the app writes. Then measure it against VB-CABLE with #13.
 4. **The engine's output stage becomes a trait** (WASAPI render for VB-CABLE, or the driver's ring), chosen in the settings and A/B'd with #13 and #14.
