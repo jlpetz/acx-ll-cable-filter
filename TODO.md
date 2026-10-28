@@ -14,13 +14,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 1. [project] Repo, workspace and crate layout
-**Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; v0 built (crates `nf-core`, `nf-mem`, `nf-stages`, `nf-engine`, `nf-gui`, `nf-app`); first commit 2026-10-28 (35876fb, the owner's OK).
+**Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; v0 built (crates `nf-core`, `nf-mem`, `nf-stages`, `nf-engine`, `nf-gui`, `nf-app`); first commit 2026-10-28 (f9b0d35, the owner's OK).
 - Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile (#17; the AEC and noise filter in the same format is our proposal, awaiting the owner); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
 - Owner's wish (tentative, 'should probably publish the spec'): a standard stage interface, published so others can add stages such as a voice changer (#3, #17).
-- Decided (owner, 2026-10-28): the x86-64-v3 CPU baseline, like TMR; both exes check the CPU first and refuse others (exit 5).
+- Decided (owner, 2026-10-28): the x86-64-v3 CPU baseline, like TMR; both exes check the CPU first and refuse others (exit 5). TMR's commit rules, rustfmt settings and fmt-then-clippy routine (`CLAUDE.md`).
 - Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `sonora =0.2.0` (from crates.io again: the vendored `mul_add` patch went with the v3 baseline, #10), later `ort =2.0.0-rc.15`.
 - The old copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` is stale (edited before the move; no `CLAUDE.md`). Removing it waits for the owner's OK.
-**Next**: ask whether TMR-APP's commit rules carry over (no `Co-Authored-By`, "TODO NN"); retire the old copy (owner's OK, #20); start future sessions in the new folder.
+**Next**: retire the old copy (owner's OK, #20); start future sessions in the new folder.
 **Detail**: this entry; project rules in `CLAUDE.md`
 
 ---

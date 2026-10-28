@@ -35,6 +35,20 @@ is windows-reactor (WinUI 3). Public release is the intent.
 - Nothing on an audio thread allocates, locks, logs or makes a blocking call. Enforce it in tests. (Future exception: an ORT inference worker, whose remaining per-run allocations are measured and kept off the capture and render threads, TODO #6.)
 - Pin exact versions of preview crates (`wasapi`, `windows-reactor`, `ort`); expect migrations.
 
+## Checks after writing code (TMR's routine; the owner, 2026-10-28)
+- **`cargo fmt --all` first** (`rustfmt.toml`: TMR's layout, dense, 140 wide). A layout worth keeping
+  (a table, one row a line) takes `#[rustfmt::skip]`. No comments inside a `use` list: they hold it
+  one name a line. A reformat-only commit goes in `.git-blame-ignore-revs`. Comments wrap at 140 too,
+  by hand (rustfmt leaves them alone); older comments still wrap nearer 100-130.
+- **Then clippy at zero warnings:** `cargo clippy --workspace --all-targets -- -D warnings`, after
+  non-trivial changes and before every commit. Fix rather than `#[allow]`.
+- **Then the tests:** `cargo test --workspace`.
+- **After touching the start-up path** (either exe's `main`, `cpu_check.rs`) or updating the
+  toolchain: `python tools/check_cpu_gate_asm.py` on a fresh `--emit asm` build (TODO #18).
+
+## Commits
+- No `Co-Authored-By` line. Write "TODO NN", never `#NNN` (GitHub links it to an issue).
+
 ## TODO files
 - **An entry holds status, decisions and the next step, nothing more.** Aim for under 2 KB;
   `python todo_check.py` fails anything over 3 KB. Options, reasoning, measurements and history go in
