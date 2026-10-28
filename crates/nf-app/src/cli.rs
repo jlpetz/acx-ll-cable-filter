@@ -405,7 +405,8 @@ PROCESSING (run, latency, process):
   --threshold DB     The static gate's threshold in dBFS (implies --gate static)
 
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no valid latency result,
-4 the large-page helper started without elevation.
+4 the large-page helper started without elevation, 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2,
+FMA), which noise-filter is built for.
 
 In a terminal, run commands through noise-filter-cli, which sits next to noise-filter.exe:
   noise-filter-cli run --output \"CABLE Input\"

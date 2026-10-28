@@ -17,5 +17,3 @@ realfft.workspace = true
 [dev-dependencies]
 # tests/rt_pool.rs: nf-mem's real-time allocator as that test binary's global allocator (RT-1).
 nf-mem.workspace = true
-# tests/sonora_patch.rs: the vendored biquad (vendor/README.md), pinned like sonora.
-sonora-common-audio = "=0.2.0"

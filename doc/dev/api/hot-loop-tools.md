@@ -33,15 +33,16 @@ Two kinds of claim aren't backed by a source read here, and are marked:
    - To vectorise a sum, peak or RMS, write independent accumulator lanes (§3 R4). The other route
      is `algebraic_add` (stable since 1.98.0, `STD/core/src/num/f32.rs:1835`), but our declared
      `rust-version` is 1.91 (`Cargo.toml:21`).
-3. **`f32::mul_add` is a call at our baseline.** The baseline is `x86-64-v2` (`.cargo/config.toml:4`),
-   which has no FMA. `mul_add` is `intrinsics::fmaf32` (`STD/core/src/num/f32.rs:2181-2183`), and
-   without the `fma` feature that becomes a call to `fmaf` (LLVM): a libm call per sample. Write
-   `a * b + c` instead.
-   - sonora 0.2.0 was the live case: 162 `fmaf` call sites, measured at about 36 µs of AEC3's
-     90 µs a block (the 2026-10-26 review's performance F1). sonora and sonora-common-audio are now
-     vendored with `mul_add` written as `a * b + c` on the AEC path (`vendor/README.md`), and AEC3
-     takes about 55 µs. The 60 sites left are all in sonora-fft's fft4g, reachable only through
-     sonora's noise suppressor, which we leave off. `--paths sonora` lists the loops that make them.
+3. **`f32::mul_add` is an FMA instruction only with FMA.** The baseline is `x86-64-v3`
+   (`.cargo/config.toml:12`, since 2026-10-28), which has FMA, so `mul_add` is one `vfmadd…`.
+   `mul_add` is `intrinsics::fmaf32` (`STD/core/src/num/f32.rs:2181-2183`), and without the `fma`
+   feature that becomes a call to `fmaf` (LLVM): a libm call per sample. Rust never fuses `a * b + c`
+   by itself (no FP contraction), so that stays a `vmulps` and a `vaddps`.
+   - The v2-era lesson: at our old `x86-64-v2` baseline sonora 0.2.0 had 162 `fmaf` call sites,
+     about 36 µs of AEC3's 90 µs a block (the 2026-10-26 review's performance F1). We vendored it
+     with `mul_add` written as `a * b + c` until the move to v3 made that moot (AEC3 now about 50 µs,
+     `doc/dev/build-report.md` §11). A build without FMA brings the calls back, so `tests/aec3.rs`
+     in nf-stages checks the build has it.
 4. **A per-sample recurrence doesn't vectorise.** A value carried from sample to sample (`g += step`,
    `g = g * a + b`, an RNG's state) is a serial chain, and LLVM won't vectorise a float induction
    without reassociation (LLVM).
@@ -75,15 +76,17 @@ Two kinds of claim aren't backed by a source read here, and are marked:
      name.
    - The loop's constants can spill there. Fix that with `#[inline(never)]` (§3 R7).
 8. **QPC can't time a single glue loop.** Our clock is QPC: about 100 ns a tick at the usual 10 MHz
-   (MS; read `QueryPerformanceFrequency`). One 480-sample SSE loop takes about 0.1 µs (estimate). Time
+   (MS; read `QueryPerformanceFrequency`). One 480-sample vector loop takes about 0.1 µs (estimate). Time
    batches of blocks, and compare builds alternately (§4).
 9. **Convert an index to float as `i32`, not `usize`.** `(i + 1) as f32` with `i: usize` is a 64-bit
-   integer conversion, and SSE4.2 has no packed one. LLVM keeps the index as pairs of `u64` and
-   converts each lane on its own (`pextrq`/`movq`, `cvtsi2ss`, `insertps`). `(i as i32 + 1) as f32`
-   is one packed `cvtdq2ps` per 4 samples.
+   integer conversion, and neither SSE4.2 nor AVX2 has a packed one (AVX-512DQ's `vcvtqq2ps` is the
+   first). LLVM keeps the index as `u64` lanes and converts each on its own (`pextrq`/`movq`,
+   `cvtsi2ss`, `insertps`). `(i as i32 + 1) as f32` is one packed `cvtdq2ps` per 4 samples at v2,
+   per 8 at v3.
    - Checked 2026-10-26 by compiling a probe with this rustc at `-C target-cpu=x86-64-v2`: a gain
      ramp over a 480-sample block. Per 8 samples, the `usize` loop took 53 instructions with 8
-     `cvtsi2ss`, the `i32` loop 20 with 2 `cvtdq2ps`.
+     `cvtsi2ss`, the `i32` loop 20 with 2 `cvtdq2ps`. Rechecked 2026-10-28 at `x86-64-v3`: the
+     `usize` loop still has one scalar `vcvtsi2ss` a sample, the `i32` loop one `vcvtdq2ps` per 8.
    - `u32` has no packed conversion at this baseline either. LLVM used `cvtdq2ps` for a `u32` index
      only because it could prove the value stays below 2^31. Random bits need a signed reinterpret:
      `Dither::apply` converts `x as i32` (`crates/nf-core/src/rt.rs:76-92`).
@@ -101,6 +104,7 @@ Two kinds of claim aren't backed by a source read here, and are marked:
 |---|---|---|
 | `tools/hot_loop_spills.py` | Ours, adapted from TMR's. The spill and review table for our crates' hot loops | this repo |
 | `tools/test_hot_loop_spills.py` | Its tests: what it selects (real v0 symbols from the bin's asm), which asm it reads by default, and a synthetic asm end to end | this repo |
+| `tools/check_cpu_gate_asm.py` | Not a hot-loop tool, but it reads the same post-LTO asm, of both exes, and imports this tool's demangler and `PANIC`: it fails if the code a CPU runs before the CPU gate has a VEX, BMI, LZCNT or MOVBE instruction (`crates/nf-app/src/cpu_check.rs`, build report §11) | this repo, with `tools/test_check_cpu_gate_asm.py` |
 | `TMR/tools/hot_loop_spills.py` | The original. Selects symbols containing `3tmr<module>` | `MODULES` `:59`, `COLD` `:62`, `BUILD` `:78`, `ASM` glob `:81`, `main` check `:293-304`, no-hot-loop fail `:347-348` |
 | `TMR/tools/bench_ab.py` | Runs several exes alternately and compares per-test speeds | §4 |
 | `TMR/tools/asm_fingerprint.py` | A normalised hash of each function, to prove a refactor left the instructions alone | Not ported. It imports `hot_loop_spills` for its selection (`:64`) and has its own `WORKERS` list (`:89`). Porting it means changing that import to our `functions(path, hot)` |
@@ -120,7 +124,7 @@ python tools/hot_loop_spills.py                       # the newest bin asm under
 python tools/hot_loop_spills.py --detail process_timed --all   # one function's loops, clean ones too
 python tools/hot_loop_spills.py --functions           # what HOT / COLD select, and each one's hot-loop count
 python tools/hot_loop_spills.py --paths nnnoiseless   # a dependency's own functions instead of ours
-python tools/hot_loop_spills.py --paths sonora        # sonora's loops, with its fmaf calls listed
+python tools/hot_loop_spills.py --paths sonora        # sonora's loops, with any libm calls listed
 python tools/hot_loop_spills.py --max 0               # exit 1 if any hot loop touches the stack (ratchet)
 python tools/hot_loop_spills.py path/to/file.s        # a saved asm
 python tools/test_hot_loop_spills.py                  # the tool's own tests (no build needed)
@@ -262,10 +266,11 @@ Ours adds:
 
 ## 3. Codegen rules for small DSP loops
 
-**Budget.** Measured on the dev VM at x86-64-v2 (`doc/dev/build-report.md` §9, p50 per block):
-RNNoise 39.8 µs, AEC3 55.0 µs (90.8 µs before sonora's `fmaf` calls were patched out, pitfall 3),
-the whole chain 96.5 µs. The glue kernels take 4-306 ns each. At SSE width, a glue loop over 480 samples is about
-120 vector iterations, well under 1 µs. So the goal for the base isn't hand-tuning. It is:
+**Budget.** Measured on the dev VM at x86-64-v3 (`doc/dev/build-report.md` §11, p50 per block):
+RNNoise 36.1 µs, AEC3 50.4 µs, the whole chain 84.6 µs (at x86-64-v2: 39.6, 54.4 and 97.0, and
+AEC3 90.8 before sonora's `fmaf` calls were patched out, pitfall 3). The glue kernels take 3-226 ns
+each (4-306 at v2). At AVX2 width, a glue loop over 480 samples is about 60 vector iterations, well
+under 1 µs. So the goal for the base isn't hand-tuning. It is:
 - every per-sample loop vectorised, or knowingly scalar;
 - no stack traffic;
 - no calls;
@@ -275,15 +280,18 @@ Beyond that, measure before changing anything. TMR Rule 6.12 (`TMR/doc/simd_code
 clean asm is necessary, not sufficient.
 
 **What the build gives us:**
-- **Baseline `x86-64-v2`** (`.cargo/config.toml:1-4`): SSE4.2, 16 `xmm` registers of 4 × f32, and no
-  AVX or FMA.
-  - Expect `movups`/`movaps`, `mulps`, `addps`, `maxps`, `andps` (abs, with a mask constant),
-    `cvtdq2ps` (an `i32` index to float, pitfall 9), `shufps`/`unpcklps` (interleave) and `sqrtps`.
-    Scalar forms end in `ss`.
-  - `is_x86_feature_detected!("avx2")` is a real run-time check at this baseline (cached, but a load
-    and a branch). Keep it out of loops, and dispatch once, in `activate`.
+- **Baseline `x86-64-v3`** (`.cargo/config.toml:1-12`, since 2026-10-28; x86-64-v2 before): AVX2,
+  FMA, BMI1/2, F16C, LZCNT and MOVBE, and 16 `ymm` registers of 8 × f32. The exes check the CPU at
+  start-up (`crates/nf-app/src/cpu_check.rs`).
+  - Expect the VEX forms, mostly on `ymm`: `vmovups`/`vmovaps`, `vmulps`, `vaddps`, `vmaxps`,
+    `vandps` (abs, with a mask constant), `vcvtdq2ps` (an `i32` index to float, pitfall 9),
+    `vshufps`/`vunpcklps`/`vperm…` (interleave), `vsqrtps`, and `vfmadd…` only where the source says
+    `mul_add` (pitfall 3). Scalar forms end in `ss`. Every SSE instruction is VEX-encoded too.
+  - `is_x86_feature_detected!` is a constant `true` for v3's features; for one above them (AVX-512,
+    say) it is a real run-time check (cached, but a load and a branch). Keep it out of loops, and
+    dispatch once, in `activate`.
   - A `#[target_feature]` function's features don't reach a helper it calls that isn't inlined (TMR
-    Rule 4, `:218-230`; Rule 6.2, `:265-269`). Our glue loops don't need AVX2.
+    Rule 4, `:218-230`; Rule 6.2, `:265-269`). Our glue loops don't need more than v3.
 - **Release profile** (`Cargo.toml:45-49`): `opt-level = 3`, fat LTO, `codegen-units = 1`,
   `panic = "abort"`. Under abort a panic still costs a compare and branch, and still blocks
   vectorisation.
@@ -393,13 +401,13 @@ block (build report §5).
 ### R4. Reductions (peak, RMS, sums) need independent lanes
 - **The meter is the right shape.** `Meter::measure` (`crates/nf-core/src/dsp/meter.rs`) and
   `mean_square` beside it keep 8 independent lanes for the peak and for the sum of squares, over
-  `as_chunks::<8>()`. Each lane is its own chain, so LLVM can pack them into `xmm` vectors without
-  reassociating anything (LLVM). The final horizontal fold runs once a block. The tool shows
-  `Meter::measure`'s two loops packed, with no stack traffic.
+  `as_chunks::<8>()`. Each lane is its own chain, so LLVM can pack them into vectors (one `ymm` at
+  v3, two `xmm` at v2) without reassociating anything (LLVM). The final horizontal fold runs once a
+  block. The tool shows `Meter::measure`'s loops packed, with no stack traffic.
 - **Why it works:** TMR Rule 2 (`TMR/doc/simd_codegen_rules.md:112-201`) says to use N independent
-  accumulators and merge them once. N is capped by the register budget: 16 `xmm`, with about 13
-  usable (`:166-180`). Eight f32 lanes cost two `xmm` per reduction. With 480 samples there are 60
-  iterations, so more chains wouldn't pay.
+  accumulators and merge them once. N is capped by the register budget: 16 vector registers, with
+  about 13 usable (`:166-180`). Eight f32 lanes cost one `ymm` per reduction at v3. With 480 samples
+  there are 60 iterations, so more chains wouldn't pay.
 - **Peak with a compare instead of `f32::max`:** `f32::max` adds NaN fix-ups (pitfall 6). A NaN
   sample then never wins (the compare is false), which suits a meter.
   ```rust
@@ -431,14 +439,15 @@ block (build report §5).
   is an instruction. The tool lists any libm call in a hot-shaped loop.
 - **Division.** `x / c` with a loop-invariant `c` stays a `divps`: strict FP may not swap it for
   `x * (1/c)` unless the result is exact (LLVM). Hoist `let inv = 1.0 / c;` out of the loop.
-- **`mul_add`** is `fmaf` at our baseline (pitfall 3). `mul_add_relaxed` would allow an unfused
-  result (`STD/core/src/num/f32.rs:1920-1922`), but it is unstable (`float_mul_add_relaxed`).
+- **`mul_add`** is one `vfmadd…` at our v3 baseline, and a call to `fmaf` in a build without FMA
+  (pitfall 3). `mul_add_relaxed` would allow an unfused result (`STD/core/src/num/f32.rs:1920-1922`),
+  but it is unstable (`float_mul_add_relaxed`).
 - **`clamp`** with run-time bounds puts an assert in the loop unless it is hoisted
   (`f32.rs:1664-1671`). Use compares, or `x.max(lo).min(hi)` where NaN handling doesn't matter.
 
 ### R6. No calls in a hot loop
 Calls to look for:
-- libm and `fmaf`;
+- libm, and `fmaf` in a build without FMA;
 - allocation and logging, which the real-time rules ban on the audio thread anyway (CLAUDE.md);
 - `dyn` calls (once a block is fine; once a sample isn't);
 - `is_x86_feature_detected!`;
@@ -515,10 +524,12 @@ the table without listing them.
 ### R9. Crossfades and short tails
 - `crossfade` (`fade.rs:7-15`) is already in the right form: index-derived `t` converted as `i32`,
   fixed-length arrays. It runs only in the block where a toggle switches (`run_slot`, `chain.rs`).
-- The slip resampler's slices are 479-481 samples long (`crates/nf-core/src/dsp/slip.rs:5`). They
-  get a vector body plus a scalar remainder of up to 3 samples, which the `scalar` column flags.
-  That's fine. TMR Rule 6.9 (`:303-306`) warns that short tails get masked, but SSE has no masked
-  moves, so expect a plain scalar tail (LLVM).
+- The slip resampler's slices are 479-481 samples long (`crates/nf-core/src/dsp/slip.rs:5`), and
+  `resample` walks each in runs that share an input offset. At v3 a run gets an 8-wide `ymm` body
+  plus a scalar remainder of up to 7 samples, with no 4-wide step between them (checked 2026-10-28:
+  `--detail SlipResampler::resample --all`). The `scalar` column flags the remainder. That's fine.
+  TMR Rule 6.9 (`:303-306`) warns that short tails get masked. AVX2 has masked moves
+  (`vmaskmovps`), but LLVM doesn't fold this tail into them, so expect a plain scalar tail (LLVM).
 
 ---
 

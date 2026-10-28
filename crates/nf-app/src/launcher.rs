@@ -26,9 +26,14 @@
 //!   terminal's, a command's output would vanish when that console closes, so the launcher waits
 //!   for Enter first.
 //!
-//! It's a separate, small program: no real-time allocator, no log.
+//! It's a separate, small program: no real-time allocator, no log. Like noise-filter.exe it checks
+//! the CPU first (cpu_check.rs): a CPU without x86-64-v3's features gets the reason on standard
+//! error and exit code 5, without starting the child. In a console of its own the launcher waits
+//! for Enter then too, so the reason doesn't vanish with the console (`refusal::pause`).
 
 #![warn(clippy::undocumented_unsafe_blocks)]
+
+mod cpu_check;
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
@@ -53,6 +58,69 @@ const TARGET: &str = "noise-filter.exe";
 const LAUNCH_FAILED: u32 = 2;
 
 fn main() {
+    // Before anything else: everything after this may run x86-64-v3 code
+    if let Some(code) = cpu_check::gate(Some(refusal::pause)) {
+        std::process::exit(code.into());
+    }
+    launch_and_exit();
+}
+
+/// The launcher's side of the CPU gate's refusal. It runs before the CPU has been let through to x86-64-v3 code, so it keeps to
+/// what the gate does (cpu_check.rs's module doc): raw kernel32 calls, declared here because the `windows` crate's wrappers build an
+/// `Error` when a call fails, and no zeroed arrays, which LLVM may fill with vector stores.
+mod refusal {
+    use std::ffi::{CStr, c_void};
+    use std::mem::MaybeUninit;
+
+    use crate::cpu_check;
+
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        fn GetConsoleWindow() -> *mut c_void;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
+        fn ReadFile(file: *mut c_void, buffer: *mut u8, len: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
+    }
+
+    /// `STD_INPUT_HANDLE`, (DWORD)-10
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+    /// The room for the line read, which only waits for Enter
+    const LINE: usize = 64;
+
+    /// The gate's `show`. The refusal is on standard error already. In a console of the launcher's own (a double-click on the
+    /// `.com`, Win+R), which closes when it exits, this waits for Enter first, as `launch` does after a command, and with the same
+    /// tests as `console_process_count` and `can_pause`: no other process on the console, a console window, a console as input.
+    pub(super) fn pause(_refusal: &CStr) {
+        let mut pids = [MaybeUninit::<u32>::uninit(); 4];
+        // SAFETY: GetConsoleProcessList writes at most `count` ids into the live buffer it gets; GetConsoleWindow and GetStdHandle
+        // take no pointers.
+        let (count, window, input) =
+            unsafe { (GetConsoleProcessList(pids.as_mut_ptr().cast(), 4), GetConsoleWindow(), GetStdHandle(STD_INPUT_HANDLE)) };
+        if count != 1 || window.is_null() || input.is_null() || input == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut mode = 0u32;
+        // SAFETY: a handle GetStdHandle returned (not null or invalid) and a live out-pointer; a handle that isn't a console fails
+        // harmlessly.
+        if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+            return;
+        }
+        cpu_check::write_stderr(b"\nPress Enter to close this window.\n");
+        let mut line = [MaybeUninit::<u8>::uninit(); LINE];
+        let mut read = 0u32;
+        // SAFETY: the console's input handle, a live buffer of the length passed, a live out-pointer, and no OVERLAPPED: a console
+        // isn't opened for overlapped I/O. A console in line mode returns after Enter; the rest of a longer line is never read, as
+        // the launcher exits.
+        unsafe { ReadFile(input, line.as_mut_ptr().cast(), LINE as u32, &mut read, std::ptr::null_mut()) };
+    }
+}
+
+/// Everything after the CPU gate. Never inlined into `main`, whose prologue would then save XMM registers with VEX moves before the
+/// gate (cpu_check.rs).
+#[inline(never)]
+fn launch_and_exit() {
     let code = match launch() {
         Ok(code) => code,
         Err(e) => {
@@ -314,9 +382,12 @@ mod tests {
         assert!(spawn(Path::new(r"C:\no\such\noise-filter.exe"), &[], true).unwrap_err().starts_with("couldn't start"));
     }
 
+    /// The console queries run anywhere, and the CPU refusal's pause returns at once: a test's console, if it has one, is cargo's
+    /// too
     #[test]
     fn console_queries_run_anywhere() {
         let _ = console_process_count();
         let _ = can_pause();
+        refusal::pause(c"");
     }
 }

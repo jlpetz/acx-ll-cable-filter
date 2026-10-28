@@ -2,7 +2,7 @@
 
 use crate::{BLOCK, Block, lin_to_db};
 
-/// Independent accumulator lanes: two `xmm` registers of f32 per reduction.
+/// Independent accumulator lanes: one `ymm` register of f32 per reduction at x86-64-v3.
 const LANES: usize = 8;
 const _: () = assert!(BLOCK.is_multiple_of(LANES));
 

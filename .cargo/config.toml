@@ -1,4 +1,12 @@
-# Windows 11 24H2 requires SSE4.2 and POPCNT, so x86-64-v2 is the safe baseline for every supported PC.
-# Hot DSP that wants AVX2 dispatches at run time (nnnoiseless/rustfft and sonora already do).
+# x86-64-v3 (AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE), as in TMR (owner, 2026-10-28). FMA makes `f32::mul_add` one instruction: at
+# x86-64-v2 it was a call to the C runtime's `fmaf` per sample, ~36 µs of AEC3's 91 µs a block. And our loops vectorise 8 f32s wide.
+# Both exes check the CPU first thing and refuse one that lacks a feature, with a message, rather than fault on an illegal instruction
+# (crates/nf-app/src/cpu_check.rs).
+# Left out: Intel's chips without AVX: those on Atom cores before Alder Lake-N, branded Atom, Pentium or Celeron (e.g. Braswell, Apollo
+# Lake, Gemini Lake, Jasper Lake, Elkhart Lake, Cherry Trail's Atom x5-Z8350), Pentium Gold and Celeron up to Comet Lake (2020), and
+# the Core i3/i5 L-series (Lakefield, 2020); and anything older than Intel Haswell (2013) or AMD Zen (2017), but for AMD's Excavator APUs
+# (2015-2016, family 15h models 60h-7Fh), which have v3. Alder Lake-N chips such as the N100 are fine: their Gracemont cores have AVX2.
+# Sources: Intel ARK; Intel's optimisation manual 248966, table 1-1; AMD's BKDGs 49125, 50742 and 55072 (CPUID leaves 1 and 7); LLVM's
+# CPU tables for the Atom cores (`rustc --print cfg -C target-cpu=goldmont`, and silvermont, goldmont-plus, tremont).
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

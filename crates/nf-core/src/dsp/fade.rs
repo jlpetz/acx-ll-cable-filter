@@ -19,7 +19,7 @@ const _: () = assert!(2 * SPLICE_FADE <= BLOCK);
 pub fn crossfade(old: &Block, new: &Block, out: &mut Block) {
     let step = 1.0 / BLOCK as f32;
     for i in 0..BLOCK {
-        // `i as i32`: converts as a packed `cvtdq2ps`; usize -> f32 is scalar at x86-64-v2.
+        // `i as i32`: converts as a packed `cvtdq2ps`; usize -> f32 is scalar below AVX-512.
         let t = (i as i32 as f32 + 0.5) * step;
         out[i] = old[i] + (new[i] - old[i]) * t;
     }

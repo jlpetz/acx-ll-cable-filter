@@ -343,7 +343,7 @@ fn power_db(ms: f32) -> f32 {
 fn linear_gain(buf: &mut Block, g0: f32, g1: f32, inv_n: f32) {
     let d = g1 - g0;
     for (i, s) in buf.iter_mut().enumerate() {
-        // `i as i32`: converts as a packed `cvtdq2ps` (usize -> f32 is scalar at x86-64-v2).
+        // `i as i32`: converts as a packed `cvtdq2ps` (usize -> f32 is scalar below AVX-512).
         let u = 1.0 - (i as i32 + 1) as f32 * inv_n;
         let u = if u > 0.0 { u } else { 0.0 };
         *s *= g1 - d * u;

@@ -29,8 +29,10 @@
 //!   Reactor's bootstrap DLL exists from build 22000.
 //!
 //! # Start-up order
-//! The panic hook and the log first, then the console, then, for the window, its single-instance
-//! claim. After that, for the commands that run the engine or real-time code
+//! The CPU gate first (cpu_check.rs): a CPU without x86-64-v3's features gets a message box and exit
+//! code 5. `main` does only that, and the rest is `app_main`, kept out of it so that its prologue
+//! doesn't run first. Then the panic hook and the log, then the console, then, for the window, its
+//! single-instance claim. After that, for the commands that run the engine or real-time code
 //! (`Command::needs_memory`), before any engine thread exists: the lock-pages privilege, the locked
 //! pool (`RtAllocator` serves the audio thread from it) and the working-set minimum.
 
@@ -59,12 +61,14 @@ mod cli;
 mod commands;
 mod config;
 mod console;
+mod cpu_check;
 mod exit;
 mod instance;
 mod logger;
 mod mutex;
 mod wav;
 
+use std::ffi::CStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -85,6 +89,27 @@ const POOL_BYTES: usize = 32 << 20;
 const WORKING_SET_BYTES: usize = 64 << 20;
 
 fn main() -> ExitCode {
+    // Before anything else: everything after this may run x86-64-v3 code
+    if let Some(code) = cpu_check::gate(Some(cpu_box)) {
+        return ExitCode::from(code);
+    }
+    app_main()
+}
+
+/// The CPU gate's box: ANSI, for its ASCII text, because converting it to UTF-16 would take x86-64-v3 code, which the CPUs it is
+/// for may not run (cpu_check.rs).
+fn cpu_box(text: &CStr) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxA};
+    use windows::core::PCSTR;
+    let caption = c"noise-filter can't run on this CPU";
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
+    unsafe { MessageBoxA(None, PCSTR(text.as_ptr().cast()), PCSTR(caption.as_ptr().cast()), MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
+}
+
+/// Everything after the CPU gate (the start-up order in the module doc). Never inlined into `main`: a large function's prologue
+/// saves XMM registers with VEX moves, which a CPU without AVX can't run (cpu_check.rs).
+#[inline(never)]
+fn app_main() -> ExitCode {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let parsed = cli::parse(&args);
     let window = matches!(parsed, Ok(Command::Gui));

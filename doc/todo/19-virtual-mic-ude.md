@@ -57,7 +57,7 @@ Status:
 - RDP mic redirection gives a real capture endpoint for functional tests (client: "Record from this computer", `audiocapturemode:i:1`; the VM allows it). Its timing goes through RDP, so it's no use for latency or drift numbers.
 
 ## Plan (proposed, awaiting the owner)
-1. Done: D is the goal (owner, 2026-10-28). Next, a research pass on the base: what the ACX AudioCodec sample, SimpleAudioSample and SYSVAD give, and what to take from low-latency-audio (ACX low-latency streaming, the ASIO driver's user-kernel interface, the format handling).
+1. Done: D is the goal (owner, 2026-10-28). The base study reported on 2026-10-28: `19-driver-base-2026-10-28.md` (the ACX AudioCodec sample, cut down, with MIT pieces from low-latency-audio; SimpleAudioSample as the fallback; the change list, an effort estimate, the first spike's checks, and drafts of a request to Microsoft).
 2. **Dev box preparation, with the owner:** EBS snapshot, then `bcdedit /set testsigning on`, then a reboot at an agreed time (it ends the Claude session and any running workflows).
 3. **D spike:** build the ACX AudioCodec sample (or SimpleAudioSample) as one capture endpoint, "noise-filter Microphone", fed from a shared-memory ring the app writes. Then measure it against VB-CABLE with #13.
 4. **The engine's output stage becomes a trait** (WASAPI render for VB-CABLE, or the driver's ring), chosen in the settings and A/B'd with #13 and #14.

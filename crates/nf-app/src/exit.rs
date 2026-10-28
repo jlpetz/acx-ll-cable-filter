@@ -13,6 +13,9 @@ pub enum Exit {
     /// The large-page helper (`setup-large-pages --elevated-helper`) started without elevation,
     /// e.g. with UAC turned off. Its caller reads this code (`setup::helper_result`).
     NotElevated = 4,
+    /// This CPU lacks a feature of x86-64-v3, which noise-filter is built for (cpu_check.rs). The
+    /// launcher exits with it too.
+    UnsupportedCpu = 5,
 }
 
 impl Exit {
@@ -23,6 +26,8 @@ impl Exit {
 
 // The window's large-page button reads the helper's code through nf-mem's constant.
 const _: () = assert!(Exit::NotElevated as u32 == nf_mem::privilege::HELPER_NOT_ELEVATED);
+// The CPU gate returns its own constant, before anything else runs.
+const _: () = assert!(Exit::UnsupportedCpu as u8 == crate::cpu_check::EXIT_CODE);
 
 /// Why a command stopped, and with which code.
 #[derive(Clone, Debug, PartialEq)]
@@ -55,7 +60,8 @@ mod tests {
 
     #[test]
     fn the_codes_are_app_mds() {
-        assert_eq!([Exit::Ok, Exit::Usage, Exit::Error, Exit::NoResult, Exit::NotElevated].map(Exit::code), [0, 1, 2, 3, 4]);
+        let all = [Exit::Ok, Exit::Usage, Exit::Error, Exit::NoResult, Exit::NotElevated, Exit::UnsupportedCpu];
+        assert_eq!(all.map(Exit::code), [0, 1, 2, 3, 4, 5]);
         assert_eq!(Failure::usage("u").exit, Exit::Usage);
         assert_eq!(Failure::error("e").exit, Exit::Error);
         assert_eq!(Failure::no_result("n").exit, Exit::NoResult);

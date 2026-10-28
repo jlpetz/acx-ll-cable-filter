@@ -39,8 +39,8 @@ pub fn restore_mxcsr(old: u32) {
 }
 
 /// Independent generator lanes in [`Dither`]: one xorshift step is a serial chain of six integer
-/// ops, so a single stream can't vectorise (793 ns a block on the dev box); eight streams fill two
-/// SSE registers and a block takes 60 vector steps (150 ns, `tests/timing.rs`).
+/// ops, so a single stream can't vectorise (793 ns a block on the dev box); eight streams fill one
+/// `ymm` register at x86-64-v3 and a block takes 60 vector steps (107 ns, `tests/timing.rs`).
 const DITHER_LANES: usize = 8;
 
 /// A tiny deterministic noise source (xorshift32 lanes) for dithering the mic and the AEC reference

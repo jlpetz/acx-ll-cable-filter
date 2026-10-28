@@ -294,17 +294,16 @@ Nothing logs on the normal hot path.
   - The scalar biquad (`C/cascaded_biquad_filter.rs:76-112, 145-149`, used by the HPF and the AEC3
     decimator), the three-band filter bank (`S/three_band_filter_bank.rs:82-121`) and `fft4g`
     (`sonora-fft-0.2.0/src/fft4g.rs:509-525`) use `f32::mul_add` with no `#[target_feature]`.
-  - Our `.cargo/config.toml` builds with `target-cpu=x86-64-v2`, which has no FMA, so each `mul_add`
-    becomes a call to the UCRT `fmaf` in per-sample loops.
-  - PR #37 (merged to main on 2026-10-09, **not in 0.2.0**) explains this and adds that under
-    `+crt-static` UCRT's `fmaf` ignores FTZ/DAZ. **(GitHub)**
-  - Fixes: vendor main (which has #37) or build with `+fma`, which raises the CPU baseline.
-  - **Done (2026-10-26):** sonora and sonora-common-audio 0.2.0 are vendored (`vendor/`, wired in by
-    `[patch.crates-io]` in the root `Cargo.toml`) with these `mul_add`s written as plain arithmetic,
-    the same result bit for bit on an FMA build. AEC3 went from about 91 to 55 µs a block on the
-    dev VM. `fft4g` keeps its 60 call sites: only sonora's noise suppressor reaches it, and we
-    leave that off. `vendor/README.md` lists the changes; drop the vendoring once a sonora
-    release has #37 (TODO #10).
+  - Without FMA each `mul_add` is a call to the UCRT `fmaf` in per-sample loops. PR #37 (merged to
+    main on 2026-10-09, **not in 0.2.0**) explains this and adds that under `+crt-static` UCRT's `fmaf`
+    ignores FTZ/DAZ. **(GitHub)**
+  - **Our build has FMA (2026-10-28):** `.cargo/config.toml` is `target-cpu=x86-64-v3`, so each
+    `mul_add` is one `vfmadd` instruction and the exes import no `fmaf`; nf-stages' `tests/aec3.rs`
+    (`the_build_has_fma_for_sonoras_mul_add`) doesn't build if the baseline loses FMA.
+  - Before, at x86-64-v2, sonora and sonora-common-audio 0.2.0 were vendored (2026-10-26 to
+    2026-10-28) with the AEC path's `mul_add`s written as plain arithmetic: AEC3 went from about 91
+    to 55 µs a block on the dev VM. At v3, with crates.io's 0.2.0, it is about 50
+    (`doc/dev/build-report.md` §11).
 
 ### 1.10 Denormals (sonora issue #34) and FTZ/DAZ
 
@@ -450,8 +449,9 @@ small "fade-in artifacts" (`N/denoise.rs:92-94`). In real time we keep it, and t
   `HashMap<usize,_>` lookups, `RefCell` borrows, an `Arc` clone and drop (atomic), and copies its input
   first (`E/dyn_size/realfft.rs:112-116, 156-161`). The cost is small but worth measuring.
 - **SIMD:** rustfft picks AVX/SSE at run time. The RNN's `i8` mat-vec (`N/rnn.rs:396-410`) is plain
-  Rust, so it only uses what `target-cpu=x86-64-v2` allows. That's where hot-loop work would pay off,
-  but it needs a fork.
+  Rust, so it only uses what `target-cpu=x86-64-v3` allows (AVX2 since 2026-10-28; RNNoise went from
+  about 40 to 36 µs a block, `doc/dev/build-report.md` §11). That's where hot-loop work would pay
+  off, but it needs a fork.
 - **Send/Sync:** `DenoiseState: Send + Sync`, statically asserted (`N/denoise.rs:123-125`), so
   `Box<DenoiseState<'static>>` can be built anywhere and moved. The easyfft TLS state is per thread and
   doesn't move with it.

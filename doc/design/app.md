@@ -1,6 +1,14 @@
 # App spec (nf-app → `noise-filter.exe`, v0)
 
 ## Start-up (main.rs)
+- **The CPU gate, first:** the build is x86-64-v3 (`.cargo/config.toml`). `main` calls
+  `cpu_check::gate` before anything else (the panic hook, the log, the console, the single-instance
+  check, the memory pool), and the rest runs in `app_main`, which is never inlined into it. A CPU
+  that lacks a v3 feature (CPUID and XCR0, read directly) gets an ASCII `MessageBoxA` naming what's
+  missing, the same text on standard error if there is one, and exit code 5. The launcher does the
+  same on standard error only, and in a console of its own waits for Enter before it exits.
+  `cpu_check.rs` says why the way there avoids AVX and BMI instructions;
+  `tools/check_cpu_gate_asm.py` checks that in the release asm (`doc/dev/build-report.md` §11).
 - **Allocator:** `#[global_allocator] static GLOBAL: nf_mem::RtAllocator = nf_mem::RtAllocator::new();`
 - **Memory, in this order, before any engine thread exists:**
   1. `nf_mem::privilege::enable_lock_memory_privilege()`; a missing privilege isn't an error;
@@ -46,4 +54,6 @@ Argument parsing is hand-rolled (no clap) to keep the binary small.
 ## Exit codes
 0 is OK; 1 is a usage error; 2 is an engine, device or file error; 3 is a test with no valid result;
 4 is the large-page helper started without elevation. `nf_mem::privilege::HELPER_NOT_ELEVATED`
-holds the 4 the window reads, and a compile-time check ties it to `Exit::NotElevated`.
+holds the 4 the window reads, and a compile-time check ties it to `Exit::NotElevated`. 5 is a CPU
+without x86-64-v3's features (`Exit::UnsupportedCpu`, tied by a compile-time check to
+`cpu_check::EXIT_CODE`, which the CPU gate returns in both exes).

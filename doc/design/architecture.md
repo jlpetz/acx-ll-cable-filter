@@ -30,11 +30,15 @@ included. It is built to take more noise models later without touching the engin
      - output meter;
   3. slip the output to the cable's clock and write it to the cable's render buffer;
   4. per-block timing, latency readout and telemetry atomics.
-- Stage CPU use is small. On the dev VM at x86-64-v2 (relative numbers only), per block: RNNoise
-  about 40 µs, AEC3 about 55 µs (with sonora's `mul_add` patched to plain arithmetic: 91 µs
-  before), and the whole chain about 97 µs (doc/dev/build-report.md §9). The i9-14900K figure for
-  AEC3 in the research is 45 µs. Inference stays on the audio thread; a worker thread is reserved
-  for heavy future models (`StageInfo::needs_worker`).
+- **CPU baseline:** x86-64-v3 (AVX2, BMI1/2, FMA; `.cargo/config.toml`, since 2026-10-28). Both
+  exes check the CPU first thing and refuse one without it with a message and exit code 5
+  (`crates/nf-app/src/cpu_check.rs`), rather than fault on an illegal instruction.
+- Stage CPU use is small. On the dev VM at x86-64-v3 (relative numbers only), per block: RNNoise
+  about 36 µs, AEC3 about 50 µs and the whole chain about 85 µs (doc/dev/build-report.md §11). At
+  x86-64-v2 they were 40, 54 and 97 µs, with sonora's `mul_add` patched to plain arithmetic (AEC3
+  took 91 µs before the patch). The i9-14900K figure for AEC3 in the research is 45 µs. Inference
+  stays on the audio thread; a worker thread is reserved for heavy future models
+  (`StageInfo::needs_worker`).
 - **Toggles** (nf-core `chain.rs` has the details):
   - Turning a stage on resets it and primes it with the last block's input, so its first block is
     processed audio. Latency 0 to the stage's goes in with a dip splice (5 ms), not a crossfade of

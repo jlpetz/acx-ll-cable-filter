@@ -14,13 +14,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 1. [project] Repo, workspace and crate layout
-**Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; no commit yet, no code yet.
+**Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; v0 built (crates `nf-core`, `nf-mem`, `nf-stages`, `nf-engine`, `nf-gui`, `nf-app`); first commit 2026-10-28 (35876fb, the owner's OK).
 - Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile (#17; the AEC and noise filter in the same format is our proposal, awaiting the owner); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
 - Owner's wish (tentative, 'should probably publish the spec'): a standard stage interface, published so others can add stages such as a voice changer (#3, #17).
-- Proposed crates: `engine` (WASAPI, clocks, threads), `dsp` (STFT, resampler, gate, meter), `stages` (AEC, noise filter, CLAP-shaped), `models` (model packs), `lab` (latency, quality), `gui` (Reactor settings window), plus the tray/engine binary.
-- Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `ort =2.0.0-rc.15`; `sonora` as a vendored fork (#10).
+- Decided (owner, 2026-10-28): the x86-64-v3 CPU baseline, like TMR; both exes check the CPU first and refuse others (exit 5).
+- Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `sonora =0.2.0` (from crates.io again: the vendored `mul_add` patch went with the v3 baseline, #10), later `ort =2.0.0-rc.15`.
 - The old copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` is stale (edited before the move; no `CLAUDE.md`). Removing it waits for the owner's OK.
-**Next**: the initial commit (the owner's OK; ask whether TMR-APP's commit rules carry over); retire the old copy (owner's OK); start future sessions in the new folder.
+**Next**: ask whether TMR-APP's commit rules carry over (no `Co-Authored-By`, "TODO NN"); retire the old copy (owner's OK, #20); start future sessions in the new folder.
 **Detail**: this entry; project rules in `CLAUDE.md`
 
 ---
@@ -109,7 +109,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
 **Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`); live test pending.
-- `sonora` 0.2.0 is vendored (`vendor/`) with its AEC-path `mul_add`s as plain arithmetic (sonora #37's fix; AEC3 91 → 55 µs a block); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. Drop the vendoring when a release has sonora #37; #38/#40 (allocations) and #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
+- `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
@@ -189,7 +189,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 18. [release] Packaging, signing, licences and the user setup guide
 **Priority**: Low | **Status**: notes.
-- Windows 11 plus the Windows App Runtime (per-user, `--quiet`). Signing: Artifact Signing takes only individuals in the US or Canada; otherwise an organisation or an OV certificate. Unsigned builds get SmartScreen/Defender trouble.
+- Windows 11, an x86-64-v3 CPU (owner, 2026-10-28; the exes refuse others, exit code 5), plus the Windows App Runtime (per-user, `--quiet`). Before a release: `tools/check_cpu_gate_asm.py` on both exes' asm, and after every toolchain update. Signing: Artifact Signing takes only individuals in the US or Canada; otherwise an organisation or an OV certificate. Unsigned builds get SmartScreen/Defender trouble.
 - Large-page setup: the installer runs elevated once and grants `SeLockMemoryPrivilege` to the user (as TMR's `--setup-large-pages` does); it takes effect at the next sign-in (#6).
 - A NOTICE file for every model's code and weights licence, and known patents (#7).
 - User guide: VB-Cable latency ~1440-1536 samples, cable format 48 kHz; Sound → Communications "Do nothing"; turn off Discord/Teams NS and AEC; avoid Bluetooth headsets.
@@ -205,8 +205,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Why not A/B (research 2026-10-26): USB audio over UDE needs a filter on every USB 3 root hub, as usbip-win2 has; usbip-win2 has an open capture bug (usbip-win2 #200) and a past bugcheck in this path (usbip-win2 #181); USB adds 1 ms framing plus class-driver queueing.
 - Candidate bases: Microsoft's ACX AudioCodec sample (MS-PL, root-enumerated, simulated stream engine), SimpleAudioSample/SYSVAD (WaveRT); microsoft/low-latency-audio (MIT, open source, unreleased) for its ACX low-latency streaming, its ASIO driver's user-kernel interface and its control panel. Its USB half doesn't apply. In-box usbaudio2.sys is closed (Thesycon).
 - Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
-**Next**: a research pass choosing the base and what to take from low-latency-audio; then an EBS snapshot, test signing and a timed reboot; then a spike measured against VB-CABLE with #13.
-**Detail**: `doc/todo/19-virtual-mic-ude.md`
+- Base study (2026-10-28): start from the ACX AudioCodec sample, cut down (about 3.5-4.5k lines when done, 19-34 dev-days, an estimate), borrowing low-latency-audio's packet-size code, stream engine and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
+**Next**: the owner's OK to install Visual Studio and the WDK and to turn on test signing (after an EBS snapshot, in the same reboot as VB-CABLE); then the spike's seven checks.
+**Detail**: `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`
 
 ---
 ### 20. [chore] Clean up the review's build caches and scratch data

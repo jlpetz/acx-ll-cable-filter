@@ -218,7 +218,6 @@ dependencies = [
  "nnnoiseless",
  "realfft",
  "sonora",
- "sonora-common-audio",
 ]
 
 [[package]]
@@ -456,6 +455,8 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "sonora"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e1ce442ab5cb392c4067b8f2cced20be4cf12e479f6dfbf44acbe9b14ac9250"
 dependencies = [
  "sonora-aec3",
  "sonora-agc2",
@@ -493,6 +494,8 @@ dependencies = [
 [[package]]
 name = "sonora-common-audio"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6635bc61b24807ceac93ad0807b1292b6b0620caa6cd360d3be89fc616b833cc"
 dependencies = [
  "derive_more",
  "sonora-simd",

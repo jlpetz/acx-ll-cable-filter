@@ -158,7 +158,7 @@ impl SlipResampler {
             let dt = delta as f32;
             let taps = w0.iter().zip(w1).zip(w2).zip(w3);
             for (k, (y, (((&p0, &p1), &p2), &p3))) in o.iter_mut().zip(taps).enumerate() {
-                // `k as i32`: a packed int -> float conversion (usize -> f32 is scalar at x86-64-v2).
+                // `k as i32`: a packed int -> float conversion (usize -> f32 is scalar below AVX-512).
                 *y = catmull_rom([p0, p1, p2, p3], (t0 + k as i32 as f32 * dt) * inv_den);
             }
             j0 = j1;

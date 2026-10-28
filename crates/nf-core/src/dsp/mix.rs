@@ -65,7 +65,7 @@ impl FloorMix {
             }
         } else {
             // Index-derived ramp (vectorises, no drift); the last sample lands on `target`. The
-            // index is converted as i32: a packed `cvtdq2ps`, where usize -> f32 is scalar at x86-64-v2.
+            // index is converted as i32: a packed `cvtdq2ps`, where usize -> f32 is scalar below AVX-512.
             let step = (target - start) * (1.0 / BLOCK as f32);
             for (i, (w, &d)) in wet.iter_mut().zip(dry_aligned).enumerate() {
                 let lim = start + (i as i32 + 1) as f32 * step;

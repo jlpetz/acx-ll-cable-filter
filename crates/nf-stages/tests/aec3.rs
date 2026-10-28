@@ -203,3 +203,13 @@ fn info_and_format() {
     let fresh = s.stats();
     assert!(fresh.erle_db.is_nan() && fresh.echo_delay_ms.is_nan(), "nothing measured yet: {fresh:?}");
 }
+
+/// sonora's AEC path (the three-band split and merge, every biquad) uses `f32::mul_add`, which is one
+/// FMA instruction at our x86-64-v3 baseline. A build without FMA (the baseline lowered to v2, say)
+/// makes each one a call to the C runtime's `fmaf`, per sample: about 36 µs of AEC3's 91 µs a block
+/// at v2 (doc/dev/api/hot-loop-tools.md, pitfall 3). sonora is built with the same flags as this test,
+/// which then doesn't build.
+#[test]
+fn the_build_has_fma_for_sonoras_mul_add() {
+    const { assert!(cfg!(target_feature = "fma"), "no FMA: sonora's mul_add calls fmaf per sample (.cargo/config.toml)") }
+}

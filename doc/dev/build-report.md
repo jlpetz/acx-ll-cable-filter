@@ -560,3 +560,238 @@ mostly small. All of them were then worked through. The §9.7 docs are updated.
 - `run --output "CABLE Input"` exits 2 with a clear message through the launcher;
 - the window opens, idles at 0.3% of a core with an 81 MB working set (32 MiB large-page pool), and
   closes cleanly.
+
+## 11. The move to x86-64-v3 (2026-10-28)
+
+The owner moved the CPU baseline from x86-64-v2 to x86-64-v3, as in TMR. Built and tested on the dev box (rustc
+1.101.0-nightly 1a2c4797e, `CARGO_TARGET_DIR=target/v3`; its Xeon 6975P-C has every v3 feature). **Nobody has run
+either exe**, on this CPU or on one without v3: the refusal has only been checked through tests and the disassembly.
+
+**What changed**
+- **`.cargo/config.toml`:** `target-cpu=x86-64-v3`, with why, which CPUs it leaves out and the sources. Checked
+  against primary sources before writing it:
+  - Intel ARK: the N100 (Alder Lake-N) and i7-4770 (Haswell) list AVX2; the J4005 (Gemini Lake) and N5105 (Jasper
+    Lake) only SSE4.2; the Pentium Gold G6400 and Celeron G5900 (Comet Lake, Q2'20) only SSE4.1/4.2; the Pentium
+    Gold 7505 (Tiger Lake, Q4'20) and G7400 (Alder Lake, Q1'22) list AVX2.
+  - Intel's optimisation manual (248966-051, table 1-1) puts the Intel N-series on Gracemont.
+  - AMD's BKDGs: family 15h models 30h-3Fh (49125, Steamroller) read AVX2 and BMI2 as 0; models 60h-6Fh (50742,
+    Excavator) read AVX2, BMI1, BMI2, FMA, F16C, MOVBE and ABM (LZCNT) as 1.
+  - Two corrections to the brief: "pre-2020 Pentium Gold or Celeron" became "up to Comet Lake (2020)", since the
+    G6400 and G5900 launched in 2020 without AVX; and not all of AMD before Zen is left out, since Excavator has v3.
+- **The CPU gate**, `crates/nf-app/src/cpu_check.rs`, ported from TMR's without CLFLUSHOPT: CPUID and XCR0 read
+  directly, 16 features, the refusal built in a stack buffer and written with `WriteFile` (and, from
+  noise-filter.exe, `MessageBoxA`). Both `main`s call `gate` first, and the rest is `#[inline(never)]` (`app_main`,
+  `launch_and_exit`). `crates/nf-app/build.rs` (new) exports `NF_TARGET_FEATURES`. Exit code 5 is
+  `Exit::UnsupportedCpu`, with a compile-time check against `cpu_check::EXIT_CODE`; `--help` and app.md list it.
+- **The vendoring is gone:** `vendor/`, `[patch.crates-io]`, `exclude = ["vendor"]`, nf-stages' `sonora-common-audio`
+  dev-dependency and `tests/sonora_patch.rs`. `Cargo.lock` was regenerated offline (`cargo metadata --offline`):
+  sonora and sonora-common-audio 0.2.0 come from crates.io again, and their checksums match the registry's
+  `.crate` files. In the test's place, nf-stages' `tests/aec3.rs` has `the_build_has_fma_for_sonoras_mul_add`, a
+  `const` assert, so a build without FMA doesn't compile it (checked at `-C target-cpu=x86-64-v2`). Neither exe
+  imports `fmaf` now; the v2 timing exe did.
+- **Docs:** `vendor/README.md` is deleted. Updated: `doc/dev/api/sonora-nnnoiseless.md` (1.9, and nnnoiseless'
+  SIMD), `doc/dev/api/hot-loop-tools.md` (pitfalls 3 and 9, §3's budget and baseline, R4, R5, R6),
+  `doc/design/architecture.md`, `doc/design/app.md`, TODO #10 and `doc/todo/10-aec.md`, `tools/hot_loop_spills.py`'s
+  help, and four nf-core comments on index conversion (no packed `usize` to `f32` below AVX-512; at v3 a probe still
+  gives one scalar `vcvtsi2ss` a sample for `usize`, and one `vcvtdq2ps` per 8 for `i32`).
+
+**The way to the refusal, in the release exes.** At v3 every SSE instruction is VEX-encoded, so a CPU without AVX
+faults on any XMM use, not only on AVX2's. Each function the CPU runs before the gate has refused was disassembled
+whole, over its range in the PDB: `cdb -z <exe> -y .` for the symbols and sizes (`x /v`), then `llvm-objdump -d`
+from `--start-address` to `--stop-address`, scanned for any `v…` mnemonic and for ANDN, BEXTR, BLS*, BZHI, MULX,
+PDEP, PEXT, RORX, SARX, SHLX, SHRX, TZCNT, LZCNT and MOVBE:
+
+| Exe | Function | Instructions | Forbidden | Vector registers |
+|---|---|---|---|---|
+| noise-filter.exe | `main` (rustc's, with std's runtime init inlined) | 61 | 0 | 0 |
+| | `__rust_begin_short_backtrace<fn() -> ExitCode>` | 5 | 0 | 0 |
+| | `noise_filter::main` (the gate inlined; tail-jumps to `app_main`) | 198 | 0 | 0 |
+| | `cpu_check::refuse` (`cpu_box` inlined) | 171 | 0 | 0 |
+| noise-filter-cli.exe | `main` | 57 | 0 | 0 |
+| | `__rust_begin_short_backtrace<fn()>` | 5 | 0 | 0 |
+| | `noise_filter_cli::main` | 188 | 0 | 0 |
+| | `cpu_check::refuse` | 164 | 0 | 0 |
+
+- What they call is std's own code, which keeps std's baseline (`SetThreadDescription::load`, `Once::call` for the
+  runtime's clean-up, `process::exit`, `rt::cleanup`, `sys::exit::exit`: also scanned, also clean), or Windows.
+- Before `main` the C runtime runs only its own initialisers: no Rust function sits in `.CRT$XC*` or `.CRT$XI*`,
+  and the TLS callback list is empty. std's runtime init doesn't allocate.
+- nf-mem's allocator: the system-heap paths of `__rust_alloc`, `__rust_realloc` and `__rust_dealloc` are clean, but
+  the pool paths of alloc, realloc and dealloc (`Router::pool_alloc`, `Router::realloc`, rlsf's `allocate` and
+  `deallocate`) have TZCNT, LZCNT, SHLX and SHRX. They are reached only inside an RtScope or for pool memory, so never
+  before the gate, which allocates nothing anyway (corrected in §11.1; this said dealloc only).
+- The launcher imports no user32.
+- This holds for this source and this compiler. `tools/check_cpu_gate_asm.py` (§11.1) now checks it in the asm: run
+  it after changing `cpu_check.rs`, either `main` or the toolchain, and before a release. A debug build isn't covered.
+
+**Timing (release, this VM).** `cargo test --release -p nf-stages --test timing -- --ignored --nocapture`, run as
+the test exe 3 times at each baseline, alternating v2 and v3. The v2 build is the last commit (0a777d6, with the
+vendored patch), built from a clean export into `target/v2-baseline`, so both columns come from the same session.
+Medians of the 3 runs, µs per block:
+
+| Row | p50 v2 | p50 v3 | change | p99 v2 | p99 v3 | mean v2 | mean v3 |
+|---|---|---|---|---|---|---|---|
+| RNNoise (noisy speech) | 39.6 | **36.1** | -9% | 55.2 | 50.7 | 40.5 | 36.6 |
+| AEC3 (echo + near end + noise) | 54.4 | **50.4** | -7% | 76.7 | 72.5 | 55.7 | 50.5 |
+| AEC3, silent reference (dithered) | 50.8 | **45.7** | -10% | 71.9 | 60.6 | 47.3 | 42.0 |
+| sonora, zero reference, no dither | 655.9 | 669.5 | +2% | 759.8 | 729.1 | 576.3 | 575.5 |
+| chain: meters + AEC3 + RNNoise | 97.0 | **84.6** | -13% | 126.5 | 105.8 | 97.9 | 85.2 |
+| chain: meters + RNNoise | 40.2 | **34.8** | -13% | 59.7 | 45.4 | 41.2 | 35.3 |
+
+- The v2 column matches §9.5 (39.8, 55.0 and 96.5 at p50), so the session was quiet.
+- AEC3 at v3 with crates.io's sonora is about 4 µs a block faster than at v2 with the patch: with FMA, `mul_add` is
+  one `vfmadd`. So there was no slowdown to investigate.
+- RNNoise gains too, although rustfft picks its kernels at run time: nnnoiseless' own loops are now built for AVX2.
+- The undithered zero-reference row, sonora's denormal stall, which the engine's dither avoids, is 2% slower.
+- The chain now takes 0.85% of a 10 ms block at p50.
+
+Glue kernels, `cargo test --release -p nf-core --test timing -- --ignored --nocapture`, alternated the same way,
+median ns per block, v2 → v3: Meter 60 → 47, DelayLine 26 → 29, crossfade 80 → 46, FloorMix steady 56 → 45,
+FloorMix ramping 135 → 79, Gate 82 → 67, NoisePost 231 → 226, Slip 481→480 291 → 191, Slip 480→481 292 → 181,
+Dither 151 → 107, DriftController 4 → 3.
+
+**Release exes** (`cargo build --release -p nf-app`): `noise-filter.exe` is 5,330,432 bytes (5,250,560 in §9.4) and
+`noise-filter-cli.exe` 145,920 (143,872). Subsystems 2 and 3, as before.
+
+**Hot loops** (`tools/hot_loop_spills.py` on each build's post-LTO asm, the same source at v2 and v3). The totals
+move from 1/1/7/0/2/15/67/4/2 to 1/1/10/1/2/14/73/6/2 (round trip gpr and simd, reload gpr and simd, panic,
+scalar, indexed, const, long). The new gpr reloads are block-level code: `audio_loop`'s packet and ring
+bookkeeping (3, from 1) and `RollingStats::percentile`, once a second. The one new simd reload is per sample: the
+4-channel f32 downmix in `CaptureStream::read_packet`, now 8 frames a pass with `vpermps`, takes one mask operand
+from the stack each pass (`vpminud 176(%rsp)`). That is one L1 load per 8 frames, on 4-channel mics only, so it was
+left alone. `fmaf` no longer shows.
+
+**Tests:** `cargo test --workspace --no-fail-fast`, debug: **449 passed, 0 failed, 10 ignored** (§10: 436 and 10).
+
+| Crate | Pass | Ignored | Was (§10) |
+|---|---|---|---|
+| nf-app | 69 (`noise-filter`) + 13 (`noise-filter-cli`) | 0 | 62 + 6 |
+| nf-core | 95 unit + 3 `rt_no_alloc` | 2 unit + 1 `timing` | same |
+| nf-engine | 110 | 5 | same |
+| nf-gui | 67 | 0 | same |
+| nf-mem | 42 unit + 5 `global_alloc` | 1 | same |
+| nf-stages | 19 unit + 9 aec3 + 4 chain + 5 rnnoise + 5 `rt_no_alloc` + 3 `rt_pool` | 1 (`timing`) | 8 aec3, 2 `sonora_patch` |
+
+`cpu_check`'s 7 tests run in both nf-app binaries, since each includes the module: that is the +14. The new aec3
+test is +1, and `sonora_patch`'s 2 went. `python tools/test_hot_loop_spills.py`: 11 pass. `python todo_check.py`
+is clean. Also checked: with `RUSTFLAGS="-C target-cpu=x86-64-v4"`, build.rs reruns and `NF_TARGET_FEATURES` lists
+the AVX-512 features, which `every_feature_the_build_enables_is_checked` would then reject.
+
+**Clippy:** `cargo clippy --workspace --all-targets -- -D warnings` is clean. It first flagged the FMA test's
+`assert!(cfg!(..))` as constant (`assertions_on_constants`); that is now the `const` assert above.
+
+**Left open**
+- Nobody has seen the refusal: no CPU here lacks a feature, and the tests fake CPUs through their CPUID words only.
+  An old Pentium or Celeron, or a VM whose hypervisor masks AVX, would show it.
+- On such a CPU noise-filter.exe shows the box at every launch, a CLI command's too: the gate runs before the
+  arguments are parsed, since parsing them takes v3 code.
+- The v2 comparison builds (`target/v2-baseline`, from `git archive 0a777d6`) and `target/v3-asm` were deleted
+  afterwards; the commands above rebuild them. (`target/v3-asm` was rebuilt for §11.1 and is kept.)
+
+### 11.1 Verification follow-ups (2026-10-28)
+
+Verifiers found ten problems in §11's changes, one medium and nine low. All ten were real, and all are fixed. None
+changes what the gate does on a CPU that has every feature.
+
+**Fixed**
+- **Nothing checked the way to the refusal again (findings 1 and 3, the medium one).** §11's check was done by hand,
+  and the toolchain floats on `nightly` with no `rust-toolchain` file. A `rustup update`, or a small source change
+  (a zeroed array, a `format!`, `missing_in` lowered with SHLX or ANDN), could put a VEX or BMI instruction before
+  the gate. The only sign would be a silent crash on exactly the CPUs the gate is for.
+  - New: `tools/check_cpu_gate_asm.py`, with 12 tests on synthetic asm in `tools/test_check_cpu_gate_asm.py`. It
+    reads both exes' post-LTO asm (`--emit asm`, as for `hot_loop_spills.py`) and walks from `main`, and from anything
+    in a `.CRT$X*` section, to every symbol referenced: calls, tail jumps, addresses taken, and what data objects
+    hold (vtables, std's `SetThreadDescription::PTR`, the unwind tables' catch funclets). It stops at `app_main` /
+    `launch_and_exit` and at panics.
+  - It fails on any VEX or EVEX instruction, on BMI1/2, LZCNT, MOVBE, XSAVE's instructions and AVX-512's masks, and
+    on the rest of x86-64-v2 above the target's own baseline (POPCNT, CRC32, the legacy SSSE3 and SSE4
+    instructions). It also fails when the walk no longer reaches `cpu_check::refuse`, or the code after the gate.
+    Both exes take about 7 s.
+  - The target's own baseline passes: `x86_64-pc-windows-msvc` is x86-64 plus CMPXCHG16B, LAHF/SAHF and SSE3
+    (`rustc -Z unstable-options --print target-spec-json`). std is built for it, and std's own functions are where
+    the legacy SSE on the path is.
+  - `ALLOWED` lets the allocator's v3 code through, with why for each: the `__rust_*` entry points, the router's
+    `pool_*` functions, `Router`'s `GlobalAlloc` methods and rlsf. Their flagged instructions are on pool branches
+    only (finding 2). The walk reaches them through std's clean-up, which frees stdout's buffer if stdout was used,
+    and through std's error formatting. The allowance is per function, so it can't tell those branches apart.
+  - It catches a real regression: with the stop at `launch_and_exit` taken out, the walk goes into the launcher's
+    code after the gate and reports 23 failures (VEX in `launch_and_exit`'s funclets, among others).
+  - TODO #18 and `doc/todo/18-release.md` now make it a release step, and a step after every toolchain update.
+  - Not done, left to the owner: pinning the nightly in `rust-toolchain.toml`, proposed (ours) in 18-release.md.
+    Other sessions build in this tree, and a dated toolchain would make rustup fetch it. The verifier's structural
+    option, running the gate from a `.CRT$XCU` initialiser before rustc's `main`, wasn't taken either: the gate and
+    its message would still be v3 code, so the check is needed anyway.
+- **The allocator's v3 code was under-described (finding 2).** It isn't only `__rust_dealloc`: the pool paths of
+  alloc, realloc and dealloc all have TZCNT, LZCNT, SHLX or SHRX. The walk finds `Router::realloc` (13 flagged),
+  `Router::pool_alloc` (10), `__rust_dealloc` (5), and rlsf's `allocate` (10), `deallocate` (5) and
+  `unlink_free_block` (1). All of them sit behind `in_scope()` (false until an RtScope) or `owns(p)` (false until
+  `install_pool`, in `app_main`'s setup_memory). The cpu_check.rs module doc and the bullet in §11 now say so.
+- **The launcher's refusal vanished in a console of its own (finding 4).** A double-click on the `.com`, or Win+R,
+  printed the refusal into a new console that closed at once. The launcher's `show` is now `refusal::pause`
+  (launcher.rs). It makes the same tests as `launch`'s pause (one process on the console, a console window, a
+  console as standard input), then writes "Press Enter to close this window." to standard error and waits in
+  `ReadFile`. Its kernel32 calls are declared raw and its buffers are `MaybeUninit`, as in the gate.
+  `cpu_check::write_stderr` is `pub(crate)` for it. `console_queries_run_anywhere` calls it, and under cargo test it
+  returns at once.
+- **Lakefield (finding 5).** Intel ARK lists only SSE4.1 and SSE4.2 for the Core i5-L16G7 and i3-L13G4 (Lakefield,
+  Q2'20). The refusal now reads "Intel Core and Xeon from Haswell (2013) on, but for the Core i3/i5 L-series
+  (Lakefield), and AMD from Zen (2017) on, with its Excavator APUs (2015-2016)". config.toml lists Lakefield among
+  what is left out. The longest refusal is now 483 bytes, of `ROOM`'s 1024.
+- **Stoney Ridge and the Atom list (finding 6).**
+  - AMD's BKDG 55072 (family 15h models 70h-7Fh, Stoney Ridge, Rev 3.09) reads AVX, AVX2, BMI1, BMI2, FMA, F16C,
+    MOVBE, ABM (LZCNT), XSAVE, POPCNT, SSE4.1/4.2, SSSE3, SSE3, CMPXCHG16B and LAHF/SAHF as 1. config.toml's
+    Excavator exception is now models 60h-7Fh, 2015-2016.
+  - The Atom list is now examples: chips on Atom cores before Alder Lake-N, branded Atom, Pentium or Celeron
+    (Braswell, Apollo Lake, Gemini Lake, Jasper Lake, Elkhart Lake, Cherry Trail's Atom x5-Z8350).
+  - ARK has no instruction-set row for the N4200 (Apollo Lake) or the Atom x6425E (Elkhart Lake). That those cores
+    lack AVX comes from LLVM's CPU tables instead: `rustc --print cfg -C target-cpu=...` gives no AVX for
+    silvermont, goldmont, goldmont-plus or tremont. The same tables back two facts §11 couldn't take from AMD:
+    znver1 has every v3 feature, and btver2 (Jaguar) has AVX but no AVX2, BMI2 or FMA. They are a secondary source.
+- **Stale SSE-era statements (finding 7).**
+  - meter.rs: `LANES` is one `ymm` per reduction at v3.
+  - hot-loop-tools.md: pitfall 8's "480-sample SSE loop" is a vector loop now. In R9, at v3 the slip resampler's
+    runs get an 8-wide `ymm` body plus a scalar remainder of up to 7 samples, with no 4-wide step between them
+    (`--detail SlipResampler::resample --all`). AVX2 has masked moves, but LLVM doesn't use them for this tail.
+  - One more of the same: rt.rs's `DITHER_LANES` doc said "two SSE registers ... 150 ns"; it is one `ymm` and
+    107 ns now.
+  - hot-loop-tools.md's line references into `.cargo/config.toml` follow its new length (12 lines).
+- **The release notes (finding 8).** `doc/todo/18-release.md` has a CPU line under Packaging (the owner's decision,
+  what runs and what is refused, exit code 5), a step 0 for requirements in the user guide, and the asm check as a
+  release step. Proposed (ours): the installer checks the CPU too. TODO #18's first line names the CPU and the
+  check; the entry is 1.2 KB.
+- **Bare sonora PR numbers (finding 9).** TODO #10 and 10-aec.md write `sonora #37`, `sonora #38` and so on, here
+  and in the rest of 10-aec.md's sonora sections; a bare `#N` is a TODO item.
+- **crt-static (finding 10).** `every_feature_the_build_enables_is_checked` leaves out features that aren't
+  instructions (`NOT_ISA`: `crt-static`). Checked with `RUSTFLAGS="-C target-cpu=x86-64-v3 -C
+  target-feature=+crt-static"` in a scratch target dir, deleted afterwards: `NF_TARGET_FEATURES` then holds `crt-static`, and the test passes
+  (it failed on that before). 18-release.md notes
+  that both exes import VCRUNTIME140.dll today (`llvm-readobj --coff-imports`). TMR's copy has the same gap; TMR
+  isn't changed from here.
+
+**The way to the refusal, rechecked** with the new script, on `target/v3-asm` rebuilt after the last source edit
+(`CARGO_TARGET_DIR=target/v3-asm cargo rustc --release -p nf-app --bin noise-filter -- --emit asm`, the same for
+`noise-filter-cli`, then `python tools/check_cpu_gate_asm.py --list`): both PASS.
+
+| Exe | Reached | Instructions | Allowed (pool code) | Key functions, instructions |
+|---|---|---|---|---|
+| noise-filter.exe | 77 functions, 138 data objects | 5,261 | 6 functions | rustc's `main` 60, `noise_filter::main` 195, `refuse` 159, `__rust_begin_short_backtrace` 5 |
+| noise-filter-cli.exe | 69 functions, 127 data objects | 3,837 | none | `main` 54, `noise_filter_cli::main` 185, `refuse` 196 (`refusal::pause` inlined), `__rust_begin_short_backtrace` 5 |
+
+- The asm counts are a few lower than §11's disassembly (61, 198, 171...): the asm has no alignment padding.
+- What the walk reaches outside the asm: Windows imports (the launcher's now include `GetConsoleProcessList`,
+  `GetConsoleWindow`, `GetConsoleMode` and `ReadFile`) and the C runtime's `memcpy`, `memmove`, `memset` and
+  `__chkstk`, which aren't checked.
+- Release exes: `noise-filter.exe` 5,330,432 bytes as before, `noise-filter-cli.exe` 146,944 (145,920 in §11).
+
+**Tests:** `CARGO_TARGET_DIR=target/v3 cargo test --workspace --no-fail-fast`: **449 passed, 0 failed, 10
+ignored**, as in §11. No test was added on the Rust side: the launcher's `console_queries_run_anywhere` now also
+calls the refusal's pause. `python tools/test_check_cpu_gate_asm.py`: 12 pass. `python tools/test_hot_loop_spills.py`:
+11 pass. `python todo_check.py` is clean.
+
+**Clippy:** `CARGO_TARGET_DIR=target/v3 cargo clippy --workspace --all-targets -- -D warnings` is clean.
+
+**Left open**
+- Nobody has seen the refusal or the launcher's wait for Enter on screen; both run only on a CPU without v3.
+- The script follows every reference, so it over-approximates; its allowance is per function. A new allowance
+  needs a reason that the code can't run before the gate.
+- Pinning the toolchain is the owner's call (above).

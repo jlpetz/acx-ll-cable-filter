@@ -11,12 +11,13 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   - the `aec3` crate (RubyBit/aec3-rs 0.4.0; MIT OR BSD-3-Clause, with a LICENSE GitHub can't classify): its README calls it a work in progress, with an API expected to change.
 
 ## Getting a real-time-safe build
-- **0.2.0 vs main:** the release (2026-07-29) is the M145 port. Main has further upstream fixes up to M156, including render-buffer headroom on underruns, which matters for loopback gaps, and #37 (fmaf ignoring FTZ under `+crt-static`).
+- **0.2.0 vs main:** the release (2026-07-29) is the M145 port. Main has further upstream fixes up to M156, including render-buffer headroom on underruns, which matters for loopback gaps, and sonora #37 (fmaf ignoring FTZ under `+crt-static`).
 - **Open PRs:**
-  - #38: denormal stall on a silent reference, stacked on #36.
-  - #40: allocation-free processing.
-  - #41: custom AEC3 config. One downstream user needed it for double-talk tuning; it also exposes `num_filters` for a wider delay window.
-- **Plan:** vendor a fork of main with #38 and #40 (and #41) merged. Until then, FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference, which zero-filled gaps make mandatory.
+  - sonora #38: denormal stall on a silent reference, stacked on sonora #36.
+  - sonora #40: allocation-free processing.
+  - sonora #41: custom AEC3 config. One downstream user needed it for double-talk tuning; it also exposes `num_filters` for a wider delay window.
+- **`mul_add` (sonora #37) no longer matters to us (2026-10-28):** the build moved to x86-64-v3, where each `mul_add` is one FMA instruction, so the exes call no `fmaf`. The vendored 0.2.0 with the AEC path's `mul_add`s as plain arithmetic (2026-10-26, AEC3 91 → 55 µs a block at v2) went with the move; crates.io's 0.2.0 takes about 50 µs at v3 (`doc/dev/build-report.md` §11).
+- **Plan:** vendor a fork of main with sonora #38 and #40 (and #41) merged. Until then, FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference, which zero-filled gaps make mandatory.
 - **One thread:** sonora's API takes `&mut self` for both render and capture, so one DSP thread owns the instance and feeds the reference frame before the matching mic frame.
 - **Full band:** set `MaxProcessingRate::Rate48kHz`. sonora's default (`Rate32kHz`, as in upstream WebRTC) caps the whole capture path at 16 kHz whatever noise model runs.
   - Rate48kHz routes audio through WebRTC's three-band filter bank (0-8/8-16/16-24 kHz). It's not perfect-reconstruction (~9.5 dB round-trip SNR), so A/B it against 32 kHz in #14.
@@ -38,7 +39,7 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   - Block the virtual cable, and our own monitor output, from being picked as the reference.
   - Warn when the noise filter is on without AEC while on speakers: Discord's own AEC then sees an echo path through a time-varying denoiser.
 - **Stats:** show AEC3's delay estimate and ERLE.
-- **Delay window:** the default delay-estimation window is about 608 ms (our calculation from the code). Bluetooth or USB speakers with large output latency may need a bigger window (custom config, #41).
+- **Delay window:** the default delay-estimation window is about 608 ms (our calculation from the code). Bluetooth or USB speakers with large output latency may need a bigger window (custom config, sonora #41).
 - **Reconvergence:** volume changes (loopback is pre-volume), render-side enhancement APOs and stalls all trigger it; one report took about a minute after a heavy stall.
 
 ## Later

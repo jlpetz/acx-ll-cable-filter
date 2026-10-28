@@ -57,7 +57,7 @@ The rest are listed by function and callee, to read:
   rt     an allocation, a lock, logging, formatting or a sleep: a real-time rule breach if the loop
          runs on the audio thread (CLAUDE.md), fine in set-up code
   libm   a libm call (`powf`, `expf`, `log10f`, `fmaf`...): per-sample maths that belongs per block,
-         or `mul_add` without FMA (at the x86-64-v2 baseline `f32::mul_add` is a call to `fmaf`)
+         or `mul_add` without FMA (our x86-64-v3 baseline has it; at v2 `mul_add` was a call to `fmaf`)
   read   anything else: an indirect call (`dyn Stage`, a COM method), a memcpy or memset of a
          computed size (a copy or fill loop LLVM collapsed), a helper that didn't inline
 
@@ -77,7 +77,7 @@ no v0 (`_R`) symbol, and one in which no hot loop is found (HOT no longer names 
             SUBSTRING, with the loops that call something listed; --all adds their clean loops
   --max     exits 1 when the loops touching the stack exceed N (a ratchet for a pre-release check)
   --paths   replaces HOT, e.g. `--paths nnnoiseless` to read a dependency's loops (inlined code is
-            counted in the function it was inlined into), or `--paths sonora` for its `fmaf` calls
+            counted in the function it was inlined into), or `--paths sonora` for sonora's loops
   --functions  lists the functions selected and their hot loops, to check HOT and COLD
 Its tests (selection and the default asm): python tools/test_hot_loop_spills.py
 """
