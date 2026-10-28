@@ -212,9 +212,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 ### 20. [chore] Clean up the review's build caches and scratch data
 **Priority**: Low | **Status**: kept for now (owner, 2026-10-28: they may be wanted again; keep them a little while).
-- `target/` is 41 GB, mostly the workflow agents' own build folders (`agent-*`, `review-*`, `fix-*`, `fix-verify-*`); `target/main` is the one in use.
+- `target/` (41 GB on 2026-10-26), mostly the workflow agents' own build folders (`agent-*`, `review-*`, `fix-*`, `fix-verify-*`, `v3-asm`, `v3-review`); since the v3 switch `target/v3` is the one in use, and `target/main` is the old v2 build.
 - A stray `crates/nf-stages/target/` (an agent's build; ignored by git since the initial commit).
-- Scratch in `%TEMP%` (`C:\Users\Administrator\AppData\Local\Temp` and its `2` subfolder): `nf-verify-*`, `nf-review-*`, `nf-gate-scratch`, `nf-fix-app`, `nf-dsp6`, `nf-core-edit`, `nfscripts`, and `nf-*.txt`/`.md` reports. The verifiers' event sims are now in the repo (`crates/nf-engine/src/pipeline/tests/events.rs`).
+- Scratch in `%TEMP%` (`C:\Users\Administrator\AppData\Local\Temp` and its `2` subfolder): `nf-verify-*`, `nf-review-*`, `nf-gate-scratch`, `nf-fix-app`, `nf-dsp6`, `nf-core-edit`, `nfscan`, `nf-review-asm`, `nfscripts`, and `nf-*.txt`/`.md`/`.log` reports. The verifiers' event sims are now in the repo (`crates/nf-engine/src/pipeline/tests/events.rs`).
 - The stale pre-move copy `C:\Users\Administrator\Downloads\TMR\noise-filter` (awaiting the owner's OK).
 **Next**: delete them once v0's live tests are done, asking first.
 **Detail**: none (this entry is the list).
