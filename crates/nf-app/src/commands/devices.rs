@@ -23,11 +23,7 @@ pub fn format_devices(list: &[DeviceInfo]) -> String {
         let mut any = false;
         for d in list.iter().filter(|d| d.flow == flow) {
             any = true;
-            let format = if d.sample_rate == 0 {
-                "format unknown".to_owned()
-            } else {
-                format!("{} Hz, {} ch", d.sample_rate, d.channels)
-            };
+            let format = if d.sample_rate == 0 { "format unknown".to_owned() } else { format!("{} Hz, {} ch", d.sample_rate, d.channels) };
             let marks: String = [(d.is_default, " [default]"), (d.is_default_communications, " [communications default]")]
                 .iter()
                 .filter(|(on, _)| *on)

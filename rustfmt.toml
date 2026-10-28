@@ -1,0 +1,11 @@
+# TMR's layout (the owner, 2026-10-28: follow TMR's rustfmt settings): dense and wide, one layout everywhere, 140 columns. Run
+# `cargo fmt --all` before clippy. A layout worth keeping (a table, one row a line) takes `#[rustfmt::skip]`. Comments wrap at 140 too,
+# by hand: rustfmt leaves them alone (`wrap_comments` only breaks lines, never joins them, so it strands words).
+# The options from `overflow_delimited_expr` on are nightly rustfmt's, which the nightly toolchain runs.
+max_width = 140
+use_small_heuristics = "Max"
+fn_params_layout = "Compressed"
+short_array_element_width_threshold = 40
+overflow_delimited_expr = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

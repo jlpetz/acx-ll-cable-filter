@@ -7,9 +7,8 @@ use nf_engine::{EngineConfig, EngineState, EngineStatus, StreamInfo, TelemetrySn
 
 use super::{db, fixed, list_devices};
 use crate::cli::EngineArgs;
-use crate::config;
-use crate::console;
 use crate::exit::Failure;
+use crate::{config, console};
 
 pub fn run(args: &EngineArgs) -> Result<(), Failure> {
     let cfg = config::engine_config(args, list_devices)?;
@@ -181,8 +180,9 @@ fn stream_line(label: &str, s: Option<&StreamInfo>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nf_engine::{GateMode, MeterSnapshot, ProcessingConfig};
+
+    use super::*;
 
     #[test]
     fn the_status_line_shows_levels_latency_cpu_drift_drops_and_allocations() {

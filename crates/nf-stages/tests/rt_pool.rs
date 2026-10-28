@@ -16,8 +16,8 @@ use nf_core::controls::ChainControls;
 use nf_core::stage::{ProcessIo, Stage};
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_mem::{PageKind, PagePolicy, RtAllocator, RtScope};
-use nf_stages::{RnnoiseStage, build_chain};
 use nf_stages::synth::{Voice, add, pink_noise, speech_like};
+use nf_stages::{RnnoiseStage, build_chain};
 
 #[global_allocator]
 static GLOBAL: RtAllocator = RtAllocator::new();
@@ -96,7 +96,12 @@ fn warmed_up_threads_give_the_pool_back_after_every_start() {
         assert!(allocs >= 30, "start {k}: only {allocs} allocations in the scope");
         assert_eq!(fallbacks, 0, "start {k}: the pool should serve the whole start");
         // ...and all of it goes back.
-        assert_eq!(c.pool_bytes_in_use, c0.pool_bytes_in_use, "start {k}: the pool kept {} bytes", c.pool_bytes_in_use.wrapping_sub(c0.pool_bytes_in_use));
+        assert_eq!(
+            c.pool_bytes_in_use,
+            c0.pool_bytes_in_use,
+            "start {k}: the pool kept {} bytes",
+            c.pool_bytes_in_use.wrapping_sub(c0.pool_bytes_in_use)
+        );
         assert_eq!(c.pool_allocs - c0.pool_allocs, c.pool_frees - c0.pool_frees, "start {k}: live pool blocks left");
     }
     let c = nf_mem::counters();
@@ -148,7 +153,12 @@ fn a_whole_chain_start_with_aec3_gives_the_pool_back_too() {
         let c = nf_mem::counters();
         assert!(allocs > 1000, "start {k}: only {allocs} allocations in the scope");
         assert_eq!(fallbacks, 0, "start {k}: the pool should serve the whole start");
-        assert_eq!(c.pool_bytes_in_use, c0.pool_bytes_in_use, "start {k}: the pool kept {} bytes", c.pool_bytes_in_use.wrapping_sub(c0.pool_bytes_in_use));
+        assert_eq!(
+            c.pool_bytes_in_use,
+            c0.pool_bytes_in_use,
+            "start {k}: the pool kept {} bytes",
+            c.pool_bytes_in_use.wrapping_sub(c0.pool_bytes_in_use)
+        );
         eprintln!("chain start {k}: {allocs} scope allocations, all freed");
     }
 }

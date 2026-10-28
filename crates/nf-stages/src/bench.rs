@@ -223,11 +223,7 @@ pub fn chain(sig: &Signals, with_aec: bool, count: Option<AllocCounter>) -> Resu
     let cfg = ProcessingConfig { aec_enabled: with_aec, ..ProcessingConfig::default() };
     let mut chain = build_chain(controls(cfg), with_aec)?;
     let mut out = [0.0f32; BLOCK];
-    let (name, mic) = if with_aec {
-        ("chain: meters + AEC3 + RNNoise", &sig.mic)
-    } else {
-        ("chain: meters + RNNoise", &sig.noisy)
-    };
+    let (name, mic) = if with_aec { ("chain: meters + AEC3 + RNNoise", &sig.mic) } else { ("chain: meters + RNNoise", &sig.noisy) };
     Ok(time_blocks(name, sig.blocks(), count, |b| {
         black_box(chain.process(block(mic, b), block(&sig.far, b), &mut out));
         black_box(&out);

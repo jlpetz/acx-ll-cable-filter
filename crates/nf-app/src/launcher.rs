@@ -42,13 +42,13 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, TRUE, WAIT_OBJECT_0};
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetConsoleProcessList, GetConsoleWindow, GetStdHandle, CONSOLE_MODE, STD_ERROR_HANDLE, STD_HANDLE,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    CONSOLE_MODE, GetConsoleMode, GetConsoleProcessList, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows::Win32::System::Environment::GetCommandLineW;
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOW, WaitForSingleObject,
 };
 use windows::core::{BOOL, HSTRING, Owned, PCWSTR, PWSTR};
 
@@ -153,8 +153,7 @@ fn launch() -> Result<u32, String> {
     let own_console = console_process_count() == 1;
     // SAFETY: the handler is an `extern "system"` fn of the signature the API takes, which lives as
     // long as the process; it only returns.
-    unsafe { SetConsoleCtrlHandler(Some(leave_it_to_the_child), true) }
-        .map_err(|e| format!("couldn't set a Ctrl+C handler ({e})"))?;
+    unsafe { SetConsoleCtrlHandler(Some(leave_it_to_the_child), true) }.map_err(|e| format!("couldn't set a Ctrl+C handler ({e})"))?;
     let child = spawn(&target, tail, true)?;
     let code = wait(&child)?;
     if own_console && can_pause() {

@@ -4,7 +4,8 @@
 //! plain `Copy` snapshot at the start of `process`. Relaxed loads are enough: each value stands
 //! alone, and one block of skew between two of them is harmless.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use crate::atomic::AtomicF32;
 use crate::config::{GateConfig, GateMode, ProcessingConfig};
@@ -107,11 +108,7 @@ impl ChainControls {
     pub fn new(cfg: &ProcessingConfig) -> Self {
         let c = Self {
             aec: AecControls { enabled: AtomicBool::new(false) },
-            noise: NoiseControls {
-                enabled: AtomicBool::new(false),
-                floor_db: AtomicF32::new(0.0),
-                gate: GateControls::new(&cfg.gate),
-            },
+            noise: NoiseControls { enabled: AtomicBool::new(false), floor_db: AtomicF32::new(0.0), gate: GateControls::new(&cfg.gate) },
             meters_enabled: AtomicBool::new(true),
             passthrough: AtomicBool::new(false),
         };

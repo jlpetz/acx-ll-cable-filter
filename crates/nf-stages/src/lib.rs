@@ -37,8 +37,7 @@ pub fn warm_up_fft_thread() {
 /// easyfft's per-thread FFT state there, so `Chain::process` then doesn't allocate on that thread
 /// (sonora's own per-block allocations aside, see [`Aec3Stage`]).
 pub fn build_chain(controls: Arc<ChainControls>, with_aec: bool) -> Result<Chain, StageError> {
-    let aec: Option<Box<dyn Stage>> =
-        if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None };
+    let aec: Option<Box<dyn Stage>> = if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None };
     let noise: Box<dyn Stage> = Box::new(RnnoiseStage::new(controls.clone()));
     let mut chain = Chain::new(controls, aec, Some(noise));
     chain.activate()?;

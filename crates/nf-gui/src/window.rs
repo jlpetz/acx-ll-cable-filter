@@ -18,24 +18,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nf_engine::{
-    DeviceInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress, LatencyReport,
-    LatencyTest, LatencyTestRequest,
+    DeviceInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress, LatencyReport, LatencyTest,
+    LatencyTestRequest,
 };
 use nf_mem::privilege::{HELPER_NOT_ELEVATED, helper_args};
 use windows_reactor::*;
 
 use crate::devices::{self, DeviceChoices, Picker};
 use crate::live::{Live, LiveInput};
-use crate::screen;
 use crate::settings::{
-    ATTACK_MS, FLOOR_DB, HOLD_MS, MARGIN_DB, MAX_REPETITIONS, MIN_HEIGHT, MIN_REPETITIONS, MIN_WIDTH, OUTPUT_MARGIN_MS,
-    RANGE_DB, RELEASE_MS, SaverHandle, Settings, THRESHOLD_DB, TestMode,
+    ATTACK_MS, FLOOR_DB, HOLD_MS, MARGIN_DB, MAX_REPETITIONS, MIN_HEIGHT, MIN_REPETITIONS, MIN_WIDTH, OUTPUT_MARGIN_MS, RANGE_DB,
+    RELEASE_MS, SaverHandle, Settings, THRESHOLD_DB, TestMode,
 };
 use crate::widgets::{
-    MAX_CONTENT, PAGE_MARGIN, SECTION_SPACING, card, combo, device_combo, secondary, selectable, slider, switch,
-    track_width,
+    MAX_CONTENT, PAGE_MARGIN, SECTION_SPACING, card, combo, device_combo, secondary, selectable, slider, switch, track_width,
 };
-use crate::{SharedEngine, format, waiting};
+use crate::{SharedEngine, format, screen, waiting};
 
 /// The status waiter's period: the status line and the diagnostics change slowly.
 const STATUS_TICK: Duration = Duration::from_millis(500);
@@ -275,15 +273,7 @@ struct TestPanel<H = LatencyTest> {
 
 impl<H> Default for TestPanel<H> {
     fn default() -> Self {
-        Self {
-            starting: false,
-            running: None,
-            generation: 0,
-            fraction: 0.0,
-            stage: "",
-            cancelling: false,
-            outcome: None,
-        }
+        Self { starting: false, running: None, generation: 0, fraction: 0.0, stage: "", cancelling: false, outcome: None }
     }
 }
 
@@ -329,12 +319,7 @@ impl<H> TestPanel<H> {
 }
 
 /// Why "Run test" is disabled, if it is.
-fn test_blocker(
-    state: EngineState,
-    job: Option<Job>,
-    probe: Option<&str>,
-    capture: Option<&str>,
-) -> Option<&'static str> {
+fn test_blocker(state: EngineState, job: Option<Job>, probe: Option<&str>, capture: Option<&str>) -> Option<&'static str> {
     if state != EngineState::Running || job.is_some() {
         Some("Start the filter first: the test measures the running chain.")
     } else if probe.is_none() || capture.is_none() {
@@ -540,10 +525,7 @@ impl Window {
         self.job = None;
         self.take_status(self.engine.status());
         // A fault's notice said the filter would restart by itself: not any more
-        if self.status.state == EngineState::Stopped
-            && !self.status.retrying
-            && self.notice.as_ref().is_some_and(|n| n.about_run)
-        {
+        if self.status.state == EngineState::Stopped && !self.status.retrying && self.notice.as_ref().is_some_and(|n| n.about_run) {
             self.notice = None;
         }
     }
@@ -570,9 +552,7 @@ impl Window {
             return;
         }
         let ui = &self.settings.ui;
-        if self.test.starting
-            || test_blocker(self.status.state, self.job, ui.test_probe.as_deref(), ui.test_capture.as_deref()).is_some()
-        {
+        if self.test.starting || test_blocker(self.status.state, self.job, ui.test_probe.as_deref(), ui.test_capture.as_deref()).is_some() {
             return;
         }
         let (Some(probe), Some(capture)) = (ui.test_probe.clone(), ui.test_capture.clone()) else {
@@ -599,10 +579,7 @@ impl Window {
             return;
         }
         self.elevating = true;
-        context.spawn_background_with_rejection(
-            |_| Msg::LargePages(setup_large_pages()),
-            Msg::LargePages(Err(NOT_RUN.to_owned())),
-        );
+        context.spawn_background_with_rejection(|_| Msg::LargePages(setup_large_pages()), Msg::LargePages(Err(NOT_RUN.to_owned())));
     }
 
     fn large_pages_done(&mut self, result: Result<u32, String>) {
@@ -620,11 +597,7 @@ impl Window {
     /// The window was resized: the meters follow, and the size is remembered for the next start.
     fn resized(&mut self, size: WindowSize) {
         // A minimised window can report a tiny (or no) size: keep only real ones
-        if !size.width.is_finite()
-            || !size.height.is_finite()
-            || size.width < MIN_WIDTH - 1.0
-            || size.height < MIN_HEIGHT - 1.0
-        {
+        if !size.width.is_finite() || !size.height.is_finite() || size.width < MIN_WIDTH - 1.0 || size.height < MIN_HEIGHT - 1.0 {
             return;
         }
         self.width = size.width;
@@ -715,9 +688,7 @@ impl Component for Window {
             }
             Msg::Noise(on) => self.configure(|c| c.processing.noise_enabled = on),
             Msg::Aec(on) => self.configure(|c| c.processing.aec_enabled = on),
-            Msg::Floor(v) => {
-                self.configure(|c| c.processing.floor_db = FLOOR_DB.clamp(v as f32, c.processing.floor_db))
-            }
+            Msg::Floor(v) => self.configure(|c| c.processing.floor_db = FLOOR_DB.clamp(v as f32, c.processing.floor_db)),
             Msg::GateMode(index) => {
                 if let Some(mode) = index.and_then(gate_mode) {
                     self.configure(|c| c.processing.gate.mode = mode);
@@ -772,8 +743,7 @@ impl Component for Window {
             }
             // A cleared box (`None`) keeps the old count, which the next view puts back
             Msg::Repetitions(Some(v)) if v.is_finite() => {
-                self.settings.ui.test_repetitions =
-                    v.round().clamp(f64::from(MIN_REPETITIONS), f64::from(MAX_REPETITIONS)) as u32;
+                self.settings.ui.test_repetitions = v.round().clamp(f64::from(MIN_REPETITIONS), f64::from(MAX_REPETITIONS)) as u32;
                 self.persist();
             }
             Msg::Repetitions(_) => {}
@@ -781,9 +751,7 @@ impl Component for Window {
             Msg::LowLatency(on) => self.configure(|c| c.io.low_latency_periods = on),
             Msg::RawMic(on) => self.configure(|c| c.io.raw_mic = on),
             Msg::KeepAlive(on) => self.configure(|c| c.io.keep_alive_reference = on),
-            Msg::OutputMargin(v) => {
-                self.configure(|c| c.io.output_margin_ms = OUTPUT_MARGIN_MS.clamp(v as f32, c.io.output_margin_ms))
-            }
+            Msg::OutputMargin(v) => self.configure(|c| c.io.output_margin_ms = OUTPUT_MARGIN_MS.clamp(v as f32, c.io.output_margin_ms)),
             Msg::EnableLargePages => self.enable_large_pages(context),
             // InfoBar.IsOpen has no feedback: clear it, so the next notice is a change Reactor applies
             Msg::CloseNotice => self.notice = None,
@@ -806,11 +774,7 @@ impl Component for Window {
                 .theme(WindowTheme::System)
                 // Sanitised on load: finite, at least the minimum
                 .client_size(self.client.0, self.client.1)
-                .constraints(WindowConstraints {
-                    min_width: Some(MIN_WIDTH),
-                    min_height: Some(MIN_HEIGHT),
-                    ..Default::default()
-                }),
+                .constraints(WindowConstraints { min_width: Some(MIN_WIDTH), min_height: Some(MIN_HEIGHT), ..Default::default() }),
         );
         context.on_window_size(context.callback(Msg::Size));
         let page = StackPanel::new()
@@ -843,10 +807,10 @@ impl Window {
         };
         let status = format::status_line(&self.status, self.job);
         Grid::new().columns([GridLength::STAR, GridLength::Auto]).column_spacing(16.0).children((
-            StackPanel::new().grid_column(0).spacing(2.0).children((
-                TextBlock::new().text("noise-filter").font_size(28.0).font_weight(FontWeight::SEMI_BOLD),
-                secondary(status),
-            )),
+            StackPanel::new()
+                .grid_column(0)
+                .spacing(2.0)
+                .children((TextBlock::new().text("noise-filter").font_size(28.0).font_weight(FontWeight::SEMI_BOLD), secondary(status))),
             Button::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
@@ -897,13 +861,7 @@ impl Window {
             "Devices",
             None,
             StackPanel::new().spacing(12.0).children((
-                device_combo(
-                    "Microphone",
-                    &self.choices.mic,
-                    placeholder("Choose a microphone"),
-                    enabled,
-                    context.callback(Msg::Mic),
-                ),
+                device_combo("Microphone", &self.choices.mic, placeholder("Choose a microphone"), enabled, context.callback(Msg::Mic)),
                 device_combo(
                     "Output (virtual cable)",
                     &self.choices.output,
@@ -918,10 +876,11 @@ impl Window {
                     enabled,
                     context.callback(Msg::Reference),
                 ),
-                Button::new()
-                    .is_enabled(!self.refreshing)
-                    .on_click(context.callback(|()| Msg::Refresh))
-                    .content(if self.refreshing { "Refreshing…" } else { "Refresh devices" }),
+                Button::new().is_enabled(!self.refreshing).on_click(context.callback(|()| Msg::Refresh)).content(if self.refreshing {
+                    "Refreshing…"
+                } else {
+                    "Refresh devices"
+                }),
             )),
         )
     }
@@ -956,19 +915,13 @@ impl Window {
                 ),
             ),
         };
-        let bypassed: View = if noise {
-            View::empty()
-        } else {
-            secondary("The noise filter is off: suppression and the gate are bypassed.").into()
-        };
+        let bypassed: View =
+            if noise { View::empty() } else { secondary("The noise filter is off: suppression and the gate are bypassed.").into() };
         card(
             "Processing",
             None,
             StackPanel::new().spacing(10.0).children((
-                CheckBox::new()
-                    .is_checked(noise)
-                    .on_is_checked_changed(context.callback(Msg::Noise))
-                    .content("Noise filter (RNNoise)"),
+                CheckBox::new().is_checked(noise).on_is_checked_changed(context.callback(Msg::Noise)).content("Noise filter (RNNoise)"),
                 StackPanel::new().children((
                     CheckBox::new()
                         .is_checked(p.aec_enabled)
@@ -978,19 +931,10 @@ impl Window {
                 )),
                 bypassed,
                 slider(format::suppression(p.floor_db), FLOOR_DB, p.floor_db, noise, context.callback(Msg::Floor)),
-                TextBlock::new()
-                    .text("Gate")
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .margin(Thickness::new(0.0, 6.0, 0.0, 0.0)),
+                TextBlock::new().text("Gate").font_weight(FontWeight::SEMI_BOLD).margin(Thickness::new(0.0, 6.0, 0.0, 0.0)),
                 combo("Mode", &GATE_MODES, gate_index(g.mode), noise, context.callback(Msg::GateMode)),
                 View::keyed_fragment([level]),
-                slider(
-                    format::labelled("Attack", g.attack_ms, 1, "ms"),
-                    ATTACK_MS,
-                    g.attack_ms,
-                    gate_on,
-                    context.callback(Msg::Attack),
-                ),
+                slider(format::labelled("Attack", g.attack_ms, 1, "ms"), ATTACK_MS, g.attack_ms, gate_on, context.callback(Msg::Attack)),
                 slider(
                     format::labelled("Release", g.release_ms, 0, "ms"),
                     RELEASE_MS,
@@ -998,20 +942,8 @@ impl Window {
                     gate_on,
                     context.callback(Msg::Release),
                 ),
-                slider(
-                    format::labelled("Hold", g.hold_ms, 0, "ms"),
-                    HOLD_MS,
-                    g.hold_ms,
-                    gate_on,
-                    context.callback(Msg::Hold),
-                ),
-                slider(
-                    format::labelled("Range (dB)", g.range_db, 0, ""),
-                    RANGE_DB,
-                    g.range_db,
-                    gate_on,
-                    context.callback(Msg::Range),
-                ),
+                slider(format::labelled("Hold", g.hold_ms, 0, "ms"), HOLD_MS, g.hold_ms, gate_on, context.callback(Msg::Hold)),
+                slider(format::labelled("Range (dB)", g.range_db, 0, ""), RANGE_DB, g.range_db, gate_on, context.callback(Msg::Range)),
                 CheckBox::new()
                     .is_checked(g.use_vad)
                     .is_enabled(gate_on)
@@ -1119,8 +1051,7 @@ impl Window {
     fn diagnostics_section(&self, context: &ViewContext<Self>) -> View {
         let io = &self.settings.engine.io;
         let facts = format::diagnostics(&self.status).into_iter().enumerate().map(|(i, line)| (i, selectable(line)));
-        let note: View =
-            if self.large_pages_set_up { secondary("Sign out and back in to apply.").into() } else { View::empty() };
+        let note: View = if self.large_pages_set_up { secondary("Sign out and back in to apply.").into() } else { View::empty() };
         let body = StackPanel::new().spacing(12.0).children((
             StackPanel::new().spacing(2.0).keyed_children(facts),
             switch("Low-latency periods (IAudioClient3)", io.low_latency_periods, context.callback(Msg::LowLatency)),
@@ -1176,10 +1107,7 @@ mod tests {
     fn the_test_needs_a_running_engine_and_both_devices() {
         let running = EngineState::Running;
         assert_eq!(test_blocker(running, None, Some("p"), Some("c")), None);
-        assert!(
-            test_blocker(EngineState::Stopped, None, Some("p"), Some("c"))
-                .is_some_and(|w| w.starts_with("Start the filter"))
-        );
+        assert!(test_blocker(EngineState::Stopped, None, Some("p"), Some("c")).is_some_and(|w| w.starts_with("Start the filter")));
         assert!(test_blocker(EngineState::Error, None, Some("p"), Some("c")).is_some());
         assert!(test_blocker(running, Some(Job::Stopping), Some("p"), Some("c")).is_some(), "stopping");
         assert!(test_blocker(running, None, None, Some("c")).is_some_and(|w| w.starts_with("Choose")));
@@ -1269,10 +1197,7 @@ mod tests {
         let fault = engine_status(S::Error, true);
         watch.observe(&fault, None, &mut notice);
         let raised = notice.clone().expect("raised");
-        assert_eq!(
-            (raised.severity, raised.title, raised.about_run),
-            (InfoBarSeverity::Error, "The filter stopped", true)
-        );
+        assert_eq!((raised.severity, raised.title, raised.about_run), (InfoBarSeverity::Error, "The filter stopped", true));
         assert!(raised.message.starts_with("The mic was unplugged.") && raised.message.contains("Press Stop"));
 
         // The user closes it: failed retries don't bring it back
@@ -1362,11 +1287,7 @@ mod tests {
         }];
         let mut s = Settings::default();
         let c = Choices::new(&list, &s);
-        assert_eq!(
-            (c.output.selected, c.reference.labels.len()),
-            (None, 2),
-            "the cable is a reference choice until it's the output"
-        );
+        assert_eq!((c.output.selected, c.reference.labels.len()), (None, 2), "the cable is a reference choice until it's the output");
         s.engine.devices.output = Some("cable-in".to_owned());
         s.ui.test_capture = Some("gone".to_owned());
         let c = Choices::new(&list, &s);

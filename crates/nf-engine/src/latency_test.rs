@@ -9,8 +9,8 @@
 //! The tap ring is handed to the audio thread lock-free (a one-slot rtrb ring of producers) and
 //! handed back the same way, so the audio thread never frees it.
 
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -266,10 +266,10 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     let (train, starts) = probe_train(&sweep, reps, GAP_S);
 
     let en = DeviceEnumerator::new().map_err(|e| failed(describe_hr(StreamRole::Probe, hr_of(&e))))?;
-    let probe_dev = resolve(&en, Some(&req.probe_device), Direction::Render, StreamRole::Probe)
-        .map_err(|f| failed(describe_start_failure(&f)))?;
-    let cap_dev = resolve(&en, Some(&req.capture_device), Direction::Capture, StreamRole::Capture)
-        .map_err(|f| failed(describe_start_failure(&f)))?;
+    let probe_dev =
+        resolve(&en, Some(&req.probe_device), Direction::Render, StreamRole::Probe).map_err(|f| failed(describe_start_failure(&f)))?;
+    let cap_dev =
+        resolve(&en, Some(&req.capture_device), Direction::Capture, StreamRole::Capture).map_err(|f| failed(describe_start_failure(&f)))?;
     let mut probe = RenderStream::open(&probe_dev, RENDER_BUFFER_HNS).map_err(|e| failed(describe_hr(StreamRole::Probe, hr_of(&e))))?;
     let mut cap = CaptureStream::open_events(&cap_dev).map_err(|e| failed(describe_hr(StreamRole::Capture, hr_of(&e))))?;
     let probe_err = |hr| failed(describe_hr(StreamRole::Probe, hr));
@@ -396,14 +396,8 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.readout_ms_median = tel.latency_valid.then_some(tel.latency_ms_median);
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
-    report.conditions = conditions(
-        st.mic.as_ref(),
-        st.output.as_ref(),
-        &probe.info.stream_info(),
-        &cap.info.stream_info(),
-        req.mode,
-        !req.through_model,
-    );
+    report.conditions =
+        conditions(st.mic.as_ref(), st.output.as_ref(), &probe.info.stream_info(), &cap.info.stream_info(), req.mode, !req.through_model);
     report.warnings.extend(mode_warnings(req, inner.controls.aec.enabled.load(Relaxed)));
     shared.running(1.0, "Done");
     Ok(report)
@@ -443,11 +437,7 @@ pub(crate) fn median(v: &[f64]) -> Option<f64> {
 /// is the first within [tap − 5 ms, + half a period) of that. Both need `confidence_db ≥ 15`; then
 /// repetitions more than 50 ms from the median app latency are dropped.
 pub(crate) fn build_report(
-    repetitions: u32,
-    probe: &[Option<f64>],
-    tap: &[TimedArrival],
-    out: &[TimedArrival],
-    period_hns: f64,
+    repetitions: u32, probe: &[Option<f64>], tap: &[TimedArrival], out: &[TimedArrival], period_hns: f64,
 ) -> LatencyReport {
     struct Rep {
         app: f64,
@@ -500,14 +490,10 @@ pub(crate) fn build_report(
             "No sweep was found in both recordings. Check that the mic is the probe cable's output, that the capture device is the output cable's recording side, and that neither is muted.".to_owned(),
         );
     } else if valid < repetitions {
-        warnings.push(format!(
-            "Only {valid} of {repetitions} sweeps were found clearly in both recordings; the result is less certain."
-        ));
+        warnings.push(format!("Only {valid} of {repetitions} sweeps were found clearly in both recordings; the result is less certain."));
     }
     if spread > SPREAD_WARN_MS {
-        warnings.push(format!(
-            "The app latency varied by {spread:.1} ms between sweeps; repeat the test with less running on the PC."
-        ));
+        warnings.push(format!("The app latency varied by {spread:.1} ms between sweeps; repeat the test with less running on the PC."));
     }
     LatencyReport {
         repetitions,
@@ -535,19 +521,17 @@ pub(crate) fn mode_warnings(req: &LatencyTestRequest, aec_enabled: bool) -> Vec<
         w.push("Acoustic results need a quiet room: background noise shows up as missed or uncertain sweeps.".to_owned());
     }
     if req.through_model {
-        w.push("Measuring through the noise filter needs a speech probe (not in this version): the filter may have removed the sweeps.".to_owned());
+        w.push(
+            "Measuring through the noise filter needs a speech probe (not in this version): the filter may have removed the sweeps."
+                .to_owned(),
+        );
     }
     w
 }
 
 /// The record of how the test ran: engine periods, RAW, autoconvert and the devices.
 pub(crate) fn conditions(
-    mic: Option<&StreamInfo>,
-    output: Option<&StreamInfo>,
-    probe: &StreamInfo,
-    capture: &StreamInfo,
-    mode: LatencyMode,
-    passthrough: bool,
+    mic: Option<&StreamInfo>, output: Option<&StreamInfo>, probe: &StreamInfo, capture: &StreamInfo, mode: LatencyMode, passthrough: bool,
 ) -> String {
     let mut parts = vec![format!(
         "{} ({})",

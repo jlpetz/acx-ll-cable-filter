@@ -14,9 +14,8 @@ use nf_engine::ProcessingConfig;
 
 use super::fixed;
 use crate::cli::ProcessArgs;
-use crate::config;
 use crate::exit::Failure;
-use crate::wav;
+use crate::{config, wav};
 
 pub fn process(args: &ProcessArgs) -> Result<(), Failure> {
     let done = process_files(args)?;
@@ -125,21 +124,15 @@ fn fill(block: &mut Block, x: &[f32], from: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::Processing;
-    use crate::exit::Exit;
     use nf_core::latency::analysis::gcc_phat;
     use nf_stages::synth::{Voice, add, delayed, pink_noise, rms, scaled, speech_like};
 
+    use super::*;
+    use crate::cli::Processing;
+    use crate::exit::Exit;
+
     fn args(dir: &Path, processing: Processing) -> ProcessArgs {
-        ProcessArgs {
-            input: dir.join("in.wav"),
-            output: dir.join("out.wav"),
-            reference: None,
-            config: None,
-            processing,
-            align: false,
-        }
+        ProcessArgs { input: dir.join("in.wav"), output: dir.join("out.wav"), reference: None, config: None, processing, align: false }
     }
 
     fn read(path: &Path) -> Vec<f32> {

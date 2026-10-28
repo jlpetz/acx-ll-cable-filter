@@ -220,8 +220,7 @@ pub(crate) struct Loaded {
 /// can't be read, is backed up as [`bad_path`] before the defaults are used. One that can't be read
 /// nor backed up is left alone, and the session is [`Loaded::read_only`].
 pub(crate) fn load(path: &Path) -> Loaded {
-    let defaults =
-        |warning: String| Loaded { settings: Settings::default(), warning: Some(warning), read_only: false };
+    let defaults = |warning: String| Loaded { settings: Settings::default(), warning: Some(warning), read_only: false };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if first_run(&e, path) => {
@@ -369,9 +368,7 @@ impl Saver {
         let (commands, received) = mpsc::channel();
         let thread = {
             let (path, errors) = (Arc::clone(&path), Arc::clone(&errors));
-            std::thread::Builder::new()
-                .name("nf-settings".to_owned())
-                .spawn(move || save_loop(&received, &path, debounce, &errors))
+            std::thread::Builder::new().name("nf-settings".to_owned()).spawn(move || save_loop(&received, &path, debounce, &errors))
         };
         let (commands, thread) = match thread {
             Ok(thread) => (Some(commands), Some(thread)),
@@ -533,10 +530,7 @@ mod tests {
         let s = parse(json).unwrap();
         let p = &s.engine.processing;
         assert_eq!((p.floor_db, p.gate.threshold_db, p.gate.attack_ms), (-60.0, -10.0, 0.5));
-        assert_eq!(
-            (p.gate.release_ms, p.gate.hold_ms, p.gate.range_db, p.gate.auto_margin_db),
-            (1000.0, 0.0, 0.0, 20.0)
-        );
+        assert_eq!((p.gate.release_ms, p.gate.hold_ms, p.gate.range_db, p.gate.auto_margin_db), (1000.0, 0.0, 0.0, 20.0));
         assert_eq!(s.engine.io.output_margin_ms, 20.0);
         assert_eq!((&s.engine.devices.mic, &s.engine.devices.reference, &s.ui.test_probe), (&None, &None, &None));
         assert_eq!(s.ui.test_repetitions, MIN_REPETITIONS);

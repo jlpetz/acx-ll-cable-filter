@@ -122,7 +122,6 @@ fn elevate(sid: Option<&str>) -> Result<(), Failure> {
     }
 }
 
-
 /// What the elevated helper's exit code means.
 pub fn helper_result(code: u32) -> Result<(), &'static str> {
     match code {
@@ -177,11 +176,8 @@ mod tests {
     fn the_chosen_account_is_named() {
         let name = |sid: &str| format!("PC\\user{} ({sid})", sid.rsplit('-').next().unwrap_or(""));
         assert_eq!(grantee_note(&Grantee::Same("S-1-5-21-1-2-3-1001".into()), &name), None);
-        let note = grantee_note(
-            &Grantee::DesktopUser { sid: "S-1-5-21-1-2-3-1001".into(), elevated: "S-1-5-21-1-2-3-500".into() },
-            &name,
-        )
-        .unwrap();
+        let note = grantee_note(&Grantee::DesktopUser { sid: "S-1-5-21-1-2-3-1001".into(), elevated: "S-1-5-21-1-2-3-500".into() }, &name)
+            .unwrap();
         assert!(note.starts_with("note: this prompt runs as PC\\user500 (S-1-5-21-1-2-3-500), but PC\\user1001"), "{note}");
         let warning =
             grantee_note(&Grantee::Fallback { sid: "S-1-5-21-1-2-3-500".into(), why: "no desktop shell is running".into() }, &name)

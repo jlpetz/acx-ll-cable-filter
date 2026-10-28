@@ -437,10 +437,11 @@ unsafe impl GlobalAlloc for Router {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::RtScope;
     use crate::region::Region;
-    use std::sync::Mutex;
 
     /// A router over its own 4 KB-page region. Field order matters: the router goes first.
     struct TestPool {
@@ -921,8 +922,7 @@ mod tests {
         assert!(allocs > 1000 && fallbacks > 10, "allocs {allocs}, fallbacks {fallbacks}");
 
         // Live pool blocks never overlap.
-        let mut spans: Vec<(usize, usize)> =
-            live.iter().filter(|b| r.owns(b.p)).map(|b| (b.p.addr(), b.p.addr() + b.l.size())).collect();
+        let mut spans: Vec<(usize, usize)> = live.iter().filter(|b| r.owns(b.p)).map(|b| (b.p.addr(), b.p.addr() + b.l.size())).collect();
         spans.sort_unstable();
         for w in spans.windows(2) {
             assert!(w[0].1 <= w[1].0, "overlap: {:x?}", w);

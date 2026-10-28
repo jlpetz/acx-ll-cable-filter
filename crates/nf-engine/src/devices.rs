@@ -21,11 +21,8 @@ pub(crate) fn list_devices() -> Result<Vec<DeviceInfo>, EngineError> {
 }
 
 fn list_on_this_thread() -> Result<Vec<DeviceInfo>, EngineError> {
-    let fail = |e: WasapiError| {
-        EngineError(format!("Windows couldn't list the audio devices (error 0x{:08X}).", hr_of(&e) as u32))
-    };
-    let _com = Com::mta()
-        .map_err(|c| EngineError(format!("Windows audio couldn't be initialised (error 0x{:08X}).", c as u32)))?;
+    let fail = |e: WasapiError| EngineError(format!("Windows couldn't list the audio devices (error 0x{:08X}).", hr_of(&e) as u32));
+    let _com = Com::mta().map_err(|c| EngineError(format!("Windows audio couldn't be initialised (error 0x{:08X}).", c as u32)))?;
     let en = DeviceEnumerator::new().map_err(fail)?;
     let mut out = Vec::new();
     for (dir, flow) in [(Direction::Capture, Flow::Capture), (Direction::Render, Flow::Render)] {

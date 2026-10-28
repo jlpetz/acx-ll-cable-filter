@@ -17,8 +17,7 @@ use windows::Win32::Security::{
     GetTokenInformation, LookupAccountNameW, LookupAccountSidW, PSID, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::System::RemoteDesktop::{
-    WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW,
-    WTSUserName,
+    WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName,
 };
 use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
@@ -104,7 +103,8 @@ fn shell_user_sid() -> Result<String, String> {
             OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
                 .map_err(|e| format!("couldn't open the desktop shell's process ({})", win32_code(&e)))?,
         );
-        OpenProcessToken(*process, TOKEN_QUERY, &mut token).map_err(|e| format!("couldn't read the desktop shell's account ({})", win32_code(&e)))?;
+        OpenProcessToken(*process, TOKEN_QUERY, &mut token)
+            .map_err(|e| format!("couldn't read the desktop shell's account ({})", win32_code(&e)))?;
         Owned::new(token)
     };
     token_user_sid(*token)

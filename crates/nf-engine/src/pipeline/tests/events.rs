@@ -455,12 +455,7 @@ fn ref_run(late_ms: f64, lead_ms: f64, ref_ppm: f64, phase: f64) -> RefOutcome {
     let steady = pre.iter().sum::<f64>() / pre.len() as f64;
     let start_settle_s = align.iter().filter(|(t, d)| *t < 30.0 && (d - steady).abs() > 48.0).map(|x| x.0).fold(0.0, f64::max);
     let post_step = align.windows(2).filter(|w| w[0].0 > 29.0).map(|w| (w[1].1 - w[0].1).abs()).fold(0.0, f64::max);
-    RefOutcome {
-        start_settle_s,
-        post_step,
-        drops_after: p.counters.reference_drops - drops,
-        gaps_after: p.counters.reference_gaps - gaps,
-    }
+    RefOutcome { start_settle_s, post_step, drops_after: p.counters.reference_drops - drops, gaps_after: p.counters.reference_gaps - gaps }
 }
 
 /// clocks-latency/F2: a wake up to 50 ms late doesn't discard reference blocks the rest of the

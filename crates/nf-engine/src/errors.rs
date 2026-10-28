@@ -169,9 +169,7 @@ impl Fault {
 
     pub(crate) fn unpack(v: u64) -> Option<Self> {
         match v >> 40 {
-            Self::KIND_STREAM => {
-                Some(Fault::Stream { role: StreamRole::from_u8((v >> 32) as u8), hr: v as u32 as i32 })
-            }
+            Self::KIND_STREAM => Some(Fault::Stream { role: StreamRole::from_u8((v >> 32) as u8), hr: v as u32 as i32 }),
             Self::KIND_STALL => Some(Fault::MicStalled),
             _ => None,
         }
@@ -197,10 +195,12 @@ pub(crate) fn describe_hr(role: StreamRole, code: i32) -> String {
         hr::AUDCLNT_E_DEVICE_IN_USE | hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => format!(
             "{noun} is in use by another app in exclusive mode. Close that app, or turn off \"Allow applications to take exclusive control\" for the device in Sound settings."
         ),
-        hr::AUDCLNT_E_SERVICE_NOT_RUNNING => "The Windows Audio service isn't running. Start it (or restart the PC) and try again.".to_owned(),
-        hr::AUDCLNT_E_UNSUPPORTED_FORMAT => format!(
-            "{noun} doesn't accept a 48 kHz stream. Set its format to 48000 Hz in Sound settings > the device > Advanced."
-        ),
+        hr::AUDCLNT_E_SERVICE_NOT_RUNNING => {
+            "The Windows Audio service isn't running. Start it (or restart the PC) and try again.".to_owned()
+        }
+        hr::AUDCLNT_E_UNSUPPORTED_FORMAT => {
+            format!("{noun} doesn't accept a 48 kHz stream. Set its format to 48000 Hz in Sound settings > the device > Advanced.")
+        }
         hr::E_ACCESSDENIED if role == StreamRole::Mic || role == StreamRole::Capture => format!(
             "Windows blocked access to {}. Turn on \"Let desktop apps access your microphone\" in Settings > Privacy & security > Microphone.",
             lower_first(noun)
@@ -218,16 +218,14 @@ pub(crate) fn describe_start_failure(f: &StartFailure) -> String {
             *code as u32
         ),
         StartFailure::NotFound(StreamRole::Reference) => {
-            "No speakers were found to take the echo reference from. Pick the speakers you listen on, or turn echo cancellation off.".to_owned()
+            "No speakers were found to take the echo reference from. Pick the speakers you listen on, or turn echo cancellation off."
+                .to_owned()
         }
         StartFailure::NotFound(role) => describe_hr(*role, hr::E_NOTFOUND),
         StartFailure::WrongDirection(StreamRole::Mic) => {
             "The device picked as the microphone is a playback device. Pick a recording device.".to_owned()
         }
-        StartFailure::WrongDirection(role) => format!(
-            "{} must be a playback device, but a recording device was picked.",
-            role.noun()
-        ),
+        StartFailure::WrongDirection(role) => format!("{} must be a playback device, but a recording device was picked.", role.noun()),
         StartFailure::OutputIsReference => same_device_message().to_owned(),
         StartFailure::DefaultMicIsOutput(adapter) => format!(
             "The default microphone is the recording side of the output cable ({adapter}), so the filter would only hear its own output. Pick your real microphone, or make it the default; the filter starts when the default changes."
@@ -287,7 +285,9 @@ pub(crate) fn describe_fault(f: Fault) -> String {
             let base = describe_hr(role, code);
             if f.device_related() { format!("{base} The filter restarts when it's back.") } else { base }
         }
-        Fault::MicStalled => "The microphone stopped sending audio for 2 seconds. Check that it's connected; the filter restarts when it's back.".to_owned(),
+        Fault::MicStalled => {
+            "The microphone stopped sending audio for 2 seconds. Check that it's connected; the filter restarts when it's back.".to_owned()
+        }
     }
 }
 

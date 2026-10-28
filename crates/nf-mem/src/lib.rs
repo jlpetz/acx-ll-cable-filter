@@ -97,11 +97,7 @@ pub fn install_pool(policy: PagePolicy, bytes: usize) -> PoolStatus {
                 }
                 // Unreachable in practice (regions are at least a page, and this runs once);
                 // the region is released on drop.
-                None => PoolStatus {
-                    kind: PageKind::None,
-                    bytes: 0,
-                    fallback_reason: Some("the pool couldn't be set up".into()),
-                },
+                None => PoolStatus { kind: PageKind::None, bytes: 0, fallback_reason: Some("the pool couldn't be set up".into()) },
             }
         })
         .clone()

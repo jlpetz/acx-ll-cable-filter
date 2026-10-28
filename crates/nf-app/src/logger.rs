@@ -188,15 +188,7 @@ impl fmt::Display for Stamp {
 fn now() -> Stamp {
     // SAFETY: no arguments; it only returns the local time.
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    Stamp {
-        year: t.wYear,
-        month: t.wMonth,
-        day: t.wDay,
-        hour: t.wHour,
-        minute: t.wMinute,
-        second: t.wSecond,
-        millis: t.wMilliseconds,
-    }
+    Stamp { year: t.wYear, month: t.wMonth, day: t.wDay, hour: t.wHour, minute: t.wMinute, second: t.wSecond, millis: t.wMilliseconds }
 }
 
 /// One log line: `2026-10-26 14:03:12.345 [4242 nf-control] WARN nf_engine::control: message`.
@@ -238,11 +230,8 @@ pub fn shows_panic_box(window: bool, console_allocated: bool, aborts: bool, main
 
 /// "panic on thread 'main' at src\x.rs:1:2: message".
 pub fn panic_text(thread: &str, location: Option<&std::panic::Location<'_>>, payload: &(dyn std::any::Any + Send)) -> String {
-    let message = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("(no message)");
+    let message =
+        payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("(no message)");
     match location {
         Some(l) => format!("panic on thread '{thread}' at {}:{}:{}: {message}", l.file(), l.line(), l.column()),
         None => format!("panic on thread '{thread}': {message}"),

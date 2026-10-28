@@ -82,13 +82,9 @@ impl Live {
             if running { m } else { MeterSnapshot { peak_dbfs: f32::NEG_INFINITY, rms_dbfs: f32::NEG_INFINITY } }
         };
         let numbers = |m: MeterSnapshot| if running { format::meter_numbers(m) } else { format::DASH.to_owned() };
-        let near_clip: View = if running && t.near_clip {
-            secondary("Near clipping: turn the mic's gain down").into()
-        } else {
-            View::empty()
-        };
-        let output_extra: View =
-            if running { secondary(format::reduction_and_speech(t)).into() } else { View::empty() };
+        let near_clip: View =
+            if running && t.near_clip { secondary("Near clipping: turn the mic's gain down").into() } else { View::empty() };
+        let output_extra: View = if running { secondary(format::reduction_and_speech(t)).into() } else { View::empty() };
         StackPanel::new().spacing(6.0).children((
             meter_header("Input", numbers(t.input), clip_badge(t.clip_latched, context), 0.0),
             meter::bar(shown(t.input), track),
@@ -124,11 +120,7 @@ fn meter_header(name: &str, numbers: String, badge: View, top: f64) -> View {
         .column_spacing(12.0)
         .margin(Thickness::new(0.0, top, 0.0, 0.0))
         .children((
-            TextBlock::new()
-                .text(name)
-                .font_weight(FontWeight::SEMI_BOLD)
-                .vertical_alignment(VerticalAlignment::Center)
-                .grid_column(0),
+            TextBlock::new().text(name).font_weight(FontWeight::SEMI_BOLD).vertical_alignment(VerticalAlignment::Center).grid_column(0),
             TextBlock::new()
                 .text(numbers)
                 .opacity(0.72)
@@ -156,20 +148,9 @@ fn clip_badge(latched: bool, context: &ViewContext<Live>) -> View {
                 .border_thickness(1.0)
                 .corner_radius(4.0)
                 .padding(Thickness::xy(6.0, 1.0))
-                .content(
-                    TextBlock::new()
-                        .text("CLIP")
-                        .font_size(11.0)
-                        .font_weight(FontWeight::BOLD)
-                        .foreground(text)
-                        .opacity(opacity),
-                ),
+                .content(TextBlock::new().text("CLIP").font_size(11.0).font_weight(FontWeight::BOLD).foreground(text).opacity(opacity)),
         )
-        .tooltip(if latched {
-            "The input clipped. Click to reset."
-        } else {
-            "Lights when the input clips, until clicked."
-        })
+        .tooltip(if latched { "The input clipped. Click to reset." } else { "Lights when the input clips, until clicked." })
 }
 
 impl Component for Live {
@@ -211,11 +192,7 @@ impl Component for Live {
         let readout = if input.show_readout { self.readout() } else { View::empty() };
         StackPanel::new().spacing(crate::widgets::SECTION_SPACING).children((
             card("Meters", Some(show_switch("Show meters", input.show_meters, input.on_show_meters.clone())), meters),
-            card(
-                "Latency",
-                Some(show_switch("Live readout", input.show_readout, input.on_show_readout.clone())),
-                readout,
-            ),
+            card("Latency", Some(show_switch("Live readout", input.show_readout, input.on_show_readout.clone())), readout),
         ))
     }
 }

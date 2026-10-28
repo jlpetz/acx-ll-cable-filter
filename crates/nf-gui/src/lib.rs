@@ -103,10 +103,7 @@ mod tests {
         // %APPDATA% is set in any interactive or service session on Windows
         if let Some(path) = default_settings_path() {
             assert!(path.ends_with(r"noise-filter\settings.json"), "{}", path.display());
-            assert_eq!(
-                path.parent().and_then(|p| p.parent()),
-                std::env::var_os("APPDATA").as_deref().map(std::path::Path::new)
-            );
+            assert_eq!(path.parent().and_then(|p| p.parent()), std::env::var_os("APPDATA").as_deref().map(std::path::Path::new));
         }
     }
 }

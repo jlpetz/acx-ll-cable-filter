@@ -83,10 +83,11 @@ pub fn probe_train(sweep: &Sweep, repetitions: usize, gap_s: f32) -> (Vec<f32>, 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::latency::analysis::{fft_convolve, find_sweep_arrivals};
     use realfft::RealFftPlanner;
     use realfft::num_complex::Complex;
+
+    use super::*;
+    use crate::latency::analysis::{fft_convolve, find_sweep_arrivals};
 
     fn default_sweep() -> Sweep {
         exp_sweep(48_000, 100.0, 16_000.0, 1.0, 0.01, 0.25)

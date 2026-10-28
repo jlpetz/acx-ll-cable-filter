@@ -51,12 +51,8 @@ pub(crate) fn to_mono(format: SampleFormat, channels: usize, src: &[u8], dst: &m
         (SampleFormat::I16, 1) => downmix_i16::<1>(src, dst),
         (SampleFormat::I16, 2) => downmix_i16::<2>(src, dst),
         (SampleFormat::F32, c) => downmix_generic::<4>(c, src, dst, f32::from_le_bytes),
-        (SampleFormat::I16, c) => {
-            downmix_generic::<2>(c, src, dst, |b| i16::from_le_bytes(b) as f32 * I16_SCALE)
-        }
-        (SampleFormat::I24, c) => {
-            downmix_generic::<3>(c, src, dst, |b| i32::from_le_bytes([0, b[0], b[1], b[2]]) as f32 * I32_SCALE)
-        }
+        (SampleFormat::I16, c) => downmix_generic::<2>(c, src, dst, |b| i16::from_le_bytes(b) as f32 * I16_SCALE),
+        (SampleFormat::I24, c) => downmix_generic::<3>(c, src, dst, |b| i32::from_le_bytes([0, b[0], b[1], b[2]]) as f32 * I32_SCALE),
         (SampleFormat::I32, c) => downmix_generic::<4>(c, src, dst, |b| i32::from_le_bytes(b) as f32 * I32_SCALE),
     }
     frames

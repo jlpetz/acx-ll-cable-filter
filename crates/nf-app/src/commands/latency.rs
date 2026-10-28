@@ -93,13 +93,7 @@ pub fn format_report(r: &LatencyReport) -> String {
     if r.valid > 0 {
         let _ = write!(s, " (lowest confidence {} dB)", fixed(f64::from(r.confidence_db_min), 1));
         let each: Vec<String> = r.app_ms.iter().map(|v| fixed(*v, 2)).collect();
-        let _ = write!(
-            s,
-            "\n  app + output cable  {} median, spread {} [{}]",
-            ms(r.app_ms_median),
-            ms(r.app_ms_spread),
-            each.join(", ")
-        );
+        let _ = write!(s, "\n  app + output cable  {} median, spread {} [{}]", ms(r.app_ms_median), ms(r.app_ms_spread), each.join(", "));
     }
     if let Some(v) = r.input_path_ms_median {
         let _ = write!(s, "\n  input path          {} median (probe play-out to the app's input)", ms(v));

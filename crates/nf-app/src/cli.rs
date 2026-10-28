@@ -22,7 +22,10 @@ pub enum Command {
     /// itself elevated, as the window's "Enable large pages" button does). `helper`: the hidden
     /// `--elevated-helper` flag that relaunch adds, so a helper that starts without elevation fails
     /// instead of relaunching itself again.
-    SetupLargePages { sid: Option<String>, helper: bool },
+    SetupLargePages {
+        sid: Option<String>,
+        helper: bool,
+    },
 }
 
 impl Command {
@@ -271,7 +274,8 @@ fn parse_run(p: &mut Parser<'_>) -> Result<EngineArgs, UsageError> {
 
 fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     let mut engine = EngineArgs::default();
-    let (mut probe, mut capture, mut mode, mut reps, mut through_model) = (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false);
+    let (mut probe, mut capture, mut mode, mut reps, mut through_model) =
+        (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false);
     while let Some(arg) = p.next() {
         match arg {
             Arg::Flag(flag, inline) => match flag {
@@ -302,8 +306,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
         }
     }
     let probe = probe.ok_or_else(|| usage("'latency' needs --probe DEV: the playback device the sweeps are played on"))?;
-    let capture =
-        capture.ok_or_else(|| usage("'latency' needs --capture DEV: the recording device that carries the filter's output"))?;
+    let capture = capture.ok_or_else(|| usage("'latency' needs --capture DEV: the recording device that carries the filter's output"))?;
     Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model })
 }
 
@@ -446,7 +449,9 @@ mod tests {
 
     #[test]
     fn help_and_version() {
-        for args in [&["--help"][..], &["-h"], &["help"], &["help", "run"], &["/?"], &["run", "--output", "x", "--help"], &["process", "-h"]] {
+        for args in
+            [&["--help"][..], &["-h"], &["help"], &["help", "run"], &["/?"], &["run", "--output", "x", "--help"], &["process", "-h"]]
+        {
             assert_eq!(p(args), Ok(Command::Help), "{args:?}");
         }
         assert_eq!(p(&["--version"]), Ok(Command::Version));
@@ -471,8 +476,8 @@ mod tests {
     #[test]
     fn run_takes_devices_config_and_processing() {
         let c = p(&[
-            "run", "--config", "s.json", "--mic", "Headset Mic", "--output=CABLE Input", "--reference", "Speakers", "--aec",
-            "--no-ns", "--floor", "-20", "--gate", "Auto", "--threshold=-45.5",
+            "run", "--config", "s.json", "--mic", "Headset Mic", "--output=CABLE Input", "--reference", "Speakers", "--aec", "--no-ns",
+            "--floor", "-20", "--gate", "Auto", "--threshold=-45.5",
         ]);
         assert_eq!(
             c,
@@ -517,9 +522,9 @@ mod tests {
 
     #[test]
     fn latency_needs_a_probe_and_a_capture() {
-        let Ok(Command::Latency(l)) =
-            p(&["latency", "--probe", "CABLE-A Input", "--capture", "CABLE-B Output", "--mic", "CABLE-A Output", "--output", "CABLE-B Input"])
-        else {
+        let Ok(Command::Latency(l)) = p(&[
+            "latency", "--probe", "CABLE-A Input", "--capture", "CABLE-B Output", "--mic", "CABLE-A Output", "--output", "CABLE-B Input",
+        ]) else {
             panic!()
         };
         assert_eq!((l.probe.as_str(), l.capture.as_str()), ("CABLE-A Input", "CABLE-B Output"));

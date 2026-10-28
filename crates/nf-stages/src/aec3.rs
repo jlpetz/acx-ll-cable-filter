@@ -43,13 +43,8 @@ pub const AEC3_LATENCY: u32 = 430;
 /// The reference dither's amplitude: about -180 dBFS.
 const REFERENCE_DITHER: f32 = 1e-9;
 
-const INFO: StageInfo = StageInfo {
-    id: "aec3",
-    name: "WebRTC AEC3",
-    role: StageRole::EchoCancel,
-    needs_reference: true,
-    needs_worker: false,
-};
+const INFO: StageInfo =
+    StageInfo { id: "aec3", name: "WebRTC AEC3", role: StageRole::EchoCancel, needs_reference: true, needs_worker: false };
 
 /// WebRTC AEC3 echo-cancel stage.
 pub struct Aec3Stage {

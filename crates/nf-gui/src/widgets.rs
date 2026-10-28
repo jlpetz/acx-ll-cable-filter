@@ -99,11 +99,7 @@ pub(crate) fn slider(header: String, span: Span, value: f32, enabled: bool, on_c
 /// A ComboBox over fixed items. `selected` must be in range: it's dropped otherwise rather than
 /// handed to WinUI.
 pub(crate) fn combo(
-    header: &'static str,
-    items: &[&'static str],
-    selected: usize,
-    enabled: bool,
-    on_change: Callback<Option<usize>>,
+    header: &'static str, items: &[&'static str], selected: usize, enabled: bool, on_change: Callback<Option<usize>>,
 ) -> View {
     ComboBox::new()
         .items_source(items.iter().copied())
@@ -117,11 +113,7 @@ pub(crate) fn combo(
 /// A device ComboBox, keyed by its items: a changed list mounts a new native control, items first
 /// and then the index, instead of replacing the items under a live selection.
 pub(crate) fn device_combo(
-    header: &'static str,
-    choices: &DeviceChoices,
-    placeholder: &str,
-    enabled: bool,
-    on_change: Callback<Option<usize>>,
+    header: &'static str, choices: &DeviceChoices, placeholder: &str, enabled: bool, on_change: Callback<Option<usize>>,
 ) -> View {
     let selected = choices.selected.filter(|&i| i < choices.labels.len());
     let combo = ComboBox::new()

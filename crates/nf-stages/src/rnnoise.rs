@@ -44,8 +44,7 @@ const INV_S16: f32 = 1.0 / S16;
 const _: () = assert!(DenoiseState::FRAME_SIZE == BLOCK);
 const _: () = assert!(RNNOISE_LATENCY as usize == BLOCK && BLOCK <= MAX_STAGE_LATENCY);
 
-const INFO: StageInfo =
-    StageInfo { id: "rnnoise", name: "RNNoise", role: StageRole::Noise, needs_reference: false, needs_worker: false };
+const INFO: StageInfo = StageInfo { id: "rnnoise", name: "RNNoise", role: StageRole::Noise, needs_reference: false, needs_worker: false };
 
 /// RNNoise noise stage.
 pub struct RnnoiseStage {
@@ -159,9 +158,10 @@ pub(crate) fn warm_up_thread() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nf_core::SAMPLE_RATE;
     use nf_core::config::ProcessingConfig;
+
+    use super::*;
 
     fn stage() -> RnnoiseStage {
         let cfg = ProcessingConfig { floor_db: -100.0, ..ProcessingConfig::default() };

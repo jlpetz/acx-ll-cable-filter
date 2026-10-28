@@ -142,9 +142,13 @@ fn gated(gate: GateConfig) -> Gated {
     let y = run.out[lat..].to_vec();
     let interiors: Vec<_> = talk.gaps.iter().map(interior).collect();
     let levels = interiors.iter().map(|r| db(rms(&y[r.clone()]) / rms(&n[r.clone()]))).collect();
-    let cores = within(&talk.syllables.iter().filter(|r| r.len() > 4800).map(|r| r.start + 2400..r.end - 2400).collect::<Vec<_>>(), 0, y.len());
+    let cores =
+        within(&talk.syllables.iter().filter(|r| r.len() > 4800).map(|r| r.start + 2400..r.end - 2400).collect::<Vec<_>>(), 0, y.len());
     let speech = db(rms_over(&y, &cores) / rms_over(&talk.samples, &cores));
-    let gr = interiors.iter().map(|r| median((r.start / BLOCK + 1..r.end / BLOCK).map(|b| run.reports[b].gain_reduction_db).collect())).collect();
+    let gr = interiors
+        .iter()
+        .map(|r| median((r.start / BLOCK + 1..r.end / BLOCK).map(|b| run.reports[b].gain_reduction_db).collect()))
+        .collect();
     Gated { out: y, gaps: talk.gaps, levels, speech, gr }
 }
 

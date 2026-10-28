@@ -67,18 +67,13 @@ pub fn resolve_device(devices: &[DeviceInfo], query: &str, flow: Flow, what: &st
         .find(|d| d.name.to_lowercase() == q)
         .or_else(|| of_flow().find(|d| d.name.to_lowercase().contains(&q)))
         .map(|d| d.id.clone())
-        .ok_or_else(|| {
-            format!("{what}: no active {} device matches \"{query}\". `noise-filter devices` lists them", kind(flow))
-        })
+        .ok_or_else(|| format!("{what}: no active {} device matches \"{query}\". `noise-filter devices` lists them", kind(flow)))
 }
 
 /// The config `run` and `latency` start the engine with: `--config` (or the defaults), the
 /// processing overrides, and the devices given on the command line, resolved against
 /// `list_devices` (called only if a device was given).
-pub fn engine_config(
-    args: &EngineArgs,
-    list_devices: impl FnOnce() -> Result<Vec<DeviceInfo>, String>,
-) -> Result<EngineConfig, Failure> {
+pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Vec<DeviceInfo>, String>) -> Result<EngineConfig, Failure> {
     let mut cfg = match &args.config {
         Some(path) => load(path)?,
         None => EngineConfig::default(),
@@ -196,8 +191,7 @@ mod tests {
 
         let e = engine_config(&EngineArgs { output: Some("nothing".into()), ..Default::default() }, list).unwrap_err();
         assert_eq!(e.exit, Exit::Error);
-        let e = engine_config(&EngineArgs { output: Some("x".into()), ..Default::default() }, || Err("COM failed".into()))
-            .unwrap_err();
+        let e = engine_config(&EngineArgs { output: Some("x".into()), ..Default::default() }, || Err("COM failed".into())).unwrap_err();
         assert_eq!(e.message, "Couldn't list the audio devices: COM failed");
     }
 
@@ -206,7 +200,11 @@ mod tests {
         let dir = crate::test_dir("config");
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{"engine": {"devices": {"output": "{ren-2}"}, "processing": {"noise_enabled": false}}}"#).unwrap();
-        let args = EngineArgs { config: Some(path.clone()), processing: Processing { aec: Some(true), ..Default::default() }, ..Default::default() };
+        let args = EngineArgs {
+            config: Some(path.clone()),
+            processing: Processing { aec: Some(true), ..Default::default() },
+            ..Default::default()
+        };
         let c = engine_config(&args, || panic!("no device was given")).unwrap();
         assert_eq!(c.devices.output.as_deref(), Some("{ren-2}"));
         assert!(!c.processing.noise_enabled && c.processing.aec_enabled);

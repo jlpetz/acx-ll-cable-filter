@@ -180,10 +180,7 @@ pub(crate) fn dropouts(t: &TelemetrySnapshot) -> String {
 /// 430/s". The pool's are the locked TLSF pool's, served in O(1); the heap's are fallbacks to the
 /// system heap, which takes a lock.
 pub(crate) fn allocations(t: &TelemetrySnapshot) -> String {
-    format!(
-        "RT heap allocations: {} (must stay 0) · Pool allocations: {}/s",
-        t.rt_heap_allocations, t.rt_pool_allocations_per_s
-    )
+    format!("RT heap allocations: {} (must stay 0) · Pool allocations: {}/s", t.rt_heap_allocations, t.rt_pool_allocations_per_s)
 }
 
 /// One stream's diagnostics: "Mic: USB Mic · 48000 Hz, 2 ch · 10.0 ms period · RAW".
@@ -191,13 +188,7 @@ pub(crate) fn stream(label: &str, s: Option<&StreamInfo>) -> String {
     let Some(s) = s else {
         return format!("{label}: not open");
     };
-    let mut line = format!(
-        "{label}: {} · {} Hz, {} ch · {} ms period",
-        s.device_name,
-        s.sample_rate,
-        s.channels,
-        fixed(s.period_ms, 1)
-    );
+    let mut line = format!("{label}: {} · {} Hz, {} ch · {} ms period", s.device_name, s.sample_rate, s.channels, fixed(s.period_ms, 1));
     if s.low_latency {
         line.push_str(" (IAudioClient3)");
     }
@@ -231,11 +222,7 @@ pub(crate) fn diagnostics(status: &EngineStatus) -> Vec<String> {
         stream("Mic", status.mic.as_ref()),
         stream("Output", status.output.as_ref()),
         stream("Echo reference", status.reference.as_ref()),
-        if running {
-            format!("Chain latency: {} ms", fixed(status.chain_latency_ms, 1))
-        } else {
-            format!("Chain latency: {DASH}")
-        },
+        if running { format!("Chain latency: {} ms", fixed(status.chain_latency_ms, 1)) } else { format!("Chain latency: {DASH}") },
     ]
 }
 
@@ -250,10 +237,7 @@ fn ms(value: Option<f64>) -> String {
 pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     let mut lines = Vec::with_capacity(8 + r.warnings.len());
     if r.valid == 0 {
-        lines.push(format!(
-            "No valid repetitions (0 of {}): no arrival was found with enough confidence.",
-            r.repetitions
-        ));
+        lines.push(format!("No valid repetitions (0 of {}): no arrival was found with enough confidence.", r.repetitions));
     } else {
         lines.push(format!(
             "App (input tap → cable out): median {} ms, spread {} ms ({} of {} valid)",
@@ -336,11 +320,7 @@ mod tests {
         assert_eq!(labelled("Attack", 2.0, 1, "ms"), "Attack: 2.0 ms");
         assert_eq!(labelled("Threshold (dBFS)", -50.0, 0, ""), "Threshold (dBFS): -50");
         assert_eq!(suppression(-60.0), "Max suppression: unlimited");
-        assert_eq!(
-            suppression(-59.7),
-            "Max suppression: unlimited",
-            "the slider's bottom, give or take a step's rounding"
-        );
+        assert_eq!(suppression(-59.7), "Max suppression: unlimited", "the slider's bottom, give or take a step's rounding");
         assert_eq!(suppression(f32::NAN), "Max suppression: unlimited");
         assert_eq!(suppression(-24.0), "Max suppression: -24 dB");
         assert_eq!(suppression(0.0), "Max suppression: 0 dB");
@@ -356,10 +336,7 @@ mod tests {
         assert_eq!(status_line(&status(EngineState::Stopped, None), Some(Job::Starting)), "Starting…");
         assert_eq!(status_line(&status(EngineState::Running, None), Some(Job::Stopping)), "Stopping…");
         assert_eq!(status_line(&status(EngineState::Starting, Some(" ")), None), "Starting…");
-        assert_eq!(
-            status_line(&status(EngineState::Running, Some("Reference device lost")), None),
-            "Running · Reference device lost"
-        );
+        assert_eq!(status_line(&status(EngineState::Running, Some("Reference device lost")), None), "Running · Reference device lost");
         assert_eq!(
             status_line(&status(EngineState::Error, Some("The mic was unplugged")), None),
             "Stopped by an error · The mic was unplugged"
@@ -383,16 +360,10 @@ mod tests {
     #[test]
     fn the_fault_text() {
         let retrying = EngineStatus { retrying: true, ..status(EngineState::Error, Some("The mic was unplugged")) };
-        assert_eq!(
-            fault(&retrying),
-            "The mic was unplugged. The filter starts again by itself when it can. Press Stop to keep it off."
-        );
+        assert_eq!(fault(&retrying), "The mic was unplugged. The filter starts again by itself when it can. Press Stop to keep it off.");
         let final_ = status(EngineState::Error, Some("The output cable's format isn't supported."));
         assert_eq!(fault(&final_), "The output cable's format isn't supported. Press Start to try again.");
-        assert_eq!(
-            fault(&status(EngineState::Error, Some("  "))),
-            "An audio device stopped working. Press Start to try again."
-        );
+        assert_eq!(fault(&status(EngineState::Error, Some("  "))), "An audio device stopped working. Press Start to try again.");
     }
 
     #[test]
@@ -403,10 +374,7 @@ mod tests {
         assert_eq!(warnings(&s), Some(("Running with a warning", "The echo reference was lost".to_owned())));
         s.warnings.push(" ".to_owned());
         s.warnings.push("MMCSS isn't available".to_owned());
-        assert_eq!(
-            warnings(&s),
-            Some(("Running with warnings", "The echo reference was lost\nMMCSS isn't available".to_owned()))
-        );
+        assert_eq!(warnings(&s), Some(("Running with warnings", "The echo reference was lost\nMMCSS isn't available".to_owned())));
         s.state = EngineState::Error;
         assert_eq!(warnings(&s), None, "only while running");
     }
@@ -514,10 +482,7 @@ mod tests {
             ..EngineStatus::default()
         };
         let lines = diagnostics(&running);
-        assert_eq!(
-            lines[..3],
-            ["Memory: large pages (16 MiB)", "MMCSS \"Pro Audio\": registered", "RAW mic: in effect"]
-        );
+        assert_eq!(lines[..3], ["Memory: large pages (16 MiB)", "MMCSS \"Pro Audio\": registered", "RAW mic: in effect"]);
         assert_eq!(lines[4], "Output: not open");
         assert_eq!(lines[6], "Chain latency: 10.0 ms");
     }
@@ -538,27 +503,20 @@ mod tests {
             conditions: "mic 10 ms, RAW".to_owned(),
             warnings: vec!["One repetition was too quiet".to_owned()],
         };
-        assert_eq!(
-            report(&r),
-            [
-                "App (input tap → cable out): median 12.3 ms, spread 0.8 ms (4 of 5 valid)",
-                "Input path: 3.2 ms",
-                "End to end: —",
-                "Chain: 10.0 ms",
-                "Live readout during the test: 12.1 ms",
-                "Confidence: 18.0 dB (lowest)",
-                "Warning: One repetition was too quiet",
-                "Conditions: mic 10 ms, RAW",
-            ]
-        );
+        assert_eq!(report(&r), [
+            "App (input tap → cable out): median 12.3 ms, spread 0.8 ms (4 of 5 valid)",
+            "Input path: 3.2 ms",
+            "End to end: —",
+            "Chain: 10.0 ms",
+            "Live readout during the test: 12.1 ms",
+            "Confidence: 18.0 dB (lowest)",
+            "Warning: One repetition was too quiet",
+            "Conditions: mic 10 ms, RAW",
+        ]);
         let none = LatencyReport { repetitions: 5, ..LatencyReport::default() };
         let lines = report(&none);
         assert!(lines[0].starts_with("No valid repetitions (0 of 5)"));
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.starts_with("Confidence") || l.starts_with("Conditions") || l.starts_with("Live readout"))
-        );
+        assert!(!lines.iter().any(|l| l.starts_with("Confidence") || l.starts_with("Conditions") || l.starts_with("Live readout")));
     }
 
     #[test]

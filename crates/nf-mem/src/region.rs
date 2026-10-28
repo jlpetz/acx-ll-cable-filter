@@ -14,10 +14,9 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{GetLastError, WIN32_ERROR};
 use windows::Win32::Security::SE_INC_WORKING_SET_NAME;
 use windows::Win32::System::Memory::{
-    GetLargePageMinimum, GetProcessWorkingSetSizeEx, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_LARGE_PAGES, MEM_RELEASE,
-    MEM_RESERVE, MemExtendedParameterAttributeFlags, PAGE_READWRITE, QUOTA_LIMITS_HARDWS_MAX_DISABLE,
-    QUOTA_LIMITS_HARDWS_MIN_ENABLE, SetProcessWorkingSetSizeEx, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualLock,
-    VirtualUnlock,
+    GetLargePageMinimum, GetProcessWorkingSetSizeEx, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE,
+    MemExtendedParameterAttributeFlags, PAGE_READWRITE, QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+    SetProcessWorkingSetSizeEx, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualLock, VirtualUnlock,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -88,9 +87,7 @@ impl Region {
         let mut params = [attr];
         // SAFETY: `params` holds plain values (no pointers) and lives across the call. Reserve and
         // commit in one call; no placeholder flags.
-        let p = unsafe {
-            VirtualAlloc2(None, None, len, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE.0, Some(&mut params))
-        };
+        let p = unsafe { VirtualAlloc2(None, None, len, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE.0, Some(&mut params)) };
         match NonNull::new(p.cast::<u8>()) {
             // Large pages are non-pageable and come back zeroed: nothing to lock or pre-fault.
             Some(ptr) => Ok(Region { ptr, len, locked: false }),

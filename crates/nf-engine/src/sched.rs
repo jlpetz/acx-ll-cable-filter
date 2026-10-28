@@ -6,9 +6,9 @@ use std::marker::PhantomData;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
-    AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_NORMAL, AvRevertMmThreadCharacteristics,
-    AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread, GetThreadPriority, SetThreadPriority,
-    THREAD_PRIORITY, THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+    AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_NORMAL, AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
+    AvSetMmThreadPriority, GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_NORMAL,
+    THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::core::w;
 

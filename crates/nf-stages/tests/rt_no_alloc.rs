@@ -112,8 +112,12 @@ fn the_rnnoise_chain_does_not_allocate_after_warm_up() {
     let s = signals(6);
     let c = controls(ProcessingConfig::default());
     let mut chain = build_chain(c.clone(), false).expect("chain");
-    let gates = [GateMode::Off, GateMode::Static, GateMode::Auto]
-        .map(|mode| GateConfig { mode, threshold_db: -45.0, attack_ms: 3.0, ..GateConfig::default() });
+    let gates = [GateMode::Off, GateMode::Static, GateMode::Auto].map(|mode| GateConfig {
+        mode,
+        threshold_db: -45.0,
+        attack_ms: 3.0,
+        ..GateConfig::default()
+    });
     // Every gate mode, floor moves (ramps), meters on and off: still nothing allocates.
     let counts = per_block(&mut chain, &s, 0..900, |b| {
         c.noise.gate.apply(&gates[b / 50 % 3]);

@@ -142,11 +142,7 @@ impl SlipResampler {
         while j0 < m {
             let Some(q) = (j0 as i64 * delta).checked_div_euclid(den) else { break };
             // The first j past j0 whose floor(j δ / den) differs from q (always > j0).
-            let next = if delta > 0 {
-                ((q + 1) * den + delta - 1).checked_div(delta)
-            } else {
-                (q * den).checked_div(delta).map(|v| v + 1)
-            };
+            let next = if delta > 0 { ((q + 1) * den + delta - 1).checked_div(delta) } else { (q * den).checked_div(delta).map(|v| v + 1) };
             let Some(next) = next else { break };
             let j1 = (next.max(j0 as i64 + 1) as usize).min(m);
             let (base, len) = ((j0 as i64 + q) as usize, j1 - j0); // ext[base] = x[j0 + q - 1]
@@ -178,8 +174,9 @@ fn nearest(input: &[f32], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::f64::consts::PI;
+
+    use super::*;
 
     fn sine(start: usize, len: usize, f: f64) -> Vec<f32> {
         (start..start + len).map(|k| (0.8 * (2.0 * PI * f * k as f64 / 48_000.0).sin()) as f32).collect()

@@ -39,8 +39,7 @@ pub(crate) struct Picker<'a> {
 }
 
 impl Picker<'_> {
-    pub const MIC: Picker<'static> =
-        Picker { flow: Flow::Capture, default_label: Some("Default microphone"), exclude: None };
+    pub const MIC: Picker<'static> = Picker { flow: Flow::Capture, default_label: Some("Default microphone"), exclude: None };
     pub const OUTPUT: Picker<'static> = Picker { flow: Flow::Render, default_label: None, exclude: None };
     pub const PROBE: Picker<'static> = Picker { flow: Flow::Render, default_label: None, exclude: None };
     pub const CAPTURE: Picker<'static> = Picker { flow: Flow::Capture, default_label: None, exclude: None };
@@ -123,14 +122,11 @@ mod tests {
     #[test]
     fn the_mic_list_has_the_default_first() {
         let c = choices(&devices(), Picker::MIC, None);
-        assert_eq!(
-            labels(&c),
-            [
-                "Default microphone (Microphone (USB Mic))",
-                "Microphone (USB Mic)",
-                "CABLE Output (VB-Audio Virtual Cable)"
-            ]
-        );
+        assert_eq!(labels(&c), [
+            "Default microphone (Microphone (USB Mic))",
+            "Microphone (USB Mic)",
+            "CABLE Output (VB-Audio Virtual Cable)"
+        ]);
         assert_eq!(c.ids, [None, Some("mic".to_owned()), Some("cable-out".to_owned())]);
         assert_eq!(c.selected, Some(0), "None is the default entry");
         let c = choices(&devices(), Picker::MIC, Some("cable-out"));
@@ -184,10 +180,7 @@ mod tests {
         let mut list = devices();
         list.push(device("mic2", "Microphone (USB Mic)", Flow::Capture, false));
         let c = choices(&list, Picker::CAPTURE, Some("mic2"));
-        assert_eq!(
-            labels(&c),
-            ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)", "Microphone (USB Mic) #2"]
-        );
+        assert_eq!(labels(&c), ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)", "Microphone (USB Mic) #2"]);
         assert_eq!(c.selected, Some(2));
     }
 
@@ -195,8 +188,7 @@ mod tests {
     fn the_selection_is_always_in_range() {
         let list = devices();
         let ids = [None, Some("mic"), Some("speakers"), Some("cable-in"), Some("nope")];
-        let pickers =
-            [Picker::MIC, Picker::OUTPUT, Picker::PROBE, Picker::CAPTURE, Picker::reference(Some("cable-in"))];
+        let pickers = [Picker::MIC, Picker::OUTPUT, Picker::PROBE, Picker::CAPTURE, Picker::reference(Some("cable-in"))];
         for picker in pickers {
             for id in ids {
                 for list in [&list[..], &[][..]] {

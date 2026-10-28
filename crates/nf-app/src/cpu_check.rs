@@ -409,10 +409,8 @@ mod tests {
         const X86_64: [&str; 4] = ["x87", "fxsr", "sse", "sse2"];
         const NOT_ISA: [&str; 1] = ["crt-static"];
         let checked: Vec<&str> = FEATURES.iter().map(|f| f.rustc).filter(|r| !r.is_empty()).collect();
-        let enabled: Vec<&str> = env!("NF_TARGET_FEATURES")
-            .split(',')
-            .filter(|f| !f.is_empty() && !X86_64.contains(f) && !NOT_ISA.contains(f))
-            .collect();
+        let enabled: Vec<&str> =
+            env!("NF_TARGET_FEATURES").split(',').filter(|f| !f.is_empty() && !X86_64.contains(f) && !NOT_ISA.contains(f)).collect();
         assert!(!enabled.is_empty(), "build.rs gave no target features");
         for f in &enabled {
             assert!(checked.contains(f), "the build enables {f}, which cpu_check doesn't check");

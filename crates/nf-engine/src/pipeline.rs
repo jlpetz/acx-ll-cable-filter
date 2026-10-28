@@ -461,12 +461,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// write, coarse corrections, the latency readout, telemetry and timing. `Ok(false)` when no
     /// complete block is buffered.
     pub(crate) fn process_block<P: BlockProcessor, S: RenderSink, T: Ticks>(
-        &mut self,
-        proc: &mut P,
-        sink: &mut S,
-        ticks: &mut T,
-        tel: &Telemetry,
-        readout: bool,
+        &mut self, proc: &mut P, sink: &mut S, ticks: &mut T, tel: &Telemetry, readout: bool,
     ) -> Result<bool, Hr> {
         if self.mic.len() < BLOCK {
             return Ok(false);
@@ -807,12 +802,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// real-time allocation counts. `scope_allocs` and `scope_fallbacks` are this thread's
     /// `nf_mem` counters; `fallback_baseline` is the fallback count after warm-up.
     pub(crate) fn publish_second<P: BlockProcessor>(
-        &mut self,
-        tel: &Telemetry,
-        proc: &P,
-        scope_allocs: u64,
-        scope_fallbacks: u64,
-        fallback_baseline: u64,
+        &mut self, tel: &Telemetry, proc: &P, scope_allocs: u64, scope_fallbacks: u64, fallback_baseline: u64,
     ) {
         tel.block_us_p50.store(self.block_us.median());
         tel.block_us_p99.store(self.block_us.percentile(0.99));
@@ -921,15 +911,7 @@ const OFFSET_RING: usize = 32;
 
 impl FillOffset {
     fn new(period: usize) -> Self {
-        Self {
-            lo: 0.0,
-            width: period.max(1) as f64,
-            primed: false,
-            ring: [0.0; OFFSET_RING],
-            ring_len: 0,
-            ring_next: 0,
-            before: None,
-        }
+        Self { lo: 0.0, width: period.max(1) as f64, primed: false, ring: [0.0; OFFSET_RING], ring_len: 0, ring_next: 0, before: None }
     }
 
     /// The sawtooth may have moved (the device ran dry): re-anchor from the next readings.
@@ -1782,10 +1764,7 @@ mod tests {
     }
 
     fn simulate_pipe<D: DriftControl, R: Resampler>(
-        mut p: Pipeline<D, R>,
-        ppm: f64,
-        ref_ppm: f64,
-        seconds: usize,
+        mut p: Pipeline<D, R>, ppm: f64, ref_ppm: f64, seconds: usize,
     ) -> (Pipeline<D, R>, FakeSink, Telemetry) {
         let mut sink = FakeSink::new(4800);
         p.prefill(&mut sink).unwrap();

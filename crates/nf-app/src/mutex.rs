@@ -92,8 +92,9 @@ pub fn name_for_path(what: &str, path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::mpsc;
+
+    use super::*;
 
     fn unique(name: &str) -> String {
         format!(r"Local\nf-app-test-{name}-{}", std::process::id())

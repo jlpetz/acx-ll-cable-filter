@@ -22,8 +22,7 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SetForegroundWindow,
-    ShowWindow,
+    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 use windows::core::{BOOL, Owned, PWSTR};
 
@@ -187,8 +186,9 @@ fn bring_forward(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::mpsc;
+
+    use super::*;
 
     fn c(hwnd: isize, exe: Option<&str>) -> Candidate {
         Candidate { hwnd, pid: hwnd as u32, exe: exe.map(PathBuf::from) }

@@ -11,8 +11,8 @@
 
 use nf_core::{BLOCK, SAMPLE_RATE};
 use wasapi::{
-    AudioCaptureClient, AudioClient, AudioClientProperties, AudioClock, AudioRenderClient, AudioSessionControl,
-    BufferFlags, Device, Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError, WaveFormat,
+    AudioCaptureClient, AudioClient, AudioClientProperties, AudioClock, AudioRenderClient, AudioSessionControl, BufferFlags, Device,
+    Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError, WaveFormat,
 };
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::STGM_READ;
@@ -26,8 +26,7 @@ use crate::pipeline::{CaptureSource, ClockReading, Hr, Packet, RenderSink};
 use crate::timing::Qpc;
 
 /// `PKEY_Devices_AudioDevice_RawProcessingSupported` (copied to avoid the EnhancedStorage feature).
-const PKEY_RAW_SUPPORTED: PROPERTYKEY =
-    PROPERTYKEY { fmtid: GUID::from_u128(0x8943b373_388c_4395_b557_bc6dbaffafdb), pid: 2 };
+const PKEY_RAW_SUPPORTED: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x8943b373_388c_4395_b557_bc6dbaffafdb), pid: 2 };
 
 /// The raw HRESULT behind a wasapi error, without formatting anything. The crate's own (non-COM)
 /// errors map to the nearest AUDCLNT code.
@@ -37,9 +36,7 @@ pub(crate) fn hr_of(e: &WasapiError) -> i32 {
         WasapiError::DeviceNotFound(_) => hr::E_NOTFOUND,
         WasapiError::UnsupportedFormat | WasapiError::UnsupportedSubformat(_) => hr::AUDCLNT_E_UNSUPPORTED_FORMAT,
         WasapiError::ClientNotInit => hr::AUDCLNT_E_NOT_INITIALIZED,
-        WasapiError::DataLengthMismatch { .. } | WasapiError::DataLengthTooShort { .. } => {
-            hr::AUDCLNT_E_BUFFER_SIZE_ERROR
-        }
+        WasapiError::DataLengthMismatch { .. } | WasapiError::DataLengthTooShort { .. } => hr::AUDCLNT_E_BUFFER_SIZE_ERROR,
         _ => hr::E_FAIL,
     }
 }
@@ -217,8 +214,7 @@ impl CaptureStream {
         let mix = device.get_iaudioclient()?.get_mixformat()?;
         // A render device initialised for capture in shared mode is a loopback stream. The buffer
         // only needs to ride out a late mic wake-up; data age is what we drain each wake.
-        let (client, fmt, autoconvert, period_hns) =
-            open_shared(device, &mix, Direction::Capture, false, false, 2_000_000)?;
+        let (client, fmt, autoconvert, period_hns) = open_shared(device, &mix, Direction::Capture, false, false, 2_000_000)?;
         let info = info_for(&name, &mix, hns_to_frames(period_hns, SAMPLE_RATE), false, autoconvert, false);
         Self::finish(client, &fmt, false, info)
     }
@@ -330,11 +326,10 @@ impl RenderStream {
         let mut client = device.get_iaudioclient()?;
         let mix = client.get_mixformat()?;
         let (def_hns, _) = client.get_device_period()?;
-        client.initialize_client(
-            &mix,
-            &Direction::Render,
-            &StreamMode::PollingShared { autoconvert: false, buffer_duration_hns: buffer_hns.max(2 * def_hns) },
-        )?;
+        client.initialize_client(&mix, &Direction::Render, &StreamMode::PollingShared {
+            autoconvert: false,
+            buffer_duration_hns: buffer_hns.max(2 * def_hns),
+        })?;
         let info = info_for(&name, &mix, hns_to_frames(def_hns, mix.get_samplespersec()), false, false, false);
         Self::finish(client, &mix, info)
     }
@@ -477,12 +472,7 @@ fn open_low_latency(device: &Device, mix: &WaveFormat, raw: bool) -> Option<(Aud
 /// `initialize_client` in shared mode at the format rule's format. Returns the client, the
 /// format, whether WASAPI converts, and the device's default period.
 fn open_shared(
-    device: &Device,
-    mix: &WaveFormat,
-    dir: Direction,
-    raw: bool,
-    events: bool,
-    buffer_hns: i64,
+    device: &Device, mix: &WaveFormat, dir: Direction, raw: bool, events: bool, buffer_hns: i64,
 ) -> Result<(AudioClient, WaveFormat, bool, i64), WasapiError> {
     let mut client = new_client(device, raw)?;
     let (fmt, autoconvert) = stream_format(mix);

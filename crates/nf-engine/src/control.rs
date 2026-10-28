@@ -443,8 +443,7 @@ pub(crate) fn device_event_needs_restart(ev: &DevEvent, v: &RunView<'_>) -> bool
         return false;
     }
     let carries = |id: &str| [v.mic_id, v.output_id].contains(&Some(id));
-    let reference_back =
-        |id: &str| v.aec_built && cfg.devices.reference.as_deref() == Some(id) && v.reference_id != Some(id);
+    let reference_back = |id: &str| v.aec_built && cfg.devices.reference.as_deref() == Some(id) && v.reference_id != Some(id);
     match ev {
         DevEvent::Removed(id) => carries(id),
         DevEvent::State(id, s) => {
@@ -620,15 +619,8 @@ fn reset_telemetry(t: &Telemetry) {
     t.output_fill_ms.store(0.0);
     t.reference_fill_ms.store(0.0);
     for c in [
-        &t.output_slips,
-        &t.reference_slips,
-        &t.capture_glitches,
-        &t.render_underruns,
-        &t.reference_gaps,
-        &t.stalls,
-        &t.output_coarse_drops,
-        &t.reference_coarse_drops,
-        &t.tap_overflows,
+        &t.output_slips, &t.reference_slips, &t.capture_glitches, &t.render_underruns, &t.reference_gaps, &t.stalls,
+        &t.output_coarse_drops, &t.reference_coarse_drops, &t.tap_overflows,
     ] {
         c.store(0, Relaxed);
     }
@@ -926,9 +918,8 @@ pub(crate) fn apply(inner: &Arc<Inner>, config: &EngineConfig) {
 
 pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
     let st = lock(&inner.status).clone();
-    let chain_latency_ms = lock(&inner.current)
-        .as_ref()
-        .map_or(0.0, |s| s.chain_latency.load(Relaxed) as f32 * 1000.0 / nf_core::SAMPLE_RATE as f32);
+    let chain_latency_ms =
+        lock(&inner.current).as_ref().map_or(0.0, |s| s.chain_latency.load(Relaxed) as f32 * 1000.0 / nf_core::SAMPLE_RATE as f32);
     EngineStatus {
         state: inner.telemetry.state(),
         message: st.message,
@@ -1068,11 +1059,7 @@ mod tests {
 
     fn cfg(mic: Option<&str>, output: Option<&str>, reference: Option<&str>, aec: bool) -> EngineConfig {
         let mut c = EngineConfig {
-            devices: DeviceSelection {
-                mic: mic.map(Into::into),
-                output: output.map(Into::into),
-                reference: reference.map(Into::into),
-            },
+            devices: DeviceSelection { mic: mic.map(Into::into), output: output.map(Into::into), reference: reference.map(Into::into) },
             ..EngineConfig::default()
         };
         c.processing.aec_enabled = aec;

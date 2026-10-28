@@ -321,11 +321,7 @@ struct Ids {
 /// opens every stream. The reference and keep-alive are optional: failing them is a warning.
 /// Devices come first: resolving is cheap, so a start that can't run (a retry waiting for a device)
 /// fails before building the stages.
-fn open_session(
-    config: &EngineConfig,
-    controls: &Arc<ChainControls>,
-    warnings: &mut Vec<Warning>,
-) -> Result<(Session, Ids), StartFailure> {
+fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: &mut Vec<Warning>) -> Result<(Session, Ids), StartFailure> {
     let aec_wanted = config.processing.aec_enabled;
     let en = DeviceEnumerator::new().map_err(|e| StartFailure::Enumerator(hr_of(&e)))?;
     let out_id = config.devices.output.as_deref().ok_or(StartFailure::NotFound(StreamRole::Output))?;
@@ -360,11 +356,8 @@ fn open_session(
     }
 
     let noise: Box<dyn Stage> = Box::new(RnnoiseStage::new(controls.clone()));
-    let aec: Option<Box<dyn Stage>> = if aec_wanted {
-        Some(Box::new(Aec3Stage::new(controls.clone()).map_err(|e| StartFailure::Stage(e.0))?))
-    } else {
-        None
-    };
+    let aec: Option<Box<dyn Stage>> =
+        if aec_wanted { Some(Box::new(Aec3Stage::new(controls.clone()).map_err(|e| StartFailure::Stage(e.0))?)) } else { None };
     let mut chain = Chain::new(controls.clone(), aec, Some(noise));
     chain.activate().map_err(|e| StartFailure::Stage(e.0))?;
 
@@ -385,10 +378,7 @@ fn open_session(
                     }
                 }
             }
-            Err(e) => warnings.push(Warning::ReferenceUnavailable(StartFailure::Open {
-                role: StreamRole::Reference,
-                hr: hr_of(&e),
-            })),
+            Err(e) => warnings.push(Warning::ReferenceUnavailable(StartFailure::Open { role: StreamRole::Reference, hr: hr_of(&e) })),
         }
     }
     let ids = Ids { mic: mic_dev.get_id().ok(), output: ids_out, reference: ref_id };
@@ -450,10 +440,7 @@ impl TopUp for KeepAlive {
 /// the reference isn't used before then, so polling it on every wake of a 1 ms mic period only
 /// multiplies WASAPI calls (performance/F3). Returns the failing stream's role and HRESULT.
 pub(crate) fn service_reference<K: TopUp, C: CaptureSource, D: DriftControl, R: Resampler>(
-    pipe: &mut Pipeline<D, R>,
-    ka: Option<&mut K>,
-    lb: Option<&mut C>,
-    now_hns: f64,
+    pipe: &mut Pipeline<D, R>, ka: Option<&mut K>, lb: Option<&mut C>, now_hns: f64,
 ) -> Result<(), (StreamRole, Hr)> {
     if !pipe.block_ready() {
         return Ok(());
@@ -513,12 +500,7 @@ fn start_reference(ka: Option<&mut KeepAlive>, lb: Option<&CaptureStream>) -> Re
 
 /// The loop. Returns the fault that ended it, or `None` when asked to stop.
 fn audio_loop(
-    s: &mut Session,
-    pipe: &mut Pipeline,
-    tel: &Telemetry,
-    shared: &AudioShared,
-    tap: &mut TapEnd,
-    fallback_baseline: u64,
+    s: &mut Session, pipe: &mut Pipeline, tel: &Telemetry, shared: &AudioShared, tap: &mut TapEnd, fallback_baseline: u64,
 ) -> Option<Fault> {
     let qpc = Qpc::new();
     let mut ticks = QpcTicks(qpc);
@@ -548,9 +530,7 @@ fn audio_loop(
         }
         // 2. Reference, when a block is due: top up the keep-alive and drain the loopback (polled:
         //    its events stop during silence).
-        if reference_live
-            && let Err((role, hr)) = service_reference(pipe, s.ka.as_mut(), s.lb.as_mut(), now as f64)
-        {
+        if reference_live && let Err((role, hr)) = service_reference(pipe, s.ka.as_mut(), s.lb.as_mut(), now as f64) {
             // The reference is optional (wasapi/B): stop its streams once (they're released with
             // the session), carry on with dithered zeros for it, and tell the control thread.
             if let Some(ka) = &s.ka {
@@ -592,12 +572,7 @@ fn audio_loop(
 
 /// Takes a new tap from the latency test, and hands a finished one back so its ring is freed on
 /// the test's thread, never here. Lock-free and allocation-free.
-fn service_tap(
-    slot: &mut Option<Producer<TapItem>>,
-    tap: &mut TapEnd,
-    shared: &AudioShared,
-    returning: &mut Option<Producer<TapItem>>,
-) {
+fn service_tap(slot: &mut Option<Producer<TapItem>>, tap: &mut TapEnd, shared: &AudioShared, returning: &mut Option<Producer<TapItem>>) {
     // Only take a new tap while nothing waits to go back, so a replaced one is never dropped here.
     if returning.is_none()
         && let Ok(p) = tap.cmd.pop()

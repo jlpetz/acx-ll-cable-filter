@@ -9,8 +9,8 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    ERROR_CANCELLED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_NOT_ALL_ASSIGNED, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
-    HLOCAL, HWND, LUID, WAIT_OBJECT_0,
+    ERROR_CANCELLED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_NOT_ALL_ASSIGNED, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE, HLOCAL,
+    HWND, LUID, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authentication::Identity::{
     LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaNtStatusToWinError, LsaOpenPolicy,
@@ -18,10 +18,9 @@ use windows::Win32::Security::Authentication::Identity::{
 };
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, IsValidSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSID,
-    SE_LOCK_MEMORY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
-    TOKEN_ELEVATION_TYPE, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-    TokenElevationType, TokenElevationTypeLimited, TokenUser,
+    AdjustTokenPrivileges, GetTokenInformation, IsValidSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSID, SE_LOCK_MEMORY_NAME,
+    SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_INFORMATION_CLASS,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenElevationType, TokenElevationTypeLimited, TokenUser,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject};
@@ -77,10 +76,7 @@ pub(crate) fn enable_privilege(name: PCWSTR) -> Result<bool, String> {
     // SAFETY: `name` is a NUL-terminated privilege name (the SE_*_NAME constants); `luid` is a
     // live out-pointer.
     unsafe { LookupPrivilegeValueW(PCWSTR::null(), name, &mut luid) }.map_err(|e| describe("unknown privilege", &e))?;
-    let tp = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
-    };
+    let tp = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
     // SAFETY: the token was opened with TOKEN_ADJUST_PRIVILEGES; `tp` outlives the call; no
     // previous state is requested, so the buffer length may be 0. GetLastError is read straight
     // after, with no call in between: AdjustTokenPrivileges succeeds even when nothing was

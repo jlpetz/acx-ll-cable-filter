@@ -54,8 +54,7 @@ pub(crate) fn primary_limit() -> Option<(f64, f64)> {
 fn to_dips(rect: RECT, dpi_x: u32, dpi_y: u32) -> Option<(f64, f64)> {
     let width = f64::from(rect.right) - f64::from(rect.left);
     let height = f64::from(rect.bottom) - f64::from(rect.top);
-    (width > 0.0 && height > 0.0 && dpi_x > 0 && dpi_y > 0)
-        .then(|| (width * 96.0 / f64::from(dpi_x), height * 96.0 / f64::from(dpi_y)))
+    (width > 0.0 && height > 0.0 && dpi_x > 0 && dpi_y > 0).then(|| (width * 96.0 / f64::from(dpi_x), height * 96.0 / f64::from(dpi_y)))
 }
 
 /// The largest client size that fits a `work` area (DIPs) with the frame, but never below the

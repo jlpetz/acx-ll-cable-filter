@@ -479,9 +479,10 @@ fn correlate(a: &[f32], b: &[f32], max_lag: usize, beta: Option<f32>) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::PI;
+
     use super::*;
     use crate::latency::sweep::{exp_sweep, probe_train};
-    use std::f64::consts::PI;
 
     /// Deterministic noise source (xorshift64*), uniform in ±1.
     struct Rng(u64);
@@ -836,7 +837,10 @@ mod tests {
         for (i, u) in [(4000usize, 0.0), (4000, 0.37), (4001, -0.81), (3990, 0.5)] {
             let (v, d1, d2) = sinc_local(&burst, i, u);
             let (ve, d1e, d2e) = band_limited(&sp, m, i as f64 + u);
-            assert!((v - ve).abs() < 1e-5 && (d1 - d1e).abs() < 1e-5 && (d2 - d2e).abs() < 1e-5, "at {i}{u:+}: {v} {d1} {d2} vs {ve} {d1e} {d2e}");
+            assert!(
+                (v - ve).abs() < 1e-5 && (d1 - d1e).abs() < 1e-5 && (d2 - d2e).abs() < 1e-5,
+                "at {i}{u:+}: {v} {d1} {d2} vs {ve} {d1e} {d2e}"
+            );
         }
         assert_eq!(sinc_local(&burst, 4000, 0.0).0, f64::from(burst[4000]), "exact at an integer");
     }
@@ -893,6 +897,9 @@ mod tests {
         let t = std::time::Instant::now();
         let (local, _) = refine_peak_local(&h, i);
         let near = t.elapsed();
-        eprintln!("one peak refined: spectrum {spectrum:?} (x100 repetitions), local {near:?}; positions differ by {:.1e}", (exact - local).abs());
+        eprintln!(
+            "one peak refined: spectrum {spectrum:?} (x100 repetitions), local {near:?}; positions differ by {:.1e}",
+            (exact - local).abs()
+        );
     }
 }

@@ -3,7 +3,8 @@
 //! The audio thread writes with relaxed stores (one block of skew between fields is harmless), and
 //! the UI takes a [`TelemetrySnapshot`] about 20 times a second.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
 use crate::atomic::AtomicF32;
 

@@ -218,6 +218,7 @@ impl Speech {
 }
 
 /// Formants (F1, F2, F3) in Hz for an adult male: /a/, /i/, /u/, /e/, /o/, /æ/.
+#[rustfmt::skip]
 const VOWELS: [[f64; 3]; 6] = [
     [730.0, 1090.0, 2440.0],
     [270.0, 2290.0, 3010.0],
@@ -278,18 +279,15 @@ pub fn speech_like(len: usize, voice: Voice, seed: u64) -> Speech {
             let pos = k as f64 / count as f64;
             let accent = rng.range(-0.06, 0.08);
             let next = (vowel + 1 + rng.next_u64() as usize % (VOWELS.len() - 1)) % VOWELS.len();
-            plan.push((
-                t,
-                Syllable {
-                    fricative,
-                    voiced,
-                    v0: vowel,
-                    v1: next,
-                    f0_start: f0 * (1.12 - 0.22 * pos + accent),
-                    f0_end: f0 * (1.08 - 0.22 * (pos + 1.0 / count as f64) + accent),
-                    gain: rng.range(0.6, 1.0),
-                },
-            ));
+            plan.push((t, Syllable {
+                fricative,
+                voiced,
+                v0: vowel,
+                v1: next,
+                f0_start: f0 * (1.12 - 0.22 * pos + accent),
+                f0_end: f0 * (1.08 - 0.22 * (pos + 1.0 / count as f64) + accent),
+                gain: rng.range(0.6, 1.0),
+            }));
             vowel = next;
             t += fricative + voiced + ms(&mut rng, 30.0, 120.0);
         }
@@ -462,12 +460,8 @@ pub fn convolve(x: &[f32], h: &[f32]) -> Vec<f32> {
 
 /// Writes `x` as a mono 48 kHz 32-bit float WAV, to listen to what a test fed and got back.
 pub fn write_wav(path: &std::path::Path, x: &[f32]) -> Result<(), hound::Error> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: nf_core::SAMPLE_RATE,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
+    let spec =
+        hound::WavSpec { channels: 1, sample_rate: nf_core::SAMPLE_RATE, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
     let mut w = hound::WavWriter::create(path, spec)?;
     for &s in x {
         w.write_sample(s)?;

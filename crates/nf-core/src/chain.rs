@@ -267,13 +267,7 @@ fn quiet(x: &Block) -> bool {
 /// this block (a latency test), so a draining slot drops its latency now rather than at a quiet
 /// block mid-test.
 fn run_slot(
-    slot: &mut Slot,
-    want: Want,
-    test_starts: bool,
-    input: &Block,
-    reference: Option<&Block>,
-    out: &mut Block,
-    scratch: &mut Block,
+    slot: &mut Slot, want: Want, test_starts: bool, input: &Block, reference: Option<&Block>, out: &mut Block, scratch: &mut Block,
 ) -> StageReport {
     let reference = if slot.needs_ref { reference } else { None };
     let mut report = StageReport::default();
@@ -352,12 +346,13 @@ fn run_slot(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
     use crate::config::ProcessingConfig;
     use crate::dsp::fade::SPLICE_FADE;
     use crate::stage::{StageInfo, StageRole};
-    use std::ops::Range;
-    use std::sync::atomic::AtomicUsize;
 
     /// A test stage: scales by `gain` and delays by `lat` samples; counts resets and calls.
     struct Scaled {
@@ -648,18 +643,18 @@ mod tests {
     fn transitions_have_no_click_and_no_comb_dip() {
         // (block, noise enabled, passthrough, what the block does)
         let schedule: &[(usize, bool, bool, Kind)] = &[
-            (20, true, false, Kind::Splice),     // stage on: latency 0 -> L
-            (40, true, true, Kind::Crossfade),   // into passthrough
-            (60, true, false, Kind::Crossfade),  // out of passthrough (restart + prime)
-            (80, false, false, Kind::Crossfade), // stage off: into the delay path
-            (230, false, false, Kind::Splice),   // the drain times out (the signal never goes quiet)
-            (250, true, false, Kind::Splice),    // on again
+            (20, true, false, Kind::Splice),      // stage on: latency 0 -> L
+            (40, true, true, Kind::Crossfade),    // into passthrough
+            (60, true, false, Kind::Crossfade),   // out of passthrough (restart + prime)
+            (80, false, false, Kind::Crossfade),  // stage off: into the delay path
+            (230, false, false, Kind::Splice),    // the drain times out (the signal never goes quiet)
+            (250, true, false, Kind::Splice),     // on again
             (270, false, false, Kind::Crossfade), // off ...
-            (275, true, false, Kind::Crossfade), // ... and on again mid-drain
-            (290, true, true, Kind::Crossfade),  // passthrough ...
-            (295, false, true, Kind::Crossfade), // ... stage off while in it: drains, no audible change
-            (300, true, true, Kind::Crossfade),  // ... back on: still the same delay path
-            (305, true, false, Kind::Crossfade), // out of passthrough
+            (275, true, false, Kind::Crossfade),  // ... and on again mid-drain
+            (290, true, true, Kind::Crossfade),   // passthrough ...
+            (295, false, true, Kind::Crossfade),  // ... stage off while in it: drains, no audible change
+            (300, true, true, Kind::Crossfade),   // ... back on: still the same delay path
+            (305, true, false, Kind::Crossfade),  // out of passthrough
         ];
         let blocks = 320;
         for lat in [480u32, 430] {
@@ -678,9 +673,9 @@ mod tests {
                 }
                 let peak = max_abs(&x);
                 let natural = max_step(&x, 0..x.len());
-                let floor_rms = (0..x.len() - BLOCK).step_by(48).map(|s| {
-                    (x[s..s + BLOCK].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / BLOCK as f64).sqrt()
-                });
+                let floor_rms = (0..x.len() - BLOCK)
+                    .step_by(48)
+                    .map(|s| (x[s..s + BLOCK].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / BLOCK as f64).sqrt());
                 let quietest = floor_rms.fold(f64::INFINITY, f64::min) as f32;
                 for &(b, _, _, kind) in schedule {
                     let around = (b - 1) * BLOCK..(b + 2) * BLOCK;

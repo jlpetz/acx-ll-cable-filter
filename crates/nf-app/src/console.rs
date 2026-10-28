@@ -18,7 +18,8 @@
 
 use std::io::BufRead;
 use std::os::windows::io::IntoRawHandle;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{HANDLE, TRUE};
@@ -218,9 +219,10 @@ impl CtrlCWatch {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use windows::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_REMOTE};
     use windows::Win32::System::Console::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT};
+
+    use super::*;
 
     /// PSReadLine reading the prompt clears ENABLE_PROCESSED_INPUT (app-privilege F1): that's
     /// warned about once, and a console that delivers Ctrl+C, or no console, isn't.
