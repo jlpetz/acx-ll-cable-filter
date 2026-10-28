@@ -206,7 +206,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Candidate bases: Microsoft's ACX AudioCodec sample (MS-PL, root-enumerated, simulated stream engine), SimpleAudioSample/SYSVAD (WaveRT); microsoft/low-latency-audio (MIT, open source, unreleased) for its ACX low-latency streaming, its ASIO driver's user-kernel interface and its control panel. Its USB half doesn't apply. In-box usbaudio2.sys is closed (Thesycon).
 - Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
 - Base study (2026-10-28): start from the ACX AudioCodec sample, cut down (about 3.5-4.5k lines when done, 19-34 dev-days, an estimate), borrowing low-latency-audio's packet-size code, stream engine and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
-**Next**: the owner's OK to install Visual Studio and the WDK and to turn on test signing (after an EBS snapshot, in the same reboot as VB-CABLE); then the spike's seven checks.
+- Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 with the C++ workload, the Spectre libraries and the WDK extension; WDK 10.0.28000.2526 and SDK 10.0.28000.2705 (ACX 1.0/1.1, KMDF up to 1.35, inf2cat, stampinf, infverif, signtool). VB-CABLE 3.3.1.7 loads on Server 2025.
+**Next**: when the owner un-pauses the spike: an EBS snapshot, `bcdedit /set testsigning on` and a reboot; then the spike's seven checks.
 **Detail**: `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`
 
 ---
