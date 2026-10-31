@@ -156,6 +156,23 @@ Next:
 1. Record what the chain is fed live (the mic and reference blocks, with the chain's output) next to `quality --save`'s
    WAVs, and run AEC3 offline on exactly those: it tells the reference's content and timing from the live processing.
    It's #14's phase 1 (save the raw take and the loopback) in a small form.
+   **Built and run (2026-11-01):** the engine's chain recorder (`Engine::record_chain`, engine.md "The chain
+   recorder"). `quality --save DIR` arms it before the start and writes `chain_mic.wav`, `chain_ref.wav`, `chain_out.wav`,
+   `chain_blocks.csv` (a row a block: capture QPC, the mic's discards and skips, the reference's read index and so the echo
+   path in samples, its lead reading, slips, owed zeros, jumps and why, AEC3's delay and ERLE) and `chain_config.json`. In DIR, `noise-filter process
+   chain_mic.wav chain_rerun.wav --ref chain_ref.wav --config chain_config.json --warm-up` reruns the live chain; it should
+   match `chain_out.wav` sample for sample (it does offline, through bursty delivery: `pipeline/tests/recorder.rs`). If it
+   does, the chain behaved live as offline and the difference is in what it was fed: compare `chain_ref.wav` against
+   `far.wav` and `chain_mic.wav` against `input.wav` (what the cables delivered against what was played; the path's moves
+   in the CSV). If it doesn't, something in the live process differs from `process`.
+   **Result:** six live 60 s takes with the recorder (`echo-5` to `echo-10` in the dev VM's
+   `Downloads
+f-quality`, outside the repo), `--no-ns`: the far-only turns after the first dropped the echo by a median
+   of 57-60 dB each take (lowest turn 21-55 dB; the first, converging turn 19-40 dB), AEC3's own ERLE 11-16 dB, no
+   reference gaps, 0-4 slips, no jumps. The offline rerun matched `chain_out.wav` exactly (largest difference 0). So the
+   engine now cancels live as well as offline (46-57 dB on the same scene). The earlier 14 dB take (`echo-4`, without the
+   recorder; 3 reference gaps and 3 slips in its start-up, AEC3's delay estimate 0) didn't recur in the six: unexplained,
+   possibly a bad start-up. If it does recur, its chain recording will show why.
 2. On real speakers in phase 2, check that the lead stays under the echo path's delay (12 ms expected with steady
    delivery; a target over 30 ms is flagged). A bursty device needing more lead than its echo path has can only be owed
    blocks or be non-causal: AEC3's delay estimate near 0 with a low ERLE would say so, and could cap the target (not done).

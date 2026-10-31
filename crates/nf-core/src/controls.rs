@@ -24,7 +24,7 @@ pub struct GateControls {
 }
 
 /// One block's view of [`GateControls`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GateParams {
     pub mode: GateMode,
     pub threshold_db: f32,
@@ -116,6 +116,18 @@ impl ChainControls {
         c
     }
 
+    /// The settings that change the chain's output, as they stand.
+    #[inline]
+    pub fn load(&self) -> ChainParams {
+        ChainParams {
+            aec_enabled: self.aec.enabled.load(Relaxed),
+            noise_enabled: self.noise.enabled.load(Relaxed),
+            passthrough: self.passthrough.load(Relaxed),
+            floor_db: self.noise.floor_db.load(),
+            gate: self.noise.gate.load(),
+        }
+    }
+
     /// Applies a whole processing config (the passthrough flag is left alone: the latency test owns it).
     pub fn apply(&self, cfg: &ProcessingConfig) {
         self.aec.enabled.store(cfg.aec_enabled, Relaxed);
@@ -123,5 +135,56 @@ impl ChainControls {
         self.noise.floor_db.store(cfg.floor_db.min(0.0));
         self.noise.gate.apply(&cfg.gate);
         self.meters_enabled.store(cfg.meters_enabled, Relaxed);
+    }
+}
+
+/// One block's view of the [`ChainControls`] that change the chain's output (the meters don't): what the chain and its
+/// stages read each block.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChainParams {
+    pub aec_enabled: bool,
+    pub noise_enabled: bool,
+    pub passthrough: bool,
+    pub floor_db: f32,
+    pub gate: GateParams,
+}
+
+impl ChainParams {
+    /// The same settings, bit for bit: as `==`, except that a NaN setting (a config can hold one) equals itself.
+    pub fn same(&self, other: &Self) -> bool {
+        let f = |a: f32, b: f32| a.to_bits() == b.to_bits();
+        let (g, h) = (&self.gate, &other.gate);
+        (self.aec_enabled, self.noise_enabled, self.passthrough) == (other.aec_enabled, other.noise_enabled, other.passthrough)
+            && f(self.floor_db, other.floor_db)
+            && (g.mode, g.use_vad) == (h.mode, h.use_vad)
+            && f(g.threshold_db, h.threshold_db)
+            && f(g.auto_margin_db, h.auto_margin_db)
+            && f(g.attack_ms, h.attack_ms)
+            && f(g.release_ms, h.release_ms)
+            && f(g.hold_ms, h.hold_ms)
+            && f(g.range_db, h.range_db)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot holds what the chain reads; a change of any of it shows, and a NaN setting still equals itself.
+    #[test]
+    fn a_snapshot_shows_each_change() {
+        let c = ChainControls::new(&ProcessingConfig::default());
+        let a = c.load();
+        assert!(a.same(&c.load()));
+        c.passthrough.store(true, Relaxed);
+        assert!(!a.same(&c.load()) && c.load().passthrough);
+        c.passthrough.store(false, Relaxed);
+        c.noise.gate.threshold_db.store(-41.0);
+        assert!(!a.same(&c.load()));
+        c.noise.gate.threshold_db.store(f32::NAN);
+        let nan = c.load();
+        assert!(nan.same(&c.load()) && nan != c.load());
+        c.meters_enabled.store(false, Relaxed);
+        assert!(nan.same(&c.load()), "the meters don't change the output");
     }
 }

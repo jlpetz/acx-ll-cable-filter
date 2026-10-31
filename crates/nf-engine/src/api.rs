@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
+pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{EngineState, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot};
 
 /// Endpoint direction.
@@ -300,6 +301,195 @@ pub struct PlayRecordResult {
     pub capture: StreamInfo,
 }
 
+/// The longest chain recording, in seconds (15 minutes, as [`play_record`]'s).
+pub const MAX_CHAIN_RECORDING_S: f64 = 900.0;
+
+/// What the echo reference's timeline did at one block ([`ChainBlock::reference`]; engine.md, "The reference"). Indices and
+/// counts are in samples at 48 kHz.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReferenceFacts {
+    /// The timeline's index of the first reference sample served with the block. The timeline counts the loopback's samples
+    /// from its first packet, frames missing by device position and losses its stamps showed included. The block's
+    /// [`ChainBlock::mic_index`] less this is the echo path as the engine holds it. Block to block it moves only by what
+    /// the facts show: on the mic's side by [`ChainBlock::mic_discarded`], on the reference's by a slip (`consumed` other
+    /// than 480) and a jump (`jumped`).
+    pub read_index: i64,
+    /// This block's lead reading: the mic block's capture time less the tap time of the first reference sample served with it,
+    /// in ms, by the streams' stamps (or by delivery when `stamped` is false), after any jump at this block. NaN without a
+    /// reading (nothing delivered yet, or a reading that wasn't a number).
+    pub lead_reading_ms: f32,
+    /// The lead as the loop holds it (its 1 s low-pass; telemetry's `reference_fill_ms`) and its target, in ms.
+    pub lead_ms: f32,
+    pub target_ms: f32,
+    /// The loop's drift estimate: positive when the loopback's clock runs fast against the mic's.
+    pub drift_ppm: f32,
+    /// The stamps time the lead (else the delivery does).
+    pub stamped: bool,
+    /// The loopback had delivered within two periods and 5 ms (else the loop coasted on its drift), and it delivered at
+    /// this block's wake.
+    pub fresh: bool,
+    pub delivered: bool,
+    /// Samples delivered past the read position when the block was served; negative while samples are owed.
+    pub buffered: i64,
+    /// Samples the block took from the timeline: 480, or 479 and 481 at a slip (resampled to 480); 0 before the first
+    /// packet (the block is zeros, and the timeline starts with that packet).
+    pub consumed: u16,
+    /// Zeros served for samples that hadn't arrived: owed, and discarded when they come (a reference gap).
+    pub owed: u16,
+    /// Zeros served for samples the timeline doesn't hold: before the loopback's first sample, after a jump back, or the
+    /// whole block before the first packet.
+    pub missing: u16,
+    /// How far the read position jumped at this block, forward (positive) or back, by the events below.
+    pub jumped: i64,
+    /// What happened at this block: the `ReferenceFacts::*` event bits.
+    pub events: u16,
+}
+
+impl ReferenceFacts {
+    /// Nothing delivered yet: the block is zeros.
+    pub const NO_READING: u16 = 1 << 0;
+    /// The first reading aligned the timeline on the target (a jump).
+    pub const ALIGNED: u16 = 1 << 1;
+    /// The low-passed lead was centred on the target in one jump: at the start-up's end, or after a break timed by delivery.
+    pub const CENTRED: u16 = 1 << 2;
+    /// A broken timeline (a step of the lead past 4 ms, or 30 ms timed by delivery) undone in one jump.
+    pub const BROKEN: u16 = 1 << 3;
+    /// Timed by delivery: a step of the count put back in a jump of whole packets.
+    pub const STEPPED: u16 = 1 << 4;
+    /// The lead target moved, and the read position with it.
+    pub const RETARGETED: u16 = 1 << 5;
+    /// In the start-up, the timing changed (a stream's stamps came or went): the start-up started over.
+    pub const RESTARTED: u16 = 1 << 6;
+    /// The stamps were given up for the rest of the run: delivery times the lead from this block on.
+    pub const UNSTAMPED: u16 = 1 << 7;
+    /// The loop coasted on its drift estimate: the loopback wasn't fresh, or the reading was too far off to use.
+    pub const COASTED: u16 = 1 << 8;
+
+    #[rustfmt::skip]
+    const NAMES: [(u16, &'static str); 9] = [
+        (Self::NO_READING, "no-reading"), (Self::ALIGNED, "aligned"), (Self::CENTRED, "centred"), (Self::BROKEN, "broken"),
+        (Self::STEPPED, "stepped"), (Self::RETARGETED, "retargeted"), (Self::RESTARTED, "restarted"),
+        (Self::UNSTAMPED, "unstamped"), (Self::COASTED, "coasted"),
+    ];
+
+    /// The names of the events at this block ("aligned", "coasted", ...), in the order of their bits.
+    pub fn event_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        Self::NAMES.iter().filter(|(bit, _)| self.events & bit != 0).map(|&(_, name)| name)
+    }
+}
+
+/// One block the chain processed, as the chain recorder saw it ([`Engine::record_chain`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChainBlock {
+    /// The run's block number: 0 is its first block after the warm-up. Consecutive, unless the recorder's ring was full.
+    pub index: u64,
+    /// The QPC time (100 ns units) of the mic block's first sample by the mic's packet stamps; NaN without them.
+    pub capture_qpc_hns: f64,
+    /// The mic's stamps are trusted (they time the reference's lead).
+    pub mic_stamped: bool,
+    /// The mic stream's index of the block's first sample: the samples pushed into the mic FIFO before it, so frames missing
+    /// by device position up to 100 ms count (as the zeros pushed for them) and a bigger gap doesn't ([`Self::mic_skipped`]).
+    /// It moves by 480 a block, plus [`Self::mic_discarded`].
+    pub mic_index: u64,
+    /// The QPC time (100 ns units) of the wake that delivered the mic's newest packet: the block's time by delivery.
+    pub mic_wake_hns: f64,
+    /// Mic samples still queued after this block: a backlog of whole blocks is a late wake or a burst.
+    pub mic_queued: u32,
+    /// Mic samples the FIFO discarded, oldest first, since the block before: it overflowed (the engine didn't run for
+    /// 200 ms). This block's `mic_index` is that much past the last block's plus 480.
+    pub mic_discarded: u64,
+    /// Frames the mic's device position skipped since the block before that weren't filled with zeros (a gap over 100 ms;
+    /// negative if the position went back). `mic_index` doesn't count them: the echo path moves by them in time, and the
+    /// reference's timeline follows by a jump when the stamps show it.
+    pub mic_skipped: i64,
+    /// What the reference's timeline did at this block; `None` without a reference (or after it failed and was dropped).
+    pub reference: Option<ReferenceFacts>,
+    /// AEC3's own estimates after this block: the echo delay it found and its ERLE (NaN while it has none, or without AEC).
+    pub aec_delay_ms: f32,
+    pub aec_erle_db: f32,
+    /// The chain's live settings as they stood after this block (on/off, passthrough, floor, gate): an [`Engine::apply`] or a
+    /// latency test that changed them shows here, and a rerun with one config matches only while they don't change.
+    pub settings: ChainParams,
+}
+
+/// What [`ChainRecorder::stop`] gives: every block the chain processed while it recorded, the chain's input and output.
+/// `mic`, `reference` and `output` are 48 kHz mono, 480 samples for each entry of `blocks`, in order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChainRecording {
+    /// The mic blocks as the chain got them: after the engine's dither (about -180 dBFS).
+    pub mic: Vec<f32>,
+    /// The reference blocks as the chain got them: the timeline's samples resampled to the block, dithered.
+    pub reference: Vec<f32>,
+    /// The chain's output blocks, before the output's drift loop resamples them for the device.
+    pub output: Vec<f32>,
+    pub blocks: Vec<ChainBlock>,
+    /// Blocks the recorder's ring had no room for, up to the end of the recording (the audio thread counts them): missing from
+    /// it, not zero-filled. The indices skip those before the last block recorded.
+    pub lost_blocks: u64,
+    /// Stopped at its length limit.
+    pub truncated: bool,
+    /// The run ended (stopped, or restarted after a fault, a device change or a settings change that rebuilds the streams)
+    /// before the recorder was stopped: the recording ends with it.
+    pub run_ended: bool,
+}
+
+impl ChainRecording {
+    /// The recording starts at the run's first block, after the engine's warm-up: armed before the start.
+    pub fn from_first_block(&self) -> bool {
+        self.blocks.first().is_some_and(|b| b.index == 0)
+    }
+
+    /// The first block whose chain settings differ from the block before's ([`ChainBlock::settings`]): an [`Engine::apply`] or
+    /// a latency test changed them during the recording.
+    pub fn settings_changed_at(&self) -> Option<u64> {
+        self.blocks.windows(2).find(|w| !w[1].settings.same(&w[0].settings)).map(|w| w[1].index)
+    }
+
+    /// The chain's whole history is here: from the run's first block, none lost, the settings unchanged. Then a chain started
+    /// as the engine starts it ([`warm_up_chain`]) with those settings and fed `mic` and `reference` block by block
+    /// reproduces `output` (`noise-filter process --warm-up` with the run's processing settings).
+    pub fn reproducible(&self) -> bool {
+        !self.blocks.is_empty() && self.from_first_block() && self.lost_blocks == 0 && self.settings_changed_at().is_none()
+    }
+
+    /// The recording's length in seconds.
+    pub fn seconds(&self) -> f64 {
+        self.mic.len() as f64 / f64::from(nf_core::SAMPLE_RATE)
+    }
+}
+
+/// A chain recording in progress ([`Engine::record_chain`]). Its own thread moves the audio thread's blocks into memory
+/// while it runs. Dropping it stops it and discards what it recorded.
+pub struct ChainRecorder {
+    pub(crate) inner: crate::recorder::Handle,
+}
+
+impl ChainRecorder {
+    /// Blocks recorded so far.
+    pub fn blocks(&self) -> u64 {
+        self.inner.blocks()
+    }
+
+    /// Blocks lost so far because the recorder's ring was full.
+    pub fn lost_blocks(&self) -> u64 {
+        self.inner.lost_blocks()
+    }
+
+    /// Stops recording (the recording ends at about this moment) and returns it. It waits up to about half a second for
+    /// the audio thread to hand the ring back.
+    pub fn stop(self) -> ChainRecording {
+        self.inner.stop()
+    }
+}
+
+/// Runs the engine's start-up warm-up on `chain`: three silent blocks, dithered as the engine dithers, through the chain on
+/// the calling thread. The engine does this before every run's first block (after the stages' first-block set-up), so a
+/// chain built and activated as the engine builds it (`nf_stages::build_chain` with the run's processing settings), warmed
+/// up with this and fed a [`ChainRecording`]'s `mic` and `reference` reproduces its `output`.
+pub fn warm_up_chain(chain: &mut nf_core::chain::Chain) {
+    crate::audio::warm_up(chain)
+}
+
 /// Lists the active capture and render endpoints.
 pub fn list_devices() -> Result<Vec<DeviceInfo>, EngineError> {
     crate::devices::list_devices()
@@ -378,5 +568,19 @@ impl Engine {
     /// Starts a latency test. The engine must be running, with the mic set to the loop's input.
     pub fn start_latency_test(&self, request: LatencyTestRequest) -> Result<LatencyTest, EngineError> {
         crate::latency_test::start(&self.inner, request)
+    }
+
+    /// Arms the chain recorder (engine.md, "The chain recorder"): every block the chain processes, its mic and reference
+    /// input as the chain gets them and its output, with the block's capture time and what the reference's timeline did,
+    /// for up to `max_seconds` (at most [`MAX_CHAIN_RECORDING_S`]). About 0.6 MB a second.
+    ///
+    /// Armed before [`Engine::start`] (or while the engine is stopped, or waiting to retry), the next run that starts records
+    /// from its first block, after the warm-up, so the recording holds the chain's whole history
+    /// ([`ChainRecording::reproducible`]). A start that fails hands it on to the next (unless it got no audio thread, or the
+    /// thread hung or died: then it records nothing more). Armed while running, the live run starts recording at its next
+    /// wake. The recording ends with the run: a stop, or a restart (a fault, a device change, a settings change that rebuilds
+    /// the streams). One recorder at a time.
+    pub fn record_chain(&self, max_seconds: f64) -> Result<ChainRecorder, EngineError> {
+        crate::recorder::arm(&self.inner, max_seconds).map(|inner| ChainRecorder { inner })
     }
 }

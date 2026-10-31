@@ -33,6 +33,7 @@ use crate::errors::{
     no_output_message, remedy_for_fault, remedy_for_start, same_device_message,
 };
 use crate::latency_test::{TapPort, tap_channel};
+use crate::recorder;
 use crate::sched::Com;
 use crate::stream::CaptureStream;
 
@@ -201,9 +202,13 @@ pub(crate) struct Inner {
     pub(crate) current: Mutex<Option<Arc<AudioShared>>>,
     /// The control side of the live run's tap hand-over (the latency test uses it).
     pub(crate) tap: Mutex<Option<TapPort>>,
+    /// The chain recorder's: one armed for the next start, and the live run's hand-over (recorder.rs).
+    pub(crate) recorder: Mutex<recorder::Slot>,
     readout: AtomicBool,
     ctl: Mutex<Option<Sender<Ctl>>>,
     pub(crate) test_running: AtomicBool,
+    /// A chain recorder is armed (one at a time).
+    pub(crate) recording: AtomicBool,
 }
 
 impl Inner {
@@ -217,9 +222,11 @@ impl Inner {
             desired: Mutex::new(Desired::default()),
             current: Mutex::new(None),
             tap: Mutex::new(None),
+            recorder: Mutex::new(recorder::Slot::default()),
             readout: AtomicBool::new(processing.latency_readout_enabled),
             ctl: Mutex::new(None),
             test_running: AtomicBool::new(false),
+            recording: AtomicBool::new(false),
         })
     }
 
@@ -686,6 +693,8 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
     let shared = Arc::new(AudioShared::default());
     shared.readout.store(readout, Relaxed);
     let (port, end) = tap_channel();
+    // A chain recorder armed before this start goes in now, so the run's first wake takes it before its first block.
+    let (rec_port, rec_end) = recorder::run_channel(inner);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::channel();
     let args = AudioArgs {
@@ -694,6 +703,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         controls: inner.controls.clone(),
         shared: shared.clone(),
         tap: end,
+        recorder: rec_end,
         ready: ready_tx,
         done: done_tx,
     };
@@ -707,6 +717,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
             run.audio = Some(handle);
             *lock(&inner.current) = Some(shared);
             *lock(&inner.tap) = Some(port);
+            recorder::run_started(inner, rec_port);
             let aec_built = opened.aec_built;
             *lock(&inner.status) = status_from(opened);
             let (stale, deferred) = settle_start(inner, config, Some(aec_built));
@@ -714,17 +725,21 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
             resend(inner, stale, deferred);
             Ok(())
         }
+        // A chain recorder armed for this start comes back from the ended run for the next (`recorder::run_failed`).
         Ok(Err(f)) => {
             settle_worker(run, worker, handle);
+            recorder::run_failed(inner, rec_port);
             Err(fail(inner, &f, config))
         }
         Err(RecvTimeoutError::Timeout) => {
             handle.shared.command.store(CMD_STOP, Relaxed);
             settle_worker(run, worker, handle);
+            recorder::run_failed(inner, rec_port);
             Err(fail(inner, &StartFailure::Timeout, config))
         }
         Err(RecvTimeoutError::Disconnected) => {
             settle_worker(run, worker, handle);
+            recorder::run_failed(inner, rec_port);
             Err(fail(inner, &StartFailure::ThreadDied, config))
         }
     }
@@ -875,6 +890,7 @@ fn stop_locked(inner: &Inner, run: &mut RunState) {
     }
     *lock(&inner.current) = None;
     *lock(&inner.tap) = None;
+    recorder::run_stopped(inner);
     lock(&inner.desired).running = None;
     clear_targets(&inner.telemetry);
 }

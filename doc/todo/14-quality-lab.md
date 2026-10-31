@@ -117,7 +117,17 @@ Notes:
       loopback stamps run late, so the echo pre-mixed into cable A came 10-40 ms ahead of its reference). The echo scene
       now plays the far voice 100 ms ahead of its echo, as a speaker's output latency would, and saves `far.wav` as played.
       Then: echo down 14.4 dB (12-18 dB a far-only turn) against 46-57 dB offline on the same scene (#10's detail file).
+    - With the chain recorder (`--save` now also writes what the chain got and gave, rerunnable exactly offline), six
+      takes: far-only turns a median of 57-60 dB each, as offline. In three of the six the analysis saw the output path's
+      delay move by 11-13 ms during the take (2 ms in the others): the output side (#9), not the echo.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
+  - **Its small first part, the chain recorder (built 2026-11-01, for #10):** `Engine::record_chain` records what the chain
+    got and gave live, block by block, from the run's first block when armed before the start (engine.md, "The chain
+    recorder"). `quality --save` writes it beside the scene's WAVs: `chain_mic.wav` and `chain_ref.wav` (the mic and the
+    reference as the chain got them, after the timeline and the dither), `chain_out.wav`, `chain_blocks.csv` (a row a
+    block) and `chain_config.json`; `process --warm-up` with that config reruns them into `chain_out.wav` exactly, and
+    other settings can process the same blocks. It isn't the raw device take: the mic and the loopback as delivered,
+    before the engine's FIFOs, with their stamps, are still to record.
 - **Phase 2:** AECMOS with talk-type segmentation, from far-end and near-end activity.
 - **Later:** the Lab page in the GUI (#15), with the blind-rating player.
 

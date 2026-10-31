@@ -94,7 +94,7 @@ pub struct QualityArgs {
     pub speech: Option<PathBuf>,
     pub noise: Option<PathBuf>,
     pub far_speech: Option<PathBuf>,
-    /// Where to write the scene, the recording and the aligned recording as WAVs.
+    /// Where to write the scene, the recording and the aligned recording as WAVs, and what the chain got and gave live.
     pub save: Option<PathBuf>,
 }
 
@@ -107,6 +107,9 @@ pub struct ProcessArgs {
     pub processing: Processing,
     /// Drop the chain's latency from the front and flush the tail, so `out[n]` lines up with `in[n]`.
     pub align: bool,
+    /// Start the chain as the engine does (`nf_engine::warm_up_chain`: three dithered silent blocks first), so a chain
+    /// recording that `quality --save` wrote reruns sample for sample.
+    pub warm_up: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -447,13 +450,15 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
 }
 
 fn parse_process(p: &mut Parser<'_>) -> Result<ProcessArgs, UsageError> {
-    let (mut files, mut reference, mut config, mut processing, mut align) = (Vec::new(), None, None, Processing::default(), false);
+    let (mut files, mut reference, mut config, mut processing) = (Vec::new(), None, None, Processing::default());
+    let (mut align, mut warm_up) = (false, false);
     while let Some(arg) = p.next() {
         match arg {
             Arg::Flag(flag, inline) => match flag {
                 "--ref" | "--reference" => reference = Some(PathBuf::from(text(flag, p.value(flag, inline)?)?)),
                 "--config" => config = Some(PathBuf::from(text(flag, p.value(flag, inline)?)?)),
                 "--align" => align = switch(flag, inline)?,
+                "--warm-up" => warm_up = switch(flag, inline)?,
                 _ => {
                     if !processing.take(p, flag, inline)? {
                         return Err(p.unknown(flag));
@@ -465,7 +470,7 @@ fn parse_process(p: &mut Parser<'_>) -> Result<ProcessArgs, UsageError> {
     }
     let mut files = files.into_iter();
     match (files.next(), files.next(), files.next()) {
-        (Some(input), Some(output), None) => Ok(ProcessArgs { input, output, reference, config, processing, align }),
+        (Some(input), Some(output), None) => Ok(ProcessArgs { input, output, reference, config, processing, align, warm_up }),
         (_, _, Some(extra)) => Err(usage(format!("'process' takes two files, IN.wav and OUT.wav; '{}' is a third", extra.display()))),
         _ => Err(usage("'process' needs IN.wav and OUT.wav")),
     }
@@ -526,8 +531,11 @@ Usage:
   noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
                        [OPTIONS]
                                  Play a test scene through the filter and measure what it did
-  noise-filter process IN.wav OUT.wav [--ref REF.wav] [--align] [--config FILE] [PROCESSING]
-                                 Filter a 48 kHz WAV offline; writes 48 kHz mono float
+  noise-filter process IN.wav OUT.wav [--ref REF.wav] [--align] [--warm-up] [--config FILE]
+                       [PROCESSING]
+                                 Filter a 48 kHz WAV offline; writes 48 kHz mono float.
+                                 --warm-up starts the chain as the engine does, so quality
+                                 --save's chain_mic.wav and chain_ref.wav rerun exactly
   noise-filter bench [IN.wav] [--seconds N] [--aec]
                                  Time RNNoise, AEC3 and the chain per block (no devices)
   noise-filter setup-large-pages [--sid SID]
@@ -556,7 +564,8 @@ QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records th
   --snr DB           The noise under the speech's level, 0 to 60 dB (default 10; echo test 60)
   --speech FILE, --noise FILE, --far-speech FILE
                      48 kHz WAVs to use instead of the synthetic speech, noise or far voice
-  --save DIR         Write the scene, the recording and the aligned recording there as WAVs
+  --save DIR         Write the scene, the recording and the aligned recording there as WAVs,
+                     and what the chain got and gave live (chain_*.wav, chain_blocks.csv)
 
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no result (latency: no
 valid repetition; quality: the recording didn't line up with the scene; either: cancelled),
@@ -815,6 +824,10 @@ mod tests {
         assert_eq!(a.output, PathBuf::from("out.wav"));
         assert_eq!(a.reference, Some(PathBuf::from("far.wav")));
         assert_eq!((a.align, a.processing.aec, a.processing.gate), (true, Some(true), Some(GateMode::Static)));
+        assert!(!a.warm_up);
+        let Ok(Command::Process(a)) = p(&["process", "chain_mic.wav", "out.wav", "--warm-up", "--ref", "chain_ref.wav"]) else { panic!() };
+        assert!(a.warm_up && !a.align);
+        assert_eq!(err(&["process", "a.wav", "b.wav", "--warm-up=1"]), "--warm-up takes no value");
         assert_eq!(err(&["process", "in.wav"]), "'process' needs IN.wav and OUT.wav");
         assert_eq!(err(&["process"]), "'process' needs IN.wav and OUT.wav");
         assert!(err(&["process", "a.wav", "b.wav", "c.wav"]).contains("'c.wav' is a third"));

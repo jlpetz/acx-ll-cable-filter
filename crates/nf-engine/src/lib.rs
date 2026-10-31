@@ -11,6 +11,8 @@
 //! - `audio`: the audio thread itself.
 //! - `control`: start/stop/apply/status, the device listener, user-worded errors (`errors`).
 //! - `latency_test`: the sweep tests (through the engine, and through a cable alone) and their analysis.
+//! - `recorder`: the chain recorder, what the chain was fed live and what it gave (`Engine::record_chain`).
+//! - `handover`: handing a ring's producer to the audio thread and back (the latency test's tap, the chain recorder).
 //! - `play_record`: playing signals and recording a capture meanwhile (the latency tests' recorder and player, and the
 //!   quality test's `play_record`).
 //! - `timing`: QPC helpers and sample-index → QPC mapping.
@@ -22,11 +24,13 @@ mod convert;
 mod devices;
 mod errors;
 mod fifo;
+mod handover;
 mod latency_test;
 #[cfg(all(test, feature = "live-probe"))]
 mod live_probe;
 mod pipeline;
 mod play_record;
+mod recorder;
 mod reference;
 mod sched;
 mod stream;

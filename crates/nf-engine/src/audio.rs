@@ -23,14 +23,16 @@ use nf_core::stage::Stage;
 use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_stages::{Aec3Stage, RnnoiseStage};
-use rtrb::{Producer, PushError};
+use rtrb::Producer;
 use wasapi::{DeviceEnumerator, Direction, Role};
 
 use crate::api::{BufferTargets, StreamInfo};
 use crate::devices::resolve;
 use crate::errors::{Fault, StartFailure, StreamRole, Warning, is_virtual_cable};
+use crate::handover::{self, End};
 use crate::latency_test::TapEnd;
 use crate::pipeline::{CaptureSource, DITHER, DriftControl, Hr, Pipeline, PipelineConfig, Resampler, TapItem, Ticks};
+use crate::recorder::ChainTx;
 use crate::sched::{Com, Mmcss, MmcssPriority};
 use crate::stream::{CaptureStream, KeepAlive, MicOptions, RenderStream, hr_of};
 use crate::timing::Qpc;
@@ -91,6 +93,8 @@ pub(crate) struct AudioArgs {
     pub(crate) controls: Arc<ChainControls>,
     pub(crate) shared: Arc<AudioShared>,
     pub(crate) tap: TapEnd,
+    /// The chain recorder's hand-over (recorder.rs); one armed before the start is in its command ring already.
+    pub(crate) recorder: End<ChainTx>,
     /// The one-shot "running" (or the failure) for `start()`.
     pub(crate) ready: SyncSender<Result<Opened, StartFailure>>,
     /// Dropped when the thread ends: the control thread waits on it to join with a timeout.
@@ -162,15 +166,19 @@ fn worker_main(jobs: Receiver<AudioArgs>) {
 }
 
 fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
-    let AudioArgs { config, telemetry, controls, shared, tap, ready, done } = args;
+    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, ready, done } = args;
     // Declared first, so dropped last: both signal "gone" after every stream is released.
     let _done = done;
     let _exit = ExitFlag(shared.clone());
-    if let Some(code) = com_error {
-        let _ = ready.send(Err(StartFailure::Com(code)));
-        return;
+    match com_error {
+        Some(code) => {
+            let _ = ready.send(Err(StartFailure::Com(code)));
+        }
+        None => run(Run { config, telemetry, controls, shared, tap, recorder: &mut recorder, ready, mmcss }),
     }
-    run(Run { config, telemetry, controls, shared, tap, ready, mmcss });
+    // A chain recorder the run never took (the start failed, or it stopped before its next wake) goes back, so a failed
+    // start's caller can keep it for the next start (recorder::run_failed). Before `_done`: the caller has it once joined.
+    handover::give_back(&mut recorder);
 }
 
 struct Run<'a> {
@@ -179,6 +187,7 @@ struct Run<'a> {
     controls: Arc<ChainControls>,
     shared: Arc<AudioShared>,
     tap: TapEnd,
+    recorder: &'a mut End<ChainTx>,
     ready: SyncSender<Result<Opened, StartFailure>>,
     mmcss: &'a Mmcss,
 }
@@ -221,7 +230,7 @@ impl Ticks for QpcTicks {
 }
 
 fn run(r: Run<'_>) {
-    let Run { config, telemetry, controls, shared, mut tap, ready, mmcss } = r;
+    let Run { config, telemetry, controls, shared, mut tap, recorder, ready, mmcss } = r;
     let mut warnings = Vec::new();
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
@@ -298,7 +307,8 @@ fn run(r: Run<'_>) {
         return;
     }
 
-    if let Some(f) = audio_loop(&mut session, &mut pipe, &telemetry, &shared, &mut tap, fallback_baseline) {
+    let mut ends = Ends { tap: &mut tap, recorder };
+    if let Some(f) = audio_loop(&mut session, &mut pipe, &telemetry, &shared, &mut ends, fallback_baseline) {
         shared.fault.store(f.pack(), Relaxed);
     }
     // `session` drops here: streams stop and are released in reverse order.
@@ -448,8 +458,9 @@ pub(crate) fn service_reference<K: TopUp, C: CaptureSource, D: DriftControl, R: 
     Ok(())
 }
 
-/// Three dithered silent blocks through the chain, on this thread.
-fn warm_up(chain: &mut Chain) {
+/// Three dithered silent blocks through the chain, on this thread: before every run's first block (and `warm_up_chain`, for
+/// an offline chain that should start from the same state).
+pub(crate) fn warm_up(chain: &mut Chain) {
     let mut dither = Dither::new(0x1234_5678);
     let mut mic = [0.0f32; BLOCK];
     let mut reference = [0.0f32; BLOCK];
@@ -492,14 +503,21 @@ fn start_reference(ka: Option<&mut KeepAlive>, lb: Option<&CaptureStream>) -> Re
     Ok(())
 }
 
+/// The audio thread's ends of the run's hand-overs: the latency test's tap and the chain recorder.
+struct Ends<'a> {
+    tap: &'a mut TapEnd,
+    recorder: &'a mut End<ChainTx>,
+}
+
 /// The loop. Returns the fault that ended it, or `None` when asked to stop.
 fn audio_loop(
-    s: &mut Session, pipe: &mut Pipeline, tel: &Telemetry, shared: &AudioShared, tap: &mut TapEnd, fallback_baseline: u64,
+    s: &mut Session, pipe: &mut Pipeline, tel: &Telemetry, shared: &AudioShared, ends: &mut Ends<'_>, fallback_baseline: u64,
 ) -> Option<Fault> {
     let qpc = Qpc::new();
     let mut ticks = QpcTicks(qpc);
     let mut last_packet = qpc.now_hns();
     let mut returning: Option<Producer<TapItem>> = None;
+    let mut returning_recorder: Option<ChainTx> = None;
     let mut reference_live = s.lb.is_some();
     loop {
         let signalled = s.mic.wait(WAIT_MS);
@@ -538,7 +556,10 @@ fn audio_loop(
             shared.reference_fault.store(Fault::Stream { role, hr }.pack(), Relaxed);
             reference_live = false;
         }
-        service_tap(&mut pipe.tap, tap, shared, &mut returning);
+        // The tap and the recorder: taken before this wake's blocks (a recorder armed before the start, at the first wake,
+        // so the run's first block is recorded), and handed back when done, to be freed on the control side.
+        handover::service(&mut pipe.tap, ends.tap, shared.tap_stop.load(Relaxed), &mut returning);
+        handover::service(&mut pipe.recorder, ends.recorder, false, &mut returning_recorder);
 
         // 3. Every complete block; 4. once a second, the slow statistics.
         let readout = shared.readout.load(Relaxed);
@@ -564,26 +585,6 @@ fn audio_loop(
     }
 }
 
-/// Takes a new tap from the latency test, and hands a finished one back so its ring is freed on
-/// the test's thread, never here. Lock-free and allocation-free.
-fn service_tap(slot: &mut Option<Producer<TapItem>>, tap: &mut TapEnd, shared: &AudioShared, returning: &mut Option<Producer<TapItem>>) {
-    // Only take a new tap while nothing waits to go back, so a replaced one is never dropped here.
-    if returning.is_none()
-        && let Ok(p) = tap.cmd.pop()
-    {
-        *returning = slot.replace(p);
-    }
-    let done = slot.as_ref().is_some_and(|p| p.is_abandoned() || shared.tap_stop.load(Relaxed));
-    if done && returning.is_none() {
-        *returning = slot.take();
-    }
-    if let Some(p) = returning.take()
-        && let Err(PushError::Full(p)) = tap.ret.push(p)
-    {
-        *returning = Some(p);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rtrb::RingBuffer;
@@ -591,58 +592,22 @@ mod tests {
     use super::*;
     use crate::latency_test::tap_channel;
 
+    /// The latency test's tap goes in and comes back through the generic hand-over (handover.rs), with the run's stop flag.
     #[test]
     fn the_tap_goes_in_and_comes_back() {
         let (mut port, mut end) = tap_channel();
         let shared = AudioShared::default();
-        let mut slot = None;
-        let mut returning = None;
+        let (mut slot, mut returning) = (None, None);
         let (tx, rx) = RingBuffer::<TapItem>::new(4);
-        assert!(port.cmd_for_test().push(tx).is_ok());
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
+        assert!(port.cmd.push(tx).is_ok());
+        handover::service(&mut slot, &mut end, shared.tap_stop.load(Relaxed), &mut returning);
         assert!(slot.is_some() && returning.is_none(), "taken");
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        assert!(slot.is_some(), "kept while the test runs");
         // The test asks for it back.
         shared.tap_stop.store(true, Relaxed);
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
+        handover::service(&mut slot, &mut end, shared.tap_stop.load(Relaxed), &mut returning);
         assert!(slot.is_none() && returning.is_none());
-        assert!(port.ret_for_test().pop().is_ok(), "returned to the control side");
+        assert!(port.ret.pop().is_ok(), "returned to the control side");
         drop(rx);
-    }
-
-    #[test]
-    fn an_abandoned_tap_is_returned_not_dropped() {
-        let (mut port, mut end) = tap_channel();
-        let shared = AudioShared::default();
-        let (mut slot, mut returning) = (None, None);
-        let (tx, rx) = RingBuffer::<TapItem>::new(1);
-        assert!(port.cmd_for_test().push(tx).is_ok());
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        drop(rx);
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        assert!(slot.is_none());
-        assert!(port.ret_for_test().pop().is_ok());
-    }
-
-    #[test]
-    fn a_full_return_ring_keeps_the_tap_for_later() {
-        let (mut port, mut end) = tap_channel();
-        let shared = AudioShared::default();
-        let (mut slot, mut returning) = (None, None);
-        // Fill the return ring with an unrelated producer the control side hasn't collected.
-        let (stale, _stale_rx) = RingBuffer::<TapItem>::new(1);
-        assert!(end.ret.push(stale).is_ok());
-        let (tx, _rx) = RingBuffer::<TapItem>::new(1);
-        assert!(port.cmd_for_test().push(tx).is_ok());
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        shared.tap_stop.store(true, Relaxed);
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        assert!(returning.is_some(), "held, not dropped");
-        assert!(port.ret_for_test().pop().is_ok());
-        service_tap(&mut slot, &mut end, &shared, &mut returning);
-        assert!(returning.is_none());
-        assert!(port.ret_for_test().pop().is_ok());
     }
 
     /// wasapi/E, gui/F1: both sides of one VB-Cable share their interface name. Following the

@@ -50,6 +50,7 @@
 use nf_core::dsp::slip::Slip;
 use nf_core::{BLOCK, SAMPLE_RATE};
 
+use crate::api::ReferenceFacts;
 use crate::fifo::Fifo;
 use crate::pipeline::{Counters, MAX_GAP_FILL, Packet};
 use crate::timing::{HNS_PER_S, StampMap};
@@ -200,6 +201,8 @@ pub(crate) struct Reference {
     /// break without stamps.
     settle_at: u64,
     needs: Needs,
+    /// What the last take did, for the chain recorder.
+    facts: ReferenceFacts,
 }
 
 impl Reference {
@@ -233,6 +236,7 @@ impl Reference {
             recent: Recent::new(),
             settle_at: START_BLOCKS,
             needs: Needs::new(),
+            facts: ReferenceFacts::default(),
         }
     }
 
@@ -270,6 +274,18 @@ impl Reference {
     /// Whether the stamps time the lead (else the delivery does); false before the first packet.
     pub(crate) fn stamped(&self) -> bool {
         self.started && self.stamped
+    }
+
+    /// What the last take did: where it read, what it served, the lead and the loop, and the jumps (the chain recorder's
+    /// per-block facts).
+    pub(crate) fn facts(&self) -> ReferenceFacts {
+        self.facts
+    }
+
+    /// Notes a jump of the read position at this take.
+    fn jumped(&mut self, event: u16, by: f64) {
+        self.facts.events |= event;
+        self.facts.jumped += by as i64;
     }
 
     /// The wake's time, before its packets are pushed.
@@ -420,12 +436,14 @@ impl Reference {
     /// Fills `out` with this block's reference input and returns its length (480 ± a slip) for the resampler. `mic` is
     /// the block's capture time. Counts gaps, jumps after the start-up, and slips.
     pub(crate) fn take(&mut self, mic: MicTime, out: &mut [f32], c: &mut Counters) -> usize {
+        self.facts = ReferenceFacts { lead_reading_ms: f32::NAN, ..ReferenceFacts::default() };
         let stamps_ok = mic.stamp.is_some() && self.stamps.trusted();
         if self.started && stamps_ok != self.stamped {
             if self.blocks < START_BLOCKS {
                 // In the start-up the timing can change either way (a stream's first stamps were flagged, or its scatter
                 // has just shown): it starts over from this reading.
                 self.restart();
+                self.facts.events |= ReferenceFacts::RESTARTED;
             } else if self.stamped {
                 // The stamps are given up for the rest of the run: delivery times the loop from now on, on the stamps'
                 // scale, so nothing moves.
@@ -433,6 +451,7 @@ impl Reference {
                 self.recent.fill(self.lp.error());
                 self.slow = SlowMean { value: self.lp.error(), n: 100 };
                 self.stamped = false;
+                self.facts.events |= ReferenceFacts::UNSTAMPED;
             }
         }
         if !self.started {
@@ -446,15 +465,20 @@ impl Reference {
                 o.fill(0.0);
             }
             c.reference_gaps += 1;
+            self.facts.events |= ReferenceFacts::NO_READING;
+            self.facts.missing = BLOCK as u16;
+            self.finish_facts(None, false);
             return BLOCK;
         };
         // A reading that isn't finite tells the loop nothing: it coasts on its own estimate.
+        let reading = raw.is_finite().then_some(raw);
         let mut raw = if raw.is_finite() { raw } else { self.target + self.lp.error() };
         let fresh = self.fresh();
         if !self.started {
             self.started = true;
             let by = (raw - self.target).round();
             self.move_read(by as i64);
+            self.jumped(ReferenceFacts::ALIGNED, by);
             raw -= by;
             self.lp = LeadLoop::starting_at(raw - self.target);
             self.recent.fill(raw - self.target);
@@ -470,6 +494,7 @@ impl Reference {
             // than a slow slew (or, without stamps, none). Timed by delivery, by the slow mean.
             let by = off.round();
             self.moved(by);
+            self.jumped(ReferenceFacts::CENTRED, by);
             raw -= by;
             e -= by;
             self.lp.realigned(by);
@@ -489,6 +514,7 @@ impl Reference {
         let mut slip = if !fresh {
             // The loopback isn't delivering (silence without the keep-alive, a stall): the reading only counts how long.
             // The loop coasts, slipping on at its drift.
+            self.facts.events |= ReferenceFacts::COASTED;
             self.lp.coast()
         } else {
             self.recent.push(e);
@@ -499,6 +525,7 @@ impl Reference {
                 // low-pass, which coasted meanwhile.
                 let by = self.recent.mean_past(self.lp.error(), step.signum() * broken).round();
                 self.undid(by);
+                self.jumped(ReferenceFacts::BROKEN | ReferenceFacts::COASTED, by);
                 if !self.stamped {
                     self.settle_at = self.blocks + START_BLOCKS;
                 }
@@ -509,6 +536,7 @@ impl Reference {
             } else if (e - self.lp.error()).abs() > 2.0 * broken {
                 // One reading that far off: a break may be under way, or a stamp is off. The loop coasts. (Nearer, it's
                 // used: leaving out the tail of the jitter on one side would pull the low-pass to the other.)
+                self.facts.events |= ReferenceFacts::COASTED;
                 self.lp.coast()
             } else if self.stamped {
                 if let Some(d) = delivery {
@@ -530,6 +558,7 @@ impl Reference {
                 if !starting && self.blocks > self.settle_at && off.abs() > past {
                     let by = (off / self.period).round() * self.period;
                     self.moved(by);
+                    self.jumped(ReferenceFacts::STEPPED, by);
                     self.lp.realigned(by);
                     self.last_step = by.signum();
                     c.reference_drops += 1;
@@ -557,19 +586,38 @@ impl Reference {
             // The same lead error against a target `by` higher (or lower), with the read position `by` earlier (later).
             self.target += by;
             self.move_read(-(by as i64));
+            self.jumped(ReferenceFacts::RETARGETED, -by);
             self.lp.retargeted(by);
             if !starting {
                 c.reference_drops += 1;
             }
         }
 
-        if self.serve(n, out) > 0 {
+        (self.facts.read_index, self.facts.buffered) = (self.read, self.end - self.read);
+        let owed = self.serve(n, out);
+        if owed > 0 {
             c.reference_gaps += 1;
         }
         if slip != Slip::None {
             c.reference_slips += 1;
         }
+        (self.facts.consumed, self.facts.owed, self.facts.fresh) = (n as u16, owed as u16, fresh);
+        self.finish_facts(reading, delivered);
         n
+    }
+
+    /// The take's facts that read the state after it: the lead of the samples served (this take's `reading`, less the
+    /// jumps made at it), the loop's lead, target and drift, the timing, and whether the loopback delivered at this wake.
+    /// Before the first packet, where the read position is too.
+    fn finish_facts(&mut self, reading: Option<f64>, delivered: bool) {
+        let ms = |samples: f64| (samples * 1000.0 / SAMPLE_RATE as f64) as f32;
+        let (lead, target, drift, stamped) = (self.lead_ms(), self.target_ms(), self.drift_ppm(), self.stamped());
+        let f = &mut self.facts;
+        f.lead_reading_ms = reading.map_or(f32::NAN, |r| ms(r - f.jumped as f64));
+        if f.events & ReferenceFacts::NO_READING != 0 {
+            (f.read_index, f.buffered) = (self.read, self.end - self.read);
+        }
+        (f.delivered, f.lead_ms, f.target_ms, f.drift_ppm, f.stamped) = (delivered, lead, target, drift, stamped);
     }
 
     /// Serves `n` samples from `read` into `out`: zeros for any before the FIFO's head (gone), the FIFO's samples, then
@@ -580,6 +628,7 @@ impl Reference {
         // `read` is never past the head while the FIFO holds samples: `move_read` and `append` discard what's behind it.
         let head = self.end - len as i64;
         let before = (head - self.read).max(0).min(n as i64) as usize;
+        self.facts.missing = before as u16;
         let real = (n - before).min(len);
         if let Some(z) = out.get_mut(..before) {
             z.fill(0.0);

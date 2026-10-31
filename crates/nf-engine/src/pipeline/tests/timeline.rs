@@ -24,8 +24,8 @@ use crate::reference::LEAD_CAP;
 /// device position. `code` is the stream index its samples are coded with: the device position in a trace; in a scene
 /// the index they were tapped at, which counts what never came even where the device position doesn't.
 #[derive(Clone, Copy, Debug)]
-struct Row {
-    now: f64,
+pub(super) struct Row {
+    pub(super) now: f64,
     kind: u8,
     frames: usize,
     pos: u64,
@@ -70,7 +70,7 @@ fn traces() -> Vec<(String, Vec<Row>)> {
 }
 
 /// The engine's pipeline for the dev box's cables: 10 ms periods everywhere.
-fn cable_pipe() -> Pipeline {
+pub(super) fn cable_pipe() -> Pipeline {
     let c = PipelineConfig { out_period: 480, out_margin: 96, ref_period: Some(480), max_packet: 4800 };
     Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new())
 }
@@ -83,7 +83,13 @@ const T0: f64 = 1e10;
 fn replay<P: BlockProcessor>(
     rows: &[Row], proc: &mut P, mic_of: &dyn Fn(u64, usize) -> Vec<f32>, lb_of: &dyn Fn(u64, usize) -> Vec<f32>,
 ) -> Pipeline {
-    let mut p = cable_pipe();
+    replay_into(cable_pipe(), rows, proc, mic_of, lb_of)
+}
+
+/// [`replay`] through a pipeline of the caller's (one with the chain recorder armed, say).
+pub(super) fn replay_into<P: BlockProcessor>(
+    mut p: Pipeline, rows: &[Row], proc: &mut P, mic_of: &dyn Fn(u64, usize) -> Vec<f32>, lb_of: &dyn Fn(u64, usize) -> Vec<f32>,
+) -> Pipeline {
     let mut sink = VSink::new(480, 0.0, 0.37, T0);
     p.prefill(&mut sink).unwrap();
     let tel = Telemetry::new();
@@ -116,7 +122,7 @@ fn replay<P: BlockProcessor>(
 }
 
 /// Samples that carry their stream index plus one, so a zero is a sample the pipeline filled in.
-fn index_coded(pos: u64, n: usize) -> Vec<f32> {
+pub(super) fn index_coded(pos: u64, n: usize) -> Vec<f32> {
     (pos + 1..pos + 1 + n as u64).map(|v| v as f32).collect()
 }
 
@@ -236,14 +242,14 @@ impl Rng {
 /// 0.3 ms). `Bursty`: as the cables, the mic 0.5 or 10.5 ms (0, 480 or 960 frames a wake), the loopback 0.5, 10.5 or 20.5
 /// ms (up to 1440 a wake), each kept for a packet or two at random.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Delivery {
+pub(super) enum Delivery {
     Steady,
     Bursty,
 }
 
 /// What happens at the scene's `at_s`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Ev {
+pub(super) enum Ev {
     None,
     /// One wake this many ms late: both streams queue.
     LateWake(f64),
@@ -266,7 +272,7 @@ enum Ev {
 
 /// Which streams' packets carry stamps.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Stamps {
+pub(super) enum Stamps {
     Both,
     MicOnly,
     LoopbackOnly,
@@ -276,23 +282,23 @@ enum Stamps {
 /// The mic's stamps: the cables' (0.5 ms steps, -0.5 to +1 ms), uniform within ±this many ms, or the wake that
 /// delivered the packet less its length (a driver that stamps at delivery).
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum MicStamps {
+pub(super) enum MicStamps {
     Cables,
     Uniform(f64),
     AtDelivery,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Scene {
+pub(super) struct Scene {
     mic: Delivery,
     lb: Delivery,
     /// The loopback's clock against the mic's.
     ppm: f64,
     /// When the loopback's first sample was tapped, against the mic's first (ms; negative: it ran first).
     lb_start_ms: f64,
-    stamps: Stamps,
+    pub(super) stamps: Stamps,
     mic_stamps: MicStamps,
-    event: Ev,
+    pub(super) event: Ev,
     /// When the event happens (s).
     at_s: f64,
     seed: u64,
@@ -309,7 +315,7 @@ fn seed(default: u64) -> u64 {
 }
 
 impl Scene {
-    fn new(mic: Delivery, lb: Delivery, ppm: f64) -> Self {
+    pub(super) fn new(mic: Delivery, lb: Delivery, ppm: f64) -> Self {
         #[rustfmt::skip]
         let sc = Self {
             mic, lb, ppm, lb_start_ms: -3.7, stamps: Stamps::Both, mic_stamps: MicStamps::Cables, event: Ev::None, at_s: EVENT_S,
@@ -320,8 +326,11 @@ impl Scene {
     fn with(self, event: Ev) -> Self {
         Self { event, ..self }
     }
-    fn at(self, event: Ev, at_s: f64) -> Self {
+    pub(super) fn at(self, event: Ev, at_s: f64) -> Self {
         Self { event, at_s, ..self }
+    }
+    pub(super) fn with_stamps(self, stamps: Stamps) -> Self {
+        Self { stamps, ..self }
     }
 
     /// The scene's packets as a probe would log them, for `SCENE_S`.
@@ -345,7 +354,7 @@ impl Scene {
 type ScenePacket = Option<(f64, f64, u64, u64)>;
 
 /// `sc`'s packets over `secs`, as a probe would log them.
-fn scene_rows(sc: &Scene, secs: f64) -> Vec<Row> {
+pub(super) fn scene_rows(sc: &Scene, secs: f64) -> Vec<Row> {
     let mut rng = Rng(sc.seed | 1);
     let ev = sc.at_s * 1e7;
     let lpkt = PKT / (1.0 + sc.ppm * 1e-6);

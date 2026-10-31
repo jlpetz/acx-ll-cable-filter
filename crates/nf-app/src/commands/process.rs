@@ -2,6 +2,11 @@
 //! `--ref` reference) must be 48 kHz; more channels are averaged to mono. The output is 48 kHz mono
 //! float, as long as the input. By default it is the stream the live app would send, so it lags the
 //! input by the chain's latency, which is printed; `--align` removes that lag.
+//!
+//! The chain starts fresh, where the engine first runs three dithered silent blocks through it
+//! (`nf_engine::warm_up_chain`). `--warm-up` does the same, so a chain recording from `quality --save`
+//! (`chain_mic.wav`, `chain_ref.wav`, with `chain_config.json` as `--config`) reruns into exactly
+//! `chain_out.wav`. The input isn't dithered here: the recording's blocks already are.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -83,6 +88,9 @@ pub fn process_files(args: &ProcessArgs) -> Result<Processed, Failure> {
     let controls = Arc::new(ChainControls::new(&cfg));
     let mut chain = nf_stages::build_chain(controls, cfg.aec_enabled)
         .map_err(|e| Failure::error(format!("Couldn't set up the processing chain: {e}")))?;
+    if args.warm_up {
+        nf_engine::warm_up_chain(&mut chain);
+    }
     let latency = chain.latency();
     let skip = if args.align { latency as usize } else { 0 };
     let out = run_chain(&mut chain, &input.samples, reference.as_deref().unwrap_or(&[]), skip);
@@ -132,7 +140,15 @@ mod tests {
     use crate::exit::Exit;
 
     fn args(dir: &Path, processing: Processing) -> ProcessArgs {
-        ProcessArgs { input: dir.join("in.wav"), output: dir.join("out.wav"), reference: None, config: None, processing, align: false }
+        ProcessArgs {
+            input: dir.join("in.wav"),
+            output: dir.join("out.wav"),
+            reference: None,
+            config: None,
+            processing,
+            align: false,
+            warm_up: false,
+        }
     }
 
     fn read(path: &Path) -> Vec<f32> {
@@ -238,6 +254,31 @@ mod tests {
         let done = process_files(&a).unwrap();
         assert_eq!(done.latency, 0);
         assert!(done.warnings[0].ends_with("is ignored: echo cancellation is off (add --aec)"), "{:?}", done.warnings);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `--warm-up` starts the chain as the engine does: the output is what a chain warmed up by
+    /// `nf_engine::warm_up_chain` and fed the input block by block gives, sample for sample, and
+    /// not what a fresh chain gives (AEC3 and RNNoise both hold the warm-up's state).
+    #[test]
+    fn warm_up_starts_the_chain_as_the_engine_does() {
+        let dir = crate::test_dir("process-warm-up");
+        let far = speech_like(2 * SAMPLE_RATE as usize, Voice::LOW, 11).samples;
+        let mic = add(&scaled(&delayed(&far, 960), 0.5), &noisy_speech()[..far.len()]);
+        wav::write_mono_f32(&dir.join("in.wav"), &mic).unwrap();
+        wav::write_mono_f32(&dir.join("far.wav"), &far).unwrap();
+        let mut a = args(&dir, Processing { aec: Some(true), ..Default::default() });
+        a.reference = Some(dir.join("far.wav"));
+        a.warm_up = true;
+        process_files(&a).unwrap();
+        let warm = read(&dir.join("out.wav"));
+        let cfg = ProcessingConfig { aec_enabled: true, ..Default::default() };
+        let mut chain = nf_stages::build_chain(Arc::new(ChainControls::new(&cfg)), true).unwrap();
+        nf_engine::warm_up_chain(&mut chain);
+        assert_eq!(warm, run_chain(&mut chain, &mic, &far, 0), "the engine's start, sample for sample");
+        a.warm_up = false;
+        process_files(&a).unwrap();
+        assert_ne!(read(&dir.join("out.wav")), warm, "a fresh chain starts elsewhere");
         let _ = std::fs::remove_dir_all(dir);
     }
 

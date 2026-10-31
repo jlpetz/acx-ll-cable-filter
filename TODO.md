@@ -102,19 +102,19 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High (phase 1-2) | **Status**: built in v0; simulated against stepped device clocks (nf-engine `pipeline/tests/events.rs`).
 - Mic, speakers and cable run on three clocks. A PI controller (nf-core `DriftController`) on each FIFO's fill drives a ±1-sample-per-block slip (`SlipResampler`); a small target fill, not a big safety margin. The output fill is interpolated from the device clock and calibrated to the padding, so the latency holds still as clocks beat; coarse corrections handle stalls and late wakes.
 - Small IAudioClient3 periods rule out RATEADJUST, so drift is corrected in the app.
-**Next**: with #8; measure real drift (ppm over 30+ minutes) on the owner's device pairs.
+**Next**: with #8; measure real drift (ppm over 30+ minutes) on the owner's device pairs. Look into the output path's delay moving 11-13 ms within a 60 s `quality` take (3 of 6 on the cables, 2026-11-01; #14's detail file): the report doesn't yet show the output's coarse drops.
 **Detail**: `doc/todo/8-audio-io.md`
 
 ---
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
-**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal; the echo now drops 14 dB live against 46-57 dB offline.
+**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal, and a chain recorder added: six live takes drop the echo by a median 57-60 dB a far-only turn, as offline (one earlier take: 14 dB, unexplained).
 - `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: record the chain's live inputs (mic and reference blocks) beside `quality --save` and run AEC3 offline on them, to find what still differs live. Then recorded pairs in #2, and real speakers in phase 2 (the lead must stay under the echo path's delay).
+**Next**: recorded pairs in #2; real speakers in phase 2 (the lead must stay under the echo path's delay). If a take comes in low again, its chain recording (`quality --save`) shows why.
 **Detail**: `doc/todo/10-aec.md`
 
 ---

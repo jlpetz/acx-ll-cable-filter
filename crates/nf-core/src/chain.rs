@@ -179,6 +179,11 @@ impl Chain {
             + self.noise.as_ref().map_or(0, |s| s.latency(c.noise.enabled.load(Relaxed)))
     }
 
+    /// The live controls the chain reads each block.
+    pub fn controls(&self) -> &ChainControls {
+        &self.controls
+    }
+
     /// The stages' slow statistics: (AEC, noise).
     pub fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
         (self.aec.as_ref().map(|s| s.stage.stats()), self.noise.as_ref().map(|s| s.stage.stats()))

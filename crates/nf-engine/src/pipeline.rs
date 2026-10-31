@@ -12,6 +12,7 @@
 use std::sync::atomic::Ordering::Relaxed;
 
 use nf_core::chain::{Chain, ChainReport};
+use nf_core::controls::ChainParams;
 use nf_core::dsp::drift::DriftController;
 use nf_core::dsp::meter::MeterBallistics;
 use nf_core::dsp::slip::{Slip, SlipResampler};
@@ -22,7 +23,9 @@ use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
+use crate::api::ChainBlock;
 use crate::fifo::Fifo;
+use crate::recorder::ChainTx;
 use crate::reference::{MicTime, Reference};
 use crate::timing::{HNS_PER_S, StampMap};
 
@@ -146,6 +149,10 @@ pub(crate) trait Ticks {
 pub(crate) trait BlockProcessor {
     fn process<T: Ticks>(&mut self, mic: &Block, reference: &Block, out: &mut Block, ticks: &mut T) -> ChainReport;
     fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>);
+    /// The live settings it reads each block, for the chain recorder (the tests' stand-ins have none).
+    fn params(&self) -> ChainParams {
+        ChainParams::default()
+    }
 }
 
 impl BlockProcessor for Chain {
@@ -155,6 +162,10 @@ impl BlockProcessor for Chain {
     }
     fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
         Chain::stage_stats(self)
+    }
+    #[inline]
+    fn params(&self) -> ChainParams {
+        self.controls().load()
     }
 }
 
@@ -228,6 +239,10 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     mic_stamps: StampMap,
     /// The wake that delivered the last mic packet (hns): the mic's timing without stamps.
     mic_last_hns: f64,
+    /// Since the last block: mic samples dropped by the FIFO (it overflowed), and device-position gaps not zero-filled
+    /// (the chain recorder's `mic_discarded` and `mic_skipped`).
+    mic_discarded: u64,
+    mic_skipped: i64,
     packet: Box<[f32]>,
     // Reference.
     has_reference: bool,
@@ -260,6 +275,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     dither: Dither,
     /// The latency test's tap, while one runs.
     pub(crate) tap: Option<Producer<TapItem>>,
+    /// The chain recorder, while one is armed (recorder.rs).
+    pub(crate) recorder: Option<ChainTx>,
     /// Display ballistics for the published meters (DSP-3).
     in_meter: MeterBallistics,
     out_meter: MeterBallistics,
@@ -285,6 +302,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             mic_next_pos: None,
             mic_stamps: StampMap::new(SAMPLE_RATE),
             mic_last_hns: 0.0,
+            mic_discarded: 0,
+            mic_skipped: 0,
             packet: vec![0.0; cfg.max_packet.max(BLOCK)].into_boxed_slice(),
             has_reference: cfg.ref_period.is_some(),
             reference: Reference::new(cfg.ref_target(), cfg.ref_period.unwrap_or(BLOCK)),
@@ -307,6 +326,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             slipped: Box::new([0.0; BLOCK + 1]),
             dither: Dither::new(0x2545_F491),
             tap: None,
+            recorder: None,
             in_meter: MeterBallistics::new(),
             out_meter: MeterBallistics::new(),
             counters: Counters::default(),
@@ -375,6 +395,9 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
                 let gap = p.device_pos.wrapping_sub(expect);
                 if p.device_pos > expect && gap <= MAX_GAP_FILL {
                     self.push_mic_zeros(gap as usize);
+                } else {
+                    // Negative when the position went back.
+                    self.mic_skipped = self.mic_skipped.wrapping_add(gap as i64);
                 }
             }
             self.mic_next_pos = Some(p.device_pos + n as u64);
@@ -388,11 +411,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             let over = n.saturating_sub(self.mic.free());
             if over > 0 {
                 // Overflow (we didn't run for 200 ms): keep the newest audio.
-                self.mic.discard(over);
+                self.mic_discarded += self.mic.discard(over) as u64;
                 self.counters.capture_glitches += 1;
             }
             if let Some(src) = self.packet.get(..n) {
-                self.mic.push(src);
+                // All of it, unless the packet is longer than the FIFO.
+                self.mic_discarded += (n - self.mic.push(src)) as u64;
             }
             self.mic_abs += n as u64;
             total += n;
@@ -402,8 +426,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 
     fn push_mic_zeros(&mut self, n: usize) {
         let over = n.saturating_sub(self.mic.free());
-        self.mic.discard(over);
-        self.mic.push_zeros(n);
+        self.mic_discarded += self.mic.discard(over) as u64;
+        self.mic_discarded += (n - self.mic.push_zeros(n)) as u64;
         self.mic_abs += n as u64;
     }
 
@@ -450,6 +474,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             return Ok(false);
         }
         let t0 = ticks.ticks();
+        let mic_moved = (std::mem::take(&mut self.mic_discarded), std::mem::take(&mut self.mic_skipped));
         let head = self.mic_abs - self.mic.len() as u64;
         let t_capture = self.mic_stamps.time_of(head);
         self.mic.pop_into(&mut self.mic_blk[..]);
@@ -463,6 +488,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.take_reference(head, t_capture);
 
         let report = proc.process(&self.mic_blk, &self.ref_blk, &mut self.out_blk, ticks);
+        self.record(proc, head, t_capture, mic_moved);
 
         self.push_output(sink, if readout { t_capture } else { None })?;
         if !readout {
@@ -509,6 +535,29 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.ref_rs.resample(input, &mut self.ref_blk[..]);
         }
         self.dither.apply(&mut self.ref_blk[..], DITHER);
+    }
+
+    /// While the chain recorder is armed, pushes this block to it: the mic and reference blocks as the chain got them, its
+    /// output, and the block's facts (its index, capture time, the mic's moves since the last block, the reference's take,
+    /// AEC3's estimates, the chain's settings). A full ring loses the block, counted.
+    fn record<P: BlockProcessor>(&mut self, proc: &P, head: u64, t_capture: Option<f64>, (discarded, skipped): (u64, i64)) {
+        let Some(rec) = self.recorder.as_mut() else { return };
+        let (aec, _) = proc.stage_stats();
+        let block = ChainBlock {
+            index: self.blocks,
+            capture_qpc_hns: t_capture.unwrap_or(f64::NAN),
+            mic_stamped: self.mic_stamps.trusted(),
+            mic_index: head,
+            mic_wake_hns: self.mic_last_hns,
+            mic_queued: u32::try_from(self.mic.len()).unwrap_or(u32::MAX),
+            mic_discarded: discarded,
+            mic_skipped: skipped,
+            reference: self.has_reference.then(|| self.reference.facts()),
+            aec_delay_ms: aec.map_or(f32::NAN, |a| a.echo_delay_ms),
+            aec_erle_db: aec.map_or(f32::NAN, |a| a.erle_db),
+            settings: proc.params(),
+        };
+        rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
     }
 
     /// Slips `out_blk` to the output clock, queues it, writes what fits, and applies the coarse
@@ -1893,8 +1942,8 @@ mod tests {
         }
     }
 
-    /// Runs `blocks` wake-ups (mic, loopback, every block, the per-second publish, the tap) and
-    /// returns the allocations and frees they made.
+    /// Runs `blocks` wake-ups (mic, loopback, every block, the per-second publish, the tap and the
+    /// chain recorder, its ring full for a while) and returns the allocations and frees they made.
     fn wake_ups<D: DriftControl, R: Resampler>(p: &mut Pipeline<D, R>, blocks: usize, warm: usize) -> (u64, u64) {
         let tel = Telemetry::new();
         let mut chain = Chain::new(Arc::new(ChainControls::new(&ProcessingConfig::default())), None, None);
@@ -1905,6 +1954,11 @@ mod tests {
         let mut lb = GenCapture { pos: 0, ready: false, stamp_hns: 0.0 };
         let (tx, mut rx) = rtrb::RingBuffer::<TapItem>::new(16);
         p.tap = Some(tx);
+        let (rec_tx, mut rec_rx) = rtrb::RingBuffer::<crate::recorder::ChainItem>::new(16);
+        let rec_tx = ChainTx::new(rec_tx);
+        let lost = rec_tx.lost();
+        p.recorder = Some(rec_tx);
+        let (mut recorded, mut wake) = (0u64, 0usize);
         let mut ticks = FakeTicks(0);
         let mut one = |p: &mut Pipeline<D, R>| {
             let now = sink.now_hns;
@@ -1919,8 +1973,14 @@ mod tests {
                     p.publish_second(&tel, &chain, 0, 0, 0);
                 }
             }
-            // The tap's consumer keeps up (the latency test's thread, here inline).
+            // The tap's and the recorder's consumers keep up (the latency test's thread and the
+            // recorder's, here inline), but for 40 wakes when the recorder's doesn't: its ring fills
+            // and blocks are lost, counted.
             while rx.pop().is_ok() {}
+            wake += 1;
+            while !(warm + 300..warm + 340).contains(&wake) && rec_rx.pop().is_ok() {
+                recorded += 1;
+            }
             sink.padding = sink.padding.saturating_sub(480);
             sink.played += 480.0;
             sink.now_hns += 100_000.0;
@@ -1933,6 +1993,10 @@ mod tests {
                 one(p);
             }
         });
+        drop(one);
+        let lost = lost.load(std::sync::atomic::Ordering::Acquire);
+        assert!(lost > 0 || blocks < 340, "the ring was full for a while");
+        assert_eq!(recorded + lost, (warm + blocks) as u64, "every block recorded or counted lost");
         (allocs, frees)
     }
 
@@ -2190,5 +2254,6 @@ mod tests {
     }
 
     mod events;
+    mod recorder;
     mod timeline;
 }

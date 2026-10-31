@@ -38,6 +38,9 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
   - the log streak: a failure or fault repeated with the same message is logged at attempts 1, 2,
     4, 8...
 - `latency_test`: below.
+- `recorder`: the chain recorder (below): what the chain got and gave live, block by block.
+- `handover`: handing a ring's producer to the audio thread and back, lock-free (the latency test's
+  tap and the chain recorder).
 - `timing`: QPC helpers (`now_100ns()`, conversion to ms).
 
 ## The audio thread (one, MMCSS "Pro Audio", kept between runs)
@@ -79,12 +82,16 @@ after 2 s with no packets, report an error and stop):
    loopback onto the reference's timeline (a FIFO of about 500 ms; "The reference" below). A
    failing loopback or keep-alive drops the reference for the rest of the run (dithered zeros, a
    warning), and the mic path carries on.
+   Then the hand-overs (`handover.rs`): the latency test's tap and the chain recorder are taken
+   from their command rings, before this wake's blocks, and handed back when they're done.
 3. While the mic FIFO holds ≥ 480:
    - Take one block.
    - **Reference:** the timeline serves 480 samples (±1 when its loop slips) for this block, with
      zeros for any that haven't arrived, and `SlipResampler::resample` makes them 480 ("The
      reference" below).
    - `chain.process_timed(mic, ref, out, qpc_now)`.
+   - **Chain recorder**, while one is armed: the block's mic, reference and output, and its facts,
+     into its ring ("The chain recorder" below).
    - **Output slip:** `out_slip = out_drift.update(output_fill)`, where the fill is frames written
      (and pending) minus the device position carried forward to now (at most a period), calibrated
      to the padding by a one-period window over the sawtooth the device's period steps make
@@ -301,6 +308,59 @@ a render found empty before its track is written is an underrun. Each track has 
 test's far end) that its errors are worded for. A running `Engine` carries on meanwhile: `noise-filter quality` measures it that
 way. The latency tests share its recorder and player. Both blocking calls (this and `cable_latency_test`) want a worker thread:
 on an STA (UI) thread COM is single-threaded already, and they fail, saying so.
+
+## The chain recorder (`recorder.rs`, TODO 10 and 14)
+What the chain was fed live and what it gave, block by block, so that a live result can be told apart from the chain's own
+behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quality --save` writes it):
+- **On the audio thread**, after each block's chain call (`Pipeline::record`), one item into a pre-allocated rtrb ring (400
+  blocks, 4 s, about 2.4 MB; its pages are touched when it's armed): the mic block and the reference block exactly as the chain
+  got them (the mic after the dither; the reference after the timeline, the slip resampler and the dither), the chain's output
+  block (before the output's drift loop resamples it for the device), and the block's facts, `ChainBlock`:
+  - the run's block index, the mic block's capture QPC (by its stamps, NaN without), whether the mic's stamps are trusted, the
+    mic stream index of its first sample, the wake that delivered it, and the mic samples still queued (a burst or a late wake);
+  - the mic's moves since the block before: samples its FIFO discarded (it overflowed: the loop hadn't run for 200 ms), and device
+    position it skipped without zero-filling (a gap over 100 ms; the stream index doesn't count it);
+  - AEC3's own delay and ERLE estimates after the block (cached by sonora: a reference, no work);
+  - the chain's live settings after the block (`nf_core::controls::ChainParams`: on/off, passthrough, floor, gate; a dozen
+    relaxed loads), so a change during the recording (an `Engine::apply`, a latency test) shows;
+  - the reference's take, `ReferenceFacts`, which `Reference::take` fills in as it goes (a few stores a block, always): the
+    timeline index it read from (the mic index less it is the echo path as the engine holds it), this block's lead reading and
+    the loop's low-passed lead, the target, the drift, whether the stamps timed it, whether the loopback was fresh and
+    delivered at this wake, the samples buffered past the read position, the samples consumed (480, or 479 and 481 at a slip),
+    the zeros served owed and missing, and how far and why the read position jumped (aligned, centred, broken, stepped,
+    retargeted; and restarted, unstamped, coasted, no reading). Block to block the read index moves by what the last block
+    consumed plus this block's jumps, and the mic index by 480 plus what the mic FIFO discarded, nothing else
+    (`pipeline/tests/recorder.rs` checks both over bursts, stalls, a mic stall past its FIFO, a broken timeline and delivery
+    timing).
+  A full ring loses the block: no allocation, lock or panic path, the indices skip it, and the audio thread counts it
+  (`ChainTx`). Each item carries the count before it, and the recorder's thread reads the count as it stops, so blocks lost
+  after the last one recorded count too (`lost_blocks`). The no-allocation test runs with the recorder armed, its ring full for
+  a while.
+- **The hand-over** is the latency test's tap's, made generic (`handover.rs`): each run has a port (control side) and an end
+  (audio thread) of two one-slot rings, for the producer going in and coming back (a `Handed`: the tap's producer, or the
+  recorder's `ChainTx`, its producer and the lost count). A producer whose consumer has gone is handed back, never dropped on
+  the audio thread, and freed on the control side (by the stop that waits for it, up to 500 ms; else at the next arm or when
+  the run stops).
+- **Arming** (`recorder::arm`), one recorder at a time. With a live run the producer goes to its command ring and the run
+  takes it at its next wake. Without one (stopped, starting, waiting to retry) it waits in `Inner::recorder`, and the next
+  start puts it in its run's command ring before handing the run over, so the run's first wake takes it before the first
+  block: the recording then holds the chain's whole history after the warm-up (`ChainRecording::reproducible`). One armed while
+  a start is opening its streams goes to the run once it's up (its first blocks may come first). A start that fails passes it
+  on: its run, ending without having taken it, hands it back (`handover::give_back` in `run_job`, before the start's join
+  returns), and the start keeps it for the next (`recorder::run_failed`), unless it was stopped meanwhile. Only a start that
+  got no audio thread, or whose thread hung or died, loses it (the recorder then records nothing more).
+- **Draining:** the recorder's own thread (normal priority) moves the ring into memory every 20 ms, up to `max_seconds` (at most
+  15 minutes; about 0.6 MB a second), and ends when stopped, at the limit (`truncated`), or once the producer has gone: the
+  run ended (a stop or a restart; `run_ended`). The recording doesn't follow a restart: the new run's chain starts afresh.
+  `ChainRecorder::stop` stops it and waits for the producer to come back.
+- **Rerunning it offline:** the engine builds its chain as `nf_stages::build_chain` does and warms it up with three dithered
+  silent blocks (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recorded mic and
+  reference are dithered already. So a chain built with the run's processing settings, warmed up and fed the recording block by
+  block reproduces its output sample for sample (`the_live_chain_reruns_offline_sample_for_sample`, AEC3 and RNNoise behind
+  bursty delivery with a loopback stall; without the warm-up it doesn't). `noise-filter process --warm-up` does this with the
+  saved WAVs. A recording armed while running, or with blocks lost, starts from a state the rerun doesn't have; one whose
+  settings changed matches a rerun with one config only up to the change (`ChainRecording::settings_changed_at`).
+  `reproducible` checks all three.
 
 ## Testing (no devices; CLAUDE.md)
 - Unit-test:

@@ -11,7 +11,7 @@
 //! play-and-record loop ([`play_train`]), the arrival timing ([`Train::arrivals`]), the matching and the statistics.
 //!
 //! The tap ring is handed to the audio thread lock-free (a one-slot rtrb ring of producers) and
-//! handed back the same way, so the audio thread never frees it.
+//! handed back the same way, so the audio thread never frees it (handover.rs).
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -33,6 +33,7 @@ use crate::audio::{AudioShared, RENDER_BUFFER_HNS};
 use crate::control::{Inner, claim_test, lock};
 use crate::devices::resolve;
 use crate::errors::{StreamRole, describe_com_failure, describe_hr, describe_start_failure};
+use crate::handover::{self, End, Port};
 use crate::pipeline::{RenderSink, TapItem, play_time_hns};
 use crate::play_record::{CANCELLED, Player, Recorder, Recording};
 use crate::sched::{Com, Mmcss, MmcssPriority};
@@ -93,33 +94,15 @@ impl TestShared {
     }
 }
 
-/// The control side of the tap hand-over: producers go in on `cmd` and come back on `ret`.
-pub(crate) struct TapPort {
-    cmd: Producer<Producer<TapItem>>,
-    ret: Consumer<Producer<TapItem>>,
-}
-
-#[cfg(test)]
-impl TapPort {
-    pub(crate) fn cmd_for_test(&mut self) -> &mut Producer<Producer<TapItem>> {
-        &mut self.cmd
-    }
-    pub(crate) fn ret_for_test(&mut self) -> &mut Consumer<Producer<TapItem>> {
-        &mut self.ret
-    }
-}
+/// The control side of the tap hand-over (handover.rs): producers go in on `cmd` and come back on `ret`.
+pub(crate) type TapPort = Port<Producer<TapItem>>;
 
 /// The audio thread's side of the tap hand-over.
-pub(crate) struct TapEnd {
-    pub(crate) cmd: Consumer<Producer<TapItem>>,
-    pub(crate) ret: Producer<Producer<TapItem>>,
-}
+pub(crate) type TapEnd = End<Producer<TapItem>>;
 
-/// One run's hand-over rings (allocated on the control thread).
+/// One run's tap hand-over rings (allocated on the control thread).
 pub(crate) fn tap_channel() -> (TapPort, TapEnd) {
-    let (cmd_tx, cmd_rx) = RingBuffer::new(1);
-    let (ret_tx, ret_rx) = RingBuffer::new(1);
-    (TapPort { cmd: cmd_tx, ret: ret_rx }, TapEnd { cmd: cmd_rx, ret: ret_tx })
+    handover::channel()
 }
 
 enum TestError {

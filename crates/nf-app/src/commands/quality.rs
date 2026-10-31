@@ -6,6 +6,12 @@
 //! reports the alignment and the levels (`quality::analysis`), the engine's own drift and echo estimates, and the dropouts: the
 //! engine's counters over the take and the recording's own gaps. Exit 0 when the recording lined up with the scene, 3 when it
 //! didn't (or the test was cancelled), 2 when something failed.
+//!
+//! With `--save` it also arms the engine's chain recorder before the start (`Engine::record_chain`), so the recording holds the
+//! run from its first block, and writes what the chain got and gave live beside the scene's WAVs: `chain_mic.wav`,
+//! `chain_ref.wav`, `chain_out.wav`, a row a block in `chain_blocks.csv`, and the config in `chain_config.json`. `process
+//! chain_mic.wav OUT.wav --ref chain_ref.wav --config chain_config.json --warm-up` reruns that chain into `chain_out.wav`
+//! exactly (TODO 10).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -13,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use nf_core::SAMPLE_RATE;
 use nf_engine::{
-    DeviceInfo, Engine, EngineConfig, EngineState, Flow, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS,
-    TelemetrySnapshot, TrackRole,
+    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, Flow, MAX_CHAIN_RECORDING_S,
+    PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, TrackRole,
 };
 
 use super::run::stream_text;
@@ -46,8 +52,18 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     check_devices(&cfg, &devices, &probe, &capture, far.as_deref()).map_err(Failure::usage)?;
     let route = route(&devices, &probe, far.as_deref(), &capture);
 
-    let engine = super::run::start(&cfg)?;
+    let engine = Engine::new();
+    // Armed before the start, the chain recorder holds the run from its first block (its whole history, for a rerun).
+    let recorder = match args.save {
+        Some(_) => Some(
+            engine.record_chain(recording_limit(&scene)).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?,
+        ),
+        None => None,
+    };
+    super::run::start_engine(&engine, &cfg)?;
     let take = play(&engine, &cfg, &scene, Route { probe, capture, far, text: route });
+    // Before the engine stops, so the recording ends with the take rather than with the run.
+    let chain = recorder.map(ChainRecorder::stop);
     engine.stop();
     console::finished();
     let take = take?;
@@ -57,6 +73,10 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     if let Some(dir) = &args.save {
         let names = save(dir, &scene, &take.recorded.recording, result.as_ref().ok().map(|a| a.aligned.as_slice()))?;
         say!("Wrote {} to {}.", names.join(", "), dir.display());
+        if let Some(chain) = &chain {
+            let names = save_chain(dir, &cfg, chain)?;
+            say!("{}", chain_line(&names, chain));
+        }
     }
     match result {
         Ok(_) => Ok(()),
@@ -116,6 +136,14 @@ fn route(devices: &[DeviceInfo], probe: &str, far: Option<&str>, capture: &str) 
     let name = |id: &str| devices.iter().find(|d| d.id == id).map_or_else(|| id.to_owned(), |d| d.name.clone());
     let far = far.map_or(String::new(), |f| format!(" and {}", name(f)));
     format!("playing on {}{far}, recording {}", name(probe), name(capture))
+}
+
+/// The chain recorder's limit: the take (the settle, the lead, the scene and the tail) and a minute to spare, within the
+/// engine's 15 minutes.
+fn recording_limit(scene: &Scene) -> f64 {
+    let r = PlayRecordRequest::default();
+    let take = scene.input.len() as f64 / f64::from(SAMPLE_RATE) + SETTLE.as_secs_f64() + f64::from(r.lead_s + r.tail_s);
+    (take + 60.0).min(MAX_CHAIN_RECORDING_S)
 }
 
 /// The take's devices (ids), and the route by their names, for the messages.
@@ -323,6 +351,133 @@ fn save(dir: &Path, scene: &Scene, recording: &[f32], aligned: Option<&[f32]>) -
     Ok(files.into_iter().map(|(name, _)| name).collect())
 }
 
+/// The chain recording's files, beside the take's WAVs.
+const CHAIN_FILES: [&str; 5] = ["chain_mic.wav", "chain_ref.wav", "chain_out.wav", "chain_blocks.csv", "chain_config.json"];
+
+/// `chain_blocks.csv`'s columns, a row a block (`nf_engine::ChainBlock`): the block's index and the mic's timing and moves
+/// (samples its FIFO discarded, device position it skipped unfilled); the reference's take (`ReferenceFacts`; empty without a
+/// reference), with `path`, the mic's index less the reference's, the echo path as the engine holds it (it moves by
+/// `mic_discarded` on the mic's side, and on the reference's by a slip, `consumed` other than 480, and a jump, `jumped`);
+/// AEC3's own estimates; and 1 where the chain's settings changed from the block before. Times are QPC in 100 ns units; a
+/// number that's unknown is empty.
+const CHAIN_COLUMNS: &str = "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,\
+                             ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,\
+                             consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed";
+const CHAIN_REFERENCE_COLUMNS: usize = 15;
+
+/// Writes the chain recording into `dir`: what the chain got (mic and reference) and gave, as 48 kHz mono float WAVs, a CSV
+/// row a block, and the engine config the take ran with (`process --config` reads it). Returns the files' names.
+fn save_chain(dir: &Path, cfg: &EngineConfig, chain: &ChainRecording) -> Result<Vec<&'static str>, Failure> {
+    let [mic, reference, out, blocks, config] = CHAIN_FILES;
+    wav::write_mono_f32(&dir.join(mic), &chain.mic)?;
+    wav::write_mono_f32(&dir.join(reference), &chain.reference)?;
+    wav::write_mono_f32(&dir.join(out), &chain.output)?;
+    let write = |name: &str, text: String| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).map_err(|e| Failure::error(format!("Couldn't write {}: {e}", path.display())))
+    };
+    write(blocks, chain_csv(chain))?;
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| Failure::error(format!("Couldn't write {config}: {e}")))?;
+    write(config, json)?;
+    Ok(CHAIN_FILES.to_vec())
+}
+
+/// `chain_blocks.csv`: [`CHAIN_COLUMNS`], then a row a block.
+fn chain_csv(chain: &ChainRecording) -> String {
+    let num = |v: f64, places: usize| if v.is_finite() { format!("{v:.places$}") } else { String::new() };
+    let mut s = String::with_capacity((chain.blocks.len() + 1) * 160);
+    s.push_str(CHAIN_COLUMNS);
+    s.push('\n');
+    let mut last = None;
+    for b in &chain.blocks {
+        let _ = write!(
+            s,
+            "{},{},{},{},{},{},{},{}",
+            b.index,
+            num(b.capture_qpc_hns, 1),
+            u8::from(b.mic_stamped),
+            b.mic_index,
+            num(b.mic_wake_hns, 1),
+            b.mic_queued,
+            b.mic_discarded,
+            b.mic_skipped
+        );
+        match &b.reference {
+            Some(r) => {
+                let events: Vec<&str> = r.event_names().collect();
+                let _ = write!(
+                    s,
+                    ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    r.read_index,
+                    i128::from(b.mic_index) - i128::from(r.read_index),
+                    num(f64::from(r.lead_reading_ms), 3),
+                    num(f64::from(r.lead_ms), 3),
+                    num(f64::from(r.target_ms), 3),
+                    num(f64::from(r.drift_ppm), 2),
+                    u8::from(r.stamped),
+                    u8::from(r.fresh),
+                    u8::from(r.delivered),
+                    r.buffered,
+                    r.consumed,
+                    r.owed,
+                    r.missing,
+                    r.jumped,
+                    events.join("|")
+                );
+            }
+            None => s.push_str(&",".repeat(CHAIN_REFERENCE_COLUMNS)),
+        }
+        let changed = last.is_some_and(|l: &ChainBlock| !b.settings.same(&l.settings));
+        let _ = writeln!(s, ",{},{},{}", num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
+        last = Some(b);
+    }
+    s
+}
+
+/// What was saved of the chain, in one line: how much, from where in the run, what was lost or cut, and how to rerun it.
+fn chain_line(names: &[&str], chain: &ChainRecording) -> String {
+    let files = match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    };
+    let Some(first) = chain.blocks.first() else {
+        return format!("Wrote {files}, but the chain recorder got no blocks: the filter's run never reached it.");
+    };
+    let mut s = format!(
+        "Wrote {files}: what the chain got and gave live, {} blocks ({} s) from {}",
+        chain.blocks.len(),
+        fixed(chain.seconds(), 1),
+        if first.index == 0 { "the run's first block".to_owned() } else { format!("block {} of the run", first.index) }
+    );
+    match chain.lost_blocks {
+        0 => s.push_str(", none lost"),
+        n => {
+            let _ = write!(s, "; {n} blocks lost to a full ring (missing from the files)");
+        }
+    }
+    if chain.truncated {
+        s.push_str("; cut at the recorder's limit");
+    }
+    if chain.run_ended {
+        s.push_str("; the filter's run ended before the take did");
+    }
+    let changed = chain.settings_changed_at();
+    if let Some(at) = changed {
+        let _ = write!(s, "; the chain's settings changed at block {at}");
+    }
+    if chain.reproducible() {
+        s.push_str(
+            ". In that folder `noise-filter process chain_mic.wav chain_rerun.wav --ref chain_ref.wav --config chain_config.json \
+             --warm-up` reruns it into chain_out.wav exactly.",
+        );
+    } else if chain.from_first_block() && chain.lost_blocks == 0 && changed.is_some() {
+        s.push_str(". A rerun with chain_config.json matches chain_out.wav only up to that block.");
+    } else {
+        s.push_str(". A rerun of it won't match chain_out.wav exactly: it doesn't hold the chain's whole history.");
+    }
+    s
+}
+
 /// The report: the alignment, each region's levels, the engine's readings, the dropouts, the streams, notes and warnings.
 pub fn format_report(test: QualityTest, result: &Result<Analysis, AlignmentFailure>, take: &Take) -> String {
     let seconds = |samples: i64| fixed(samples as f64 / f64::from(SAMPLE_RATE), 4);
@@ -484,7 +639,7 @@ fn difference(a: f32, b: f32, signed: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nf_engine::{DeviceSelection, StreamInfo};
+    use nf_engine::{ChainParams, DeviceSelection, ReferenceFacts, StreamInfo};
 
     use super::*;
     use crate::cli::Processing;
@@ -903,6 +1058,121 @@ mod tests {
         }
         println!("lowest aligned {lowest_aligned:.3}, highest misaligned {highest_misaligned:.3}, threshold {MIN_CORRELATION}");
         assert!(lowest_aligned > 1.5 * MIN_CORRELATION && highest_misaligned < 0.5 * MIN_CORRELATION);
+    }
+
+    fn chain_block(index: u64, reference: Option<ReferenceFacts>) -> ChainBlock {
+        ChainBlock {
+            index,
+            capture_qpc_hns: 1e10 + index as f64 * 1e5,
+            mic_stamped: true,
+            mic_index: index * 480,
+            mic_wake_hns: 1e10 + index as f64 * 1e5 + 2e5,
+            mic_queued: 0,
+            mic_discarded: if index == 1 { 960 } else { 0 },
+            mic_skipped: if index == 1 { -48 } else { 0 },
+            reference,
+            aec_delay_ms: f32::NAN,
+            aec_erle_db: 3.25,
+            settings: ChainParams { passthrough: index >= 1, ..ChainParams::default() },
+        }
+    }
+
+    /// `--save`'s chain files: the three WAVs as recorded, a CSV row a block (the reference's columns empty without one, an
+    /// unknown number empty), and the config, which `process --config` reads back.
+    #[test]
+    fn saving_the_chain_writes_its_files_and_a_row_a_block() {
+        let dir = crate::test_dir("quality-chain");
+        let facts = ReferenceFacts {
+            read_index: -96,
+            lead_reading_ms: 14.25,
+            lead_ms: 14.0,
+            target_ms: 14.1,
+            drift_ppm: -1.5,
+            stamped: true,
+            fresh: true,
+            delivered: false,
+            buffered: -12,
+            consumed: 481,
+            owed: 12,
+            missing: 0,
+            jumped: 96,
+            events: ReferenceFacts::ALIGNED | ReferenceFacts::COASTED,
+        };
+        let chain = ChainRecording {
+            mic: (0..960).map(|i| i as f32 * 1e-3).collect(),
+            reference: vec![0.125; 960],
+            output: vec![-0.5; 960],
+            blocks: vec![chain_block(0, Some(facts)), chain_block(1, None)],
+            ..Default::default()
+        };
+        let mut cfg = EngineConfig::default();
+        cfg.processing.aec_enabled = true;
+        cfg.processing.noise_enabled = false;
+        let names = save_chain(&dir, &cfg, &chain).unwrap();
+        assert_eq!(names, CHAIN_FILES);
+        let read = |name: &str| wav::read_mono_48k(&dir.join(name)).unwrap().samples;
+        assert_eq!(
+            (read("chain_mic.wav"), read("chain_ref.wav"), read("chain_out.wav")),
+            (chain.mic.clone(), chain.reference, chain.output)
+        );
+        let csv = std::fs::read_to_string(dir.join("chain_blocks.csv")).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let columns = lines[0].split(',').count();
+        assert_eq!(lines[0], CHAIN_COLUMNS);
+        assert!(lines.iter().all(|l| l.split(',').count() == columns), "{csv}");
+        assert_eq!(
+            lines[1],
+            "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,,3.25,0"
+        );
+        assert_eq!(lines[2], "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1");
+        let back = crate::config::load(&dir.join("chain_config.json")).unwrap();
+        assert_eq!(back, cfg, "process --config reads it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_chain_line_says_what_was_saved_and_how_to_rerun_it() {
+        let blocks = |from: u64, n: u64| (from..from + n).map(|i| chain_block(i, None)).collect::<Vec<_>>();
+        let rec = |from, n, lost| ChainRecording {
+            mic: vec![0.0; n as usize * 480],
+            blocks: blocks(from, n),
+            lost_blocks: lost,
+            ..Default::default()
+        };
+        let steady = |mut r: ChainRecording| {
+            for b in &mut r.blocks {
+                b.settings = ChainParams::default();
+            }
+            r
+        };
+        let line = chain_line(&CHAIN_FILES, &steady(rec(0, 250, 0)));
+        assert!(
+            line.starts_with(
+                "Wrote chain_mic.wav, chain_ref.wav, chain_out.wav, chain_blocks.csv and chain_config.json: what the chain got and \
+                 gave live, 250 blocks (2.5 s) from the run's first block, none lost. In that folder `noise-filter process"
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with("--warm-up` reruns it into chain_out.wav exactly."), "{line}");
+        let line = chain_line(&CHAIN_FILES, &steady(rec(0, 250, 3)));
+        assert!(line.contains("from the run's first block; 3 blocks lost to a full ring") && line.contains("won't match"), "{line}");
+        // `chain_block` turns passthrough on from block 1.
+        let line = chain_line(&CHAIN_FILES, &rec(0, 250, 0));
+        assert!(line.contains("none lost; the chain's settings changed at block 1. A rerun with chain_config.json matches"), "{line}");
+        let late = ChainRecording { truncated: true, run_ended: true, ..steady(rec(12, 10, 0)) };
+        let line = chain_line(&CHAIN_FILES, &late);
+        assert!(line.contains("from block 12 of the run, none lost; cut at the recorder's limit; the filter's run ended"), "{line}");
+        assert!(line.ends_with("it doesn't hold the chain's whole history."), "{line}");
+        assert!(chain_line(&CHAIN_FILES, &ChainRecording::default()).contains("got no blocks"));
+    }
+
+    /// The chain recorder covers the take: the settle, the lead, the scene and the tail, and a minute more.
+    #[test]
+    fn the_recorder_covers_the_take() {
+        let scene = signals::build(QualityTest::Noise, 30.0, None, &UserAudio::default()).unwrap();
+        assert!((recording_limit(&scene) - (30.0 + 1.5 + 3.0 + 60.0)).abs() < 0.1, "{}", recording_limit(&scene));
+        assert!(recording_limit(&scene) <= MAX_CHAIN_RECORDING_S);
     }
 
     #[test]
