@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use nf_engine::{GateMode, LatencyMode};
 
+use crate::quality::QualityTest;
+
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -16,6 +18,7 @@ pub enum Command {
     Devices,
     Run(EngineArgs),
     Latency(LatencyArgs),
+    Quality(QualityArgs),
     Process(ProcessArgs),
     Bench(BenchArgs),
     /// `--sid` names the account to grant (the non-elevated side passes its own when it relaunches
@@ -32,11 +35,16 @@ impl Command {
     /// Whether the command runs the engine or real-time code, and so wants the locked pool, the
     /// lock-pages privilege and the working-set minimum before any engine thread exists.
     pub fn needs_memory(&self) -> bool {
-        matches!(self, Command::Gui | Command::Run(_) | Command::Latency(_) | Command::Bench(_))
+        match self {
+            Command::Gui | Command::Run(_) | Command::Quality(_) | Command::Bench(_) => true,
+            // The cable-only test runs no engine
+            Command::Latency(l) => !l.cable_only,
+            _ => false,
+        }
     }
 }
 
-/// Processing options shared by `run`, `latency` and `process`. `None` keeps the config's value.
+/// Processing options shared by `run`, `latency`, `quality` and `process`. `None` keeps the config's value.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Processing {
     pub aec: Option<bool>,
@@ -46,7 +54,7 @@ pub struct Processing {
     pub threshold_db: Option<f32>,
 }
 
-/// `run`'s options, which `latency` takes too.
+/// `run`'s options, which `latency` and `quality` take too.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineArgs {
     pub config: Option<PathBuf>,
@@ -65,6 +73,29 @@ pub struct LatencyArgs {
     pub mode: LatencyMode,
     pub repetitions: u32,
     pub through_model: bool,
+    /// `--cable-only`: the sweeps from the probe to the capture with no engine, so `engine`, `mode` and `through_model` are
+    /// unused (the parser refuses them).
+    pub cable_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QualityArgs {
+    pub engine: EngineArgs,
+    /// The playback device that feeds the filter's mic, and the recording device that carries its output.
+    pub probe: String,
+    pub capture: String,
+    pub test: QualityTest,
+    /// The echo test's far-end device: it plays the far voice and is the echo reference.
+    pub far: Option<String>,
+    pub seconds: f32,
+    /// The noise below the speech's active level; `None` takes the test's default.
+    pub snr_db: Option<f32>,
+    /// 48 kHz recordings to use instead of the synthetic speech, noise and far voice.
+    pub speech: Option<PathBuf>,
+    pub noise: Option<PathBuf>,
+    pub far_speech: Option<PathBuf>,
+    /// Where to write the scene, the recording and the aligned recording as WAVs.
+    pub save: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +119,18 @@ pub struct BenchArgs {
 
 /// The latency test's default repetitions (the engine's `LatencyTestRequest` default).
 pub const DEFAULT_REPETITIONS: u32 = 5;
+/// `quality`'s default scene length, and its range. The echo scene is one FFT convolution over its whole length, as `bench`'s
+/// is, hence the same cap.
+pub const DEFAULT_QUALITY_SECONDS: f32 = 30.0;
+pub const MIN_QUALITY_SECONDS: f32 = 5.0;
+pub const MAX_QUALITY_SECONDS: f32 = 300.0;
+/// The echo test's shortest scene: its first far-only turn (0-3 s) is the echo canceller's to converge in, so the ERLE is
+/// measured from the next one (9-12 s).
+pub const MIN_ECHO_SECONDS: f32 = 12.0;
+/// `quality --snr` starts at 0 dB: lower, a scene played with the filter off no longer correlates clearly enough with its clean
+/// speech to be aligned (`quality::analysis::MIN_CORRELATION`).
+pub const MIN_QUALITY_SNR_DB: f32 = 0.0;
+pub const MAX_QUALITY_SNR_DB: f32 = 60.0;
 /// `bench`'s default length, as `tests/timing.rs`.
 pub const DEFAULT_BENCH_SECONDS: f32 = 30.0;
 /// `bench --seconds` at most. The synthetic signals' echo is one FFT convolution over the whole
@@ -127,6 +170,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "devices" => Command::Devices,
         "run" => return parse_run(&mut p).map(Command::Run),
         "latency" => return parse_latency(&mut p).map(Command::Latency),
+        "quality" => return parse_quality(&mut p).map(Command::Quality),
         "process" => return parse_process(&mut p).map(Command::Process),
         "bench" => return parse_bench(&mut p).map(Command::Bench),
         "setup-large-pages" => return parse_setup(&mut p),
@@ -274,8 +318,10 @@ fn parse_run(p: &mut Parser<'_>) -> Result<EngineArgs, UsageError> {
 
 fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     let mut engine = EngineArgs::default();
-    let (mut probe, mut capture, mut mode, mut reps, mut through_model) =
-        (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false);
+    let (mut probe, mut capture, mut mode, mut reps, mut through_model, mut cable_only) =
+        (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false, false);
+    // The first option given that only the test through the filter uses
+    let mut filter_option: Option<&str> = None;
     while let Some(arg) = p.next() {
         match arg {
             Arg::Flag(flag, inline) => match flag {
@@ -286,7 +332,8 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
                         "virtual" => LatencyMode::VirtualLoop,
                         "acoustic" => LatencyMode::Acoustic,
                         other => return Err(usage(format!("--mode takes virtual or acoustic, not '{other}'"))),
-                    }
+                    };
+                    filter_option.get_or_insert(flag);
                 }
                 "--reps" => {
                     let v = p.value(flag, inline)?;
@@ -295,19 +342,108 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
                         _ => return Err(usage(format!("--reps takes a count from 1 to 100, not '{v}'"))),
                     };
                 }
-                "--through-model" => through_model = switch(flag, inline)?,
+                "--through-model" => {
+                    through_model = switch(flag, inline)?;
+                    filter_option.get_or_insert(flag);
+                }
+                "--cable-only" => cable_only = switch(flag, inline)?,
                 _ => {
                     if !engine.take(p, flag, inline)? {
                         return Err(p.unknown(flag));
                     }
+                    filter_option.get_or_insert(flag);
                 }
             },
             Arg::Positional(a) => return Err(usage(format!("'latency' takes no argument '{a}'"))),
         }
     }
+    // Refused rather than ignored: a --mic or --aec given here would otherwise look as if it had been measured.
+    if cable_only && let Some(flag) = filter_option {
+        return Err(usage(format!("'latency --cable-only' times the probe-to-capture path alone, without the filter: drop {flag}")));
+    }
     let probe = probe.ok_or_else(|| usage("'latency' needs --probe DEV: the playback device the sweeps are played on"))?;
-    let capture = capture.ok_or_else(|| usage("'latency' needs --capture DEV: the recording device that carries the filter's output"))?;
-    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model })
+    let capture = capture.ok_or_else(|| {
+        usage(if cable_only {
+            "'latency --cable-only' needs --capture DEV: the recording side of the probe's cable"
+        } else {
+            "'latency' needs --capture DEV: the recording device that carries the filter's output"
+        })
+    })?;
+    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only })
+}
+
+fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
+    let mut q = QualityArgs {
+        engine: EngineArgs::default(),
+        probe: String::new(),
+        capture: String::new(),
+        test: QualityTest::Noise,
+        far: None,
+        seconds: DEFAULT_QUALITY_SECONDS,
+        snr_db: None,
+        speech: None,
+        noise: None,
+        far_speech: None,
+        save: None,
+    };
+    let (mut probe, mut capture) = (None, None);
+    let path = |flag: &str, v: &str| text(flag, v).map(PathBuf::from);
+    while let Some(arg) = p.next() {
+        match arg {
+            Arg::Flag(flag, inline) => match flag {
+                "--probe" => probe = Some(text(flag, p.value(flag, inline)?)?),
+                "--capture" => capture = Some(text(flag, p.value(flag, inline)?)?),
+                "--test" => {
+                    q.test = match p.value(flag, inline)?.trim().to_ascii_lowercase().as_str() {
+                        "noise" => QualityTest::Noise,
+                        "echo" => QualityTest::Echo,
+                        other => return Err(usage(format!("--test takes noise or echo, not '{other}'"))),
+                    }
+                }
+                "--far" => q.far = Some(text(flag, p.value(flag, inline)?)?),
+                "--seconds" => {
+                    let v = p.value(flag, inline)?;
+                    q.seconds = number(flag, v, MIN_QUALITY_SECONDS, MAX_QUALITY_SECONDS, "a length from 5 to 300 s")?;
+                }
+                "--snr" => {
+                    let v = p.value(flag, inline)?;
+                    let what = "the noise's level under the speech, from 0 to 60 dB";
+                    q.snr_db = Some(number(flag, v, MIN_QUALITY_SNR_DB, MAX_QUALITY_SNR_DB, what)?);
+                }
+                "--speech" => q.speech = Some(path(flag, p.value(flag, inline)?)?),
+                "--noise" => q.noise = Some(path(flag, p.value(flag, inline)?)?),
+                "--far-speech" => q.far_speech = Some(path(flag, p.value(flag, inline)?)?),
+                "--save" => q.save = Some(path(flag, p.value(flag, inline)?)?),
+                _ => {
+                    if !q.engine.take(p, flag, inline)? {
+                        return Err(p.unknown(flag));
+                    }
+                }
+            },
+            Arg::Positional(a) => return Err(usage(format!("'quality' takes no argument '{a}'"))),
+        }
+    }
+    q.probe = probe
+        .ok_or_else(|| usage("'quality' needs --probe DEV: the playback device that feeds the filter's mic (e.g. \"CABLE-A Input\")"))?;
+    q.capture = capture.ok_or_else(|| {
+        usage("'quality' needs --capture DEV: the recording device that carries the filter's output (e.g. \"CABLE Output\")")
+    })?;
+    match q.test {
+        QualityTest::Echo if q.far.is_none() => Err(usage(
+            "'quality --test echo' needs --far DEV: the far end's speakers, which play the far voice and give the filter its echo \
+             reference (e.g. \"CABLE-B Input\")",
+        )),
+        QualityTest::Echo if q.engine.reference.is_some() => {
+            Err(usage("'quality --test echo' takes its echo reference from --far: drop --reference"))
+        }
+        QualityTest::Echo if q.seconds < MIN_ECHO_SECONDS => Err(usage(format!(
+            "'quality --test echo' needs --seconds {MIN_ECHO_SECONDS} or more: its first far-only turn is the echo canceller's to \
+             converge in, and the ERLE is measured from the next one (9-12 s)"
+        ))),
+        QualityTest::Noise if q.far.is_some() => Err(usage("--far is for the echo test: add --test echo, or drop it")),
+        QualityTest::Noise if q.far_speech.is_some() => Err(usage("--far-speech is for the echo test: add --test echo, or drop it")),
+        _ => Ok(q),
+    }
 }
 
 fn parse_process(p: &mut Parser<'_>) -> Result<ProcessArgs, UsageError> {
@@ -385,6 +521,11 @@ Usage:
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
                        [--through-model] [OPTIONS]
                                  Measure the latency with sweeps and print the report
+  noise-filter latency --cable-only --probe DEV --capture DEV [--reps N]
+                                 The same sweeps through one cable alone, without the filter
+  noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
+                       [OPTIONS]
+                                 Play a test scene through the filter and measure what it did
   noise-filter process IN.wav OUT.wav [--ref REF.wav] [--align] [--config FILE] [PROCESSING]
                                  Filter a 48 kHz WAV offline; writes 48 kHz mono float
   noise-filter bench [IN.wav] [--seconds N] [--aec]
@@ -393,21 +534,32 @@ Usage:
                                  Grant the lock-pages privilege (asks for elevation)
   noise-filter --help | --version
 
-OPTIONS (run, latency):
+OPTIONS (run, latency, quality):
   --config FILE      Settings JSON: the window's settings.json, or an engine config
   --mic DEV          Microphone (default: the system default)
   --output DEV       Playback device that gets the filtered mic, e.g. \"CABLE Input\" (required)
   --reference DEV    Speakers whose sound AEC removes (default: the default playback device)
   DEV is a device id or part of its name (exact name first, then the first match, any case).
 
-PROCESSING (run, latency, process):
-  --aec, --no-aec    Echo cancellation on or off (default off)
+PROCESSING (run, latency, quality, process):
+  --aec, --no-aec    Echo cancellation on or off (default off; on in quality's echo test)
   --ns, --no-ns      Noise filter on or off (default on)
   --floor DB         The most the noise filter may attenuate, 0 to -120 dB (default -60)
   --gate MODE        off, static or auto (default off)
   --threshold DB     The static gate's threshold in dBFS (implies --gate static)
 
-Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no valid latency result,
+QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records the output):
+  --test noise|echo  Speech in noise (the default), or speech with a far voice's echo
+  --far DEV          The echo test's far-end speakers: they play the far voice and are the
+                     echo reference, e.g. \"CABLE-B Input\"
+  --seconds N        The scene's length, 5 to 300 s (default 30; the echo test needs 12)
+  --snr DB           The noise under the speech's level, 0 to 60 dB (default 10; echo test 60)
+  --speech FILE, --noise FILE, --far-speech FILE
+                     48 kHz WAVs to use instead of the synthetic speech, noise or far voice
+  --save DIR         Write the scene, the recording and the aligned recording there as WAVs
+
+Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no result (latency: no
+valid repetition; quality: the recording didn't line up with the scene; either: cancelled),
 4 the large-page helper started without elevation, 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2,
 FMA), which noise-filter is built for.
 
@@ -458,7 +610,9 @@ mod tests {
         assert_eq!(p(&["-V"]), Ok(Command::Version));
         assert_eq!(err(&["--version", "x"]), "'--version' takes no argument 'x'");
         let help = help_text();
-        for command in ["devices", "run", "latency", "process", "bench", "setup-large-pages", "--version"] {
+        for command in
+            ["devices", "run", "latency", "--cable-only", "quality", "--far-speech", "process", "bench", "setup-large-pages", "--version"]
+        {
             assert!(help.contains(command), "{command}");
         }
         assert!(help.contains(env!("CARGO_PKG_VERSION")));
@@ -545,6 +699,113 @@ mod tests {
     }
 
     #[test]
+    fn latency_cable_only_takes_the_probe_the_capture_and_reps_alone() {
+        let Ok(Command::Latency(l)) =
+            p(&["latency", "--cable-only", "--probe", "CABLE-A Input", "--capture", "CABLE-A Output", "--reps=3"])
+        else {
+            panic!()
+        };
+        assert!(l.cable_only);
+        assert_eq!((l.probe.as_str(), l.capture.as_str(), l.repetitions), ("CABLE-A Input", "CABLE-A Output", 3));
+        assert_eq!((l.engine, l.mode, l.through_model), (EngineArgs::default(), LatencyMode::VirtualLoop, false));
+        let Ok(Command::Latency(l)) = p(&["latency", "--cable-only", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert_eq!(l.repetitions, DEFAULT_REPETITIONS);
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert!(!l.cable_only, "off unless asked for");
+        // The filter's options are refused, before or after the flag: they would look as if they had been measured
+        let filter_options: [&[&str]; 7] =
+            [&["--mic", "x"], &["--output", "x"], &["--aec"], &["--floor", "-20"], &["--config", "s.json"], &["--mode", "acoustic"], &[
+                "--through-model",
+            ]];
+        for opt in filter_options {
+            for cable_first in [true, false] {
+                let mut args = vec!["latency", "--probe", "a", "--capture", "b"];
+                if cable_first {
+                    args.push("--cable-only");
+                }
+                args.extend_from_slice(opt);
+                if !cable_first {
+                    args.push("--cable-only");
+                }
+                let expected = format!("'latency --cable-only' times the probe-to-capture path alone, without the filter: drop {}", opt[0]);
+                assert_eq!(err(&args), expected);
+            }
+        }
+        assert_eq!(
+            err(&["latency", "--cable-only", "--probe", "a"]),
+            "'latency --cable-only' needs --capture DEV: the recording side of the probe's cable"
+        );
+        assert!(err(&["latency", "--cable-only", "--capture", "b"]).starts_with("'latency' needs --probe"));
+        assert_eq!(err(&["latency", "--cable-only=yes", "--probe", "a", "--capture", "b"]), "--cable-only takes no value");
+    }
+
+    #[test]
+    fn quality_takes_a_scene_devices_and_runs_options() {
+        let Ok(Command::Quality(q)) =
+            p(&["quality", "--probe", "CABLE-A Input", "--capture", "CABLE Output", "--mic", "CABLE-A Output", "--output", "CABLE Input"])
+        else {
+            panic!()
+        };
+        let expected = QualityArgs {
+            engine: EngineArgs { mic: Some("CABLE-A Output".into()), output: Some("CABLE Input".into()), ..Default::default() },
+            probe: "CABLE-A Input".into(),
+            capture: "CABLE Output".into(),
+            test: QualityTest::Noise,
+            far: None,
+            seconds: DEFAULT_QUALITY_SECONDS,
+            snr_db: None,
+            speech: None,
+            noise: None,
+            far_speech: None,
+            save: None,
+        };
+        assert_eq!(q, expected);
+        let Ok(Command::Quality(q)) = p(&[
+            "quality", "--probe", "A", "--capture", "B", "--test", "Echo", "--far=CABLE-B Input", "--seconds", "60", "--snr", "20",
+            "--speech", "me.wav", "--noise", "fan.wav", "--far-speech", "you.wav", "--save", "out", "--no-aec", "--floor", "-30",
+        ]) else {
+            panic!()
+        };
+        assert_eq!((q.test, q.far.as_deref(), q.seconds, q.snr_db), (QualityTest::Echo, Some("CABLE-B Input"), 60.0, Some(20.0)));
+        assert_eq!(q.speech, Some(PathBuf::from("me.wav")));
+        assert_eq!(q.noise, Some(PathBuf::from("fan.wav")));
+        assert_eq!(q.far_speech, Some(PathBuf::from("you.wav")));
+        assert_eq!(q.save, Some(PathBuf::from("out")));
+        assert_eq!((q.engine.processing.aec, q.engine.processing.floor_db), (Some(false), Some(-30.0)));
+    }
+
+    #[test]
+    fn quality_refuses_what_its_test_cant_use() {
+        assert!(err(&["quality", "--capture", "B"]).starts_with("'quality' needs --probe DEV"));
+        assert!(err(&["quality", "--probe", "A"]).starts_with("'quality' needs --capture DEV"));
+        let with = |extra: &[&str]| err(&[&["quality", "--probe", "A", "--capture", "B"][..], extra].concat());
+        assert_eq!(with(&["--test", "music"]), "--test takes noise or echo, not 'music'");
+        assert_eq!(with(&["--seconds", "4"]), "--seconds takes a length from 5 to 300 s, not '4'");
+        assert!(with(&["--seconds", "301"]).starts_with("--seconds takes"));
+        assert_eq!(with(&["--snr", "-1"]), "--snr takes the noise's level under the speech, from 0 to 60 dB, not '-1'");
+        assert!(with(&["--snr", "61"]).starts_with("--snr takes"));
+        assert_eq!(with(&["--speech"]), "--speech needs a value");
+        assert_eq!(with(&["--save="]), "--save needs a value");
+        assert_eq!(with(&["extra"]), "'quality' takes no argument 'extra'");
+        assert_eq!(with(&["--reps", "3"]), "'quality' has no option '--reps'");
+        // The echo test needs its far end, and takes its reference from it
+        assert!(with(&["--test", "echo"]).starts_with("'quality --test echo' needs --far DEV"));
+        assert_eq!(
+            with(&["--test", "echo", "--far", "F", "--reference", "R"]),
+            "'quality --test echo' takes its echo reference from --far: drop --reference"
+        );
+        // The far end belongs to the echo test
+        assert_eq!(with(&["--far", "F"]), "--far is for the echo test: add --test echo, or drop it");
+        assert_eq!(with(&["--far-speech", "you.wav"]), "--far-speech is for the echo test: add --test echo, or drop it");
+        // The echo test needs a far-only turn after the first
+        let short = with(&["--test", "echo", "--far", "F", "--seconds", "11.9"]);
+        assert!(short.starts_with("'quality --test echo' needs --seconds 12 or more"), "{short}");
+        assert!(p(&["quality", "--probe", "A", "--capture", "B", "--test", "echo", "--far", "F", "--seconds", "12"]).is_ok());
+        // The noise test may still run AEC on a reference of its own
+        assert!(p(&["quality", "--probe", "A", "--capture", "B", "--reference", "R", "--aec"]).is_ok());
+    }
+
+    #[test]
     fn process_takes_two_files_and_processing() {
         let Ok(Command::Process(a)) = p(&["process", "in.wav", "--ref", "far.wav", "out.wav", "--aec", "--align", "--gate", "static"])
         else {
@@ -602,6 +863,9 @@ mod tests {
     fn only_engine_commands_want_the_pool() {
         let wants = |args: &[&str]| p(args).map(|c| c.needs_memory()).unwrap_or(false);
         assert!(wants(&[]) && wants(&["run"]) && wants(&["bench"]) && wants(&["latency", "--probe", "a", "--capture", "b"]));
+        assert!(wants(&["quality", "--probe", "a", "--capture", "b"]));
+        // The cable-only test runs no engine
+        assert!(!wants(&["latency", "--cable-only", "--probe", "a", "--capture", "b"]));
         assert!(!wants(&["devices"]) && !wants(&["--help"]) && !wants(&["--version"]) && !wants(&["setup-large-pages"]));
         assert!(!wants(&["process", "a.wav", "b.wav"]));
     }

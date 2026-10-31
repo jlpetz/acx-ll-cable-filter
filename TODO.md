@@ -140,21 +140,21 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 13. [lab] Latency measurement
-**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0; needs two cables to run.
+**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0, layer 2 run on the dev VM's VB-CABLE loop (2026-11-01); a cable-only mode built 2026-11-01, not yet run live.
 - Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
-**Next**: run layer 2 once cables are installed; layer 3 in phase 2.
+**Next**: run `latency --cable-only` on cable A and on the output cable. Compare cable A with the virtual loop's input path, and the output cable with its app + output cable share (which holds it once), to see how much of the readout's 56-66 ms (design about 32-42) is VB-CABLE's. Layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---
 
 ### 14. [lab] Quality analyser: the Lab mode (MOS)
-**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26.
+**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built 2026-11-01, not yet run live.
 - Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
-**Next**: phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
+**Next**: run `quality` on the cables (the noise test, then `--test echo --far "CABLE-B Input"`). Phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`
 
 ---

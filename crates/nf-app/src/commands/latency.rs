@@ -1,11 +1,14 @@
 //! `latency`: starts the engine with `run`'s options, runs the sweep test (TODO #13) and prints the
 //! report. Exit 0 with at least one valid repetition, 3 with none or when cancelled, 2 if the test
 //! couldn't run.
+//!
+//! `latency --cable-only` runs no engine: the same sweeps from the probe straight to the capture (`nf_engine::cable_latency_test`,
+//! on this thread), which times one cable alone, to tell its share of the latency from the app's.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use nf_engine::{Flow, LatencyMode, LatencyProgress, LatencyReport, LatencyTestRequest};
+use nf_engine::{CableLatencyReport, CableLatencyRequest, Flow, LatencyMode, LatencyProgress, LatencyReport, LatencyTestRequest};
 
 use super::{fixed, list_devices};
 use crate::cli::LatencyArgs;
@@ -19,6 +22,9 @@ const SETTLE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(200);
 
 pub fn latency(args: &LatencyArgs) -> Result<(), Failure> {
+    if args.cable_only {
+        return cable_only(args);
+    }
     let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
     let cfg = config::engine_config(&args.engine, || Ok(devices.clone()))?;
     let probe = resolve_device(&devices, &args.probe, Flow::Render, "--probe").map_err(Failure::error)?;
@@ -85,6 +91,68 @@ fn measure(engine: &nf_engine::Engine, args: &LatencyArgs, probe: String, captur
     }
 }
 
+/// The cable-only test: no engine, the sweeps blocking this thread (Ctrl+C cancels them).
+fn cable_only(args: &LatencyArgs) -> Result<(), Failure> {
+    console::handle_ctrl_c();
+    let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
+    let probe = resolve_device(&devices, &args.probe, Flow::Render, "--probe").map_err(Failure::error)?;
+    let capture = resolve_device(&devices, &args.capture, Flow::Capture, "--capture").map_err(Failure::error)?;
+    let name = |id: &str| devices.iter().find(|d| d.id == id).map_or_else(|| id.to_owned(), |d| d.name.clone());
+    say!(
+        "Latency test, cable only: {} sweeps from {} to {}, without the filter (about {} s). Ctrl+C cancels.",
+        args.repetitions,
+        name(&probe),
+        name(&capture),
+        2 * args.repetitions + 2
+    );
+    let request = CableLatencyRequest {
+        probe_device: probe,
+        capture_device: capture,
+        repetitions: args.repetitions,
+        cancel: Some(console::stop_flag()),
+    };
+    // The test blocks this thread: say now if Ctrl+C can't reach it.
+    if let Some(w) = console::CtrlCWatch::default().check() {
+        say!("{w}");
+    }
+    let result = nf_engine::cable_latency_test(&request);
+    console::finished();
+    match result {
+        Ok(report) => {
+            say!("{}", format_cable_report(&report));
+            if report.valid > 0 { Ok(()) } else { Err(Failure::no_result("No repetition gave a valid result (see the warnings above).")) }
+        }
+        Err(_) if console::stop_requested() => Err(Failure::no_result("The latency test was cancelled.")),
+        Err(e) => Err(Failure::error(format!("The latency test failed: {e}"))),
+    }
+}
+
+/// The cable-only report. Against the engine test's report: the mic cable's figure compares with its input path, and the output
+/// cable's with its "app + output cable" share, which holds it (TODO #13's detail, "Cable-only mode").
+pub fn format_cable_report(r: &CableLatencyReport) -> String {
+    let ms = |v: f64| format!("{} ms", fixed(v, 2));
+    let mut s = String::new();
+    let _ = write!(s, "Latency (cable only): {} of {} repetitions valid", r.valid, r.repetitions);
+    if r.valid > 0 {
+        let _ = write!(s, " (lowest confidence {} dB)", fixed(f64::from(r.confidence_db_min), 1));
+        let each: Vec<String> = r.cable_ms.iter().map(|v| fixed(*v, 2)).collect();
+        let _ =
+            write!(s, "\n  probe to capture    {} median, spread {} [{}]", ms(r.cable_ms_median), ms(r.cable_ms_spread), each.join(", "));
+        let _ = write!(
+            s,
+            "\n  compare with        the engine test's input path (the mic cable), or its app + output cable (the output cable's \
+             share is in it)"
+        );
+    }
+    if !r.conditions.is_empty() {
+        let _ = write!(s, "\n  conditions: {}", r.conditions);
+    }
+    for w in &r.warnings {
+        let _ = write!(s, "\n  warning: {w}");
+    }
+    s
+}
+
 /// The report, as the window shows it.
 pub fn format_report(r: &LatencyReport) -> String {
     let ms = |v: f64| format!("{} ms", fixed(v, 2));
@@ -146,5 +214,30 @@ mod tests {
         );
         let none = LatencyReport { repetitions: 5, app_ms_median: f64::NAN, confidence_db_min: f32::NAN, ..Default::default() };
         assert_eq!(format_report(&none), "Latency: 0 of 5 repetitions valid\n  chain offset        0.00 ms");
+    }
+
+    #[test]
+    fn the_cable_only_report_is_labelled_and_lists_each_repetition() {
+        let r = CableLatencyReport {
+            repetitions: 5,
+            valid: 3,
+            cable_ms: vec![55.1, 56.25, 55.6],
+            cable_ms_median: 55.6,
+            cable_ms_spread: 1.15,
+            confidence_db_min: 42.04,
+            conditions: "cable only; probe: CABLE-A Input (48000 Hz, 2 ch, 10.00 ms period)".into(),
+            warnings: vec!["Only 3 of 5 sweeps were found clearly in the capture; the result is less certain.".into()],
+        };
+        assert_eq!(
+            format_cable_report(&r),
+            "Latency (cable only): 3 of 5 repetitions valid (lowest confidence 42.0 dB)\n  \
+             probe to capture    55.60 ms median, spread 1.15 ms [55.10, 56.25, 55.60]\n  \
+             compare with        the engine test's input path (the mic cable), or its app + output cable (the output cable's \
+             share is in it)\n  \
+             conditions: cable only; probe: CABLE-A Input (48000 Hz, 2 ch, 10.00 ms period)\n  \
+             warning: Only 3 of 5 sweeps were found clearly in the capture; the result is less certain."
+        );
+        let none = CableLatencyReport { repetitions: 2, cable_ms_median: f64::NAN, confidence_db_min: f32::NAN, ..Default::default() };
+        assert_eq!(format_cable_report(&none), "Latency (cable only): 0 of 2 repetitions valid");
     }
 }

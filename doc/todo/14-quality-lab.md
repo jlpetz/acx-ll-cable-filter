@@ -79,6 +79,31 @@ Notes:
 
 ## Phases
 - **Phase 0:** the batch CLI with #2: playlist, DNSMOS/SIGMOS feature parity, scorecard.
+  - **Its live half, `noise-filter quality` (built 2026-11-01, not yet run live):** plays a scene through the running filter
+    over the virtual cables and measures the recording, with levels, not MOS. The noise test is speech in pink noise (10 dB
+    SNR). The echo test (12 s at least) is 3 s turns of far only, double talk and near only, with the far voice on `--far`, the
+    echo reference, and noise 60 dB under the speech, so the noise doesn't cap the ERLE (at 30 dB it sat 25 dB under the echo).
+    Synthetic signals by default, or 48 kHz WAVs, whose speech activity gets a 200 ms hangover (P.56's) so their reverberation
+    counts as speech, not pause.
+  - **Alignment is windowed**, because one lag for the whole take lost the scene once the path's delay moved by about 1.5 ms
+    (drift between the cables, the engine's slip-based drift loop). A coarse delay comes from the cross-correlation of 5 ms
+    frame envelopes; then 2 s windows of the clean speech are each correlated within 50 ms of it, for their own delay and
+    coefficient. The median coefficient decides (under 0.3 is no result), and the windows' delays make the track the recording
+    is read along; a window that locks onto a pitch period (5-10 ms off its neighbours) is dropped. The report gives the
+    windows, the delay's range and the drift in ppm, and warns past 2 ms of movement. Measured offline through the chain
+    (2026-11-01): 0.49-0.97 aligned, with 100 ppm drift, ±1 ms wander and 1 ms steps included, and 0.97 for 300 s drifting
+    50 ppm; 0.10 at most for recordings without the scene (another talker 0.07, the scene 4 s off 0.10). The old single-lag
+    figures were 0.035 at most for recordings without the scene but 0.17 for the scene 10-50 ms off its delay (its pitch
+    periods), a margin of about 1.8 times; the windows' ±50 ms search finds the true delay instead of such an offset.
+  - **Regions:** noise in pauses (and 200 ms clear of speech, past the filter's release) and the speech's own share in its
+    syllable cores: the output's projection on the clean speech per 20 ms, so noise or echo left there isn't counted as speech
+    (the rest is reported beside it). The echo test measures each region inside its own kind of turn, from the second turn on:
+    the echo's drop where only the far end talks (the ERLE; with the noise filter on, the chain's echo reduction), pooled and
+    per far-only turn, with the first, converging turn on its own and the ceiling the scene's noise sets; and the near
+    speech's share alone, in double talk, and with both talkers mid-syllable. Plus the engine's drift and AEC3's own delay and
+    ERLE estimates (the reference-to-mic lag behind a given ERLE), and dropouts (the engine's counters and the recording's
+    gaps). `--save` writes input, clean, far, recording and aligned WAVs, which the metric models can score later. The
+    analysis is a pure function, tested on synthetic recordings.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
 - **Phase 2:** AECMOS with talk-type segmentation, from far-end and near-end activity.
 - **Later:** the Lab page in the GUI (#15), with the blind-rating player.

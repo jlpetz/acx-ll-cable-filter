@@ -23,6 +23,8 @@ pub(crate) mod hr {
     pub(crate) const AUDCLNT_E_SERVICE_NOT_RUNNING: i32 = 0x8889_0010_u32 as i32;
     pub(crate) const AUDCLNT_E_BUFFER_SIZE_ERROR: i32 = 0x8889_0016_u32 as i32;
     pub(crate) const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026_u32 as i32;
+    /// COM is already initialised on this thread in another apartment: an STA (a UI thread) asked for the MTA.
+    pub(crate) const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 }
 
 /// Which stream (or device) something concerns.
@@ -34,6 +36,8 @@ pub(crate) enum StreamRole {
     KeepAlive = 4,
     Probe = 5,
     Capture = 6,
+    /// The far end of `play_record`'s echo test: the speakers playing the far voice.
+    FarEnd = 7,
 }
 
 impl StreamRole {
@@ -44,6 +48,7 @@ impl StreamRole {
             3 => StreamRole::Reference,
             4 => StreamRole::KeepAlive,
             5 => StreamRole::Probe,
+            7 => StreamRole::FarEnd,
             _ => StreamRole::Capture,
         }
     }
@@ -56,6 +61,7 @@ impl StreamRole {
             StreamRole::Reference | StreamRole::KeepAlive => "The speakers used as the echo reference",
             StreamRole::Probe => "The probe device",
             StreamRole::Capture => "The capture device",
+            StreamRole::FarEnd => "The far-end device",
         }
     }
 }
@@ -229,6 +235,15 @@ pub(crate) fn describe_hr(role: StreamRole, code: i32) -> String {
     }
 }
 
+/// Words a failure to initialise COM (as MTA) on the thread of a blocking test call.
+pub(crate) fn describe_com_failure(code: i32) -> String {
+    if code == hr::RPC_E_CHANGED_MODE {
+        "This thread already uses COM in single-threaded mode (a UI thread): run the test from a worker thread.".to_owned()
+    } else {
+        format!("Windows audio couldn't be initialised (error 0x{:08X}).", code as u32)
+    }
+}
+
 /// Words a start-up failure.
 pub(crate) fn describe_start_failure(f: &StartFailure) -> String {
     match f {
@@ -385,6 +400,11 @@ mod tests {
         assert!(describe_warning(&Warning::OutputIsSpeakers("Speakers (Realtek(R) Audio)".into())).contains("plays out loud"));
         assert!(describe_warning(&Warning::CableIsDefaultPlayback("CABLE Input".into())).contains("default playback"));
         assert!(describe_hr(StreamRole::Mic, hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED).contains("disconnected"));
+        assert!(describe_hr(StreamRole::FarEnd, hr::AUDCLNT_E_DEVICE_INVALIDATED).starts_with("The far-end device was disconnected"));
+        assert_eq!(StreamRole::from_u8(StreamRole::FarEnd as u8), StreamRole::FarEnd);
+        // A UI thread's COM: said plainly; anything else keeps its code
+        assert!(describe_com_failure(hr::RPC_E_CHANGED_MODE).contains("worker thread"));
+        assert_eq!(describe_com_failure(hr::E_FAIL), "Windows audio couldn't be initialised (error 0x80004005).");
     }
 
     /// The owner's ask (2026-10-31): a mic that Windows' privacy settings block offers a way to the setting;

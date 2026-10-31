@@ -2,3 +2,11 @@
 target/
 .claude/settings.local.json
 .claude/*.lock
+# No audio in the repo, ever (the owner, 2026-11-01): test audio is fetched into a local cache, see
+# doc/todo/14-test-audio-catalogue-2026-11-01.md
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+*.m4a

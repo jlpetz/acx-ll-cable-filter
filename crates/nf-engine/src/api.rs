@@ -2,6 +2,7 @@
 //! implementation behind it lives in the crate's private modules.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
 pub use nf_core::telemetry::{EngineState, MeterSnapshot, TelemetrySnapshot};
@@ -202,9 +203,119 @@ impl LatencyTest {
     }
 }
 
+/// What the cable-only latency test measures: the sweep train played on `probe_device` and found in `capture_device`, with no
+/// engine in between. One virtual cable (its input as the probe, its output as the capture), or any playback-to-recording path.
+#[derive(Clone, Debug)]
+pub struct CableLatencyRequest<'a> {
+    pub probe_device: String,
+    pub capture_device: String,
+    /// Sweeps to play (each about 1 s plus gaps). 5 by default.
+    pub repetitions: u32,
+    /// Set (e.g. by Ctrl+C) to stop the test early; it then fails with "The test was cancelled."
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl Default for CableLatencyRequest<'_> {
+    fn default() -> Self {
+        Self { probe_device: String::new(), capture_device: String::new(), repetitions: 5, cancel: None }
+    }
+}
+
+/// The cable-only latency test's result. All times in ms.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CableLatencyReport {
+    pub repetitions: u32,
+    /// Repetitions whose arrival was found with enough confidence.
+    pub valid: u32,
+    /// Per valid repetition: the probe's play-out (its AudioClock) to the arrival in the capture (its packets' QPC stamps).
+    pub cable_ms: Vec<f64>,
+    pub cable_ms_median: f64,
+    /// Max minus min of `cable_ms`.
+    pub cable_ms_spread: f64,
+    /// Lowest arrival confidence among valid repetitions, in dB.
+    pub confidence_db_min: f32,
+    /// Both streams' formats and periods, for the record.
+    pub conditions: String,
+    pub warnings: Vec<String>,
+}
+
+/// What a [`PlayTrack`]'s device is to the test, for the wording of its errors ("The probe device ...").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrackRole {
+    /// The device that feeds the filter's mic.
+    #[default]
+    Probe,
+    /// The far end's speakers in an echo test.
+    FarEnd,
+}
+
+/// One playback endpoint and what it plays.
+#[derive(Clone, Debug)]
+pub struct PlayTrack<'a> {
+    /// Endpoint id.
+    pub device: String,
+    pub role: TrackRole,
+    /// 48 kHz mono in ±1.
+    pub samples: &'a [f32],
+}
+
+/// What [`play_record`] plays and records.
+#[derive(Clone, Debug)]
+pub struct PlayRecordRequest<'a> {
+    /// The tracks, all started together after the lead. Each device plays one.
+    pub play: Vec<PlayTrack<'a>>,
+    /// The capture endpoint recorded meanwhile (id).
+    pub capture_device: String,
+    /// Silence every track plays first, in seconds: the streams settle. 1 s by default.
+    pub lead_s: f32,
+    /// The recording runs on this long after the longest track ends, for the path's latency and tails. 2 s by default.
+    pub tail_s: f32,
+    /// Set (e.g. by Ctrl+C) to stop early; it then fails with "The test was cancelled."
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl Default for PlayRecordRequest<'_> {
+    fn default() -> Self {
+        Self { play: Vec::new(), capture_device: String::new(), lead_s: 1.0, tail_s: 2.0, cancel: None }
+    }
+}
+
+/// What [`play_record`] recorded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayRecordResult {
+    /// The capture as 48 kHz mono, from the capture's start (just before the tracks start); frames missing by device
+    /// position are zeros.
+    pub recording: Vec<f32>,
+    /// The lead in frames: each track's samples start this far into its stream.
+    pub lead_frames: usize,
+    /// Jumps in the capture's device position, and the frames zero-filled for them (a jump over 1 s isn't filled).
+    pub capture_gaps: u64,
+    pub gap_frames: u64,
+    /// Times a playback stream was found empty before its track had all been written (it ran dry).
+    pub playback_underruns: u64,
+    /// The playback streams, in the request's order, and the capture stream.
+    pub playback: Vec<StreamInfo>,
+    pub capture: StreamInfo,
+}
+
 /// Lists the active capture and render endpoints.
 pub fn list_devices() -> Result<Vec<DeviceInfo>, EngineError> {
     crate::devices::list_devices()
+}
+
+/// Runs the cable-only latency test on the calling thread and blocks until it's done (about 2 s a repetition). It needs no
+/// [`Engine`]: COM (MTA) is initialised on this thread for the test, and the thread runs at MMCSS "Pro Audio" while streaming.
+/// Call it from a worker thread: on an STA (UI) thread COM is single-threaded already, and it fails.
+pub fn cable_latency_test(request: &CableLatencyRequest<'_>) -> Result<CableLatencyReport, EngineError> {
+    crate::latency_test::cable_latency_test(request)
+}
+
+/// Plays the tracks and records the capture endpoint meanwhile, on the calling thread, blocking until the longest track and
+/// the tail have played. COM (MTA) is initialised on this thread for it, and the thread runs at MMCSS "Pro Audio" while
+/// streaming. Call it from a worker thread: on an STA (UI) thread COM is single-threaded already, and it fails. A running
+/// [`Engine`] carries on meanwhile, which is how `noise-filter quality` measures it.
+pub fn play_record(request: &PlayRecordRequest<'_>) -> Result<PlayRecordResult, EngineError> {
+    crate::play_record::play_record(request)
 }
 
 /// The engine. `Send + Sync`: the UI holds it in an `Arc` and calls it from its own thread. Every

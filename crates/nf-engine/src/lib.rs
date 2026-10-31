@@ -9,7 +9,9 @@
 //!   latency readout, statistics) behind stream traits, so tests drive it with fakes.
 //! - `audio`: the audio thread itself.
 //! - `control`: start/stop/apply/status, the device listener, user-worded errors (`errors`).
-//! - `latency_test`: the sweep test runner and its analysis.
+//! - `latency_test`: the sweep tests (through the engine, and through a cable alone) and their analysis.
+//! - `play_record`: playing signals and recording a capture meanwhile (the latency tests' recorder and player, and the
+//!   quality test's `play_record`).
 //! - `timing`: QPC helpers and sample-index → QPC mapping.
 
 mod api;
@@ -21,6 +23,7 @@ mod errors;
 mod fifo;
 mod latency_test;
 mod pipeline;
+mod play_record;
 mod sched;
 mod stream;
 #[cfg(test)]

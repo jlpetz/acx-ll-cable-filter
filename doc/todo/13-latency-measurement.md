@@ -122,6 +122,26 @@ existing tools). Sources are Microsoft Learn, the Chromium and wasapi 0.26.0 sou
   output target). Some of it is probably VB-CABLE's own timestamps and play position; a cable-only measurement (a sweep
   through one cable, no app) is next, to separate the two.
 
+## Cable-only mode (built 2026-11-01, not yet run live)
+`latency --cable-only --probe "CABLE-A Input" --capture "CABLE-A Output" [--reps N]` plays the same sweep train with no engine
+(`nf_engine::cable_latency_test`, on the calling thread, COM MTA and MMCSS while streaming) and times each sweep from the
+probe's play-out (its AudioClock, as the engine test does) to its arrival in the capture (the packets' QPC stamps). The report
+is the engine test's, labelled "cable only": median, spread, each repetition, the lowest confidence, and both streams' formats
+and periods. Both tests share the play-and-record loop and the analysis. `run`'s options, `--mode` and `--through-model` are
+refused with it. Next: run it on cable A and on the output cable, and compare each cable's own figure with the virtual loop's
+input path and its app + output cable share, to see how much of the readout's excess over the design the cables account for.
+
+Reading it against the engine test (the report's "compare with" line says the same):
+- **Which figure is which.** The engine report's app figure (output capture minus the tap) already holds the output cable, so
+  its end to end is input path + app. The fair comparisons are cable-only on cable A against the input path, and cable-only on
+  the output cable against the output cable's share of app + output cable (what's left of it is the engine's own part).
+  Adding cable(A) + app + cable(output) would count the output cable twice.
+- **Same timing, different capture clients.** Both tests time the probe by its AudioClock and the arrival by the capture
+  packets' QPC stamps (the engine's tap is stamped from the mic packets' QPC too). But cable-only records with the test's own
+  shared-mode event capture at the default period, while the engine's mic opens with IAudioClient3's low-latency period and RAW
+  when it can. If VB-CABLE's stamps depend on the client's period, cable(A) can differ from the input path for that alone:
+  compare the periods on the two reports' conditions lines. A low-latency capture option for cable-only would test it.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

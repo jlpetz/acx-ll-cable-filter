@@ -12,7 +12,7 @@ included. It is built to take more noise models later without touching the engin
 | `nf-stages` | `RnnoiseStage` (nnnoiseless, with `NoisePost`: floor mix + gate) and `Aec3Stage` (sonora). Offline harness tests. | none |
 | `nf-engine` | WASAPI devices and streams, the MMCSS audio thread, drift control, telemetry, the latency readout, the latency test runner, and the control thread. Public API in `api.rs`. | yes |
 | `nf-gui` | The Reactor settings window and settings persistence. | via Reactor |
-| `nf-app` | `noise-filter.exe`: the window by default; CLI subcommands `run`, `devices`, `latency`, `process`, `bench`, `setup-large-pages`. Installs `RtAllocator` as `#[global_allocator]`. | yes |
+| `nf-app` | `noise-filter.exe`: the window by default; CLI subcommands `run`, `devices`, `latency`, `quality`, `process`, `bench`, `setup-large-pages`. Installs `RtAllocator` as `#[global_allocator]`. | yes |
 
 ## Processing
 - Fixed format inside the app: **48 kHz, mono, f32, 480-frame (10 ms) blocks** (`nf_core::BLOCK`).

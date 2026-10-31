@@ -17,7 +17,7 @@
 //!   lags), using PHAT-β weighting (`|X|^β`; β ≈ 0.7-0.8 for speech), lags limited to ±max_lag,
 //!   parabolic refinement. Returns `(lag, confidence_db)`, or `None` if either input is all zeros.
 //! - `xcorr_delay(a, b, max_lag)`: plain normalised cross-correlation peak, for waveform-preserving
-//!   paths; same return.
+//!   paths; same return. `xcorr_peak` returns the peak's height too (the correlation coefficient).
 //! - Tests: synthetic delays of 0, 1, 480, 1234.37 (fractional, via windowed-sinc delay) samples are
 //!   recovered within 0.05 samples at 40 dB SNR; with a -6 dB echo 5 ms later the first arrival is
 //!   still chosen; gcc_phat on a vowel-like harmonic signal recovers the delay.
@@ -394,21 +394,37 @@ fn chunk_max(c: &[f32]) -> f32 {
     c.iter().fold(0.0f32, |m, &v| if v > m { v } else { m })
 }
 
+/// A correlation peak: where it is, how high, and how far above the rest of the correlation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CorrelationPeak {
+    /// The delay of `b` relative to `a` in samples (positive: `b` lags).
+    pub delay: f64,
+    /// |c| at the (refined) peak. For [`xcorr_peak`] that is the correlation coefficient, 0 to 1: the
+    /// inputs are scaled by their whole energies, so 1 means `b` is `a` delayed and scaled.
+    pub peak: f32,
+    pub confidence_db: f32,
+}
+
 /// GCC-PHAT-β delay of `b` relative to `a`.
 pub fn gcc_phat(a: &[f32], b: &[f32], max_lag: usize, beta: f32) -> Option<(f64, f32)> {
     let beta = if beta.is_finite() { beta.clamp(0.0, 1.0) } else { 1.0 };
-    correlate(a, b, max_lag, Some(beta))
+    correlate(a, b, max_lag, Some(beta)).map(|p| (p.delay, p.confidence_db))
 }
 
 /// Normalised cross-correlation delay of `b` relative to `a`.
 pub fn xcorr_delay(a: &[f32], b: &[f32], max_lag: usize) -> Option<(f64, f32)> {
+    xcorr_peak(a, b, max_lag).map(|p| (p.delay, p.confidence_db))
+}
+
+/// [`xcorr_delay`] with the peak's height: the correlation coefficient at that delay.
+pub fn xcorr_peak(a: &[f32], b: &[f32], max_lag: usize) -> Option<CorrelationPeak> {
     correlate(a, b, max_lag, None)
 }
 
 /// The shared correlator: `c[τ] = Σ a[n] b[n+τ]`, weighted by `1 / |G|^β` (PHAT-β) or by the
 /// inputs' energies (`beta = None`), searched over `-max_lag..=max_lag` (and the lags the lengths
 /// allow).
-fn correlate(a: &[f32], b: &[f32], max_lag: usize, beta: Option<f32>) -> Option<(f64, f32)> {
+fn correlate(a: &[f32], b: &[f32], max_lag: usize, beta: Option<f32>) -> Option<CorrelationPeak> {
     let energy = |x: &[f32]| x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>();
     let (ea, eb) = (energy(a), energy(b));
     if !(ea > 0.0 && eb > 0.0) {
@@ -474,7 +490,7 @@ fn correlate(a: &[f32], b: &[f32], max_lag: usize, beta: Option<f32>) -> Option<
         let circular = |j: usize| j.abs_diff(i).min(m - j.abs_diff(i));
         confidence_db(peak, (0..m).filter(|&j| circular(j) > guard).map(|j| time[j]))
     };
-    Some((delay, conf))
+    Some(CorrelationPeak { delay, peak, confidence_db: conf })
 }
 
 #[cfg(test)]
@@ -687,6 +703,29 @@ mod tests {
             assert!((lag - d).abs() < 0.05, "xcorr, delay {d}: {lag}");
             assert!(conf > 20.0, "xcorr, delay {d}: confidence {conf}");
         }
+    }
+
+    /// The coefficient is 1 for a delayed, scaled copy, and falls as uncorrelated noise is added:
+    /// sqrt(S / (S + N)) for powers S and N.
+    #[test]
+    fn xcorr_peak_is_the_correlation_coefficient() {
+        let n = 24_000;
+        let src = Rng(11).noise(n + 1000, 0.1);
+        let a = src[..n].to_vec();
+        let b: Vec<f32> = delayed(&src, 300.0, 0)[..n].iter().map(|v| v * 0.5).collect();
+        let p = xcorr_peak(&a, &b, 1000).expect("found");
+        assert!((p.delay - 300.0).abs() < 0.05, "{p:?}");
+        // b lacks a's last 300 samples, and holds 300 zeros in their place: 1 - 300/24000 of the energy.
+        let expected = ((n - 300) as f64 / n as f64).sqrt();
+        assert!((f64::from(p.peak) - expected).abs() < 0.01, "{p:?}, expected {expected}");
+        let mut noisy = b.clone();
+        add(&mut noisy, &Rng(12).noise(n, 0.05), 1.0); // S = N
+        let p = xcorr_peak(&a, &noisy, 1000).expect("found");
+        assert!((f64::from(p.peak) - 0.5f64.sqrt()).abs() < 0.03, "{p:?}");
+        assert_eq!(xcorr_delay(&a, &noisy, 1000), Some((p.delay, p.confidence_db)));
+        // Unrelated noise barely correlates.
+        let p = xcorr_peak(&a, &Rng(13).noise(n, 0.1), 1000).expect("found");
+        assert!(p.peak < 0.05, "{p:?}");
     }
 
     #[test]

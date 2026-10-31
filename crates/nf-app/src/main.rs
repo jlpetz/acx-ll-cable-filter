@@ -66,6 +66,7 @@ mod exit;
 mod instance;
 mod logger;
 mod mutex;
+mod quality;
 mod wav;
 
 use std::ffi::CStr;

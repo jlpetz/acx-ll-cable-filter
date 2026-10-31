@@ -167,19 +167,20 @@ pub fn describe_status(s: &EngineStatus) -> String {
 }
 
 fn stream_line(label: &str, s: Option<&StreamInfo>) -> String {
-    let Some(s) = s else { return format!("{label:<10} --") };
+    match s {
+        Some(s) => format!("{label:<10} {}", stream_text(s)),
+        None => format!("{label:<10} --"),
+    }
+}
+
+/// "CABLE Input (48000 Hz, 2 ch, period 10.00 ms, RAW)".
+pub fn stream_text(s: &StreamInfo) -> String {
     let flags: String = [(s.low_latency, ", low-latency period"), (s.raw, ", RAW"), (s.autoconvert, ", rate converted")]
         .iter()
         .filter(|(on, _)| *on)
         .map(|(_, f)| *f)
         .collect();
-    format!(
-        "{label:<10} {} ({} Hz, {} ch, period {} ms{flags})",
-        s.device_name,
-        s.sample_rate,
-        s.channels,
-        fixed(f64::from(s.period_ms), 2)
-    )
+    format!("{} ({} Hz, {} ch, period {} ms{flags})", s.device_name, s.sample_rate, s.channels, fixed(f64::from(s.period_ms), 2))
 }
 
 #[cfg(test)]

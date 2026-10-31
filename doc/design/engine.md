@@ -207,6 +207,20 @@ Preconditions: the engine is running. `probe_device` and `capture_device` exist,
 Mode differences: Acoustic means the probe plays on the speakers. Warn if AEC is on (it's bypassed
 in passthrough anyway) and suggest a quiet room. The maths is the same.
 
+**Cable only** (`cable_latency_test`, no engine): the same train and the same play-and-record loop, blocking the calling thread
+(COM MTA; MMCSS while streaming, dropped before the analysis). Each sweep start's play-out time (the probe's AudioClock) to its
+arrival in the capture (QPC stamps), matched, filtered and summarised as above, into a `CableLatencyReport` with both streams'
+formats and periods.
+
+## Play and record (`play_record.rs`)
+`play_record` plays 48 kHz mono buffers into one or more render endpoints (each after a lead of silence, about 1 s) and records
+one capture endpoint until the longest has played plus a tail (about 2 s), blocking the calling thread (COM MTA; MMCSS while
+streaming). The renders get 200 ms buffers kept 100 ms full; capture gaps by device position are zero-filled and counted, and
+a render found empty before its track is written is an underrun. Each track has a role (`TrackRole`: the probe, or an echo
+test's far end) that its errors are worded for. A running `Engine` carries on meanwhile: `noise-filter quality` measures it that
+way. The latency tests share its recorder and player. Both blocking calls (this and `cable_latency_test`) want a worker thread:
+on an STA (UI) thread COM is single-threaded already, and they fail, saying so.
+
 ## Testing (no devices; CLAUDE.md)
 - Unit-test:
   - the FIFO ring;

@@ -5,6 +5,7 @@ mod bench;
 mod devices;
 mod latency;
 mod process;
+mod quality;
 mod run;
 mod setup;
 
@@ -25,6 +26,7 @@ pub fn run_cli(command: &Command) -> Result<(), Failure> {
         Command::Devices => devices::devices(),
         Command::Run(args) => run::run(args),
         Command::Latency(args) => latency::latency(args),
+        Command::Quality(args) => quality::quality(args),
         Command::Process(args) => process::process(args),
         Command::Bench(args) => bench::bench(args),
         Command::SetupLargePages { sid, helper } => setup::setup_large_pages(sid.as_deref(), *helper),

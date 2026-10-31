@@ -9,7 +9,7 @@
 //! its caller reads only its exit code.
 //!
 //! Ctrl+C: [`handle_ctrl_c`] turns Ctrl+C, Ctrl+Break and closing the console into
-//! [`stop_requested`], so `run` and `latency` stop the engine cleanly (`SetConsoleCtrlHandler`).
+//! [`stop_requested`], so `run`, `latency` and `quality` stop cleanly (`SetConsoleCtrlHandler`).
 //! Ctrl+C only arrives if the shell waits for the command. PowerShell doesn't wait for a windowed
 //! program: its prompt comes back, and while PSReadLine reads a line it turns the console's
 //! processed input off, so Ctrl+C becomes a keystroke. The `noise-filter-cli` launcher (launcher.rs,
@@ -153,6 +153,11 @@ pub fn stop_requested() -> bool {
     STOP.load(SeqCst)
 }
 
+/// The flag behind [`stop_requested`], for the engine's blocking tests to watch (`cancel` in their requests).
+pub fn stop_flag() -> &'static AtomicBool {
+    &STOP
+}
+
 /// The command has finished its clean-up: a closing console may end the process now.
 pub fn finished() {
     FINISHED.store(true, SeqCst);
@@ -189,7 +194,7 @@ pub fn ctrl_c_is_a_signal(mode: CONSOLE_MODE) -> bool {
     mode.contains(ENABLE_PROCESSED_INPUT)
 }
 
-/// What `run` and `latency` print, once, when Ctrl+C can't reach them.
+/// What `run`, `latency` and `quality` print, once, when Ctrl+C can't reach them.
 pub const CTRL_C_BLOCKED: &str = "warning: Ctrl+C can't reach noise-filter from this prompt. The shell didn't wait for it \
      (PowerShell doesn't wait for a windowed program) and has taken the console's input back. To stop it cleanly, close \
      this terminal window or tab. Next time, start it as `noise-filter-cli` (or as noise-filter.com, see --help): \
