@@ -54,7 +54,11 @@ pub fn start(cfg: &EngineConfig) -> Result<nf_engine::Engine, Failure> {
     console::handle_ctrl_c();
     say!("{}", describe_config(cfg));
     let engine = nf_engine::Engine::new();
-    engine.start(cfg).map_err(|e| Failure::error(format!("Couldn't start the filter: {e}")))?;
+    engine.start(cfg).map_err(|e| {
+        // A fix the app can take the user to: in a terminal, the command that opens it.
+        let hint = engine.status().remedy.map_or(String::new(), |r| format!("\nTo open the setting: start {}", r.settings_uri()));
+        Failure::error(format!("Couldn't start the filter: {e}{hint}"))
+    })?;
     say!("{}", describe_status(&engine.status()));
     Ok(engine)
 }

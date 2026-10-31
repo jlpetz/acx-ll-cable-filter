@@ -25,12 +25,12 @@ use nf_core::controls::ChainControls;
 use nf_core::telemetry::{EngineState, Telemetry};
 use wasapi::{DeviceEnumerator, DeviceEventCallbacks, DeviceEventRegistration, DeviceState, Direction, Role};
 
-use crate::api::{BufferTargets, EngineError, EngineStatus, StreamInfo};
+use crate::api::{BufferTargets, EngineError, EngineStatus, Remedy, StreamInfo};
 use crate::audio::{AudioArgs, AudioShared, CMD_STOP, Opened, Worker};
 use crate::devices::resolve;
 use crate::errors::{
     Fault, StartFailure, StreamRole, describe_fault, describe_reference_lost, describe_start_failure, describe_warning, hr,
-    no_output_message, same_device_message,
+    no_output_message, remedy_for_fault, remedy_for_start, same_device_message,
 };
 use crate::latency_test::{TapPort, tap_channel};
 use crate::sched::Com;
@@ -92,6 +92,8 @@ pub(crate) struct StatusInfo {
     pub(crate) reference_lost: bool,
     /// The endpoint it lost, for re-attaching it.
     pub(crate) lost_reference_id: Option<String>,
+    /// What the user can do about `message` (the window's button).
+    pub(crate) remedy: Option<Remedy>,
 }
 
 impl StatusInfo {
@@ -358,7 +360,8 @@ impl Inner {
                             log::warn!("{line}");
                         }
                     }
-                    *lock(&self.status) = StatusInfo { message: Some(msg), ..StatusInfo::default() };
+                    let remedy = fault.and_then(remedy_for_fault);
+                    *lock(&self.status) = StatusInfo { message: Some(msg), remedy, ..StatusInfo::default() };
                     self.telemetry.set_state(EngineState::Error);
                     // A device that went away, is busy or is being reset (a format change, an
                     // exclusive-mode app) may send no event when it's back: retry on a timer too.
@@ -774,7 +777,11 @@ fn fail(inner: &Inner, f: &StartFailure, config: &EngineConfig) -> Failed {
     if let Some(line) = streak_line(&mut lock(&inner.desired).streak, &msg, "audio start failed") {
         log::warn!("{line}");
     }
-    lock(&inner.status).message = Some(msg.clone());
+    {
+        let mut st = lock(&inner.status);
+        st.message = Some(msg.clone());
+        st.remedy = remedy_for_start(f);
+    }
     inner.telemetry.set_state(EngineState::Error);
     resend(inner, stale, deferred);
     Failed { msg, transient: f.transient() }
@@ -849,6 +856,7 @@ fn status_from(o: Opened) -> StatusInfo {
         targets: o.targets,
         reference_lost: false,
         lost_reference_id: None,
+        remedy: None,
     }
 }
 
@@ -931,6 +939,7 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
         chain_latency_ms,
         warnings: st.warnings,
         retrying: inner.armed(),
+        remedy: st.remedy,
     }
 }
 
@@ -1477,6 +1486,22 @@ mod tests {
         lock(&inner.status).reference_id = Some("hp".into());
         assert!(!inner.device_event_wants_restart(&DevEvent::Property("hp".into())));
         assert_eq!(inner.lost_reference(), None);
+    }
+
+    /// A start that Windows' microphone privacy settings refused says so in the status, with the way to
+    /// the setting; the next start clears it.
+    #[test]
+    fn a_start_refused_by_the_privacy_settings_offers_the_setting() {
+        let c = cfg(Some("mic1"), Some("cable"), None, false);
+        let inner = Inner::new();
+        lock(&inner.desired).config = Some(c.clone());
+        let f = fail(&inner, &StartFailure::Open { role: StreamRole::Mic, hr: hr::E_ACCESSDENIED }, &c);
+        assert!(!f.transient, "waits for the user, not a timer");
+        let st = status(&inner);
+        assert_eq!(st.remedy, Some(Remedy::MicPrivacy));
+        assert!(st.message.is_some_and(|m| m.contains("Privacy")));
+        fail(&inner, &StartFailure::NotFound(StreamRole::Mic), &c);
+        assert_eq!(status(&inner).remedy, None);
     }
 
     /// verify-gui NEW-2: a failed start records the wait before it publishes Error, so a status read

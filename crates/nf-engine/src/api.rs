@@ -80,6 +80,32 @@ pub struct EngineStatus {
     pub warnings: Vec<String>,
     /// Stopped by a fault but armed: the engine retries by itself (timed backoff and device events).
     pub retrying: bool,
+    /// What the user can do about the error in `message`, when the app can take them there.
+    pub remedy: Option<Remedy>,
+}
+
+/// A fix for a failure that the app can take the user to (the window offers it as a button).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remedy {
+    /// Windows' microphone privacy settings keep desktop apps from recording: the mic, or any recording
+    /// endpoint (a virtual cable's recording side counts as a microphone).
+    MicPrivacy,
+}
+
+impl Remedy {
+    /// The button's text.
+    pub fn label(self) -> &'static str {
+        match self {
+            Remedy::MicPrivacy => "Open microphone privacy settings",
+        }
+    }
+
+    /// The Settings page that fixes it, for the shell to open (`start ms-settings:...` in a terminal).
+    pub fn settings_uri(self) -> &'static str {
+        match self {
+            Remedy::MicPrivacy => "ms-settings:privacy-microphone",
+        }
+    }
 }
 
 /// The buffer fills the engine holds (engine.md "Targets"), for diagnostics. Zero while stopped.

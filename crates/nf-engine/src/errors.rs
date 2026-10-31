@@ -4,6 +4,8 @@
 //! control thread turns it into a sentence here. Everything in this module is pure.
 
 /// HRESULTs we word specially (values from `windows::Win32::Media::Audio` / `Foundation`).
+use crate::api::Remedy;
+
 pub(crate) mod hr {
     pub(crate) const E_FAIL: i32 = 0x8000_4005_u32 as i32;
     pub(crate) const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
@@ -134,6 +136,23 @@ pub(crate) fn transient_hr(code: i32) -> bool {
             | hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED
             | hr::E_NOTFOUND
     )
+}
+
+/// The fix the app can offer for a failed start: Windows refused a recording endpoint, which is what the
+/// microphone privacy settings do to desktop apps.
+pub(crate) fn remedy_for_start(f: &StartFailure) -> Option<Remedy> {
+    match f {
+        StartFailure::Open { role: StreamRole::Mic | StreamRole::Capture, hr: hr::E_ACCESSDENIED } => Some(Remedy::MicPrivacy),
+        _ => None,
+    }
+}
+
+/// The same for a fault that stopped a run (access turned off while recording).
+pub(crate) fn remedy_for_fault(f: Fault) -> Option<Remedy> {
+    match f {
+        Fault::Stream { role: StreamRole::Mic | StreamRole::Capture, hr: hr::E_ACCESSDENIED } => Some(Remedy::MicPrivacy),
+        _ => None,
+    }
 }
 
 /// Whether an endpoint or interface name is one of the virtual cables users install (VB-Audio's
@@ -366,6 +385,21 @@ mod tests {
         assert!(describe_warning(&Warning::OutputIsSpeakers("Speakers (Realtek(R) Audio)".into())).contains("plays out loud"));
         assert!(describe_warning(&Warning::CableIsDefaultPlayback("CABLE Input".into())).contains("default playback"));
         assert!(describe_hr(StreamRole::Mic, hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED).contains("disconnected"));
+    }
+
+    /// The owner's ask (2026-10-31): a mic that Windows' privacy settings block offers a way to the setting;
+    /// other failures, and other devices refused, don't.
+    #[test]
+    fn a_blocked_mic_points_to_the_privacy_settings() {
+        let denied = |role| StartFailure::Open { role, hr: hr::E_ACCESSDENIED };
+        assert_eq!(remedy_for_start(&denied(StreamRole::Mic)), Some(Remedy::MicPrivacy));
+        assert_eq!(remedy_for_start(&denied(StreamRole::Capture)), Some(Remedy::MicPrivacy));
+        assert_eq!(remedy_for_start(&denied(StreamRole::Output)), None);
+        assert_eq!(remedy_for_start(&StartFailure::Open { role: StreamRole::Mic, hr: hr::AUDCLNT_E_DEVICE_IN_USE }), None);
+        assert_eq!(remedy_for_start(&StartFailure::NotFound(StreamRole::Mic)), None);
+        assert_eq!(remedy_for_fault(Fault::Stream { role: StreamRole::Mic, hr: hr::E_ACCESSDENIED }), Some(Remedy::MicPrivacy));
+        assert_eq!(remedy_for_fault(Fault::MicStalled), None);
+        assert_eq!(Remedy::MicPrivacy.settings_uri(), "ms-settings:privacy-microphone");
     }
 
     /// wasapi/E: only the virtual cables people install count as cables; a real card's mic and

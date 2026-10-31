@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use nf_engine::{
     DeviceInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress, LatencyReport, LatencyTest,
-    LatencyTestRequest,
+    LatencyTestRequest, Remedy,
 };
 use nf_mem::privilege::{HELPER_NOT_ELEVATED, helper_args};
 use windows_reactor::*;
@@ -131,6 +131,8 @@ pub(crate) enum Msg {
     // Window
     CloseNotice,
     CloseWarnings,
+    /// Open the Settings page that fixes the engine's error.
+    OpenRemedy(Remedy),
     Size(WindowSize),
 }
 
@@ -345,6 +347,27 @@ fn stage_line(stage: &str, fraction: f32) -> String {
 fn setup_large_pages() -> Result<u32, String> {
     let sid = nf_mem::privilege::current_user_sid()?;
     nf_mem::privilege::run_elevated(&helper_args(&sid))
+}
+
+/// The fix to offer for the engine's error: only while it isn't running (a start or a run that failed).
+fn remedy_offered(status: &EngineStatus) -> Option<Remedy> {
+    status.remedy.filter(|_| !matches!(status.state, EngineState::Running | EngineState::Starting))
+}
+
+/// Opens a Settings page (an `ms-settings:` URI) through the shell.
+fn open_settings(uri: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+    let target = HSTRING::from(uri);
+    // SAFETY: plain arguments; `target` and the literals are NUL-terminated and outlive the call.
+    let code = unsafe { ShellExecuteW(None, w!("open"), &target, None, None, SW_SHOWNORMAL) }.0 as isize;
+    // ShellExecute returns a value above 32 on success, an error code otherwise.
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("Windows couldn't open {uri} (error {code}). Open Settings > Privacy & security > Microphone yourself."))
+    }
 }
 
 /// The notice for a helper that exited with `code` (not 0).
@@ -755,6 +778,11 @@ impl Component for Window {
             Msg::EnableLargePages => self.enable_large_pages(context),
             // InfoBar.IsOpen has no feedback: clear it, so the next notice is a change Reactor applies
             Msg::CloseNotice => self.notice = None,
+            Msg::OpenRemedy(remedy) => {
+                if let Err(e) = open_settings(remedy.settings_uri()) {
+                    self.notice = Some(Notice::new(InfoBarSeverity::Error, "Couldn't open Settings", e));
+                }
+            }
             // Also raised when the bar closes because the warnings cleared: then there's nothing to hide
             Msg::CloseWarnings => {
                 if self.warnings.shown(&self.status).is_some() {
@@ -822,19 +850,27 @@ impl Window {
         ))
     }
 
+    /// The notice, and under it the button for a fix the app can take the user to (Reactor's InfoBar has
+    /// no action button of its own).
     fn notice_bar(&self, context: &ViewContext<Self>) -> View {
         let (severity, title, message) = match &self.notice {
             Some(n) => (n.severity, n.title, n.message.clone()),
             None => (InfoBarSeverity::Informational, "", String::new()),
         };
-        InfoBar::new()
-            .severity(severity)
-            .title(title)
-            .message(message)
-            .is_open(self.notice.is_some())
-            .is_closable(true)
-            .on_closed(context.callback(|()| Msg::CloseNotice))
-            .into()
+        let remedy = remedy_offered(&self.status);
+        StackPanel::new().spacing(8.0).children((
+            InfoBar::new()
+                .severity(severity)
+                .title(title)
+                .message(message)
+                .is_open(self.notice.is_some())
+                .is_closable(true)
+                .on_closed(context.callback(|()| Msg::CloseNotice)),
+            match remedy {
+                Some(r) => Button::new().on_click(context.callback(move |()| Msg::OpenRemedy(r))).content(r.label()),
+                None => View::empty(),
+            },
+        ))
     }
 
     /// The engine's warnings while it runs; closed when they clear (or the user closes it).
@@ -1083,6 +1119,18 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner's ask (2026-10-31): a start that the microphone privacy settings refused offers a button to
+    /// them, until the engine runs again.
+    #[test]
+    fn a_blocked_mic_offers_the_privacy_settings() {
+        let failed = EngineStatus { state: EngineState::Error, remedy: Some(Remedy::MicPrivacy), ..EngineStatus::default() };
+        assert_eq!(remedy_offered(&failed), Some(Remedy::MicPrivacy));
+        let running = EngineStatus { state: EngineState::Running, ..failed.clone() };
+        assert_eq!(remedy_offered(&running), None);
+        assert_eq!(remedy_offered(&EngineStatus::default()), None);
+        assert_eq!(Remedy::MicPrivacy.label(), "Open microphone privacy settings");
+    }
 
     /// app-privilege F3: the window's relaunch is marked as the helper, so with UAC off it stops
     /// with code 4 instead of relaunching itself, and the notice explains that code.
