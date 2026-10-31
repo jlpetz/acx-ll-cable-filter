@@ -391,6 +391,11 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     let out_t = timed(&out, find_sweep_arrivals(&out.samples, &sweep, reps, min_spacing));
     let period_hns = (sweep.signal.len() as f64 + 2.0 * GAP_S as f64 * fs) / fs * HNS_PER_S;
     let mut report = build_report(req.repetitions, &probe_t, &tap_t, &out_t, period_hns);
+    if report.valid < req.repetitions {
+        // Which side lost the sweeps, and how loud each recording was: tells a silent or muted device
+        // from a garbled one.
+        report.warnings.push(found_line(req.repetitions, tap_t.len(), &tap.samples, out_t.len(), &out.samples));
+    }
 
     let tel = inner.telemetry.snapshot();
     report.readout_ms_median = tel.latency_valid.then_some(tel.latency_ms_median);
@@ -401,6 +406,19 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.warnings.extend(mode_warnings(req, inner.controls.aec.enabled.load(Relaxed)));
     shared.running(1.0, "Done");
     Ok(report)
+}
+
+/// "Sweeps found: 5 of 5 at the app's input (peak -12.0 dBFS), 0 of 5 in the output capture (peak -inf dBFS)."
+fn found_line(reps: u32, tap_found: usize, tap: &[f32], out_found: usize, out: &[f32]) -> String {
+    let peak = |x: &[f32]| {
+        let p = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if p > 0.0 { format!("{:.1} dBFS", 20.0 * p.log10()) } else { "silent".to_owned() }
+    };
+    format!(
+        "Sweeps found: {tap_found} of {reps} at the app's input (peak {}), {out_found} of {reps} in the output capture (peak {}).",
+        peak(tap),
+        peak(out)
+    )
 }
 
 fn drain_tap(rx: &mut Consumer<TapItem>, rec: &mut Recording) {
@@ -641,6 +659,13 @@ mod tests {
         assert!((r.app_ms_median - 30.5).abs() < 1e-9);
         assert_eq!(r.input_path_ms_median, None);
         assert_eq!(r.end_to_end_ms_median, None);
+    }
+
+    /// Which side lost the sweeps, in the report's words.
+    #[test]
+    fn the_found_line_names_each_side() {
+        let line = found_line(5, 5, &[0.0, 0.25, -0.5], 0, &[0.0; 4]);
+        assert_eq!(line, "Sweeps found: 5 of 5 at the app's input (peak -6.0 dBFS), 0 of 5 in the output capture (peak silent).");
     }
 
     #[test]
