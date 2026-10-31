@@ -102,6 +102,26 @@ existing tools). Sources are Microsoft Learn, the Chromium and wasapi 0.26.0 sou
 - **Scope:** we measure up to the cable output. Discord's own capture and jitter buffering is out of
   reach.
 
+## Measurements
+**Dev VM, VB-CABLE, virtual loop** (2026-10-31 to 11-01): `latency --probe "CABLE-A Input" --capture "CABLE Output" --mic
+"CABLE-A Output" --output "CABLE Input" --mode virtual --reps 5`, release build at x86-64-v3, the chain in passthrough
+(RNNoise's 10 ms offset). Each row is one run.
+
+| Cable Latency (base and A) | Probe to app input | App + output cable | End to end | App's live readout | Cable errors |
+|---|---|---|---|---|---|
+| 7168 (default) | 60.1 ms | 125.4 ms | 185.4 ms | 63.1 ms | not watched |
+| 3 x 512 or 768 | 52-59 ms | 118-124 ms | 175-179 ms | 56-66 ms | rising; b256 and b512 red |
+| 3 x 1024 = 3072 | 56.0 / 61.8 ms | 123.2 / 127.3 ms | 179.0 / 189.6 ms | 66.3 / 63.7 ms | none |
+
+- VB-CABLE settles at about 55-60 ms a hop whatever its Latency setting, and wanders by 5-10 ms from run to run, which is as
+  large as any difference between settings. Cable B as the output, at the default, measured 125.4 ms app + cable with a
+  17 ms spread between sweeps.
+- After a Latency change both cables passed only silence ("peak silent" in the report) until `pnputil /restart-device` on
+  their devices.
+- The app's live readout (56-66 ms) is above its design (about 32-42 ms: a block of input, the chain's 10 ms, the 22 ms
+  output target). Some of it is probably VB-CABLE's own timestamps and play position; a cable-only measurement (a sweep
+  through one cable, no app) is next, to separate the two.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

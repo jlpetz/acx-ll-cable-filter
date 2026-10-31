@@ -31,7 +31,12 @@
 ## User setup guide
 0. Requirements: Windows 11 and an x86-64-v3 CPU (most Intel Core from 2013 and AMD from 2017 on; see Packaging). On another CPU noise-filter says at start-up which features it lacks, and exits.
 1. Install VB-Cable (the user's job; the app never installs drivers).
-   - Set its latency to about 1440-1536 samples (the default 7168 can add up to 149 ms at 48 kHz).
+   - Set its Latency in its control panel to 3 x the largest buffer its statistics show in use (the b128/b256/b512/b1024
+     counters; a bucket turns red, and its error count rises, when the Latency is too small for it). On the dev VM that is
+     3 x 1024 = 3072 samples: 3 x 512 dropped audio. Lowering it barely shortens the delay (measured 2026-11-01, #13), so
+     don't go below what stays error-free.
+   - After changing it, restart the cable (or reboot): on the dev VM the cable passed only silence until its device was
+     restarted.
    - Set CABLE Input and CABLE Output to 48 kHz in Windows Sound settings, to match the app.
    - Run the control panel as administrator. The manual says Internal SR changes persist only then; the latency setting probably does too (unverified; check once on a desktop).
 2. Don't make CABLE Input the default playback device. In Discord, Teams or OBS, select CABLE Output as the mic.
