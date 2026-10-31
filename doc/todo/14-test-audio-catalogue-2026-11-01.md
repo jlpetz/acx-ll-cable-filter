@@ -3,6 +3,16 @@ licence verifier, then this synthesis; no claim was refuted). Nothing has been d
 
 # noise-filter test-audio catalogue (checked 2026-11-01)
 
+**The owner's decisions (2026-11-01):**
+- **No audio in the repo, ever:** it's bloat. The repo keeps this catalogue (links) and a fetch script; the audio lives in a local
+  cache only. Read "commit" in the starter set below as "fetch to the local cache".
+- **A small local starter set** to get going; the rest of the catalogue stays as links until a test needs it.
+- **Whatever the licences allow, used locally:** we never re-host or re-share. The project is free and non-commercial, so
+  non-commercial (NC) sets are fine for local testing too. Open question for later (TODO #7): whether NC terms follow model
+  weights trained on NC data, if we ever publish such weights.
+- **Freesound:** the owner downloads the five CC0 originals (448209, 242042, 273620, 337101, 370973) by hand into their
+  Downloads folder; the fetch script picks them up from there by their `<id>__` file names.
+
 **We have no audio yet.** A local `find` under `C:\Users\Administrator\Downloads` turned up no WAV, FLAC or MP3 files, so all test audio has to be fetched. "(inference)" marks my own reasoning, not something a source says. **NC** = non-commercial, **SA** = share-alike, **ND** = no derivatives. "Repo" = may we commit a small subset to our MIT OR Apache-2.0 repo.
 
 Licence texts: [CC0](https://creativecommons.org/publicdomain/zero/1.0/legalcode), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode), [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/legalcode), [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/), [CC BY-SA 3.0 AU](https://creativecommons.org/licenses/by-sa/3.0/au/), [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode).
