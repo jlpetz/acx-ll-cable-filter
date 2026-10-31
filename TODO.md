@@ -153,6 +153,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built and first run 2026-11-01: the noise test works (-27 dB noise, -0.6 dB speech); the echo test found #10's reference gaps.
 - Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
+- Test audio (2026-11-01): `python -I tools/fetch_test_audio.py` fetches a licence-checked starter set (19 takes: speech, noise, music, an AEC pair) into `%LOCALAPPDATA%
+oise-filter	est-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-catalogue-2026-11-01.md`.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
 **Next**: rerun the echo test once #10's gaps are fixed. Phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`

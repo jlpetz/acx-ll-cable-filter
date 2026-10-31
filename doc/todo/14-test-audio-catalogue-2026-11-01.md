@@ -1,5 +1,5 @@
 <!-- TODO 14 detail: the test-audio catalogue of 2026-11-01 (a research workflow: four searches, each checked by an adversarial
-licence verifier, then this synthesis; no claim was refuted). Nothing has been downloaded yet. -->
+licence verifier, then this synthesis; no claim was refuted). Section 5 fetches the starter set. -->
 
 # noise-filter test-audio catalogue (checked 2026-11-01)
 
@@ -13,7 +13,7 @@ licence verifier, then this synthesis; no claim was refuted). Nothing has been d
 - **Freesound:** the owner downloads the five CC0 originals (448209, 242042, 273620, 337101, 370973) by hand into their
   Downloads folder; the fetch script picks them up from there by their `<id>__` file names.
 
-**We have no audio yet.** A local `find` under `C:\Users\Administrator\Downloads` turned up no WAV, FLAC or MP3 files, so all test audio has to be fetched. "(inference)" marks my own reasoning, not something a source says. **NC** = non-commercial, **SA** = share-alike, **ND** = no derivatives. "Repo" = may we commit a small subset to our MIT OR Apache-2.0 repo.
+**The starter set is fetched into a local cache by `tools/fetch_test_audio.py`: see section 5.** "(inference)" marks my own reasoning, not something a source says. **NC** = non-commercial, **SA** = share-alike, **ND** = no derivatives. "Repo" = may we commit a small subset to our MIT OR Apache-2.0 repo.
 
 Licence texts: [CC0](https://creativecommons.org/publicdomain/zero/1.0/legalcode), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode), [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/legalcode), [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/), [CC BY-SA 3.0 AU](https://creativecommons.org/licenses/by-sa/3.0/au/), [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode).
 
@@ -120,12 +120,13 @@ Everything ends up as 48 kHz 16-bit mono.
 | Dog | 337101 "Group_of_Dogs_Barking.WAV" by ivolipa: CC0, 48 kHz 24-bit stereo WAV, 21.8 s, 6.0 MB | Freesound | commit | same as keyboard |
 | Cafe | 370973 "coffee shop ambience" by waweee: CC0, 48 kHz 24-bit mono WAV, 4:56, 40.7 MB | Freesound | commit a 30 s excerpt | same as keyboard |
 | Cafe, standard reference | DEMAND `PCAFETER_48k.zip`, member `ch01.wav`, 300 s | [Zenodo](https://zenodo.org/records/1227121/files/PCAFETER_48k.zip): zip is 314,117,272 B, md5 b7b8b10f41b747cd0fd3849db13cebd2; the member is ~17-23 MB by Range | fetch | "DEMAND, J. Thiemann, N. Ito, E. Vincent, doi:10.5281/zenodo.1227121, CC BY-SA 3.0. Excerpt, converted." Anything mixed with it stays **SA**. |
-| Music | Open Goldberg file "Kimiko Ishizaka - J.S. Bach- -Open- Goldberg Variations, BWV 988 (Piano) - 05 Variatio 4 a 1 Clav..flac": 68.57 s, 19,963,388 B, sha1 336565df01932980923ba966ca4b6093f8825f3 | [archive.org metadata](https://archive.org/metadata/OpenGoldbergVariations) | commit a 20 s excerpt | courtesy: "Kimiko Ishizaka, Open Goldberg Variations, CC0" |
+| Music | Open Goldberg file "Kimiko Ishizaka - J.S. Bach- -Open- Goldberg Variations, BWV 988 (Piano) - 05 Variatio 4 a 1 Clav..flac": 68.57 s, 19,963,388 B, sha1 336565dfc01932980923ba966ca4b6093f8825f3 | [archive.org metadata](https://archive.org/metadata/OpenGoldbergVariations) | commit a 20 s excerpt | courtesy: "Kimiko Ishizaka, Open Goldberg Variations, CC0" |
 | RIRs | 4 simulated at 48 kHz with pyroomacoustics: small office, living room, car, and a laptop speaker-to-mic path. Plus the real Motus `best_of.zip` | [Motus](https://zenodo.org/records/4923187), 461.5 MB | simulated: commit; Motus: fetch | "Motus, doi:10.5281/zenodo.4923187, CC BY 4.0; one capsule extracted and resampled" |
 | AEC double talk | (a) Our own: the TSP FA take as near end and a VCTK male as far end, passed through a simulated echo path, which gives ground truth. (b) One double-talk mic + loopback pair from the ICASSP 2022 test set. (c) 2-3 noise-free `fullband_synthetic` examples picked from `meta.csv`, each 5 files of 960,044 B | (b) GitHub LFS media URL; (c) the Azure zip by Range | (a) commit; (b) and (c) fetch | (a) the TSP and VCTK lines; (b) and (c) cite the AEC Challenge, which grants no licence |
 | Benchmarks | VoiceBank-DEMAND test set (325 MB) to check STOI against ~0.922 (PESQ only if you accept its notice); DNS4 blind `testclips/` (825 MB) for DNSMOS | links in section 1 | fetch | Valentini-Botinhao (2017), doi:10.7488/ds/2117, CC BY 4.0 |
 
 ## 3. Fetch plan: `tools/fetch_test_audio.py`
+The plan as proposed. Section 5 describes what was built and where it differs.
 - **Sources file** (`tools/test_audio_sources.json`, committed). For each item it holds:
   - the URL and the kind (`file`, `zip-member` or `tar-prefix`), plus the member path;
   - the expected size and SHA-256;
@@ -160,3 +161,24 @@ Everything ends up as 48 kHz 16-bit mono.
 - **LibriVox** is public domain only in the US; outside it, the authors and translators should have died at least 70 years ago. Fetch the `_128kb.mp3` original, not archive.org's VBR transcode.
 - **ACE:** CC BY versus BY-ND is unresolved, so don't ship modified copies.
 - **Installer:** anything bundled needs its BSD text, CC BY credits and SA licence text in the app's NOTICE.
+
+## 5. Fetching the starter set
+`tools/fetch_test_audio.py` fetches section 2's starter set into a local cache. `tools/test_audio_sources.json` holds each source's URL, licence and attribution, every file's pinned size and SHA-256, and each output's recipe. Nothing it fetches goes in the repo; `.gitignore` refuses audio files anyway.
+1. **Dependencies** (once): `python -m pip install numpy soundfile soxr`. Don't use `--user`: `python -I` leaves out the user site-packages.
+2. **Freesound** (once, by hand, since it needs a login): download the originals of [448209](https://freesound.org/s/448209/), [242042](https://freesound.org/s/242042/), [273620](https://freesound.org/s/273620/), [337101](https://freesound.org/s/337101/) and [370973](https://freesound.org/s/370973/) into your Downloads folder under Freesound's names (`<id>__<user>__<title>.<ext>`), or anywhere else plus `--freesound-dir`. Use each page's Download button (the original), not the preview player, which fails the pin. The script copies them into the cache and checks them against their pins. A missing clip is named with its link and skipped.
+3. **Run** `python -I tools/fetch_test_audio.py` (`--dir` for another cache). The first run took 195 s on the dev box: 71 requests, 74 MB. A second run only checks hashes and fetches nothing. Failed requests (HTTP 429 and 5xx, dropped connections) are tried up to 6 times, 5-80 s apart: archive.org has answered 500 three times running. A take whose input is missing is left out of `manifest.json`, and its old file is removed from `wav48/`.
+
+The cache is `%LOCALAPPDATA%\noise-filter\test-audio`:
+- `raw/`: the files as published, 132 MB. Zip members come by HTTP Range and are CRC-checked: 6.5 MB of TSP's 254 MB zip, 20 MB of VCTK's 11.75 GB, 19.6 MB of DEMAND's 314 MB.
+- `wav48/`: 19 takes of 48 kHz mono 16-bit PCM, 104 MB and 19 minutes:
+  - speech: `speech_tsp_*` (6 speakers, 14.5-17 s) and `speech_vctk_p225/p226/p237/p248` (mic1, utterances 003-008, 38-48 s), each joined with 0.4 s gaps and 10 ms fades;
+  - noise: `noise_cafe_demand_pcafeter_ch01` (300 s) and `noise_keyboard/fan/aircon/dogs/cafe_<id>`;
+  - music: `music_goldberg_var04` (69 s, from 96 kHz stereo);
+  - echo: the ICASSP 2022 double-talk pair `aec_icassp2022_dt_00113069_mic`/`_lpb` (39 s; tier `unlicensed`, local only).
+- `manifest.json`: per take, its source URLs, licence, attribution, changes, the raw and converted SHA-256s, rate and duration. `ATTRIBUTION.md` is generated from it, with the TSP notice.
+
+Takes are whole recordings, not section 2's excerpts, since the cache has no size limit. Freesound 337101 and the AEC mic file are clipped in the originals.
+
+**Where this differs from section 3's plan** (our choices, not the owner's): the AEC pair (tier `unlicensed`) is fetched by default, since there are no tier flags (`--unlicensed`, `--non-commercial`) yet. The kinds are `zip`, `file` and `freesound`; there's no tar reader yet. A recipe joins, fades and trims, but has no gain or channel choice (channels are averaged) and does no level normalisation.
+
+To add a source, write its entry and outputs without `size`/`sha256` and run once with `--pin`: that fetches it, checks what it can (CRC-32, a publisher's SHA-1) and records the pins.

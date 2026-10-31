@@ -1,0 +1,380 @@
+{
+  "schema": 1,
+  "about": [
+    "The test-audio starter set that tools/fetch_test_audio.py fetches into a local cache (TODO 14; the catalogue is",
+    "doc/todo/14-test-audio-catalogue-2026-11-01.md). Kinds: 'zip' fetches members of a remote zip by HTTP Range, 'file' downloads",
+    "whole files, 'freesound' picks up the owner's own downloads (<id>__*). Every file is pinned by size and SHA-256 (python -I",
+    "tools/fetch_test_audio.py --pin fills in missing pins). Each output joins its inputs in order, each faded in and out over",
+    "fade_ms and with gap_s of silence between them, optionally cut by start_s and length_s, and becomes wav48/<name>.wav, 48 kHz",
+    "mono 16-bit. Tiers: 'permissive' has a licence that allows our use; 'unlicensed' has none, so it stays local."
+  ],
+  "sources": [
+    {
+      "id": "tsp",
+      "title": "TSP Speech Database (48 kHz)",
+      "page": "https://www.mmsp.ece.mcgill.ca/Documents/Data/TSP-Speech-Database/",
+      "kind": "zip",
+      "url": "https://www.mmsp.ece.mcgill.ca/Documents/Data/TSP-Speech-Database/48k.zip",
+      "size": 253816919,
+      "licence": "Simplified BSD (2-clause)",
+      "licence_url": "https://www.mmsp.ece.mcgill.ca/Documents/Data/TSP-Speech-Database/Licence.html",
+      "tier": "permissive",
+      "attribution": "Speech from the TSP Speech Database, Copyright (c) 2018 Peter Kabal; Simplified BSD licence (the notice is below).",
+      "notice": [
+        "Copyright (c) 2018 Peter Kabal",
+        "All rights reserved.",
+        "",
+        "Redistribution and use in source and binary forms, with or without modification,",
+        "are permitted provided that the following conditions are met:",
+        "",
+        "1. Redistributions of source code must retain the above copyright notice, this",
+        "list of conditions and the following disclaimer.",
+        "",
+        "2. Redistributions in binary form must reproduce the above copyright notice,",
+        "this list of conditions and the following disclaimer in the documentation and/or",
+        "other materials provided with the distribution.",
+        "",
+        "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"",
+        "AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE",
+        "IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE",
+        "ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE",
+        "LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR",
+        "CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF",
+        "SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS",
+        "INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN",
+        "CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING",
+        "IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY",
+        "OF SUCH DAMAGE."
+      ],
+      "files": [
+        {"name": "48k/FA/FA01_01.wav", "size": 243994, "sha256": "9d12d380933d2cd14a0f9cdb4fc54f3d409d449f1d84b62c1701ba7868377727"},
+        {"name": "48k/FA/FA01_02.wav", "size": 220270, "sha256": "2a665eb3b2ab5757112eabd73493f743a18aa70a1a5a4b0e35a5fc8d2c905db4"},
+        {"name": "48k/FA/FA01_03.wav", "size": 197450, "sha256": "cd6b930545bad1128fcc876bcb6cb926f59626a9d05865e7c61db1416023045c"},
+        {"name": "48k/FA/FA01_04.wav", "size": 243992, "sha256": "defcf844dc9d56e0441f9344abd4b1394871c6dd3eec21722ec630130fe05b1e"},
+        {"name": "48k/FA/FA01_05.wav", "size": 261326, "sha256": "6f8c7a9f4a32ccb703c10ba7d7c9192aaa1fbf8fb0a1bcc61c85fccf22592c87"},
+        {"name": "48k/FA/FA01_06.wav", "size": 249466, "sha256": "4a156d3bcd2ac9fb891e1a2719f6721af958ad3ebfcc846ca0b055c1c44afe99"},
+        {"name": "48k/FB/FB07_01.wav", "size": 242384, "sha256": "cdbea0bb2f8d9ade101a26929256d913d9b60d88b21aceaf14c890f7a09fad97"},
+        {"name": "48k/FB/FB07_02.wav", "size": 236034, "sha256": "869c38e124f1dc6e3e3d5876b7476d71a52ed571caa6e8f6dc487d42e6521364"},
+        {"name": "48k/FB/FB07_03.wav", "size": 222436, "sha256": "86c93f4859fbcaaca8a0abe2645214b4b572ee10869abec6553c566d22edce35"},
+        {"name": "48k/FB/FB07_04.wav", "size": 235132, "sha256": "f3c50e92d1a54d6ae3de097768f157812578225d5af72e032228f1dcb209208b"},
+        {"name": "48k/FB/FB07_05.wav", "size": 226060, "sha256": "1d30ce1cc360354d4c1941f6453bf6c53241d26914650feba8d944377aa95c55"},
+        {"name": "48k/FB/FB07_06.wav", "size": 249634, "sha256": "d3b86bd504fc25887aeb3c948a45d656f0453822ba69f35caba291093daa083f"},
+        {"name": "48k/FC/FC13_01.wav", "size": 192516, "sha256": "9031deb5f94168ac69f99f87db0f580661084f8436446fe8bf2f20542efda22d"},
+        {"name": "48k/FC/FC13_02.wav", "size": 223348, "sha256": "b5f25be2d07bf5daddaf80e6d50f6c1066e8cedcc099b979996de44eee7a748e"},
+        {"name": "48k/FC/FC13_03.wav", "size": 216094, "sha256": "792de0036908811ff3faa279b042c57c3657854b2ee852908a3b2533855664da"},
+        {"name": "48k/FC/FC13_04.wav", "size": 228784, "sha256": "7519ca9b26dbf500af8d0c2d26799a583eab10e12ebe393e924df69a9e769d62"},
+        {"name": "48k/FC/FC13_05.wav", "size": 207026, "sha256": "eafc283a40321c5cfa7193f772b1764d576399653e5cd9beae517c6748148c37"},
+        {"name": "48k/FC/FC13_06.wav", "size": 236036, "sha256": "0c872e957d858eefaaa67243b98c36a2ffee5201cc496bf4e34d0644838cb2e0"},
+        {"name": "48k/MA/MA01_01.wav", "size": 228782, "sha256": "f004f68959f7e5c1f70fd569fd7899d076b7847faa2f5ac784642e117ee9b815"},
+        {"name": "48k/MA/MA01_02.wav", "size": 224250, "sha256": "9da6aadbdb91a7bb42190f701c3a55d43299a37e6bbb69e2a3fd70d584b9b03b"},
+        {"name": "48k/MA/MA01_03.wav", "size": 179826, "sha256": "6bf43bbc2d4e5223ac3a631b12fe22ee0c8fe413052e609e8e4e142590e6076b"},
+        {"name": "48k/MA/MA01_04.wav", "size": 245096, "sha256": "00a485ca59b208a2536ab22a601910cc885df1c1b70b0174485dfb8b8f50b28c"},
+        {"name": "48k/MA/MA01_05.wav", "size": 223336, "sha256": "370b98d78baaeb1e88ef5abf3a2b1fe165cb174b426d8436a93aa796e4e50c7f"},
+        {"name": "48k/MA/MA01_06.wav", "size": 206212, "sha256": "90db1d4f27d4a9eb6c2bc27a14c25af468e4c77234d1e761588edaa893f1535e"},
+        {"name": "48k/MB/MB07_01.wav", "size": 233952, "sha256": "85bc4e55ac17a89258e30fd76f8fe4a8761fbe1b926a8eab3defdb719cce7194"},
+        {"name": "48k/MB/MB07_02.wav", "size": 224824, "sha256": "3263b1b854fb44b4879ea7510b10d2b3df5d71fcc8a121eb860693ac6c83b01a"},
+        {"name": "48k/MB/MB07_03.wav", "size": 227560, "sha256": "ef1e608d6694cbdb0e84b965b432dcc2792e05703e7dae1aa1442d2ddd0b3b8d"},
+        {"name": "48k/MB/MB07_04.wav", "size": 237604, "sha256": "0894b713e023e54e22423f58a114dfc21abe22c0424fc0aae4d49c29a82ea33c"},
+        {"name": "48k/MB/MB07_05.wav", "size": 217520, "sha256": "95d6178eae7cc68176bf4faf83cb532bfc665ab55e7cbef508ea9b34bb05f681"},
+        {"name": "48k/MB/MB07_06.wav", "size": 258588, "sha256": "e022da0b428622711d7d69cbaa03ef9570a83b74517fc9110780087c2ea687fe"},
+        {"name": "48k/MC/MC13_01.wav", "size": 166222, "sha256": "95b82510a9a28b020f2330e575cdabcf404ed152dfd479b6aa9509e6fcd1b1a1"},
+        {"name": "48k/MC/MC13_02.wav", "size": 189802, "sha256": "ffaabe8b2606e2d9351ab98efa35a51188fda2251481f794a4b267e7283bdbbc"},
+        {"name": "48k/MC/MC13_03.wav", "size": 201586, "sha256": "f1e894fae656197fb918c280d4323b665e51e2ea851a9a8e0c6c9b5dd9ed3d32"},
+        {"name": "48k/MC/MC13_04.wav", "size": 207932, "sha256": "32c4a03ddb052b775f651b5572e952fa0f4238a2884be4fc493c45b3f3fd85fc"},
+        {"name": "48k/MC/MC13_05.wav", "size": 222434, "sha256": "1e47adb6da32c8469e231ce9a4e5f7fec080dd63ae7e4a9be78bcaa8ac018c41"},
+        {"name": "48k/MC/MC13_06.wav", "size": 218808, "sha256": "1329425b6f4d0e08610c1746b4cd59977ecf7d537e86e7efc41e7a753ab2a3c3"}
+      ]
+    },
+    {
+      "id": "vctk",
+      "title": "CSTR VCTK Corpus 0.92",
+      "page": "https://datashare.ed.ac.uk/handle/10283/3443",
+      "kind": "zip",
+      "url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/535f4286-e54c-4038-838c-a02285e32cb2/content",
+      "size": 11747302977,
+      "licence": "CC BY 4.0",
+      "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+      "tier": "permissive",
+      "attribution": "Contains audio from the CSTR VCTK Corpus 0.92 (Yamagishi, Veaux, MacDonald; University of Edinburgh), https://doi.org/10.7488/ds/2645, CC BY 4.0.",
+      "files": [
+        {"name": "wav48_silence_trimmed/p225/p225_003_mic1.flac", "size": 387806, "sha256": "877a8327608bd37b82d125adca98bdf7c92c904dff8c58fb711d7d9be364dc99"},
+        {"name": "wav48_silence_trimmed/p225/p225_004_mic1.flac", "size": 201860, "sha256": "1246c29924c2707cfe39c2123fbd37340fbe337000729a926aeffaeacde9050b"},
+        {"name": "wav48_silence_trimmed/p225/p225_005_mic1.flac", "size": 301038, "sha256": "1447829bb068e0185a8dd7349abda9e16980148c220847a6785ae0be908b369a"},
+        {"name": "wav48_silence_trimmed/p225/p225_006_mic1.flac", "size": 314302, "sha256": "d7e68924b9017ed970d9cc84b3efdf8da3e223ac6af686b614720d2d2ba6aceb"},
+        {"name": "wav48_silence_trimmed/p225/p225_007_mic1.flac", "size": 238554, "sha256": "258816c57e92c23172295f50bd5130f4ba29bb0586c94ed697421f829b753b24"},
+        {"name": "wav48_silence_trimmed/p225/p225_008_mic1.flac", "size": 360119, "sha256": "c4c4d3e1e128821c364db33fcec4b708e36edcea3bbc70f5334d6715aa4e00f9"},
+        {"name": "wav48_silence_trimmed/p226/p226_003_mic1.flac", "size": 392004, "sha256": "856c6a2bb57a54183bf383a2cc162d969b18a8714d40e9792de8f4670a7d299f"},
+        {"name": "wav48_silence_trimmed/p226/p226_004_mic1.flac", "size": 269752, "sha256": "07655937143294483640eb7bd850405aaea4b055726fcccf8f059100f7935ee6"},
+        {"name": "wav48_silence_trimmed/p226/p226_005_mic1.flac", "size": 348304, "sha256": "4d6dd88ece124fc95d4b6411e15c09bd818df48d0a35cb82d27b40db549f2504"},
+        {"name": "wav48_silence_trimmed/p226/p226_006_mic1.flac", "size": 282537, "sha256": "e9a4c5ddf578a04fd5ad1739d1cbe68d7e9c18f8e66cab1364efe643ed7b1ca1"},
+        {"name": "wav48_silence_trimmed/p226/p226_007_mic1.flac", "size": 225754, "sha256": "70b3d1488aecdee9a6d987cdf8b4c23d078b99f5a5dc4100a2498f51120e6340"},
+        {"name": "wav48_silence_trimmed/p226/p226_008_mic1.flac", "size": 379546, "sha256": "9570b6f075670d731ed0f0e0097db48988972b7a541e36da6455c9f1003ae3c6"},
+        {"name": "wav48_silence_trimmed/p237/p237_003_mic1.flac", "size": 315602, "sha256": "e3726b18cee8215227de18a4b58000152a98eeccd9c90e103125259739cb10b4"},
+        {"name": "wav48_silence_trimmed/p237/p237_004_mic1.flac", "size": 225608, "sha256": "bdeaffd9941da37b7892135355f7cdc84276e72a951beecb913033de855ac933"},
+        {"name": "wav48_silence_trimmed/p237/p237_005_mic1.flac", "size": 273288, "sha256": "9f0a2b703e5e1a9be5a581543987a90a5a3f5010aff7687ab06c43d59697ec3f"},
+        {"name": "wav48_silence_trimmed/p237/p237_006_mic1.flac", "size": 251460, "sha256": "29785bbbdc415ee7fb0dc1fd2cb339c99241cfa9362425056e8ee8c6752d0e7e"},
+        {"name": "wav48_silence_trimmed/p237/p237_007_mic1.flac", "size": 191517, "sha256": "9ca232c892e0376e37592daefd1a372c584ae969b9ed53fb01a26c2ea11dc7d5"},
+        {"name": "wav48_silence_trimmed/p237/p237_008_mic1.flac", "size": 294627, "sha256": "b59651c37fde3c005e83d14055184dc522a6c9fb7560ac4dd6846d9c829f2c91"},
+        {"name": "wav48_silence_trimmed/p248/p248_003_mic1.flac", "size": 434924, "sha256": "9483455d6c9a4f7856ad8bd5d3e04317846d67c7c38ea0c1bc6a9b317ab873a7"},
+        {"name": "wav48_silence_trimmed/p248/p248_004_mic1.flac", "size": 265075, "sha256": "0991f0e369f57d852855a1c3881a38620db0a34f20533d9247f89471d2df95d9"},
+        {"name": "wav48_silence_trimmed/p248/p248_005_mic1.flac", "size": 390648, "sha256": "d2fbfcf48b783d89235cd2333b92a277b35e34491319a3b7fbf535d50c293b4a"},
+        {"name": "wav48_silence_trimmed/p248/p248_006_mic1.flac", "size": 346345, "sha256": "cfb9739fac6e3986ee02b6a713d28692d22f07052805efd124edcb34abf773b0"},
+        {"name": "wav48_silence_trimmed/p248/p248_007_mic1.flac", "size": 256121, "sha256": "15cf83a90aa0323c57f3646cf58e910169b24e3834d29b3d1a70c1199bad7c53"},
+        {"name": "wav48_silence_trimmed/p248/p248_008_mic1.flac", "size": 445635, "sha256": "cec6169900f2e9e3005afb7267dc5bb743e53af36b3064e9209279dacb231cad"}
+      ]
+    },
+    {
+      "id": "demand",
+      "title": "DEMAND, PCAFETER (cafeteria)",
+      "page": "https://zenodo.org/records/1227121",
+      "kind": "zip",
+      "url": "https://zenodo.org/records/1227121/files/PCAFETER_48k.zip?download=1",
+      "size": 314117272,
+      "licence": "CC BY-SA 3.0 (per DEMAND's own PDF; Zenodo's metadata says CC BY 4.0)",
+      "licence_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "tier": "permissive",
+      "attribution": "DEMAND, J. Thiemann, N. Ito, E. Vincent, doi:10.5281/zenodo.1227121, CC BY-SA 3.0. Anything mixed with it stays CC BY-SA.",
+      "files": [
+        {"name": "PCAFETER/ch01.wav", "size": 28800428, "sha256": "af249ff8026cf3866f3fec6e4dd9d36cec44968083a4f004113dea6bbb995e8d"}
+      ]
+    },
+    {
+      "id": "goldberg",
+      "title": "The Open Goldberg Variations, Kimiko Ishizaka",
+      "page": "https://archive.org/details/OpenGoldbergVariations",
+      "kind": "file",
+      "licence": "CC0 1.0",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "tier": "permissive",
+      "attribution": "Kimiko Ishizaka, \"Variatio 4 a 1 Clav.\", The Open Goldberg Variations, CC0 (a courtesy credit: none is required).",
+      "files": [
+        {"name": "05 Variatio 4 a 1 Clav.flac", "url": "https://archive.org/download/OpenGoldbergVariations/Kimiko%20Ishizaka%20-%20J.S.%20Bach-%20-Open-%20Goldberg%20Variations%2C%20BWV%20988%20%28Piano%29%20-%2005%20Variatio%204%20a%201%20Clav..flac", "sha1": "336565dfc01932980923ba966ca4b6093f8825f3", "size": 19963388, "sha256": "d544334f6f23133caa930e3654d1ebc46f0c1d3e31e6fb382d915f2bd3d1397d"}
+      ]
+    },
+    {
+      "id": "aec2022",
+      "title": "ICASSP 2022 AEC Challenge test set, double talk",
+      "page": "https://github.com/microsoft/AEC-Challenge/tree/main/datasets/test_set_icassp2022",
+      "kind": "file",
+      "licence": "none: the recordings are provided 'under the original terms that Microsoft received such datasets'",
+      "licence_url": "https://github.com/microsoft/AEC-Challenge#dataset-licenses",
+      "tier": "unlicensed",
+      "attribution": "From the ICASSP 2022 Acoustic Echo Cancellation Challenge test set (Cutler et al., ICASSP 2022), https://github.com/microsoft/AEC-Challenge. No licence covers these recordings: local tests only.",
+      "files": [
+        {"name": "00113069-3e44-460a-be8d-9c252979a801_doubletalk_mic.wav", "url": "https://media.githubusercontent.com/media/microsoft/AEC-Challenge/8f861f0f8ffca26a3d1d16f17f2594ea89abe7ac/datasets/test_set_icassp2022/doubletalk/00113069-3e44-460a-be8d-9c252979a801_doubletalk_mic.wav", "size": 3767084, "sha256": "040bdc4a23bff026b3fd1fe53ac309c3a751079b360d997c984fa40cfd97a6b3"},
+        {"name": "00113069-3e44-460a-be8d-9c252979a801_doubletalk_lpb.wav", "url": "https://media.githubusercontent.com/media/microsoft/AEC-Challenge/8f861f0f8ffca26a3d1d16f17f2594ea89abe7ac/datasets/test_set_icassp2022/doubletalk/00113069-3e44-460a-be8d-9c252979a801_doubletalk_lpb.wav", "size": 3744044, "sha256": "b8e946385e0c1fa648dc33ba5f166c984bd51ee1de94eb70981e18e9093f1db5"}
+      ]
+    },
+    {
+      "id": "freesound",
+      "title": "Freesound",
+      "page": "https://freesound.org/",
+      "kind": "freesound",
+      "licence": "CC0 1.0 (each clip's licence was read on its page on 2026-11-01)",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "tier": "permissive",
+      "attribution": "CC0: no credit required.",
+      "files": [
+        {"name": "448209", "title": "Keyboard Typing", "author": "florianreichelt", "page": "https://freesound.org/s/448209/", "size": 7192364, "sha256": "29c495480c31869f791ac13cb20566c899604b8a40e5f4bd33859e078f185163"},
+        {"name": "242042", "title": "Computer Fan Loop", "author": "Ezcah", "page": "https://freesound.org/s/242042/", "size": 3233893, "sha256": "8d6f49a6f229cf03efcf32336d53aa6e167f51eccc8f24996611e248cb73f6e3"},
+        {"name": "273620", "title": "Old air conditioning unit", "author": "myrinvp", "page": "https://freesound.org/s/273620/", "size": 6239064, "sha256": "2f1fc9d24d7ec3e2ee702b38ee6a7de114cc3975b9e41e555fa65619d5685c0f"},
+        {"name": "337101", "title": "Group_of_Dogs_Barking.WAV", "author": "ivolipa", "page": "https://freesound.org/s/337101/", "size": 6299264, "sha256": "20920981089ca8d9b2ac6d142c4442f586fa6b6451c3e5cd699141e920f7f467"},
+        {"name": "370973", "title": "coffee shop ambience", "author": "waweee", "page": "https://freesound.org/s/370973/", "size": 42630144, "sha256": "f7b6b3c8d92dac7142d951c22a5414abc1266ee10e5b9651b5ef528a519f1c92"}
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "speech_tsp_fa01",
+      "source": "tsp",
+      "inputs": [
+        "48k/FA/FA01_01.wav",
+        "48k/FA/FA01_02.wav",
+        "48k/FA/FA01_03.wav",
+        "48k/FA/FA01_04.wav",
+        "48k/FA/FA01_05.wav",
+        "48k/FA/FA01_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_tsp_fb07",
+      "source": "tsp",
+      "inputs": [
+        "48k/FB/FB07_01.wav",
+        "48k/FB/FB07_02.wav",
+        "48k/FB/FB07_03.wav",
+        "48k/FB/FB07_04.wav",
+        "48k/FB/FB07_05.wav",
+        "48k/FB/FB07_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_tsp_fc13",
+      "source": "tsp",
+      "inputs": [
+        "48k/FC/FC13_01.wav",
+        "48k/FC/FC13_02.wav",
+        "48k/FC/FC13_03.wav",
+        "48k/FC/FC13_04.wav",
+        "48k/FC/FC13_05.wav",
+        "48k/FC/FC13_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_tsp_ma01",
+      "source": "tsp",
+      "inputs": [
+        "48k/MA/MA01_01.wav",
+        "48k/MA/MA01_02.wav",
+        "48k/MA/MA01_03.wav",
+        "48k/MA/MA01_04.wav",
+        "48k/MA/MA01_05.wav",
+        "48k/MA/MA01_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_tsp_mb07",
+      "source": "tsp",
+      "inputs": [
+        "48k/MB/MB07_01.wav",
+        "48k/MB/MB07_02.wav",
+        "48k/MB/MB07_03.wav",
+        "48k/MB/MB07_04.wav",
+        "48k/MB/MB07_05.wav",
+        "48k/MB/MB07_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_tsp_mc13",
+      "source": "tsp",
+      "inputs": [
+        "48k/MC/MC13_01.wav",
+        "48k/MC/MC13_02.wav",
+        "48k/MC/MC13_03.wav",
+        "48k/MC/MC13_04.wav",
+        "48k/MC/MC13_05.wav",
+        "48k/MC/MC13_06.wav"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_vctk_p225",
+      "source": "vctk",
+      "inputs": [
+        "wav48_silence_trimmed/p225/p225_003_mic1.flac",
+        "wav48_silence_trimmed/p225/p225_004_mic1.flac",
+        "wav48_silence_trimmed/p225/p225_005_mic1.flac",
+        "wav48_silence_trimmed/p225/p225_006_mic1.flac",
+        "wav48_silence_trimmed/p225/p225_007_mic1.flac",
+        "wav48_silence_trimmed/p225/p225_008_mic1.flac"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_vctk_p226",
+      "source": "vctk",
+      "inputs": [
+        "wav48_silence_trimmed/p226/p226_003_mic1.flac",
+        "wav48_silence_trimmed/p226/p226_004_mic1.flac",
+        "wav48_silence_trimmed/p226/p226_005_mic1.flac",
+        "wav48_silence_trimmed/p226/p226_006_mic1.flac",
+        "wav48_silence_trimmed/p226/p226_007_mic1.flac",
+        "wav48_silence_trimmed/p226/p226_008_mic1.flac"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_vctk_p237",
+      "source": "vctk",
+      "inputs": [
+        "wav48_silence_trimmed/p237/p237_003_mic1.flac",
+        "wav48_silence_trimmed/p237/p237_004_mic1.flac",
+        "wav48_silence_trimmed/p237/p237_005_mic1.flac",
+        "wav48_silence_trimmed/p237/p237_006_mic1.flac",
+        "wav48_silence_trimmed/p237/p237_007_mic1.flac",
+        "wav48_silence_trimmed/p237/p237_008_mic1.flac"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {
+      "name": "speech_vctk_p248",
+      "source": "vctk",
+      "inputs": [
+        "wav48_silence_trimmed/p248/p248_003_mic1.flac",
+        "wav48_silence_trimmed/p248/p248_004_mic1.flac",
+        "wav48_silence_trimmed/p248/p248_005_mic1.flac",
+        "wav48_silence_trimmed/p248/p248_006_mic1.flac",
+        "wav48_silence_trimmed/p248/p248_007_mic1.flac",
+        "wav48_silence_trimmed/p248/p248_008_mic1.flac"
+      ],
+      "gap_s": 0.4,
+      "fade_ms": 10
+    },
+    {"name": "noise_cafe_demand_pcafeter_ch01", "source": "demand", "inputs": ["PCAFETER/ch01.wav"]},
+    {"name": "music_goldberg_var04", "source": "goldberg", "inputs": ["05 Variatio 4 a 1 Clav.flac"]},
+    {
+      "name": "aec_icassp2022_dt_00113069_mic",
+      "source": "aec2022",
+      "inputs": ["00113069-3e44-460a-be8d-9c252979a801_doubletalk_mic.wav"]
+    },
+    {
+      "name": "aec_icassp2022_dt_00113069_lpb",
+      "source": "aec2022",
+      "inputs": ["00113069-3e44-460a-be8d-9c252979a801_doubletalk_lpb.wav"]
+    },
+    {
+      "name": "noise_keyboard_448209",
+      "source": "freesound",
+      "inputs": ["448209"],
+      "title": "Freesound 448209: \"Keyboard Typing\" by florianreichelt",
+      "page": "https://freesound.org/s/448209/",
+      "attribution": "\"Keyboard Typing\" by florianreichelt, https://freesound.org/s/448209/, CC0 1.0 (a courtesy credit: none is required)."
+    },
+    {
+      "name": "noise_fan_242042",
+      "source": "freesound",
+      "inputs": ["242042"],
+      "title": "Freesound 242042: \"Computer Fan Loop\" by Ezcah",
+      "page": "https://freesound.org/s/242042/",
+      "attribution": "\"Computer Fan Loop\" by Ezcah, https://freesound.org/s/242042/, CC0 1.0 (a courtesy credit: none is required)."
+    },
+    {
+      "name": "noise_aircon_273620",
+      "source": "freesound",
+      "inputs": ["273620"],
+      "title": "Freesound 273620: \"Old air conditioning unit\" by myrinvp",
+      "page": "https://freesound.org/s/273620/",
+      "attribution": "\"Old air conditioning unit\" by myrinvp, https://freesound.org/s/273620/, CC0 1.0 (a courtesy credit: none is required)."
+    },
+    {
+      "name": "noise_dogs_337101",
+      "source": "freesound",
+      "inputs": ["337101"],
+      "title": "Freesound 337101: \"Group_of_Dogs_Barking.WAV\" by ivolipa",
+      "page": "https://freesound.org/s/337101/",
+      "attribution": "\"Group_of_Dogs_Barking.WAV\" by ivolipa, https://freesound.org/s/337101/, CC0 1.0 (a courtesy credit: none is required)."
+    },
+    {
+      "name": "noise_cafe_370973",
+      "source": "freesound",
+      "inputs": ["370973"],
+      "title": "Freesound 370973: \"coffee shop ambience\" by waweee",
+      "page": "https://freesound.org/s/370973/",
+      "attribution": "\"coffee shop ambience\" by waweee, https://freesound.org/s/370973/, CC0 1.0 (a courtesy credit: none is required)."
+    }
+  ]
+}
