@@ -42,6 +42,22 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
 - **Delay window:** the default delay-estimation window is about 608 ms (our calculation from the code). Bluetooth or USB speakers with large output latency may need a bigger window (custom config, sonora #41).
 - **Reconvergence:** volume changes (loopback is pre-volume), render-side enhancement APOs and stalls all trigger it; one report took about a minute after a heavy stall.
 
+## First live test (2026-11-01)
+`quality --test echo` over the dev VM's VB-CABLE cables (#14's detail file has the runs): AEC3 removed only 1-5 dB of echo a
+far-only turn (7-23 dB with the base cable as the far end), where the same scene offline removes 21-53 dB, with a 96 ms
+lead and 30 ppm of drift too. The engine counted 5-8 reference gaps a second whichever cable carried the reference: its
+reference FIFO (target one loopback period + one block + 96 samples, 22 ms) found less than a block at a mic wake. Each gap
+zero-fills to the target and resets the drift loop, and the coarse correction later discards the excess. Both move the
+reference against the mic, so AEC3's linear filter never holds (its delay estimate wandered from 96 to 116 ms in one take).
+
+Next:
+1. Log the loopback packets (count, size, QPC) against the mic wakes on the cables, to see whether the loopback comes in
+   bursts (VB-CABLE's statistics show 1024-frame buffers) or stops.
+2. Proposed fix: a late loopback packet should be waited for, not zero-filled. The reference's latency costs nothing at the
+   output, only its lead over the echo, so a deeper target (raised on an underflow, as a jitter buffer would) keeps the
+   timeline whole. It has to stay inside the echo path's own delay (loopback taps at mix time, ahead of the speakers).
+3. Then rerun the echo test, and on real speakers in phase 2.
+
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).
   - Where the OEM supplies no Communications-mode processing, this path gets Voice Clarity (Windows 11 client editions).

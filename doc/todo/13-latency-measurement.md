@@ -119,17 +119,31 @@ existing tools). Sources are Microsoft Learn, the Chromium and wasapi 0.26.0 sou
 - After a Latency change both cables passed only silence ("peak silent" in the report) until `pnputil /restart-device` on
   their devices.
 - The app's live readout (56-66 ms) is above its design (about 32-42 ms: a block of input, the chain's 10 ms, the 22 ms
-  output target). Some of it is probably VB-CABLE's own timestamps and play position; a cable-only measurement (a sweep
-  through one cable, no app) is next, to separate the two.
+  output target). The cable-only runs below show the readout is right: the excess is the engine's.
 
-## Cable-only mode (built 2026-11-01, not yet run live)
+**Cable only** (2026-11-01): `latency --cable-only --reps 5`, each cable's Input to its own Output, both streams at a 10 ms
+period (as the engine's mic was). Each figure is one run's median; the sweeps within a run spread by 1-2 ms.
+
+| Cable (its Latency) | Probe to capture |
+|---|---|
+| A (3072) | 60.8 / 52.3 ms |
+| Base (3072) | 62.3 / 60.2 ms |
+| B (7168, the default) | 61.7 ms |
+
+- Each cable costs 52-62 ms by itself: all of the virtual loop's input path (52-62 ms). So the engine's own part of app +
+  output cable (118-127 ms) is about 60-65 ms, which is what its readout says. VB-CABLE's stamps don't inflate the readout;
+  the engine holds about 20-30 ms more than its design.
+- Not yet explained. Candidates: the shared-mode audio engine's period on each side (a capture packet waits up to a period
+  before the app is woken; the mix runs a period ahead of the device), which the design sum leaves out; and the output
+  target (a period + a block + the margin, 22 ms), whose block may be more than it needs.
+
+## Cable-only mode (built and run 2026-11-01)
 `latency --cable-only --probe "CABLE-A Input" --capture "CABLE-A Output" [--reps N]` plays the same sweep train with no engine
 (`nf_engine::cable_latency_test`, on the calling thread, COM MTA and MMCSS while streaming) and times each sweep from the
 probe's play-out (its AudioClock, as the engine test does) to its arrival in the capture (the packets' QPC stamps). The report
 is the engine test's, labelled "cable only": median, spread, each repetition, the lowest confidence, and both streams' formats
 and periods. Both tests share the play-and-record loop and the analysis. `run`'s options, `--mode` and `--through-model` are
-refused with it. Next: run it on cable A and on the output cable, and compare each cable's own figure with the virtual loop's
-input path and its app + output cable share, to see how much of the readout's excess over the design the cables account for.
+refused with it. Its results are under Measurements.
 
 Reading it against the engine test (the report's "compare with" line says the same):
 - **Which figure is which.** The engine report's app figure (output capture minus the tap) already holds the output cable, so

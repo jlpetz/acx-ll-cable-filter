@@ -79,7 +79,7 @@ Notes:
 
 ## Phases
 - **Phase 0:** the batch CLI with #2: playlist, DNSMOS/SIGMOS feature parity, scorecard.
-  - **Its live half, `noise-filter quality` (built 2026-11-01, not yet run live):** plays a scene through the running filter
+  - **Its live half, `noise-filter quality` (built and first run 2026-11-01):** plays a scene through the running filter
     over the virtual cables and measures the recording, with levels, not MOS. The noise test is speech in pink noise (10 dB
     SNR). The echo test (12 s at least) is 3 s turns of far only, double talk and near only, with the far voice on `--far`, the
     echo reference, and noise 60 dB under the speech, so the noise doesn't cap the ERLE (at 30 dB it sat 25 dB under the echo).
@@ -104,6 +104,15 @@ Notes:
     ERLE estimates (the reference-to-mic lag behind a given ERLE), and dropouts (the engine's counters and the recording's
     gaps). `--save` writes input, clean, far, recording and aligned WAVs, which the metric models can score later. The
     analysis is a pure function, tested on synthetic recordings.
+  - **First live runs** (2026-11-01, the dev VM's cables: probe CABLE-A Input, mic CABLE-A Output, output CABLE Input,
+    capture CABLE Output; WAVs kept outside the repo in `C:\Users\Administrator\Downloads\nf-quality\`):
+    - Noise test, defaults: noise in pauses -27.2 dB (-28.9 dB 200 ms clear of speech), speech -0.6 dB, no dropouts. 15 of
+      15 windows aligned (lowest 0.44), path delay 191 ms, which matches #13's end to end.
+    - Echo test, `--far "CABLE-B Input"`: the echo drops only 2.2 dB (median far-only turn) with the noise filter on, 2.1 dB
+      with `--no-ns` over 60 s, and AEC3's own ERLE estimate is 0.2-0.7 dB. Through `process`, the saved scene and its far
+      voice give 21-53 dB a turn, and 27-54 dB with the mic 96 ms behind the reference and 30 ppm of drift. So AEC3 copes
+      and the live reference path doesn't: 57 reference gaps in 30 s, 450 in 60 s (#10). With the base cable as the far end
+      (and cable B as the output) it was 7-23 dB a turn, with 177 gaps in 30 s.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
 - **Phase 2:** AECMOS with talk-type segmentation, from far-end and near-end activity.
 - **Later:** the Lab page in the GUI (#15), with the blind-rating player.

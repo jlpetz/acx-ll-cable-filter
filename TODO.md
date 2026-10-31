@@ -108,13 +108,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
-**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`); live test pending.
+**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`); first live test 2026-11-01 (#14's `quality`): only 1-5 dB of echo removed, from reference gaps.
 - `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: offline on recorded mic+loopback pairs in #2, then live in phase 2.
+**Next**: fix the reference FIFO's underflows (5-8 a second on the cables, each moving the reference against the mic): log the loopback's packets against the mic wakes, then wait for a late packet (a deeper target) instead of zero-filling. Rerun the echo test; then recorded pairs in #2 and live on speakers in phase 2.
 **Detail**: `doc/todo/10-aec.md`
 
 ---
@@ -140,21 +140,21 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 13. [lab] Latency measurement
-**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0, layer 2 run on the dev VM's VB-CABLE loop (2026-11-01); a cable-only mode built 2026-11-01, not yet run live.
+**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0, layer 2 run on the dev VM's VB-CABLE loop and a cable-only mode built and run (2026-11-01): each cable is 52-62 ms by itself, so the readout is right and the engine holds about 60 ms against a 32-42 ms design.
 - Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
-**Next**: run `latency --cable-only` on cable A and on the output cable. Compare cable A with the virtual loop's input path, and the output cable with its app + output cable share (which holds it once), to see how much of the readout's 56-66 ms (design about 32-42) is VB-CABLE's. Layer 3 in phase 2.
+**Next**: find the engine's extra 20-30 ms (the shared-mode engine's periods? the output target's block?) and try the target a block lower. Layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---
 
 ### 14. [lab] Quality analyser: the Lab mode (MOS)
-**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built 2026-11-01, not yet run live.
+**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built and first run 2026-11-01: the noise test works (-27 dB noise, -0.6 dB speech); the echo test found #10's reference gaps.
 - Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
-**Next**: run `quality` on the cables (the noise test, then `--test echo --far "CABLE-B Input"`). Phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
+**Next**: rerun the echo test once #10's gaps are fixed. Phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`
 
 ---
