@@ -1,9 +1,10 @@
 //! The audio thread's per-block bookkeeping, apart from WASAPI (engine.md "The audio thread").
 //!
-//! [`Pipeline`] owns the mic and reference FIFOs, both drift loops, the output's pending samples,
-//! the latency readout and the rolling statistics. It talks to streams only through
-//! [`CaptureSource`] and [`RenderSink`], to the chain through [`BlockProcessor`] and to the clock
-//! through [`Ticks`], so tests drive it with fakes and a simulated device clock.
+//! [`Pipeline`] owns the mic FIFO, the reference's timeline ([`Reference`], reference.rs), the
+//! output's drift loop and pending samples, the latency readout and the rolling statistics. It
+//! talks to streams only through [`CaptureSource`] and [`RenderSink`], to the chain through
+//! [`BlockProcessor`] and to the clock through [`Ticks`], so tests drive it with fakes and a
+//! simulated device clock.
 //!
 //! Everything called per wake-up or per block is real-time: no allocation, locks, logging,
 //! formatting or panics. Errors are raw HRESULTs.
@@ -22,6 +23,7 @@ use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
 use crate::fifo::Fifo;
+use crate::reference::{MicTime, Reference};
 use crate::timing::{HNS_PER_S, StampMap};
 
 /// A raw HRESULT from a failed stream call.
@@ -32,24 +34,20 @@ pub(crate) type Hr = i32;
 pub(crate) const DITHER: f32 = 1e-9;
 /// Mic FIFO capacity: 200 ms.
 const MIC_FIFO: usize = 9_600;
-/// Reference FIFO capacity: 500 ms.
-const REF_FIFO: usize = 24_000;
-/// Missing mic frames (by device position) up to this many are replaced by zeros so the stream
-/// stays continuous; a bigger jump is only counted.
-const MAX_GAP_FILL: u64 = 4_800;
+/// Missing mic or loopback frames (by device position) up to this many are replaced by zeros so
+/// the stream stays continuous; a bigger jump is only counted (on the mic; the reference's stamps
+/// show it as a broken timeline).
+pub(crate) const MAX_GAP_FILL: u64 = 4_800;
 /// Output samples we can hold while the device buffer is full.
 const PENDING: usize = 6 * BLOCK;
-/// Headroom on the reference FIFO's target, in frames (2 ms). The loopback delivers whole
-/// periods, so when its clock is slower than the mic's the measured fill steps down by a packet;
-/// at exactly "period + block" that leaves one block, and one sample less is a zero-filled gap (a
-/// 10 ms jump in the echo path). The output side gets the same headroom from `output_margin_ms`.
+/// Headroom on the reference's starting lead, in frames (2 ms). Steady delivery needs up to a
+/// loopback period of lead, at the worst phase of the two clocks, plus the packets' timing jitter.
+/// The output side gets the same headroom from `output_margin_ms`.
 pub(crate) const REF_MARGIN: usize = 96;
 /// Blocks per statistics period (1 s).
 pub(crate) const STATS_BLOCKS: u64 = 100;
 /// 100 ns units per sample at the app's rate.
 const HNS_PER_SAMPLE: f64 = HNS_PER_S / SAMPLE_RATE as f64;
-/// Loopback stamps further than this from now are ignored (500 ms, as for the mic).
-const MAX_STAMP_SKEW_HNS: f64 = 5e6;
 /// A readout outside (0, 2000) ms is a bad stamp, not a latency.
 const MAX_READOUT_MS: f64 = 2_000.0;
 
@@ -103,7 +101,8 @@ pub(crate) trait RenderSink {
     fn clock(&mut self) -> Result<Option<ClockReading>, Hr>;
 }
 
-/// The drift loop, as nf-core's `DriftController` provides it.
+/// The output's drift loop, as nf-core's `DriftController` provides it (the reference has its own:
+/// reference.rs).
 pub(crate) trait DriftControl {
     fn update(&mut self, fill_samples: f32) -> Slip;
     fn ppm(&self) -> f32;
@@ -179,10 +178,13 @@ pub(crate) struct Counters {
     /// Output coarse drops: times the fill ran over target + 2 blocks and whole blocks were dropped
     /// back to within half a block (one per event), plus pending overflows.
     pub output_drops: u64,
-    /// Blocks whose reference was (partly) zero-filled.
+    /// Blocks whose reference was (partly) zeros for samples that hadn't arrived: none had yet, or
+    /// they came late and were discarded when they did (the timeline kept whole; reference.rs).
     pub reference_gaps: u64,
-    /// Reference coarse drops: times the reference fill ran over target + 2 blocks and whole blocks
-    /// were discarded back to within half a block (not counting the start-up alignment).
+    /// Reference coarse corrections after the start-up: jumps of the reference's timeline, either
+    /// way. A broken timeline undone (a stall longer than the buffers, a device reset), a change of
+    /// the lead target (a raise when underflows persisted, a lowering after five minutes under), or,
+    /// timed by delivery, a step of the count put back or a centring after a break.
     pub reference_drops: u64,
     pub output_slips: u64,
     pub reference_slips: u64,
@@ -208,9 +210,11 @@ impl PipelineConfig {
     pub(crate) fn out_target(&self) -> usize {
         self.out_period + BLOCK + self.out_margin
     }
-    /// One loopback period + one block (+ [`REF_MARGIN`]); 0 without a reference.
+    /// The reference's starting lead target (engine.md "The reference"): one loopback period +
+    /// [`REF_MARGIN`]; 0 without a reference. It may rise in the first seconds, and later when
+    /// underflows persist (and come back down after five minutes under).
     pub(crate) fn ref_target(&self) -> usize {
-        self.ref_period.map_or(0, |p| p + BLOCK + REF_MARGIN)
+        self.ref_period.map_or(0, |p| p + REF_MARGIN)
     }
 }
 
@@ -222,19 +226,13 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     mic_abs: u64,
     mic_next_pos: Option<u64>,
     mic_stamps: StampMap,
+    /// The wake that delivered the last mic packet (hns): the mic's timing without stamps.
+    mic_last_hns: f64,
     packet: Box<[f32]>,
     // Reference.
     has_reference: bool,
-    ref_fifo: Fifo,
-    ref_drift: D,
+    reference: Reference,
     ref_rs: R,
-    ref_target: usize,
-    ref_period: usize,
-    /// End time (hns) of the last stamped loopback packet, for the interpolated fill.
-    ref_last_end_hns: Option<f64>,
-    /// The time of the current wake-up, from `drain_reference`.
-    ref_now_hns: f64,
-    last_ref_fill: f32,
     // Output.
     out_drift: D,
     out_rs: R,
@@ -253,8 +251,6 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     out_started: bool,
     /// Dropping whole output blocks back towards the target (after a coarse overfill).
     out_draining: bool,
-    /// The first reference block has aligned the FIFO to its target.
-    ref_started: bool,
     // Block buffers.
     mic_blk: Box<Block>,
     ref_blk: Box<Block>,
@@ -280,23 +276,19 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
 }
 
 impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
-    /// Allocates everything the run needs. Not real-time.
-    pub(crate) fn new(cfg: PipelineConfig, out_drift: D, ref_drift: D, out_rs: R, ref_rs: R) -> Self {
+    /// Allocates everything the run needs. Not real-time. The output's drift loop is `out_drift`;
+    /// the reference's is its own ([`Reference`]).
+    pub(crate) fn new(cfg: PipelineConfig, out_drift: D, out_rs: R, ref_rs: R) -> Self {
         Self {
             mic: Fifo::new(MIC_FIFO),
             mic_abs: 0,
             mic_next_pos: None,
             mic_stamps: StampMap::new(SAMPLE_RATE),
+            mic_last_hns: 0.0,
             packet: vec![0.0; cfg.max_packet.max(BLOCK)].into_boxed_slice(),
             has_reference: cfg.ref_period.is_some(),
-            ref_fifo: Fifo::new(REF_FIFO),
-            ref_drift,
+            reference: Reference::new(cfg.ref_target(), cfg.ref_period.unwrap_or(BLOCK)),
             ref_rs,
-            ref_target: cfg.ref_target(),
-            ref_period: cfg.ref_period.unwrap_or(0),
-            ref_last_end_hns: None,
-            ref_now_hns: 0.0,
-            last_ref_fill: 0.0,
             out_drift,
             out_rs,
             out_target: cfg.out_target(),
@@ -308,7 +300,6 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             fill_offset: FillOffset::new(cfg.out_period),
             out_started: false,
             out_draining: false,
-            ref_started: false,
             mic_blk: Box::new([0.0; BLOCK]),
             ref_blk: Box::new([0.0; BLOCK]),
             ref_in: Box::new([0.0; BLOCK + 1]),
@@ -335,9 +326,10 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.out_target
     }
 
+    /// The reference's lead target now, in samples.
     #[cfg(test)]
     pub(crate) fn ref_target(&self) -> usize {
-        self.ref_target
+        self.reference.target() as usize
     }
 
     /// Seeds the per-second pool-allocation count with the count after warm-up.
@@ -365,9 +357,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// from now on, with no gaps counted, and the mic-to-output path carries on.
     pub(crate) fn drop_reference(&mut self) {
         self.has_reference = false;
-        self.ref_fifo.clear();
-        self.ref_last_end_hns = None;
-        self.last_ref_fill = 0.0;
+        self.reference.clear();
     }
 
     /// Drains every ready mic packet into the mic FIFO. Detects gaps by device position (the
@@ -394,6 +384,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             if let Some(ts) = p.qpc_hns {
                 self.mic_stamps.observe(self.mic_abs, ts, now_hns);
             }
+            self.mic_last_hns = now_hns;
             let over = n.saturating_sub(self.mic.free());
             if over > 0 {
                 // Overflow (we didn't run for 200 ms): keep the newest audio.
@@ -416,23 +407,15 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.mic_abs += n as u64;
     }
 
-    /// Drains every ready loopback packet into the reference FIFO (oldest dropped on overflow), and
-    /// notes when the last stamped packet ended, for the interpolated fill.
+    /// Drains every ready loopback packet onto the reference's timeline (its stamps, position gaps
+    /// and owed samples are the timeline's business: reference.rs).
     pub(crate) fn drain_reference<C: CaptureSource>(&mut self, src: &mut C, now_hns: f64) -> Result<usize, Hr> {
-        self.ref_now_hns = now_hns;
+        self.reference.wake(now_hns);
         let mut total = 0;
         while let Some(p) = src.read_packet(&mut self.packet)? {
             let n = p.frames.min(self.packet.len());
-            if let Some(ts) = p.qpc_hns {
-                let end = ts as f64 + n as f64 * HNS_PER_SAMPLE;
-                if (end - now_hns).abs() < MAX_STAMP_SKEW_HNS {
-                    self.ref_last_end_hns = Some(end);
-                }
-            }
-            let over = n.saturating_sub(self.ref_fifo.free());
-            self.ref_fifo.discard(over);
-            if let Some(src) = self.packet.get(..n) {
-                self.ref_fifo.push(src);
+            if let Some(s) = self.packet.get(..n) {
+                self.reference.push(&p, s, now_hns);
             }
             total += n;
         }
@@ -454,7 +437,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// Reference samples buffered.
     #[cfg(test)]
     pub(crate) fn ref_len(&self) -> usize {
-        self.ref_fifo.len()
+        self.reference.fifo_len()
     }
 
     /// Processes one block if the mic FIFO holds one: reference slip, the chain, output slip and
@@ -477,7 +460,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             }
         }
         self.dither.apply(&mut self.mic_blk[..], DITHER);
-        self.take_reference();
+        self.take_reference(head, t_capture);
 
         let report = proc.process(&self.mic_blk, &self.ref_blk, &mut self.out_blk, ticks);
 
@@ -505,80 +488,27 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.blocks > 0 && self.blocks.is_multiple_of(STATS_BLOCKS)
     }
 
-    /// Fills `ref_blk`: pops the slipped amount from the reference FIFO and resamples it to one
-    /// block; zero-fills (and counts a gap) when the FIFO can't serve a block. Dithered either way.
-    ///
-    /// Coarse corrections (clocks-latency/F2): beyond two blocks over the target (the drift loop's
-    /// own range), whole blocks are discarded back to within half a block of it, so a late first mic
-    /// block or a stall costs one jump instead of 15-25 s of slow slipping. The first block aligns
-    /// the FIFO the same way from half a block over. Both leave out the reference the rest of this
-    /// wake's mic backlog will take, so a late wake isn't mistaken for excess.
-    fn take_reference(&mut self) {
+    /// Fills `ref_blk` for the mic block whose first sample is `head` (captured at `t_capture` by
+    /// its stamp): the reference's timeline serves 480 samples, plus or minus its loop's slip, and
+    /// they're resampled to one block (reference.rs). Dithered, as is the silence served without a
+    /// reference. The block is timed by its stamp while the mic's stamps are trusted, and by the
+    /// wake that delivered the mic's newest sample either way, for the timing without stamps.
+    fn take_reference(&mut self, head: u64, t_capture: Option<f64>) {
         if !self.has_reference {
             self.ref_blk.fill(0.0);
             self.dither.apply(&mut self.ref_blk[..], DITHER);
             return;
         }
-        let len = self.ref_fifo.len();
-        let fill = self.ref_fill();
-        self.last_ref_fill = fill;
-        let first = !self.ref_started;
-        self.ref_started = true;
-        // The whole mic blocks still queued take their reference blocks in this same wake, so they
-        // don't count as excess (as on the output side).
-        let backlog = (self.mic.len() / BLOCK * BLOCK) as f32;
-        let over = fill - self.ref_target as f32 - backlog;
-        let mut slip = self.ref_drift.update(fill);
-        let mut n = slip.consumed_len();
-        if len < n {
-            if len >= BLOCK {
-                // At a packet boundary: serve the block, skip the slip.
-                slip = Slip::None;
-                n = BLOCK;
-            } else {
-                // Silence on the loopback (no packets) or a stall: zero-fill up to the target.
-                self.counters.reference_gaps += 1;
-                self.ref_fifo.push_zeros(self.ref_target.max(BLOCK) - len);
-                self.ref_drift.reset(self.ref_fifo.len() as f32);
-                slip = Slip::None;
-                n = BLOCK;
-            }
-        } else if over > (2 * BLOCK) as f32 || (first && over > (BLOCK / 2) as f32) {
-            // Whole blocks, rounded, keeping one block to serve.
-            let k = ((over + (BLOCK / 2) as f32) / BLOCK as f32) as usize;
-            self.ref_fifo.discard((k * BLOCK).min(len.saturating_sub(BLOCK)));
-            if !first {
-                self.counters.reference_drops += 1;
-            }
-            self.ref_drift.reset(self.ref_fill());
-            slip = Slip::None;
-            n = BLOCK;
+        let mic = MicTime {
+            stamp: t_capture.filter(|_| self.mic_stamps.trusted()),
+            delivered: self.mic_last_hns - self.mic_abs.saturating_sub(head) as f64 * HNS_PER_SAMPLE,
+            scatter: self.mic_stamps.scatter_hns(),
+        };
+        let n = self.reference.take(mic, &mut self.ref_in[..], &mut self.counters);
+        if let Some(input) = self.ref_in.get(..n) {
+            self.ref_rs.resample(input, &mut self.ref_blk[..]);
         }
-        if slip != Slip::None {
-            self.counters.reference_slips += 1;
-        }
-        let input = &mut self.ref_in[..n.min(BLOCK + 1)];
-        if !self.ref_fifo.pop_into(input) {
-            input.fill(0.0);
-        }
-        self.ref_rs.resample(input, &mut self.ref_blk[..]);
         self.dither.apply(&mut self.ref_blk[..], DITHER);
-    }
-
-    /// The reference FIFO's fill for the drift loop: the samples buffered plus those the loopback
-    /// has produced since its last packet ended (at most a period). Without that, the reading moves
-    /// in whole packets and, with two 10 ms clocks, its error jumps a packet once per beat period
-    /// (nf-core `drift.rs`).
-    fn ref_fill(&self) -> f32 {
-        let len = self.ref_fifo.len() as f64;
-        match self.ref_last_end_hns {
-            Some(end) => {
-                // max/min: clamp asserts its (runtime) bounds, a panic path on the audio thread.
-                let in_flight = ((self.ref_now_hns - end) / HNS_PER_SAMPLE).max(0.0).min(self.ref_period as f64);
-                (len + in_flight) as f32
-            }
-            None => len as f32,
-        }
     }
 
     /// Slips `out_blk` to the output clock, queues it, writes what fits, and applies the coarse
@@ -822,12 +752,18 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
         if self.has_reference {
-            tel.reference_drift_ppm.store(self.ref_drift.ppm());
-            tel.reference_fill_ms.store(self.last_ref_fill * (1000.0 / SAMPLE_RATE as f32));
+            // The reference's "fill" is its lead over the mic block, the quantity its loop holds,
+            // and its target can move (reference.rs). Whether the stamps time it, too.
+            tel.reference_drift_ppm.store(self.reference.drift_ppm());
+            tel.reference_fill_ms.store(self.reference.lead_ms());
+            tel.reference_target_ms.store(self.reference.target_ms());
+            tel.reference_stamped.store(self.reference.stamped(), Relaxed);
         } else {
             // None, or dropped mid-run.
             tel.reference_drift_ppm.store(0.0);
             tel.reference_fill_ms.store(0.0);
+            tel.reference_target_ms.store(0.0);
+            tel.reference_stamped.store(false, Relaxed);
         }
         let c = &self.counters;
         tel.output_slips.store(c.output_slips, Relaxed);
@@ -1191,45 +1127,79 @@ mod tests {
 
     fn pipe(reference: bool) -> Pipeline<FakeDrift, FakeResampler> {
         let c = cfg(reference);
-        Pipeline::new(c, FakeDrift::new(c.out_target()), FakeDrift::new(c.ref_target()), FakeResampler, FakeResampler)
+        Pipeline::new(c, FakeDrift::new(c.out_target()), FakeResampler, FakeResampler)
     }
 
     fn ramp(start: usize, n: usize) -> Vec<f32> {
         (start..start + n).map(|v| (v % 1000) as f32 * 1e-3).collect()
     }
 
+    /// The reference's starting target is now a lead, one loopback period + the margin: what steady
+    /// delivery needs at the worst phase of the clocks (reference.rs). It was a FIFO fill of a
+    /// period + a block + the margin, which counted the mic block's own 10 ms as well.
     #[test]
     fn targets_follow_the_spec() {
         let c = cfg(true);
         assert_eq!(c.out_target(), 480 + 480 + 96);
-        assert_eq!(c.ref_target(), 960 + REF_MARGIN);
+        assert_eq!(c.ref_target(), 480 + REF_MARGIN);
         assert_eq!(cfg(false).ref_target(), 0);
     }
 
+    /// Index-coded samples, plus one so that a zero is a filled-in sample.
+    fn idx1(start: usize, n: usize) -> Vec<f32> {
+        (start + 1..start + 1 + n).map(|v| v as f32).collect()
+    }
+
+    /// Loopback samples `from..to`, index-coded, in stamped packets of at most 480: sample 0 was
+    /// tapped at `t0`.
+    fn push_tapped(lb: &mut FakeCapture, from: usize, to: usize, t0: f64) {
+        for k in (from..to).step_by(480) {
+            let n = (to - k).min(480);
+            lb.push(k as u64, Some((t0 + k as f64 * 1e7 / 48_000.0) as u64), idx1(k, n));
+        }
+    }
+
+    /// The first block lines the reference up by the stamps, either way: the sample served with
+    /// the mic block was tapped the target (576 samples, 12 ms) before the block's first sample
+    /// was captured, with zeros for any before the loopback's first. Later blocks carry on from
+    /// there, and the lead is published against its target.
     #[test]
-    fn reference_fill_counts_samples_in_flight() {
-        let mut p = pipe(true);
-        let mut lb = FakeCapture::default();
-        // A packet that ended at t = 1 s; 5 ms later half a period is in flight.
-        let t = 1e7;
-        lb.push(0, Some((t - 100_000.0) as u64), vec![0.0; 480]);
-        p.drain_reference(&mut lb, t + 50_000.0).unwrap();
-        assert!((p.ref_fill() - 720.0).abs() < 1e-3, "{}", p.ref_fill());
-        // Capped at one period while no packets come.
-        p.drain_reference(&mut lb, t + 3e6).unwrap();
-        assert_eq!(p.ref_fill(), 960.0);
-        // Before the packet's end (stamp jitter): nothing extra.
-        p.drain_reference(&mut lb, t - 1_000.0).unwrap();
-        assert_eq!(p.ref_fill(), 480.0);
-        // Unstamped packets: just the FIFO.
-        let mut p = pipe(true);
-        lb.push(0, None, vec![0.0; 480]);
-        p.drain_reference(&mut lb, t).unwrap();
-        assert_eq!(p.ref_fill(), 480.0);
-        // A stamp 2 s off is ignored.
-        lb.push(480, Some((t + 2e7) as u64), vec![0.0; 480]);
-        p.drain_reference(&mut lb, t).unwrap();
-        assert_eq!(p.ref_fill(), 960.0);
+    fn the_first_block_aligns_the_reference_by_the_stamps() {
+        // How long the loopback ran before the mic's first sample, in samples, and the first
+        // sample served: 576 before the mic's, or zeros.
+        for (ran, first) in [(1920usize, Some(1344.0)), (336, None), (0, None)] {
+            let mut p = pipe(true);
+            let mut sink = FakeSink::new(4800);
+            p.prefill(&mut sink).unwrap();
+            let tel = Telemetry::new();
+            let mut spy = RefSpy(Vec::new());
+            let (mut mic, mut lb) = (FakeCapture::default(), FakeCapture::default());
+            let t = 1e10;
+            let h = 1e7 / 48_000.0;
+            for b in 0..3usize {
+                let now = t + (b + 1) as f64 * 100_000.0 + 5_000.0;
+                mic.push((b * 480) as u64, Some((t + (b * 480) as f64 * h) as u64), vec![0.0; 480]);
+                // Everything the loopback has tapped by the mic block's end, in stamped packets.
+                let (from, to) = (if b == 0 { 0 } else { ran + b * 480 }, ran + (b + 1) * 480);
+                push_tapped(&mut lb, from, to, t - ran as f64 * h);
+                p.drain_mic(&mut mic, now).unwrap();
+                p.drain_reference(&mut lb, now).unwrap();
+                p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+            }
+            let served = |b: usize| {
+                spy.0[b * 480..(b + 1) * 480].iter().position(|&v| v >= 0.5).map(|k| (spy.0[b * 480 + k] - 1.0) as f64 - k as f64)
+            };
+            let expect = ran as f64 - 576.0;
+            match first {
+                Some(f) => assert_eq!(served(0), Some(f), "ran {ran}"),
+                None if ran + 480 > 576 => assert_eq!(served(0), Some(expect), "ran {ran}: zeros, then sample 0"),
+                None => assert_eq!(served(0), None, "ran {ran}: all before the loopback's first sample"),
+            }
+            assert_eq!(served(2), Some(expect + 960.0), "ran {ran}: the timeline carries on");
+            assert_eq!((p.counters.reference_gaps, p.counters.reference_drops, p.counters.reference_slips), (0, 0, 0), "ran {ran}");
+            p.publish_second(&tel, &spy, 0, 0, 0);
+            assert!((tel.reference_target_ms.load() - 12.0).abs() < 1e-3 && (tel.reference_fill_ms.load() - 12.0).abs() < 0.1);
+        }
     }
 
     #[test]
@@ -1391,13 +1361,7 @@ mod tests {
     #[test]
     fn two_blocks_per_wake_with_jitter_are_no_underruns() {
         let c = cfg(false);
-        let mut p = Pipeline::new(
-            c,
-            DriftController::new(c.out_target() as f32),
-            DriftController::new(BLOCK as f32),
-            SlipResampler::new(),
-            SlipResampler::new(),
-        );
+        let mut p = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
         let mut sink = FakeSink::new(4800);
         p.prefill(&mut sink).unwrap();
         let tel = Telemetry::new();
@@ -1586,6 +1550,9 @@ mod tests {
         assert_eq!(r, Err(0x8889_0004_u32 as i32));
     }
 
+    /// No loopback packets at all (silence without the keep-alive): each block's reference is
+    /// dithered zeros and a gap, and nothing is buffered or owed: the timeline starts with the
+    /// first packet. (It used to pad the FIFO up to its target.)
     #[test]
     fn reference_gaps_are_zero_filled_and_dithered() {
         let mut p = pipe(true);
@@ -1594,95 +1561,86 @@ mod tests {
         let tel = Telemetry::new();
         let mut spy = RefSpy(Vec::new());
         let mut mic = FakeCapture::default();
-        mic.push(0, None, vec![0.0; 480]);
-        p.drain_mic(&mut mic, 0.0).unwrap();
-        // No loopback packets at all (silence without the keep-alive).
-        p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
-        assert_eq!(p.counters.reference_gaps, 1);
-        assert_eq!(p.ref_len(), p.ref_target() - 480, "padded to the target, one block served");
+        for b in 0..2usize {
+            mic.push((b * 480) as u64, None, vec![0.0; 480]);
+            p.drain_mic(&mut mic, 0.0).unwrap();
+            p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+        }
+        assert_eq!(p.counters.reference_gaps, 2);
+        assert_eq!(p.ref_len(), 0);
         assert!(spy.0.iter().all(|v| v.abs() <= 1.0001e-9) && spy.0.iter().any(|&v| v != 0.0), "dithered silence");
     }
 
-    #[test]
-    fn reference_is_served_in_order_and_overflow_drops_blocks() {
+    /// Runs `blocks` stamped 10 ms wakes with the loopback 20 ms ahead of the mic. `lb_at(b)`
+    /// says whether the loopback delivers at wake `b` (everything it has tapped by the mic
+    /// block's end when it does); `mic_lost` is a span of mic packets that never arrive. Returns
+    /// the pipeline and the reference index each block started at (`None` for all zeros).
+    fn stamped_run(
+        blocks: usize, lb_at: impl Fn(usize) -> bool, mic_lost: std::ops::Range<usize>,
+    ) -> (Pipeline<FakeDrift, FakeResampler>, Vec<Option<f64>>) {
         let mut p = pipe(true);
         let mut sink = FakeSink::new(4800);
         p.prefill(&mut sink).unwrap();
         let tel = Telemetry::new();
         let mut spy = RefSpy(Vec::new());
-        let mut mic = FakeCapture::default();
-        let mut lb = FakeCapture::default();
-        // Measured at the target (960) every block, so no slips.
-        lb.push(0, None, ramp(0, 480));
-        p.drain_reference(&mut lb, 0.0).unwrap();
-        for b in 0..2usize {
-            mic.push((b * 480) as u64, None, vec![0.0; 480]);
-            lb.push(0, None, ramp(480 + b * 480, 480));
-            p.drain_mic(&mut mic, 0.0).unwrap();
-            p.drain_reference(&mut lb, 0.0).unwrap();
-            p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+        let (mut mic, mut lb) = (FakeCapture::default(), FakeCapture::default());
+        let (t, h) = (1e10, 1e7 / 48_000.0);
+        let mut sent = 0usize;
+        for b in 0..blocks {
+            let now = t + (b + 1) as f64 * 100_000.0 + 5_000.0;
+            if !mic_lost.contains(&b) {
+                mic.push((b * 480) as u64, Some((t + (b * 480) as f64 * h) as u64), vec![0.0; 480]);
+            }
+            if lb_at(b) {
+                let to = 960 + (b + 1) * 480;
+                push_tapped(&mut lb, sent, to, t - 960.0 * h);
+                sent = to;
+            }
+            p.drain_mic(&mut mic, now).unwrap();
+            if p.block_ready() {
+                p.drain_reference(&mut lb, now).unwrap();
+            }
+            while p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap() {}
+            sink.advance(480.0, 100_000.0);
         }
-        let expect = ramp(0, 960);
-        for (a, b) in spy.0.iter().zip(&expect) {
-            assert!((a - b).abs() < 1e-8, "{a} vs {b}");
-        }
-        assert_eq!(p.counters.reference_gaps, 0);
-        // A burst of 5 extra blocks: whole blocks are dropped to within half a block of the target.
-        for _ in 0..5 {
-            lb.push(0, None, vec![0.0; 480]);
-        }
-        p.drain_reference(&mut lb, 0.0).unwrap();
-        mic.push(960, None, vec![0.0; 480]);
-        p.drain_mic(&mut mic, 0.0).unwrap();
-        let before = p.ref_len();
-        p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
-        assert_eq!(p.counters.reference_drops, 1);
-        let kept = p.ref_len() + 480;
-        assert_eq!((before - kept) % 480, 0, "whole blocks");
-        assert!(kept.abs_diff(p.ref_target()) <= 240, "{kept} vs {}", p.ref_target());
+        let starts = spy.0.chunks(480).map(|blk| blk.iter().position(|&v| v >= 0.5).map(|k| (blk[k] - 1.0) as f64 - k as f64)).collect();
+        (p, starts)
     }
 
-    /// clocks-latency/F2 on the reference: decided on the interpolated fill, past two blocks over the
-    /// target, rounded to within half a block. A first block that finds the FIFO well over (the
-    /// loopback started 40 ms before the mic's first block) aligns it without counting a drop, and
-    /// an error inside the loop's range is left to the loop.
+    /// A loopback that stalls for 40 ms after the start-up and then delivers it all at once moves
+    /// nothing: the blocks it was late for get zeros (three gaps), its late samples are discarded,
+    /// and the next block carries on where the timeline is. In order throughout, no jumps or slips.
     #[test]
-    fn reference_coarse_corrections_have_no_dead_band() {
-        let run = |first: usize, later: Option<usize>| {
-            let mut p = pipe(true);
-            let mut sink = FakeSink::new(4800);
-            p.prefill(&mut sink).unwrap();
-            let tel = Telemetry::new();
-            let mut mic = FakeCapture::default();
-            let mut lb = FakeCapture::default();
-            lb.push_frames(first, 0.0);
-            p.drain_reference(&mut lb, 0.0).unwrap();
-            mic.push(0, None, vec![0.0; 480]);
-            p.drain_mic(&mut mic, 0.0).unwrap();
-            p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
-            let after_first = p.ref_len() + 480;
-            if let Some(extra) = later {
-                lb.push_frames(extra, 0.0);
-                p.drain_reference(&mut lb, 0.0).unwrap();
-                mic.push(480, None, vec![0.0; 480]);
-                p.drain_mic(&mut mic, 0.0).unwrap();
-                p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+    fn a_late_loopback_is_owed_not_shifted() {
+        let (p, starts) = stamped_run(400, |b| !(350..354).contains(&b), 0..0);
+        for (b, s) in starts.iter().enumerate() {
+            match b {
+                // Partly served, then all owed.
+                351..354 => assert!(s.is_none_or(|s| s == 384.0 + 480.0 * b as f64), "block {b}: {s:?}"),
+                _ => assert_eq!(*s, Some(384.0 + 480.0 * b as f64), "block {b}"),
             }
-            (p.counters.reference_drops, after_first, p.ref_len())
-        };
-        let target = cfg(true).ref_target();
-        // 2400 at the first block: aligned to within half a block, not counted.
-        let (drops, first, _) = run(2400, None);
-        assert_eq!(drops, 0);
-        assert!(first.abs_diff(target) <= 240, "{first}");
-        // At the target, then 2.5 blocks over (2400 in the FIFO): dropped once, to within half a block.
-        let (drops, _, len) = run(target, Some(2400 - (target - 480)));
-        assert_eq!(drops, 1);
-        assert!((len + 480).abs_diff(target) <= 240, "{len}");
-        // 1.5 blocks over: the loop's job, no discard.
-        let (drops, _, len) = run(target, Some(1776 - (target - 480)));
-        assert_eq!(drops, 0);
-        assert!(len >= 1776 - 481, "{len}");
+        }
+        let c = p.counters;
+        assert_eq!((c.reference_gaps, c.reference_drops, c.reference_slips), (3, 0, 0), "{c:?}");
+        assert_eq!(p.ref_target(), cfg(true).ref_target(), "one stall doesn't raise the target");
+    }
+
+    /// clocks-latency/F2, now on the stamps: 200 ms of mic packets lost after the start-up (too
+    /// many to zero-fill) put the mic's stamps 200 ms ahead of its samples, a broken timeline.
+    /// One jump (counted) discards the reference that played meanwhile, and the echo path is back
+    /// where it was. (Coarse corrections used to read the FIFO's fill, past two blocks over.)
+    #[test]
+    fn a_broken_timeline_is_one_jump() {
+        let (p, starts) = stamped_run(450, |_| true, 350..370);
+        let lag = |b: usize, mic_block: usize| starts[b].map(|r| (mic_block * 480) as f64 - r);
+        // Before: 576 - 960 = -384 samples between the streams' indices.
+        assert_eq!(lag(349, 349), Some(-384.0));
+        // After the loss the mic's block 370 is the pipeline's block 350; five blocks later it jumps.
+        assert_eq!(starts.len(), 430);
+        assert_eq!(lag(429, 449), Some(-384.0));
+        assert_eq!(p.counters.reference_drops, 1);
+        let moves = (300..429).filter(|&b| starts[b + 1].zip(starts[b]).is_none_or(|(n, o)| n - o != 480.0)).count();
+        assert_eq!(moves, 1, "one jump");
     }
 
     /// wasapi/B: once the reference is dropped, the chain gets dithered zeros with no gaps counted,
@@ -1718,43 +1676,6 @@ mod tests {
         p.publish_second(&tel, &spy, 0, 0, 0);
         assert_eq!((tel.reference_fill_ms.load(), tel.reference_drift_ppm.load()), (0.0, 0.0));
         assert_eq!(p.counters.render_underruns, 0, "the output carried on");
-    }
-
-    #[test]
-    fn reference_at_a_packet_boundary_skips_the_slip_instead_of_a_gap() {
-        struct AlwaysDrop;
-        impl DriftControl for AlwaysDrop {
-            fn update(&mut self, _f: f32) -> Slip {
-                Slip::Drop
-            }
-            fn ppm(&self) -> f32 {
-                0.0
-            }
-            fn reset(&mut self, _f: f32) {}
-        }
-        let c = cfg(true);
-        let mut p = Pipeline::new(c, AlwaysDrop, AlwaysDrop, FakeResampler, FakeResampler);
-        let mut sink = FakeSink::new(4800);
-        p.prefill(&mut sink).unwrap();
-        let tel = Telemetry::new();
-        let mut mic = FakeCapture::default();
-        let mut lb = FakeCapture::default();
-        lb.push(0, None, vec![0.1; 480]);
-        p.drain_reference(&mut lb, 0.0).unwrap();
-        mic.push(0, None, vec![0.0; 480]);
-        p.drain_mic(&mut mic, 0.0).unwrap();
-        p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
-        assert_eq!(p.counters.reference_gaps, 0);
-        assert_eq!(p.counters.reference_slips, 0);
-        assert_eq!(p.ref_len(), 0);
-        // With enough buffered, the drop goes through: 481 consumed.
-        lb.push(0, None, vec![0.1; 960]);
-        p.drain_reference(&mut lb, 0.0).unwrap();
-        mic.push(480, None, vec![0.0; 480]);
-        p.drain_mic(&mut mic, 0.0).unwrap();
-        p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
-        assert_eq!(p.counters.reference_slips, 1);
-        assert_eq!(p.ref_len(), 960 - 481);
     }
 
     /// Simulates a mic at 48 kHz against a cable that consumes `ppm` faster than the mic produces
@@ -1829,13 +1750,7 @@ mod tests {
     fn real_drift_loop_and_resampler() {
         for ppm in [-1000.0, -300.0, 50.0, 300.0, 1000.0] {
             let c = cfg(true);
-            let p = Pipeline::new(
-                c,
-                DriftController::new(c.out_target() as f32),
-                DriftController::new(c.ref_target() as f32),
-                SlipResampler::new(),
-                SlipResampler::new(),
-            );
+            let p = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
             let (p, sink, tel) = simulate_pipe(p, ppm, -ppm / 2.0, 120);
             let k = p.counters;
             assert_eq!(k.render_underruns, 0, "{ppm}: {k:?}");
@@ -2034,13 +1949,7 @@ mod tests {
     #[ignore]
     fn the_audio_path_never_allocates_with_the_real_drift_loop() {
         let c = cfg(true);
-        let mut p = Pipeline::new(
-            c,
-            DriftController::new(c.out_target() as f32),
-            DriftController::new(c.ref_target() as f32),
-            SlipResampler::new(),
-            SlipResampler::new(),
-        );
+        let mut p = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
         assert_eq!(wake_ups(&mut p, 1_000, 10), (0, 0));
     }
 
@@ -2216,13 +2125,7 @@ mod tests {
     /// by the device's real position) from `settle` seconds on, with the pipeline and the sink.
     fn simulate_stepped(ppm: f64, clock: bool, seconds: usize, settle: usize) -> (Vec<f64>, Pipeline, StepSink) {
         let c = cfg(false);
-        let mut p = Pipeline::new(
-            c,
-            DriftController::new(c.out_target() as f32),
-            DriftController::new(BLOCK as f32),
-            SlipResampler::new(),
-            SlipResampler::new(),
-        );
+        let mut p = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
         let t0 = 1e10;
         let mut sink = StepSink::new(ppm, 0.3, t0, clock);
         p.prefill(&mut sink).unwrap();
@@ -2287,4 +2190,5 @@ mod tests {
     }
 
     mod events;
+    mod timeline;
 }

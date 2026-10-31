@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use nf_engine::{EngineConfig, EngineState, EngineStatus, StreamInfo, TelemetrySnapshot};
+use nf_engine::{EngineConfig, EngineState, EngineStatus, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot};
 
 use super::{db, fixed, list_devices};
 use crate::cli::EngineArgs;
@@ -65,9 +65,11 @@ pub fn start(cfg: &EngineConfig) -> Result<nf_engine::Engine, Failure> {
 
 /// What the status line's columns are.
 pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency median/p95 (mic capture to cable play-out); \
-     CPU p99 per block; drift output/reference; dropouts mic/output/reference, then, once there are any, mic stalls \
-     (100 ms with no packet) and whole blocks dropped to catch up, output/reference (coarse); real-time heap \
-     allocations (pool allocations per second). Ctrl+C stops.";
+     CPU p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic \
+     block it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not \
+     cover); dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse \
+     corrections, output/reference (whole blocks dropped to catch up; on the reference, jumps of its timeline); \
+     real-time heap allocations (pool allocations per second). Ctrl+C stops.";
 
 /// One line of live telemetry. `retrying`: stopped by a fault, with the engine set to restart by
 /// itself (`EngineStatus::retrying`).
@@ -99,8 +101,18 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool) -> String {
     if t.output_coarse_drops > 0 || t.reference_coarse_drops > 0 {
         rare.push_str(&format!(" coarse {}/{}", t.output_coarse_drops, t.reference_coarse_drops));
     }
+    let mut reference = String::new();
+    if t.reference_target_ms > 0.0 {
+        reference = format!("  ref {}/{} ms", fixed(f64::from(t.reference_fill_ms), 1), fixed(f64::from(t.reference_target_ms), 1));
+        if !t.reference_stamped {
+            reference.push_str(" by delivery");
+        }
+        if t.reference_target_ms > REFERENCE_TARGET_HIGH_MS {
+            reference.push_str(" high");
+        }
+    }
     format!(
-        "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}  cpu {} µs  drift {}/{} ppm  drops {}/{}/{}{rare}  rt {} ({}/s)",
+        "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}  cpu {} µs  drift {}/{} ppm{reference}  drops {}/{}/{}{rare}  rt {} ({}/s)",
         db(t.input.peak_dbfs),
         db(t.input.rms_dbfs),
         db(t.output.peak_dbfs),
@@ -239,6 +251,18 @@ mod tests {
         let t = TelemetrySnapshot { stalls: 1, output_coarse_drops: 3, reference_coarse_drops: 5, ..quiet };
         assert!(status_line(&t, false).contains("drops 1/0/0 stalls 1 coarse 3/5  rt 0"), "{}", status_line(&t, false));
         assert!(LEGEND.contains("stalls") && LEGEND.contains("coarse"));
+    }
+
+    /// With a reference, its lead and target follow the drift, and say when the delivery times it or the target is high.
+    #[test]
+    fn the_reference_lead_shows_with_a_reference() {
+        let quiet = TelemetrySnapshot { state: EngineState::Running, ..Default::default() };
+        assert!(!status_line(&quiet, false).contains("ref "), "{}", status_line(&quiet, false));
+        let t = TelemetrySnapshot { reference_fill_ms: 23.36, reference_target_ms: 23.4, reference_stamped: true, ..quiet };
+        assert!(status_line(&t, false).contains("drift 0/0 ppm  ref 23.4/23.4 ms  drops 0/0/0"), "{}", status_line(&t, false));
+        let t = TelemetrySnapshot { reference_target_ms: 31.0, reference_stamped: false, ..t };
+        assert!(status_line(&t, false).contains("ref 23.4/31.0 ms by delivery high  drops"), "{}", status_line(&t, false));
+        assert!(LEGEND.contains("lead/target"));
     }
 
     #[test]

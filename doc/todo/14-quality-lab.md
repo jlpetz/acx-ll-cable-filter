@@ -113,6 +113,10 @@ Notes:
       voice give 21-53 dB a turn, and 27-54 dB with the mic 96 ms behind the reference and 30 ppm of drift. So AEC3 copes
       and the live reference path doesn't: 57 reference gaps in 30 s, 450 in 60 s (#10). With the base cable as the far end
       (and cable B as the output) it was 7-23 dB a turn, with 177 gaps in 30 s.
+    - After #10's reference fix the gaps were gone but the echo still dropped 2 dB: the rig was non-causal (VB-CABLE's
+      loopback stamps run late, so the echo pre-mixed into cable A came 10-40 ms ahead of its reference). The echo scene
+      now plays the far voice 100 ms ahead of its echo, as a speaker's output latency would, and saves `far.wav` as played.
+      Then: echo down 14.4 dB (12-18 dB a far-only turn) against 46-57 dB offline on the same scene (#10's detail file).
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
 - **Phase 2:** AECMOS with talk-type segmentation, from far-end and near-end activity.
 - **Later:** the Lab page in the GUI (#15), with the blind-rating player.

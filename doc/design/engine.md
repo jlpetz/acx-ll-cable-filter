@@ -23,6 +23,7 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
   - `LoopbackStream`: shared-mode loopback capture of a render endpoint.
   - `KeepAlive`: a silent render stream on the reference endpoint at its default period, so its
     loopback never stops.
+- `reference`: the reference's timeline (below, "The reference").
 - `audio`: the audio thread (below).
 - `control`: `Inner` (telemetry, status, the command channel, the audio-thread handle),
   `start/stop/apply/status`, and status messages worded for the user. The control thread owns:
@@ -75,14 +76,14 @@ after 2 s with no packets, report an error and stop):
    about 200 ms), remembering the QPC time of the first un-consumed sample (from packet
    `timestamp` + offset/fs).
 2. **Reference**, only on a wake that will process a block: top up the keep-alive and drain the
-   loopback into the reference FIFO (about 500 ms). If it's empty for this block (no keep-alive
-   and silence), zero-fill and count `reference_gaps`. A failing loopback or keep-alive drops the
-   reference for the rest of the run (dithered zeros, a warning), and the mic path carries on.
+   loopback onto the reference's timeline (a FIFO of about 500 ms; "The reference" below). A
+   failing loopback or keep-alive drops the reference for the rest of the run (dithered zeros, a
+   warning), and the mic path carries on.
 3. While the mic FIFO holds ≥ 480:
    - Take one block.
-   - **Reference slip:** `ref_slip = ref_drift.update(ref_fill)`, where the fill counts what the
-     loopback has produced since its last packet (at most a period); pop
-     `ref_slip.consumed_len()` samples and `SlipResampler::resample` them to 480.
+   - **Reference:** the timeline serves 480 samples (±1 when its loop slips) for this block, with
+     zeros for any that haven't arrived, and `SlipResampler::resample` makes them 480 ("The
+     reference" below).
    - `chain.process_timed(mic, ref, out, qpc_now)`.
    - **Output slip:** `out_slip = out_drift.update(output_fill)`, where the fill is frames written
      (and pending) minus the device position carried forward to now (at most a period), calibrated
@@ -99,8 +100,7 @@ after 2 s with no packets, report an error and stop):
        target: an underrun. Zeros top the device up to the target once this wake's blocks are
        written; the loop restores the rest. A late wake whose blocks cover it gets no zeros;
      - more than two blocks over the target, whole blocks are dropped back to within half a block
-       (one coarse drop per event). The reference FIFO does the same, leaving out what the mic
-       backlog will take, and its first block aligns it from half a block over.
+       (one coarse drop per event).
      - After a correction, `DriftController::reset` at the fill the next wake will read.
    - **Latency readout** (if enabled):
      `t_play = clock.qpc + (frames_written_total_before_this_block - clock.pos_frames) / fs_out`
@@ -129,12 +129,93 @@ Never allocate, lock, log or make blocking calls inside the loop:
 - Output render target = one render period + one block + `io.output_margin_ms`, measured before
   each block's write. (Whether one period + the margin is enough is to be measured on a real
   cable: it would take a block, 10 ms, off the latency.)
-- Reference FIFO target = one loopback period + one block + 2 ms.
-- Both are visible in telemetry.
+- Reference lead target: one loopback period + 2 ms to start with; it can rise in the first 2.5 s
+  and when underflows persist, up to 50 ms, and comes back down after five minutes under ("The
+  reference" below).
+- Both are visible in telemetry (`reference_fill_ms` is the reference's lead, against
+  `reference_target_ms`).
 
 **Stop:** set the flag and wait for the run to end (≤ 1 s); the run stops and releases its streams
 in reverse order and the thread goes back to waiting. MMCSS and COM stay with the thread until the
 engine is dropped.
+
+## The reference (`reference.rs`, TODO 10)
+AEC3 converges on the echo path, a mic sample's index less that of the reference sample served
+with it, and holds as long as that stays put. The first design held a FIFO at one loopback period
++ a block, read by a PI loop on its fill. On the dev box's cables, whose mic delivers 0, 480 or 960
+frames a wake and whose loopback delivers up to 1440, with a 10-30 ms swing between them, it moved
+the path several times a second: a short FIFO zero-filled up to the target, an overfull one dropped
+whole blocks, and the loop slipped after the swings (330 samples in 10 s against 9 ppm of real
+drift). AEC3 kept 1-6 dB of its own ERLE. The timeline replaces it:
+- **A virtual read position.** Each block consumes its 480 (±1) samples whether they've arrived or
+  not. Missing ones are served as zeros and owed, discarded when they come, so the timeline stays
+  whole. A reference gap counts a block that was served zeros that way.
+- **The lead, from the stamps.** The loop's input is the lead: the mic block's capture time (its
+  `StampMap`) less the loopback's tap time of the sample served with it (the loopback's own
+  `StampMap`). It sees only the two clocks, so bursts don't reach it. On the cables the loopback's
+  stamps jitter by 0.05 ms and the mic's are in 0.5 ms steps within ±1 ms. `StampMap` measures each
+  stream's scatter (how far each stamp lands from where the one before put it); past 3.5 ms RMS, a
+  driver that stamps at delivery or stamps that are noise, it stops trusting them for good.
+- **Without trusted stamps** (on either stream) the lead is timed by when the packets were
+  delivered, for the rest of the run (in the start-up the timing can still change either way, and
+  the start-up starts over). Delivered at the mic's wakes, that reading swings with the bursts and
+  moves with the drift only by a whole packet once per beat of the two clocks (33 s at 300 ppm,
+  5.5 min at 30 ppm). So then nothing slips: the path drifts at the clocks' rate, and each step of
+  the count is put back in a jump of a packet once a 3 s mean of the lead is 0.6 of a packet off
+  (0.9 the other way from the last step: the mean can sit at half a packet while the count steps).
+- **The loop.** Slips at the drift, a least-squares slope of the lead without our own moves over
+  about 20 s (trusted after 10 s, once its standard error is within 10 ppm), plus an offset
+  correction (10 ppm per sample) only outside a ±0.5 ms dead band, until back within 0.125 ms. At
+  most one slip a block (1000 ppm). Blocks the loop coasts through (no fresh delivery, a reading
+  left out) still count as time for the fit, so a silence's drift isn't a step in it.
+- **The target.** One loopback period + 2 ms: what steady delivery needs at the worst phase of the
+  clocks. A take's need is the least lead that would have served it whole. Only fresh takes count
+  (the loopback delivered within two periods and 5 ms), and only once the loopback delivers again: a
+  stall's first wakes are fresh, but need more each wake, and silence without the keep-alive says
+  nothing about the delivery. A need counts once three wakes have reached it. In the first 2.5 s
+  (AEC3 hasn't converged) the target rises, a jump each time, to that need plus 3 ms. After that
+  only when underflows persist: a leaky count of short takes (10 s time constant) reaching 60, 6% of
+  them for good or 0.6 s in a row (timed by delivery 200: a step of the count is put back first),
+  to what the last 10 s needed plus 3 ms. That matters for a drifting bursty loopback: its phase
+  against the mic's wakes sets its need, the start-up sees one phase, and at the worst one 13-20%
+  of its blocks were short for 30 s of every 100 (at 100 ppm), costing AEC3 3-4 dB throughout; one
+  raise covers that phase for good. A jump costs AEC3 5-10 s; a few owed blocks in a hundred about
+  1 dB. The target comes back down, in one jump, once the need has stayed 3 ms or more under it for
+  five minutes (longer than a drifting loopback's good phase down to about 15 ppm), and it's capped
+  at 50 ms. The cap must stay under the echo path's own delay: the loopback taps the mix ahead of
+  the speakers, so the echo arrives the output's latency (and the air's) after its reference, and a
+  lead beyond that puts the echo before its reference (AEC3's delay estimate then reads 0). The
+  cables' echo path is 60 ms; a bursty cable's lead ends at 23-33 ms. Nothing measures the echo
+  path's delay yet, so a target over 30 ms (`REFERENCE_TARGET_HIGH_MS`) is flagged where it's
+  shown (the GUI readout, `run`'s status line, the quality report's warnings).
+- **Jumps**, counted as reference coarse drops after the start-up: the alignment at the first
+  reading (either way: discarding, or zeros before the loopback's first sample), a centring at the
+  start-up's end when the low-passed lead is off by more than 0.125 ms, a change of target, and a
+  broken timeline. A break is a step of the lead past 4 ms (or 2.5 times the stamps' jitter) from
+  the low-pass, in the median of the last 9 readings and in 7 of them: the mic losing more than the
+  100 ms it zero-fills, a device reset, a stamp that jumped. One jump undoes it, by the mean of the
+  readings past it, and the drift fit starts over (the readings after a step get it right to about
+  ±0.3 ms on the cables' bursty mic, and the residual would be a step in its line). A reading
+  twice that far from the low-pass is left out of it. Timed by delivery a break is a step past
+  30 ms, undone in one jump and centred 2.5 s later. Loopback packets lost past the position fill,
+  and silence without the keep-alive, need no jump: a loopback stamp more than 4 ms (or 4 times its
+  scatter) from its place on the timeline is suspect, and once the next stamp agrees (or the device
+  position jumped by about as much) zeros go in where the samples should have been: by the
+  position's count when it agrees, else by the stamps at the loopback's rate. A stamp that's off on
+  its own is left out.
+- Telemetry: `reference_fill_ms` is the low-passed lead, `reference_target_ms` its target,
+  `reference_stamped` whether the stamps time it, `reference_drift_ppm` the loop's drift estimate.
+
+Replayed through the pipeline, the four 30 s traces from the cables (`live_probe.rs`;
+`pipeline/tests/timeline.rs`) went from 206-283 gaps, 205-282 drops and up to 2021 slips to 0-3
+gaps (in the start-up), no drops, 1-2 slips, and no move of the path and no block short after 3 s,
+at a lead of 13.5-23.4 ms. Behind AEC3 offline (the quality test's turns, the echo path 25-100 ms
+behind the loopback), AEC3's own ERLE is within 3 dB of the same audio delivered steadily wherever
+the lead fits in the echo path, and the echo removed where only the far end talks the same; a bursty
+loopback's 27 ms lead in a 25 ms echo path isn't causal (AEC3's delay estimate reads 0 and its ERLE
+falls 6 dB). The synthetic scenes there test bursts, drift up to ±300 ppm, stalls, losses, silence
+without the keep-alive, late wakes, a late loopback, streams without stamps and stamps that are off
+or noisy; `NF_SEED` plays them with another seed.
 
 ## WASAPI hot-path rules (doc/dev/api/wasapi.md)
 - `read_from_device` returns one packet per call: loop until it returns 0 frames. Read into
@@ -228,6 +309,9 @@ on an STA (UI) thread COM is single-threaded already, and they fail, saying so.
   - the latency-readout arithmetic;
   - the QPC interpolation;
   - the report statistics.
-- `#[ignore]` tests may enumerate devices; never open streams in tests.
+- `#[ignore]` tests may enumerate devices; never open streams in tests. One exception, outside
+  every plain `cargo test`: the live probe (`live_probe.rs`), built only with the `live-probe`
+  feature, ignored, and doing nothing unless `NF_LIVE_PROBE` is set, which the owner runs to trace a
+  device's delivery for the reference's replays.
 - The audio loop's logic should be split so its per-block bookkeeping can be driven by a fake
   stream in a test: a trait over capture/render that the WASAPI wrappers implement.

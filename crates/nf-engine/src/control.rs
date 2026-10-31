@@ -642,6 +642,7 @@ fn reset_telemetry(t: &Telemetry) {
 fn clear_targets(t: &Telemetry) {
     t.output_target_ms.store(0.0);
     t.reference_target_ms.store(0.0);
+    t.reference_stamped.store(false, Relaxed);
 }
 
 pub(crate) fn start(inner: &Arc<Inner>, config: &EngineConfig) -> Result<(), EngineError> {

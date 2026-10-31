@@ -62,19 +62,45 @@ pub(crate) fn ticks_to_hns(ticks: i64, freq: i64) -> i64 {
 /// Stamps further than this from "now" are rejected (Chromium's sanity check).
 const MAX_STAMP_AGE_HNS: f64 = 500.0 * 1e4;
 
+/// How far each stamp lands from where the one before it put it, its scatter, is measured as an RMS over about 3 s (each
+/// reading clipped at 10 ms, so that a gap or a lost packet is one bounded outlier). Stamps that scatter by more than
+/// 3.5 ms (a stamp's own jitter of about 2.5 ms, as the difference of two) once a second of them is in aren't trusted
+/// again: the driver stamps when it delivers, or its stamps are noise. The cables' mic stamps, in 0.5 ms steps within
+/// ±1 ms, scatter by about 0.8 ms, their loopback's by 0.05 ms.
+const SCATTER_TAU_S: f64 = 3.0;
+const SCATTER_CLIP_HNS: f64 = 100_000.0;
+const SCATTER_LIMIT_HNS: f64 = 35_000.0;
+const SCATTER_WARMUP_S: f64 = 1.0;
+
 /// Maps a stream's absolute sample index to its capture time, anchored at the latest trusted
 /// packet stamp. Each new stamp re-anchors the map, so the device's clock drift never accumulates.
+/// It also measures the stamps' scatter, and stops trusting them for good when it's too wide.
 #[derive(Clone, Debug)]
 pub(crate) struct StampMap {
     anchor_index: u64,
     anchor_hns: f64,
     hns_per_sample: f64,
     valid: bool,
+    /// The scatter's weighted mean square (hns²), the weight it has gathered (its decayed sum, towards 1), and the stream
+    /// time it covers (s).
+    scatter_sq: f64,
+    scatter_w: f64,
+    scatter_s: f64,
+    untrusted: bool,
 }
 
 impl StampMap {
     pub(crate) fn new(sample_rate: u32) -> Self {
-        Self { anchor_index: 0, anchor_hns: 0.0, hns_per_sample: HNS_PER_S / sample_rate as f64, valid: false }
+        Self {
+            anchor_index: 0,
+            anchor_hns: 0.0,
+            hns_per_sample: HNS_PER_S / sample_rate as f64,
+            valid: false,
+            scatter_sq: 0.0,
+            scatter_w: 0.0,
+            scatter_s: 0.0,
+            untrusted: false,
+        }
     }
 
     /// Offers the stamp of the packet whose first sample has absolute index `index`. Rejected when
@@ -88,10 +114,35 @@ impl StampMap {
         if self.valid && (t < self.anchor_hns || index < self.anchor_index) {
             return false;
         }
+        self.note(index, t);
         self.anchor_index = index;
         self.anchor_hns = t;
         self.valid = true;
         true
+    }
+
+    /// Counts a stamp towards the scatter without anchoring on it (one the caller holds as suspect). Same checks as
+    /// `observe`.
+    pub(crate) fn note_only(&mut self, index: u64, stamp_hns: u64, now_hns: f64) {
+        let t = stamp_hns as f64;
+        if (t - now_hns).abs() <= MAX_STAMP_AGE_HNS && self.valid && t >= self.anchor_hns && index >= self.anchor_index {
+            self.note(index, t);
+        }
+    }
+
+    fn note(&mut self, index: u64, t: f64) {
+        if !self.valid {
+            return;
+        }
+        let dt = index.saturating_sub(self.anchor_index) as f64 * self.hns_per_sample / HNS_PER_S;
+        let a = (dt / SCATTER_TAU_S).min(1.0);
+        let d = (t - self.time_of_unchecked(index)).abs().min(SCATTER_CLIP_HNS);
+        self.scatter_sq += a * (d * d - self.scatter_sq);
+        self.scatter_w += a * (1.0 - self.scatter_w);
+        self.scatter_s += dt;
+        if self.scatter_s >= SCATTER_WARMUP_S && self.scatter_hns() > SCATTER_LIMIT_HNS {
+            self.untrusted = true;
+        }
     }
 
     /// The capture time of absolute sample `index`, if any stamp has been taken.
@@ -104,6 +155,16 @@ impl StampMap {
     fn time_of_unchecked(&self, index: u64) -> f64 {
         let offset = index as f64 - self.anchor_index as f64;
         self.anchor_hns + offset * self.hns_per_sample
+    }
+
+    /// The stamps' scatter (hns, RMS): 0 until two have been taken.
+    pub(crate) fn scatter_hns(&self) -> f64 {
+        if self.scatter_w > 0.0 { (self.scatter_sq / self.scatter_w).sqrt() } else { 0.0 }
+    }
+
+    /// Whether a stamp has been taken and the stamps haven't scattered too widely (once they have, never again).
+    pub(crate) fn trusted(&self) -> bool {
+        self.valid && !self.untrusted
     }
 }
 

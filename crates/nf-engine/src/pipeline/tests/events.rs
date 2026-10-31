@@ -11,7 +11,7 @@ use super::*;
 /// A render device on its own clock that takes `period` frames per tick, with its position stepped
 /// at the tick (as shared-mode engines report it). While stalled it takes nothing and its clock
 /// stops.
-struct VSink {
+pub(super) struct VSink {
     period: usize,
     padding: usize,
     tick_hns: f64,
@@ -27,7 +27,7 @@ struct VSink {
 }
 
 impl VSink {
-    fn new(period: usize, ppm: f64, phase: f64, now: f64) -> Self {
+    pub(super) fn new(period: usize, ppm: f64, phase: f64, now: f64) -> Self {
         let tick_hns = period as f64 * 1e7 / (48_000.0 * (1.0 + ppm * 1e-6));
         Self {
             period,
@@ -45,7 +45,7 @@ impl VSink {
         }
     }
 
-    fn advance_to(&mut self, t: f64) {
+    pub(super) fn advance_to(&mut self, t: f64) {
         while self.next_tick <= t {
             let stalled = self.stall.is_some_and(|(a, b)| self.next_tick >= a && self.next_tick < b);
             if !stalled {
@@ -145,13 +145,7 @@ struct Outcome {
 
 fn run(c: Case) -> Outcome {
     let cfg = PipelineConfig { out_period: c.out_period, out_margin: 96, ref_period: None, max_packet: 4800 };
-    let mut p: Pipeline = Pipeline::new(
-        cfg,
-        DriftController::new(cfg.out_target() as f32),
-        DriftController::new(BLOCK as f32),
-        SlipResampler::new(),
-        SlipResampler::new(),
-    );
+    let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new());
     let t0 = 1e10;
     let mut sink = VSink::new(c.out_period, c.ppm, c.phase, t0);
     p.prefill(&mut sink).unwrap();
@@ -401,13 +395,7 @@ struct RefOutcome {
 /// meanwhile). `lead_ms`: how long the loopback ran before the mic's first packet.
 fn ref_run(late_ms: f64, lead_ms: f64, ref_ppm: f64, phase: f64) -> RefOutcome {
     let c = PipelineConfig { out_period: 480, out_margin: 96, ref_period: Some(480), max_packet: 4800 };
-    let mut p: Pipeline = Pipeline::new(
-        c,
-        DriftController::new(c.out_target() as f32),
-        DriftController::new(c.ref_target() as f32),
-        SlipResampler::new(),
-        SlipResampler::new(),
-    );
+    let mut p: Pipeline = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
     let t0 = 1e10;
     let mut sink = VSink::new(480, 0.0, 0.37, t0);
     p.prefill(&mut sink).unwrap();

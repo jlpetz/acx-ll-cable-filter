@@ -8,7 +8,8 @@
 //!   (the synthetic high voice, or `--far-speech`) in the far-only and double-talk turns. The mic gets the near speech, the far
 //!   voice through a room impulse response (RT60 0.15 s, 150 ms long) at 6 dB below the near speech's active level, and pink
 //!   noise 60 dB below it (or `--snr`): low, so the noise doesn't cap the ERLE the analysis can see. The far voice itself, at
-//!   -20 dBFS active level, goes to the far-end device: the engine's echo reference.
+//!   -20 dBFS active level, goes to the far-end device: the engine's echo reference. It's played 100 ms ahead of its echo in
+//!   the mic, as a speaker's output latency would put it ([`ECHO_DELAY_S`]).
 //! - **Recordings** (`--speech`, `--noise`, `--far-speech`) replace the synthetic speech, noise or far voice. They must be
 //!   48 kHz (mono, or downmixed); they're looped or trimmed to the scene's length, and speech is set to the same active level.
 //!   Their speech activity comes from a frame-energy detector ([`detect_activity`]) plus a 200 ms hangover (ITU-T P.56's), so
@@ -39,6 +40,11 @@ pub const DEFAULT_ECHO_SNR_DB: f32 = 60.0;
 pub const TURN_S: f64 = 3.0;
 /// The room impulse response's length: the echo outlasts the far voice by this much.
 pub const RIR_S: f64 = 0.15;
+/// The far voice is played this much ahead of its echo in the mic, as a speaker's output latency would put it. The cables
+/// need it: their loopback stamps run late, so an echo mixed into the mic's cable reached the mic 40 ms before cable B's
+/// loopback stamp for it at its default Latency, and 10 ms before the base cable's (2026-11-01, doc/todo/10-aec.md). An
+/// echo ahead of its reference can't be cancelled.
+pub const ECHO_DELAY_S: f64 = 0.1;
 const RIR_RT60_S: f32 = 0.15;
 /// The fades where a recording is gated to its turns.
 const GATE_FADE_S: f64 = 0.01;
@@ -83,7 +89,8 @@ pub struct Scene {
     pub clean: Vec<f32>,
     /// The noise alone, as mixed in.
     pub noise: Vec<f32>,
-    /// Echo test: the echo alone as mixed in, and the far voice for the far-end device.
+    /// Echo test: the echo alone as mixed in, and the far voice in step with it ([`Scene::far_played`] is what the far-end
+    /// device plays).
     pub echo: Option<Vec<f32>>,
     pub far: Option<Vec<f32>>,
     /// Where the near speech, and the far voice, are active (sample ranges in time order).
@@ -170,13 +177,26 @@ fn echo_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, String
     scene.description = format!(
         "Echo test, {} s in {TURN_S:.0} s turns of far only, double talk and near only: near {} at {SPEECH_DBFS:.1} dBFS active level, \
          the far voice's echo {ECHO_BELOW_DB:.1} dB below it (RT60 {RIR_RT60_S:.2} s), {} {snr_db:.1} dB below it{scaled}; \
-         the far voice ({}) at {SPEECH_DBFS:.1} dBFS active level on the far-end device{far_scaled}.",
+         the far voice ({}) at {SPEECH_DBFS:.1} dBFS active level on the far-end device{far_scaled}, {:.0} ms ahead of its echo.",
         seconds_text(len),
         speech_name(user.speech.is_some(), "--speech"),
         noise_name(user),
         speech_name(user.far_speech.is_some(), "--far-speech"),
+        ECHO_DELAY_S * 1000.0,
     );
     Ok(scene)
+}
+
+impl Scene {
+    /// Echo test: the far voice as the far-end device plays it, [`ECHO_DELAY_S`] ahead of its echo in the mic (its start
+    /// cut by that much, silence at its end).
+    pub fn far_played(&self) -> Option<Vec<f32>> {
+        let far = self.far.as_ref()?;
+        let lead = ((ECHO_DELAY_S * f64::from(SAMPLE_RATE)) as usize).min(far.len());
+        let mut x = far[lead..].to_vec();
+        x.resize(far.len(), 0.0);
+        Some(x)
+    }
 }
 
 fn near_track(len: usize, user: &UserAudio) -> Result<Track, String> {
@@ -444,7 +464,7 @@ mod tests {
         let s = build(QualityTest::Noise, 10.0, None, &UserAudio::default()).unwrap();
         assert_eq!(s.input.len(), 10 * FS);
         assert_eq!((s.clean.len(), s.noise.len()), (10 * FS, 10 * FS));
-        assert!(s.far.is_none() && s.echo.is_none() && s.far_activity.is_empty());
+        assert!(s.far.is_none() && s.far_played().is_none() && s.echo.is_none() && s.far_activity.is_empty());
         assert!((level_db(&s.clean, &s.near_activity) - SPEECH_DBFS).abs() < 0.01);
         assert!((db(rms(&s.noise)) - (SPEECH_DBFS - DEFAULT_NOISE_SNR_DB)).abs() < 0.01);
         // The input is exactly the two parts
@@ -484,6 +504,13 @@ mod tests {
         assert!(echo[..FS].iter().any(|&v| v != 0.0));
         let tail_end = 6 * FS + (RIR_S * FS as f64) as usize;
         assert!(echo[tail_end..9 * FS].iter().all(|&v| v.abs() < 1e-6));
+        // The far-end device plays the far voice 100 ms ahead of its echo, the same length
+        let lead = (ECHO_DELAY_S * FS as f64) as usize;
+        let played = s.far_played().unwrap();
+        assert_eq!((lead, played.len()), (4_800, far.len()));
+        assert_eq!(played[..far.len() - lead], far[lead..]);
+        assert!(played[far.len() - lead..].iter().all(|&v| v == 0.0));
+        assert!(s.description.ends_with("on the far-end device, 100 ms ahead of its echo."), "{}", s.description);
         let input_parts = s.input.iter().zip(&s.clean).zip(s.noise.iter().zip(echo.iter()));
         assert!(input_parts.into_iter().all(|((i, c), (n, e))| (i - (c + n + e)).abs() < 1e-6));
         assert!(s.description.starts_with("Echo test, 18 s in 3 s turns"), "{}", s.description);

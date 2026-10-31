@@ -251,13 +251,7 @@ fn run(r: Run<'_>) {
         output_ms: out_target as f32 * 1000.0 / SAMPLE_RATE as f32,
         reference_ms: ref_target as f32 * 1000.0 / SAMPLE_RATE as f32,
     };
-    let mut pipe: Pipeline = Pipeline::new(
-        pcfg,
-        DriftController::new(out_target as f32),
-        DriftController::new(ref_target.max(BLOCK) as f32),
-        SlipResampler::new(),
-        SlipResampler::new(),
-    );
+    let mut pipe: Pipeline = Pipeline::new(pcfg, DriftController::new(out_target as f32), SlipResampler::new(), SlipResampler::new());
 
     // Prefill the output to its target, warm the chain up with 3 silent blocks (so the stages'
     // first-block set-up is behind us), then take the allocation baseline.
@@ -731,13 +725,7 @@ mod tests {
 
     fn test_pipe() -> Pipeline {
         let cfg = PipelineConfig { out_period: 480, out_margin: 96, ref_period: Some(480), max_packet: 960 };
-        Pipeline::new(
-            cfg,
-            DriftController::new(cfg.out_target() as f32),
-            DriftController::new(cfg.ref_target() as f32),
-            SlipResampler::new(),
-            SlipResampler::new(),
-        )
+        Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new())
     }
 
     /// performance/F3: with a 48-frame (1 ms) mic period, the reference is serviced on the one wake

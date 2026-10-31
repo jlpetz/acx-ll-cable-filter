@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
 use crate::atomic::AtomicF32;
 
+/// A reference lead target above this (ms) may be longer than the echo path's own delay: the loopback taps the mix ahead
+/// of the speakers, whose output latency can be as little as 10-30 ms, and a lead past the echo's delay puts the echo
+/// before its reference, which AEC3 can't cancel (its delay estimate then reads about 0). Shown as a warning.
+pub const REFERENCE_TARGET_HIGH_MS: f32 = 30.0;
+
 /// Engine run state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineState {
@@ -81,8 +86,11 @@ pub struct Telemetry {
     pub latency_ms_median: AtomicF32,
     pub latency_ms_p95: AtomicF32,
     pub output_drift_ppm: AtomicF32,
+    /// The reference loop's drift estimate: positive when the loopback's clock runs fast against the mic's.
     pub reference_drift_ppm: AtomicF32,
     pub output_fill_ms: AtomicF32,
+    /// The reference's lead (low-passed): how long before the mic block's capture the reference served with it was
+    /// tapped. Its loop holds it at `reference_target_ms` (nf-engine `reference.rs`).
     pub reference_fill_ms: AtomicF32,
     pub output_slips: AtomicU64,
     pub reference_slips: AtomicU64,
@@ -90,7 +98,8 @@ pub struct Telemetry {
     pub capture_glitches: AtomicU64,
     /// Times the output cable's buffer ran dry.
     pub render_underruns: AtomicU64,
-    /// Blocks where the reference had to be zero-filled.
+    /// Blocks whose reference was (partly) zeros for samples that hadn't arrived (discarded when they did, so the echo
+    /// path doesn't move).
     pub reference_gaps: AtomicU64,
     /// Whole-chain processing time per block over the last second, in µs.
     pub block_us_p50: AtomicF32,
@@ -107,15 +116,21 @@ pub struct Telemetry {
     pub rt_pool_allocations_per_s: AtomicU64,
     /// Mic event waits that timed out (100 ms with no packet).
     pub stalls: AtomicU64,
-    /// Coarse corrections of the output, or the reference: times whole blocks were dropped to pull
-    /// an overfull buffer back to its target (one per event, however many blocks it dropped).
+    /// Coarse corrections of the output: times whole blocks were dropped to pull an overfull buffer
+    /// back to its target (one per event, however many blocks it dropped). Of the reference: jumps of
+    /// its timeline after the start-up, either way (a broken timeline undone, a change of its lead
+    /// target, or without stamps a step of the count put back).
     pub output_coarse_drops: AtomicU64,
     pub reference_coarse_drops: AtomicU64,
     /// Latency-test tap blocks lost because the tap ring was full.
     pub tap_overflows: AtomicU64,
-    /// The fill targets the drift loops hold, in ms (0 while stopped or without a reference).
+    /// The targets the drift loops hold, in ms (0 while stopped or without a reference): the output's
+    /// fill, and the reference's lead (published each second: it can move).
     pub output_target_ms: AtomicF32,
     pub reference_target_ms: AtomicF32,
+    /// The reference's lead is timed by both streams' QPC stamps; false: by when their packets were delivered (a stream
+    /// without stamps, or whose stamps scatter too widely), which can't slip at the drift (nf-engine `reference.rs`).
+    pub reference_stamped: AtomicBool,
     pub mic_period_ms: AtomicF32,
     pub output_period_ms: AtomicF32,
 }
@@ -158,6 +173,7 @@ pub struct TelemetrySnapshot {
     pub tap_overflows: u64,
     pub output_target_ms: f32,
     pub reference_target_ms: f32,
+    pub reference_stamped: bool,
     pub mic_period_ms: f32,
     pub output_period_ms: f32,
 }
@@ -217,6 +233,7 @@ impl Telemetry {
             tap_overflows: self.tap_overflows.load(Relaxed),
             output_target_ms: self.output_target_ms.load(),
             reference_target_ms: self.reference_target_ms.load(),
+            reference_stamped: self.reference_stamped.load(Relaxed),
             mic_period_ms: self.mic_period_ms.load(),
             output_period_ms: self.output_period_ms.load(),
         }

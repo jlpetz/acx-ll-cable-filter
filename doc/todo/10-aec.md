@@ -58,6 +58,108 @@ Next:
    timeline whole. It has to stay inside the echo path's own delay (loopback taps at mix time, ahead of the speakers).
 3. Then rerun the echo test, and on real speakers in phase 2.
 
+## Fix (2026-11-01): the reference timeline
+The probe (`live_probe.rs`, step 1) traced the cables: the mic delivers 0, 480 or 960 frames a 10 ms wake, its data 19-21
+ms old, its QPC stamps in 0.5 ms steps within ±1 ms; the loopback steadily or in bursts of up to 1440, its stamps within
+0.05 ms; loopback frames against mic frames swing by 20-30 ms; the stamps put the clocks 1-2 ppm apart. Four 30 s traces
+are in `%LOCALAPPDATA%\noise-filter\traces` (not in git; the probe writes there, built with `--features live-probe`).
+`reference.rs` replaces the reference FIFO (engine.md, "The reference", has the details):
+- a virtual read position: missing samples are served as zeros and owed (discarded when they come), so the timeline
+  stays whole;
+- the loop holds the *lead* (the mic block's capture time less the loopback tap time of the sample served with it) from
+  both streams' stamps, which bursts don't reach: slips at a least-squares drift (20 s window, trusted once its standard
+  error is within 10 ppm), corrections only outside ±0.5 ms;
+- a lead target of one period + 2 ms, raised in the first 2.5 s to what three wakes' fresh takes needed + 3 ms (the
+  cables: 13.5-23.4 ms); after that raised only when underflows persist (6% of the takes for good, or 0.6 s in a row),
+  lowered after five minutes 3 ms or more under, capped at 50 ms;
+- one jump undoes a broken timeline (a step of the lead past 4 ms in the median of 9 readings and in 7 of them);
+  loopback samples that never came (lost, or silence without the keep-alive) are zero-filled once two stamps agree (or
+  the position does), so they need none;
+- a stream without stamps, or whose stamps scatter past 3.5 ms (stamped at delivery, or noise), is timed by delivery:
+  no slips, a jump of a packet per step of the count (once a beat of the clocks), breaks undone and centred.
+
+### Review round (same day)
+The first version had holes, found by a review with scratch scenes:
+- **Silence without the keep-alive raised the target.** Over 2.2 s of it every take counted as short, and the target
+  jumped to near the cap for good. Now a take counts only while the loopback is fresh (delivered within two periods and
+  5 ms), so 3 s or 10 s of silence leaves the target and the path where they were (no jump).
+- **A stall in the start-up ratcheted the target to the cap** (a 100 ms stall at 1 s: 47 ms, for the session; non-causal
+  on any echo path under it). Now a need counts once three wakes reached it, and a run of wakes counts only once the
+  loopback delivers again (a stall's first wakes are fresh but need more each wake). And the target comes back down.
+- **Without stamps, a loopback slower than the mic lost the reference for good** (all-zero blocks from about 100 s at
+  -300 ppm, 13 min at 30 ppm). Now a 3 s mean of the delivery-timed lead puts each step of the count back in a jump of a
+  packet: five over 170 s at ±300 ppm, one block of zeros per jump back, and nothing else lost.
+- **Noisy stamps made jumps** (±5 ms jitter: 9-10 in 37 s; stamps put on at delivery: 178). Breaks now go by the median
+  and 7 of 9 readings, with thresholds scaled by the stamps' jitter, and stamps that scatter past 3.5 ms are given up
+  for delivery timing: ±3 ms jitter stays stamped with no jump, ±5 ms and delivery stamps switch with none (one count
+  step at 300 ppm in 40 s).
+- **One loopback stamp 5 ms off put 240 zeros in** and two moves of the path. Now it needs the next stamp (or the
+  position) to agree: a stamp off on its own moves nothing.
+- **The offline AEC3 check measured AEC3's suppressor**, not its filter. It now has the quality test's turns (far only,
+  double talk, near only; pink noise), the echo path at 25, 40, 60 and 100 ms, a start-up stall and 3 s of silence, and
+  asserts AEC3's own ERLE.
+- Found on the way: a drifting bursty loopback's phase against the mic's wakes sets its need, and the start-up sees one
+  phase. At the worst one, 13-20% of its blocks came up short for 30 s of every 100 (100 ppm), which cost AEC3 3-4 dB
+  of its ERLE throughout; a fifth of the takes for good was too high a bar to raise for it. At 6% it raises once, at the
+  first such phase, and every block is whole after.
+- The quality report, `run`'s status line and the GUI show the lead, the target and whether stamps timed it; the report
+  counts slips and jumps over the take and warns when the target passes 30 ms.
+
+Replayed through the pipeline (`traces_hold_the_echo_path`; moves, short blocks and the lag after 3 s; before: the
+committed pipeline, the implementer's figures):
+
+| trace | gaps | drops | slips | path moves | short blocks | lag after 3 s | target |
+|---|---|---|---|---|---|---|---|
+| CABLE_Input-1, before | 237 | 235 | 326 | 314 | 171 all zero | 74..1536 | |
+| after | 3 | 0 | 2 | 0 | 0 | 1090..1092 | 23.3 ms |
+| CABLE-B_Input-2, before | 206 | 205 | 414 | 290 | 152 all zero | 28..1056 | |
+| after | 3 | 0 | 2 | 0 | 0 | 1101..1102 | 23.4 ms |
+| CABLE_Input-3, before | 283 | 282 | 88 | 333 | 197 all zero | 88..1056 | |
+| after | 0 | 0 | 1 | 0 | 0 | 620..621 | 13.7 ms |
+| CABLE-B_Input-4, before | 10 | 6 | 2021 | 15 | 9 all zero | 75..1056 | |
+| after | 0 | 0 | 1 | 0 | 0 | 617..618 | 13.5 ms |
+
+(The 3 gaps are start-up takes, before the target rose to what the bursty mic's late packets need.)
+
+Offline AEC3 on those deliveries (`aec3_converges_on_the_traces`: the quality test's turns, the far voice through a room of
+RT60 0.15 s at 25/40/60/100 ms behind the loopback by the traces' own stamps, against the same audio delivered steadily):
+- Near voice silent: AEC3's own ERLE, live/steady, 13.4-16.1 / 15.4-16.6 dB across the traces and delays (within 0-2.9
+  dB, the 23 ms leads lowest); the echo removed where the far voice sounds 61-62 dB for both (the noise floor caps it).
+  Before the fix the check's first version (a continuous far end, no near voice) had AEC3's ERLE at 0.9-5.9 dB against
+  about 9.6 dB with steady delivery.
+- Near voice in its turns: in double talk the near voice's own share is 6.7-7.4 dB down, live and steady alike (AEC3's
+  suppressor); AEC3's ERLE moves by up to 10 dB from run to run, steady included (its own divergences in double talk).
+- Synthetic: a bursty loopback (lead 27 ms) in a 25 ms echo path isn't causal (AEC3's delay estimate reads 0, its ERLE
+  8.5 dB against 14.6 steady); in 40 ms and up it's within 1 dB. A 100 ms start-up stall and 3 s of far-end silence
+  change nothing; a bursty loopback drifting 300 ppm, raised once, ends 0.7-2.7 dB under steady.
+- The check still doesn't reproduce the live 1-5 dB: the reference path explains AEC3's own low ERLE, maybe not all of
+  the live result (the quality test's measure, the live echo path's 96-116 ms).
+
+### Live again (same day)
+- `quality --test echo --no-ns --seconds 60` with the fix: reference gaps 1 (was 450), 0 slips, 0 jumps, the lead 14.0 ms
+  (target 14.1), but the echo still dropped only 2.0 dB and AEC3's own ERLE was 0.2 dB.
+- A live recording of the mic and the loopback side by side, with their QPC stamps (a temporary probe, kept outside the
+  repo), showed why: **the cable rig was non-causal.** The echo, pre-mixed into cable A's stream, reached the mic about 40
+  ms before cable B's loopback stamp for the same far audio (cable B at its default Latency, 7168), and about 10 ms before
+  the base cable's (3072). VB-CABLE's loopback stamps run late by part of its Latency. On real speakers the echo comes out
+  of the device the loopback taps, so it always follows the tap; only this rig puts it ahead. Offline AEC3 on that
+  stamp-aligned live pair removed 2-8 dB; with the mic 100 ms later, 23-56 dB.
+- So the quality test's echo scene now plays the far voice 100 ms ahead of its echo (`ECHO_DELAY_S`, a speaker's output
+  latency; `far.wav` is saved as played). Live: the echo drops 14.4 dB (far-only turns 12-18 dB; the first, converging
+  turn 21 dB), the lead 14.5 ms, 3 slips, 0 jumps, 3 start-up gaps.
+- Still short of offline: the same saved scene through `process --ref far.wav` drops 46-57 dB a turn once converged (22
+  dB in the first), and the live mic and loopback recorded together (aligned by stamps at a 14 ms lead) got 49-56 dB. So
+  the signals can be cancelled, and something in the engine's live path still differs. AEC3's own figures live: delay
+  0.0 ms, ERLE 5.9 dB.
+
+Next:
+1. Record what the chain is fed live (the mic and reference blocks, with the chain's output) next to `quality --save`'s
+   WAVs, and run AEC3 offline on exactly those: it tells the reference's content and timing from the live processing.
+   It's #14's phase 1 (save the raw take and the loopback) in a small form.
+2. On real speakers in phase 2, check that the lead stays under the echo path's delay (12 ms expected with steady
+   delivery; a target over 30 ms is flagged). A bursty device needing more lead than its echo path has can only be owed
+   blocks or be non-causal: AEC3's delay estimate near 0 with a low ERLE would say so, and could cap the target (not done).
+
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).
   - Where the OEM supplies no Communications-mode processing, this path gets Voice Clarity (Windows 11 client editions).

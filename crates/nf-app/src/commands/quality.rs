@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use nf_core::SAMPLE_RATE;
 use nf_engine::{
-    DeviceInfo, Engine, EngineConfig, EngineState, Flow, PlayRecordRequest, PlayRecordResult, PlayTrack, TelemetrySnapshot, TrackRole,
+    DeviceInfo, Engine, EngineConfig, EngineState, Flow, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS,
+    TelemetrySnapshot, TrackRole,
 };
 
 use super::run::stream_text;
@@ -140,7 +141,8 @@ fn play(engine: &Engine, cfg: &EngineConfig, scene: &Scene, route: Route) -> Res
     }
     let before = engine.telemetry();
     let mut play = vec![PlayTrack { device: route.probe, role: TrackRole::Probe, samples: &scene.input }];
-    if let (Some(device), Some(samples)) = (route.far, scene.far.as_deref()) {
+    let far = scene.far_played();
+    if let (Some(device), Some(samples)) = (route.far, far.as_deref()) {
         play.push(PlayTrack { device, role: TrackRole::FarEnd, samples });
     }
     let request = PlayRecordRequest { play, capture_device: route.capture, cancel: Some(console::stop_flag()), ..Default::default() };
@@ -170,7 +172,14 @@ fn play(engine: &Engine, cfg: &EngineConfig, scene: &Scene, route: Route) -> Res
     if after.blocks < before.blocks {
         warnings.push("The filter restarted during the test, so its dropout counts cover only the time since.".to_owned());
     }
-    let readings = EngineReadings::of(cfg, &after);
+    if cfg.processing.aec_enabled && after.reference_target_ms > REFERENCE_TARGET_HIGH_MS {
+        warnings.push(format!(
+            "The echo reference's lead target rose to {} ms: an echo that comes back sooner than that (speakers with a short \
+             output latency) arrives before its reference, and AEC3 can't cancel it (its delay estimate then reads about 0).",
+            fixed(f64::from(after.reference_target_ms), 1)
+        ));
+    }
+    let readings = EngineReadings::of(cfg, &before, &after);
     Ok(Take { dropouts: Dropouts::between(&before, &after, &recorded), recorded, engine: readings, warnings })
 }
 
@@ -189,39 +198,58 @@ fn wait_running(engine: &Engine) -> Result<(), Failure> {
     }
 }
 
-/// What the engine ran, and its own estimates at the end of the take: the drift loops', and AEC3's (the echo delay it found,
-/// and its ERLE), which show what a measured ERLE went with.
+/// What the engine ran, and its own estimates at the end of the take: the drift loops'; the echo reference's lead and the
+/// target its loop holds (how long before the mic block the reference served with it was tapped), whether the streams'
+/// stamps timed it, and its slips and jumps over the take (a jump moves the echo path, and AEC3 takes seconds to follow);
+/// and AEC3's (the echo delay it found, and its ERLE). They show what a measured ERLE went with.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EngineReadings {
     pub aec: bool,
     pub noise_filter: bool,
     pub output_drift_ppm: f32,
     pub reference_drift_ppm: f32,
+    pub reference_lead_ms: f32,
+    pub reference_target_ms: f32,
+    pub reference_stamped: bool,
+    pub reference_slips: u64,
+    pub reference_jumps: u64,
     pub aec_delay_ms: f32,
     pub aec_erle_db: f32,
 }
 
 impl EngineReadings {
-    fn of(cfg: &EngineConfig, t: &TelemetrySnapshot) -> Self {
+    fn of(cfg: &EngineConfig, before: &TelemetrySnapshot, t: &TelemetrySnapshot) -> Self {
         Self {
             aec: cfg.processing.aec_enabled,
             noise_filter: cfg.processing.noise_enabled,
             output_drift_ppm: t.output_drift_ppm,
             reference_drift_ppm: t.reference_drift_ppm,
+            reference_lead_ms: t.reference_fill_ms,
+            reference_target_ms: t.reference_target_ms,
+            reference_stamped: t.reference_stamped,
+            reference_slips: t.reference_slips.saturating_sub(before.reference_slips),
+            reference_jumps: t.reference_coarse_drops.saturating_sub(before.reference_coarse_drops),
             aec_delay_ms: t.aec_delay_ms,
             aec_erle_db: t.aec_erle_db,
         }
     }
 
-    /// "output drift +1.2 ppm, reference drift -0.4 ppm; AEC3's estimates: echo delay 40.0 ms, ERLE 31.2 dB".
+    /// "output drift +1.2 ppm, reference drift -0.4 ppm, lead 23.4 ms (target 23.4), 2 slips and 0 jumps over the take;
+    /// AEC3's estimates: echo delay 40.0 ms, ERLE 31.2 dB". The lead says "by delivery" when the stamps didn't time it.
     fn line(&self) -> String {
         let ppm = |v: f32| if v.is_finite() { format!("{v:+.1}") } else { "--".into() };
         let mut s = format!("{:<26} output drift {} ppm", "engine", ppm(self.output_drift_ppm));
         if self.aec {
             let _ = write!(
                 s,
-                ", reference drift {} ppm; AEC3's estimates: echo delay {} ms, ERLE {} dB",
+                ", reference drift {} ppm, lead {} ms{} (target {}), {} slips and {} jumps over the take; AEC3's estimates: echo delay \
+                 {} ms, ERLE {} dB",
                 ppm(self.reference_drift_ppm),
+                fixed(f64::from(self.reference_lead_ms), 1),
+                if self.reference_stamped { "" } else { " by delivery" },
+                fixed(f64::from(self.reference_target_ms), 1),
+                self.reference_slips,
+                self.reference_jumps,
                 fixed(f64::from(self.aec_delay_ms), 1),
                 fixed(f64::from(self.aec_erle_db), 1)
             );
@@ -280,7 +308,9 @@ impl Dropouts {
 fn save(dir: &Path, scene: &Scene, recording: &[f32], aligned: Option<&[f32]>) -> Result<Vec<&'static str>, Failure> {
     std::fs::create_dir_all(dir).map_err(|e| Failure::error(format!("Couldn't create {}: {e}", dir.display())))?;
     let mut files: Vec<(&'static str, &[f32])> = vec![("input.wav", &scene.input), ("clean.wav", &scene.clean)];
-    if let Some(far) = &scene.far {
+    // As played: ahead of its echo in input.wav, as `process --ref` would get it from a speaker's loopback.
+    let far = scene.far_played();
+    if let Some(far) = &far {
         files.push(("far.wav", far));
     }
     files.push(("recording.wav", recording));
@@ -631,6 +661,11 @@ mod tests {
             noise_filter: false,
             output_drift_ppm: -2.0,
             reference_drift_ppm: 0.44,
+            reference_lead_ms: 23.36,
+            reference_target_ms: 23.4,
+            reference_stamped: true,
+            reference_slips: 2,
+            reference_jumps: 0,
             aec_delay_ms: 40.0,
             aec_erle_db: 31.25,
         };
@@ -644,8 +679,8 @@ mod tests {
             "\n  near speech, double talk   clean -18.4 dBFS, output -inf dBFS (speech -inf, rest -inf): change under -101.6 dB \
              over 1.4 s\n",
             "\n    both mid-syllable        clean -18.2 dBFS, output -21.0 dBFS (speech -21.3, rest -32.6): change -3.1 dB over 0.4 s\n",
-            "\n  engine                     output drift -2.0 ppm, reference drift +0.4 ppm; AEC3's estimates: echo delay 40.0 ms, \
-             ERLE 31.2 dB\n",
+            "\n  engine                     output drift -2.0 ppm, reference drift +0.4 ppm, lead 23.4 ms (target 23.4), 2 slips and 0 \
+             jumps over the take; AEC3's estimates: echo delay 40.0 ms, ERLE 31.2 dB\n",
         ] {
             assert!(report.contains(line), "{line}\nnot in\n{report}");
         }
@@ -717,22 +752,34 @@ mod tests {
     fn the_engine_readings_come_from_the_config_and_the_telemetry() {
         let mut cfg = EngineConfig::default();
         cfg.processing.aec_enabled = true;
+        let before = TelemetrySnapshot { reference_slips: 10, reference_coarse_drops: 1, ..Default::default() };
         let t = TelemetrySnapshot {
             output_drift_ppm: 3.0,
             reference_drift_ppm: -1.0,
+            reference_fill_ms: 12.5,
+            reference_target_ms: 12.0,
+            reference_stamped: false,
+            reference_slips: 13,
+            reference_coarse_drops: 2,
             aec_delay_ms: 52.0,
             aec_erle_db: 12.0,
             ..Default::default()
         };
-        let r = EngineReadings::of(&cfg, &t);
+        let r = EngineReadings::of(&cfg, &before, &t);
         assert_eq!(r, EngineReadings {
             aec: true,
             noise_filter: true,
             output_drift_ppm: 3.0,
             reference_drift_ppm: -1.0,
+            reference_lead_ms: 12.5,
+            reference_target_ms: 12.0,
+            reference_stamped: false,
+            reference_slips: 3,
+            reference_jumps: 1,
             aec_delay_ms: 52.0,
             aec_erle_db: 12.0
         });
+        assert!(r.line().contains("lead 12.5 ms by delivery (target 12.0), 3 slips and 1 jumps over the take"), "{}", r.line());
         let off = EngineReadings { output_drift_ppm: f32::NAN, ..Default::default() };
         assert_eq!(off.line(), format!("{:<26} output drift -- ppm", "engine"));
     }
@@ -868,7 +915,7 @@ mod tests {
         assert_eq!(names, ["input.wav", "clean.wav", "far.wav", "recording.wav", "aligned.wav"]);
         let read = |name: &str| wav::read_mono_48k(&out.join(name)).unwrap().samples;
         assert_eq!(read("recording.wav"), recording);
-        assert_eq!(read("far.wav"), *scene.far.as_ref().unwrap());
+        assert_eq!(read("far.wav"), scene.far_played().unwrap());
         assert_eq!(read("aligned.wav"), scene.clean);
         let noise = signals::build(QualityTest::Noise, 5.0, None, &UserAudio::default()).unwrap();
         let names = save(&out, &noise, &recording, None).unwrap();

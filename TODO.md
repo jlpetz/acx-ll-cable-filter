@@ -108,13 +108,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
-**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`); first live test 2026-11-01 (#14's `quality`): only 1-5 dB of echo removed, from reference gaps.
+**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal; the echo now drops 14 dB live against 46-57 dB offline.
 - `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: fix the reference FIFO's underflows (5-8 a second on the cables, each moving the reference against the mic): log the loopback's packets against the mic wakes, then wait for a late packet (a deeper target) instead of zero-filling. Rerun the echo test; then recorded pairs in #2 and live on speakers in phase 2.
+**Next**: record the chain's live inputs (mic and reference blocks) beside `quality --save` and run AEC3 offline on them, to find what still differs live. Then recorded pairs in #2, and real speakers in phase 2 (the lead must stay under the echo path's delay).
 **Detail**: `doc/todo/10-aec.md`
 
 ---

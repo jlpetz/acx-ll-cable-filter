@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
-pub use nf_core::telemetry::{EngineState, MeterSnapshot, TelemetrySnapshot};
+pub use nf_core::telemetry::{EngineState, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot};
 
 /// Endpoint direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,7 +114,9 @@ impl Remedy {
 pub struct BufferTargets {
     /// Output render-buffer target: one render period + one block + `io.output_margin_ms`.
     pub output_ms: f32,
-    /// Reference FIFO target: one loopback period + one block (0 without a reference).
+    /// The reference's starting lead target: one loopback period + 2 ms (0 without a reference). It can rise in the first
+    /// seconds and when underflows persist, and come back down after five minutes under; telemetry's `reference_target_ms`
+    /// has the current one (engine.md, "The reference").
     pub reference_ms: f32,
 }
 

@@ -4,7 +4,7 @@
 //! Numbers come from atomics the audio thread writes, so any of them can be NaN or infinite. They
 //! print as "—" (or "-∞" for a silent level), never as "NaN", and -0.0 prints as "0".
 
-use nf_engine::{EngineState, EngineStatus, LatencyReport, MeterSnapshot, StreamInfo, TelemetrySnapshot};
+use nf_engine::{EngineState, EngineStatus, LatencyReport, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot};
 
 use crate::settings::{FLOOR_DB, TestMode};
 use crate::window::Job;
@@ -135,17 +135,27 @@ fn target(ms: f32) -> String {
     if ms > 0.0 { fixed(ms, 1) } else { DASH.to_owned() }
 }
 
-/// Readout line 1b: "Drift out/ref: +12/-40 ppm · Fill out/ref: 15.0/12.0 ms (target 15.5/12.0)".
+/// Readout line 1b: "Drift out/ref: +12/-40 ppm · Output fill: 15.0 ms (target 15.5) · Reference lead: 12.0 ms (target
+/// 12.0)". The reference's is a lead (how long before the mic block its reference was tapped), not a fill; it says when
+/// it's timed by delivery (no trusted stamps), and when its target is high: over `REFERENCE_TARGET_HIGH_MS` it may pass
+/// the echo path's own delay, and the echo come before its reference.
 pub(crate) fn clocks(t: &TelemetrySnapshot) -> String {
-    format!(
-        "Drift out/ref: {}/{} ppm · Fill out/ref: {}/{} ms (target {}/{})",
+    let mut s = format!(
+        "Drift out/ref: {}/{} ppm · Output fill: {} ms (target {}) · Reference lead: {} ms (target {})",
         signed(t.output_drift_ppm, 0),
         signed(t.reference_drift_ppm, 0),
         fixed(t.output_fill_ms, 1),
-        fixed(t.reference_fill_ms, 1),
         target(t.output_target_ms),
+        fixed(t.reference_fill_ms, 1),
         target(t.reference_target_ms)
-    )
+    );
+    if t.reference_target_ms > 0.0 && !t.reference_stamped {
+        s.push_str(", by delivery");
+    }
+    if t.reference_target_ms > REFERENCE_TARGET_HIGH_MS {
+        s.push_str(", high for speakers");
+    }
+    s
 }
 
 /// Readout line 2a: "CPU per block: p50 45 µs, p99 80 µs (AEC p99 30, noise p99 40)".
@@ -161,7 +171,8 @@ pub(crate) fn cpu(t: &TelemetrySnapshot) -> String {
 
 /// Readout line 2b: "Dropouts: capture 0, output 1, reference gaps 2, mic stalls 0 · Coarse drops
 /// out/ref: 0/0 · Tap overflows: 0". A coarse drop is one correction that dropped whole blocks to
-/// pull an overfull buffer back to its target; a tap overflow is a block the latency test lost.
+/// pull an overfull buffer back to its target (on the reference, a jump of its timeline); a tap
+/// overflow is a block the latency test lost.
 pub(crate) fn dropouts(t: &TelemetrySnapshot) -> String {
     format!(
         "Dropouts: capture {}, output {}, reference gaps {}, mic stalls {} · Coarse drops out/ref: {}/{} · Tap \
@@ -404,6 +415,7 @@ mod tests {
             tap_overflows: 7,
             output_target_ms: 15.5,
             reference_target_ms: 12.0,
+            reference_stamped: true,
             noise_reduction_db: -12.0,
             speech_probability: 0.874,
             input: MeterSnapshot { peak_dbfs: -12.06, rms_dbfs: -23.4 },
@@ -415,7 +427,10 @@ mod tests {
     fn the_readout_lines() {
         let t = telemetry();
         assert_eq!(pipeline(&t), "Pipeline: 12.3 ms (p95 14.1)");
-        assert_eq!(clocks(&t), "Drift out/ref: +12/-40 ppm · Fill out/ref: 15.0/12.0 ms (target 15.5/12.0)");
+        assert_eq!(clocks(&t), "Drift out/ref: +12/-40 ppm · Output fill: 15.0 ms (target 15.5) · Reference lead: 12.0 ms (target 12.0)");
+        // Timed by delivery, and a target that may pass a speaker's echo path, are said.
+        let odd = TelemetrySnapshot { reference_stamped: false, reference_target_ms: 31.0, ..t };
+        assert!(clocks(&odd).ends_with("(target 31.0), by delivery, high for speakers"), "{}", clocks(&odd));
         assert_eq!(cpu(&t), "CPU per block: p50 45 µs, p99 80 µs (AEC p99 30, noise p99 41)");
         assert_eq!(
             dropouts(&t),
@@ -437,13 +452,13 @@ mod tests {
         assert_eq!(pipeline(&nan), "Pipeline: —");
         assert_eq!(reduction_and_speech(&nan), "Reduction: -12.0 dB · Speech: —");
         assert!(clocks(&nan).starts_with("Drift out/ref: —/-40 ppm"));
-        assert!(clocks(&nan).ends_with("(target —/12.0)"), "{}", clocks(&nan));
+        assert!(clocks(&nan).contains("Output fill: 15.0 ms (target —)"), "{}", clocks(&nan));
         let wild = TelemetrySnapshot { speech_probability: 7.0, ..t };
         assert_eq!(reduction_and_speech(&wild), "Reduction: -12.0 dB · Speech: 1.00");
         // No reference: no target for it
         let no_reference = TelemetrySnapshot { reference_target_ms: 0.0, reference_fill_ms: 0.0, ..t };
         let line = clocks(&no_reference);
-        assert!(line.ends_with("Fill out/ref: 15.0/0.0 ms (target 15.5/—)"), "{line}");
+        assert!(line.ends_with("Reference lead: 0.0 ms (target —)"), "{line}");
     }
 
     fn stream_info() -> StreamInfo {

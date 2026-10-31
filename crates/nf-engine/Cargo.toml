@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# The live probe (src/live_probe.rs): an ignored test that opens real audio devices to trace a device's delivery. Only
+# built with this feature, so that no plain `cargo test` can open a device.
+live-probe = []
+
 [dependencies]
 nf-core.workspace = true
 nf-mem.workspace = true

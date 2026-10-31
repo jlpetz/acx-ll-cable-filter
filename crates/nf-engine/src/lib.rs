@@ -7,6 +7,7 @@
 //! - `stream`: the WASAPI wrappers (capture, render, loopback, keep-alive), converting at the edge.
 //! - `pipeline`: the audio thread's per-block bookkeeping (FIFOs, slips, coarse corrections, the
 //!   latency readout, statistics) behind stream traits, so tests drive it with fakes.
+//! - `reference`: the reference's timeline, read in step with the mic so the echo path holds still.
 //! - `audio`: the audio thread itself.
 //! - `control`: start/stop/apply/status, the device listener, user-worded errors (`errors`).
 //! - `latency_test`: the sweep tests (through the engine, and through a cable alone) and their analysis.
@@ -22,8 +23,11 @@ mod devices;
 mod errors;
 mod fifo;
 mod latency_test;
+#[cfg(all(test, feature = "live-probe"))]
+mod live_probe;
 mod pipeline;
 mod play_record;
+mod reference;
 mod sched;
 mod stream;
 #[cfg(test)]
