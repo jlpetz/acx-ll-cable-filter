@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use nf_engine::{GateMode, LatencyMode};
 
 use crate::quality::QualityTest;
+use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, MAX_ECHO_DELAY_MS};
 
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +88,8 @@ pub struct QualityArgs {
     pub test: QualityTest,
     /// The echo test's far-end device: it plays the far voice and is the echo reference.
     pub far: Option<String>,
+    /// The echo test's echo delay in ms: its echo reaches the mic this long after the far end's loopback taps the far voice.
+    pub echo_delay_ms: f32,
     pub seconds: f32,
     /// The noise below the speech's active level; `None` takes the test's default.
     pub snr_db: Option<f32>,
@@ -382,6 +385,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
         capture: String::new(),
         test: QualityTest::Noise,
         far: None,
+        echo_delay_ms: DEFAULT_ECHO_DELAY_MS,
         seconds: DEFAULT_QUALITY_SECONDS,
         snr_db: None,
         speech: None,
@@ -389,7 +393,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
         far_speech: None,
         save: None,
     };
-    let (mut probe, mut capture) = (None, None);
+    let (mut probe, mut capture, mut echo_delay) = (None, None, false);
     let path = |flag: &str, v: &str| text(flag, v).map(PathBuf::from);
     while let Some(arg) = p.next() {
         match arg {
@@ -404,6 +408,11 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
                     }
                 }
                 "--far" => q.far = Some(text(flag, p.value(flag, inline)?)?),
+                "--echo-delay" => {
+                    let v = p.value(flag, inline)?;
+                    q.echo_delay_ms = number(flag, v, 0.0, MAX_ECHO_DELAY_MS, "an echo delay from 0 to 300 ms (e.g. --echo-delay 25)")?;
+                    echo_delay = true;
+                }
                 "--seconds" => {
                     let v = p.value(flag, inline)?;
                     q.seconds = number(flag, v, MIN_QUALITY_SECONDS, MAX_QUALITY_SECONDS, "a length from 5 to 300 s")?;
@@ -445,6 +454,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
         ))),
         QualityTest::Noise if q.far.is_some() => Err(usage("--far is for the echo test: add --test echo, or drop it")),
         QualityTest::Noise if q.far_speech.is_some() => Err(usage("--far-speech is for the echo test: add --test echo, or drop it")),
+        QualityTest::Noise if echo_delay => Err(usage("--echo-delay is for the echo test: add --test echo, or drop it")),
         _ => Ok(q),
     }
 }
@@ -560,6 +570,11 @@ QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records th
   --test noise|echo  Speech in noise (the default), or speech with a far voice's echo
   --far DEV          The echo test's far-end speakers: they play the far voice and are the
                      echo reference, e.g. \"CABLE-B Input\"
+  --echo-delay MS    The echo test's echo path: its echo reaches the mic this long after
+                     the far end's loopback taps the far voice, as a speaker's output
+                     latency and the air would: 0 to 300 ms (default 25). Each take first
+                     times its devices' own offset with a short sweep on both, and reports
+                     the delay it got
   --seconds N        The scene's length, 5 to 300 s (default 30; the echo test needs 12)
   --snr DB           The noise under the speech's level, 0 to 60 dB (default 10; echo test 60)
   --speech FILE, --noise FILE, --far-speech FILE
@@ -619,9 +634,10 @@ mod tests {
         assert_eq!(p(&["-V"]), Ok(Command::Version));
         assert_eq!(err(&["--version", "x"]), "'--version' takes no argument 'x'");
         let help = help_text();
-        for command in
-            ["devices", "run", "latency", "--cable-only", "quality", "--far-speech", "process", "bench", "setup-large-pages", "--version"]
-        {
+        for command in [
+            "devices", "run", "latency", "--cable-only", "quality", "--far-speech", "--echo-delay", "process", "bench",
+            "setup-large-pages", "--version",
+        ] {
             assert!(help.contains(command), "{command}");
         }
         assert!(help.contains(env!("CARGO_PKG_VERSION")));
@@ -761,6 +777,7 @@ mod tests {
             capture: "CABLE Output".into(),
             test: QualityTest::Noise,
             far: None,
+            echo_delay_ms: DEFAULT_ECHO_DELAY_MS,
             seconds: DEFAULT_QUALITY_SECONDS,
             snr_db: None,
             speech: None,
@@ -772,10 +789,12 @@ mod tests {
         let Ok(Command::Quality(q)) = p(&[
             "quality", "--probe", "A", "--capture", "B", "--test", "Echo", "--far=CABLE-B Input", "--seconds", "60", "--snr", "20",
             "--speech", "me.wav", "--noise", "fan.wav", "--far-speech", "you.wav", "--save", "out", "--no-aec", "--floor", "-30",
+            "--echo-delay", "12.5",
         ]) else {
             panic!()
         };
         assert_eq!((q.test, q.far.as_deref(), q.seconds, q.snr_db), (QualityTest::Echo, Some("CABLE-B Input"), 60.0, Some(20.0)));
+        assert_eq!(q.echo_delay_ms, 12.5);
         assert_eq!(q.speech, Some(PathBuf::from("me.wav")));
         assert_eq!(q.noise, Some(PathBuf::from("fan.wav")));
         assert_eq!(q.far_speech, Some(PathBuf::from("you.wav")));
@@ -806,6 +825,19 @@ mod tests {
         // The far end belongs to the echo test
         assert_eq!(with(&["--far", "F"]), "--far is for the echo test: add --test echo, or drop it");
         assert_eq!(with(&["--far-speech", "you.wav"]), "--far-speech is for the echo test: add --test echo, or drop it");
+        assert_eq!(with(&["--echo-delay", "25"]), "--echo-delay is for the echo test: add --test echo, or drop it");
+        // The echo delay: 0 to 300 ms
+        let echo = |d: &str| with(&["--test", "echo", "--far", "F", "--echo-delay", d]);
+        assert_eq!(echo("301"), "--echo-delay takes an echo delay from 0 to 300 ms (e.g. --echo-delay 25), not '301'");
+        assert!(echo("-1").starts_with("--echo-delay takes") && echo("x").starts_with("--echo-delay takes"));
+        for (d, ms) in [("0", 0.0), ("300", 300.0)] {
+            let Ok(Command::Quality(q)) =
+                p(&["quality", "--probe", "A", "--capture", "B", "--test", "echo", "--far", "F", "--echo-delay", d])
+            else {
+                panic!()
+            };
+            assert_eq!(q.echo_delay_ms, ms);
+        }
         // The echo test needs a far-only turn after the first
         let short = with(&["--test", "echo", "--far", "F", "--seconds", "11.9"]);
         assert!(short.starts_with("'quality --test echo' needs --seconds 12 or more"), "{short}");

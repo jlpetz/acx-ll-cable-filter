@@ -113,15 +113,16 @@ after 2 s with no packets, report an error and stop):
      `t_play = clock.qpc + (frames_written_total_before_this_block - clock.pos_frames) / fs_out`
      (the position from `AudioClock::get_position`, read once per block);
      `latency = t_play - t_capture_of_block_first_sample`.
-     Push it (in ms) to `RollingStats<100>`.
+     Push it (in ms) to `RollingStats<100>`, and its budget ("The latency budget" below). It times the block's first
+     *output* sample, so the chain's offset isn't in it.
    - **Telemetry:** meters (dBFS, through display ballistics: a 1 s peak hold falling at 20 dB/s,
      and a 300 ms power-domain RMS), clip latch (`clip_latched |= clipped`), near-clip, speech
      probability, and the noise stage's reduction (`noise_reduction_db`: its output against its
      latency-aligned input, the floor mix and gate included).
    - **Timing:** whole-block µs into `RollingStats<100>`; AEC and noise ticks.
 4. **Once a second (every 100 blocks):**
-   - publish p50/p99/max timings, latency median/p95, drift ppm, fills (ms), slip counts and AEC
-     stats (`chain.stage_stats()`);
+   - publish p50/p99/max timings, latency median/p95 and its budget (each part's mean and p95, and
+     the run's totals), drift ppm, fills (ms), slip counts and AEC stats (`chain.stage_stats()`);
    - publish `rt_heap_allocations = thread_scope_fallbacks() - baseline` (must stay 0; log once,
      from the control thread, if it grows) and `rt_pool_allocations_per_s` (the per-second growth of
      `thread_scope_allocs()`; nonzero with AEC3, because sonora 0.2.0 allocates per block, served
@@ -135,7 +136,8 @@ Never allocate, lock, log or make blocking calls inside the loop:
 **Targets:**
 - Output render target = one render period + one block + `io.output_margin_ms`, measured before
   each block's write. (Whether one period + the margin is enough is to be measured on a real
-  cable: it would take a block, 10 ms, off the latency.)
+  cable: it would take a block, 10 ms, off the latency. In the event simulation it is for steady
+  delivery and isn't for a bursty mic's missed wakes: TODO 13's detail, "Budget".)
 - Reference lead target: one loopback period + 2 ms to start with; it can rise in the first 2.5 s
   and when underflows persist, up to 50 ms, and comes back down after five minutes under ("The
   reference" below).
@@ -145,6 +147,49 @@ Never allocate, lock, log or make blocking calls inside the loop:
 **Stop:** set the flag and wait for the run to end (≤ 1 s); the run stops and releases its streams
 in reverse order and the thread goes back to waiting. MMCSS and COM stay with the thread until the
 engine is dropped.
+
+## The latency budget (`budget.rs`, TODO 13)
+Each block's readout split along its first sample's way, into parts that add up to it exactly, block by block
+(`nf_core::telemetry::LatencyBudget`; `pipeline/tests/budget.rs` checks the sum and what moves each part):
+
+| Part | From, to | How |
+|---|---|---|
+| Mic delivery | the first sample's capture time (the mic's stamps) to the wake that read it | measured (`WakeLog`) |
+| Wait | that wake (its time, taken before the mic is read) to the block's write (the output clock's reading, taken as it's written) | measured |
+| Output queue | what's queued ahead of the block's first output sample as it's written | measured (the output fill) |
+| Render side | the moment the queue would have drained to the play-out the AudioClock predicts | derived: the rest |
+| Chain | the chain's stream offset | reported by the stages; not in the readout |
+
+- **Mic delivery** is at least the packet (10 ms for a block-sized one), plus how late the device and its driver delivered
+  it and the thread's wake-up. Each wake's first sample and QPC time go into `WakeLog` (256 wakes, trimmed as blocks take
+  their samples). A full log counts a new wake's samples as the newest held (its time earlier than theirs: delivery reads
+  short and wait long by as much; it takes a period under 0.8 ms with the FIFO full).
+- **Wait** is all the audio thread does between the wake and the block's write. First the wake's own work: reading the mic's
+  packets, servicing the reference (the keep-alive's top-up and, with AEC on, the loopback's drain) and the tap's and the
+  recorder's hand-overs. Then the blocks before this one in the same wake, whole (each one's chain, write, recording and
+  statistics), and this block up to its write (its reference, its chain, the output's padding). And the wakes between, when
+  a block's first samples came a wake before its last.
+- **Output queue:** the output fill as the drift loop reads it (frames up to the sample less the device position now,
+  calibrated to the padding by `FillOffset`; the padding and pending samples before a calibration), with this block's
+  corrections in it (zeros written, pending samples dropped).
+- **The queue's mean is the output target** whatever the delivery: the drift loop holds the mean of the fills read before
+  each write. A block that comes late finds less queued (the device played on meanwhile), so mic delivery + queue holds
+  still block for block, and the readout with it: it's set by the output's clock.
+- **Render side:** half the device period for a device that takes a period at a time and whose clock plays a sample as it
+  takes it (the queue is calibrated to the middle of the padding's steps), plus whatever the shared-mode engine and the
+  device hold after taking a sample, as their clock reports it. A device whose clock counts the silence it played after
+  running dry reads that far ahead from then on: the readout drops by the silence for the rest of the run, and the render
+  side shows it (it can go negative; TODO 13's detail, "Budget").
+- **The chain isn't in the readout:** the block's first output sample carries the input from the chain's offset before the
+  block's first input sample. The first sample's own way through the app is the readout plus the chain's offset
+  (`LatencyBudget::total_ms`); the latency test's app figure holds both.
+- **Cost:** per block a wake-log lookup (amortised O(1)), a few subtractions and five `RollingStats<100>` pushes; per
+  second five means and five percentiles of 100 values. No allocation, no panic path.
+- **Where it shows:** telemetry's `budget_mean` and `budget_p95` (over the readout's window, its last 100 blocks; valid with
+  `latency_valid`; the p95s are each part's own and don't add up) and `budget_totals` (the run's sums and blocks, so two
+  snapshots give the means between them); `ChainBlock::budget` and six columns of `chain_blocks.csv`; the quality report's
+  and the latency report's "latency budget" line (the means over the take or the test); `run`'s status line
+  (`lat 61.3/66.0 ms [16.2+0.1+22.0+23.0]`); the GUI's readout ("Budget (means): ...") and its latency report.
 
 ## The reference (`reference.rs`, TODO 10)
 AEC3 converges on the echo path, a mic sample's index less that of the reference sample served
@@ -192,9 +237,11 @@ drift). AEC3 kept 1-6 dB of its own ERLE. The timeline replaces it:
   at 50 ms. The cap must stay under the echo path's own delay: the loopback taps the mix ahead of
   the speakers, so the echo arrives the output's latency (and the air's) after its reference, and a
   lead beyond that puts the echo before its reference (AEC3's delay estimate then reads 0). The
-  cables' echo path is 60 ms; a bursty cable's lead ends at 23-33 ms. Nothing measures the echo
-  path's delay yet, so a target over 30 ms (`REFERENCE_TARGET_HIGH_MS`) is flagged where it's
-  shown (the GUI readout, `run`'s status line, the quality report's warnings).
+  cables' echo path is 60 ms; a bursty cable's lead ends at 23-33 ms. Nothing in the engine measures
+  the echo path's delay, so a target over 30 ms (`REFERENCE_TARGET_HIGH_MS`) is flagged where it's
+  shown (the GUI readout, `run`'s status line, the quality report's warnings). The quality echo
+  test puts its echo `--echo-delay` (25 ms by default) after the reference's tap, measures where it
+  landed in its chain recording, and warns when AEC3 got it less than 2 ms after its reference.
 - **Jumps**, counted as reference coarse drops after the start-up: the alignment at the first
   reading (either way: discarding, or zeros before the loopback's first sample), a centring at the
   start-up's end when the low-passed lead is off by more than 0.125 ms, a change of target, and a
@@ -309,10 +356,20 @@ test's far end) that its errors are worded for. A running `Engine` carries on me
 way. The latency tests share its recorder and player. Both blocking calls (this and `cable_latency_test`) want a worker thread:
 on an STA (UI) thread COM is single-threaded already, and they fail, saying so.
 
+A track can carry a second signal placed while the take runs (`PlayTrack::late`, a `LatePart`): its start, in frames after the
+lead, is an `AtomicU64` set once by a compare-exchange from `LatePart::UNSET`. The caller sets it from another thread when it
+knows (`LatePart::set`); the track's player, which writes 100 ms ahead, reads it at each top-up, writes silence after the first
+signal meanwhile, and sets `default` itself if it gets there first (a later set then fails). A start the writer has already
+passed starts the part where the writer is. Starts are clamped to the first signal's end..=`latest`, the take runs until every
+track's programme has played (a late part counts from its latest start until it's placed) and the tail, and
+`PlayRecordResult::late_starts` says where each part went and whether the caller's start or the default placed it. `quality`'s
+echo test places its far voice so, once it has timed a marker in the chain recording (app.md).
+
 ## The chain recorder (`recorder.rs`, TODO 10 and 14)
 What the chain was fed live and what it gave, block by block, so that a live result can be told apart from the chain's own
 behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quality --save` writes it):
-- **On the audio thread**, after each block's chain call (`Pipeline::record`), one item into a pre-allocated rtrb ring (400
+- **On the audio thread**, after each block's chain call and its write (`Pipeline::record`, whether or not the write failed),
+  one item into a pre-allocated rtrb ring (400
   blocks, 4 s, about 2.4 MB; its pages are touched when it's armed): the mic block and the reference block exactly as the chain
   got them (the mic after the dither; the reference after the timeline, the slip resampler and the dither), the chain's output
   block (before the output's drift loop resamples it for the device), and the block's facts, `ChainBlock`:
@@ -321,6 +378,7 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   - the mic's moves since the block before: samples its FIFO discarded (it overflowed: the loop hadn't run for 200 ms), and device
     position it skipped without zero-filling (a gap over 100 ms; the stream index doesn't count it);
   - AEC3's own delay and ERLE estimates after the block (cached by sonora: a reference, no work);
+  - the block's latency budget ("The latency budget"), while the readout is on and the block had one;
   - the chain's live settings after the block (`nf_core::controls::ChainParams`: on/off, passthrough, floor, gate; a dozen
     relaxed loads), so a change during the recording (an `Engine::apply`, a latency test) shows;
   - the reference's take, `ReferenceFacts`, which `Reference::take` fills in as it goes (a few stores a block, always): the
@@ -352,7 +410,10 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
 - **Draining:** the recorder's own thread (normal priority) moves the ring into memory every 20 ms, up to `max_seconds` (at most
   15 minutes; about 0.6 MB a second), and ends when stopped, at the limit (`truncated`), or once the producer has gone: the
   run ended (a stop or a restart; `run_ended`). The recording doesn't follow a restart: the new run's chain starts afresh.
-  `ChainRecorder::stop` stops it and waits for the producer to come back.
+  `ChainRecorder::stop` stops it and waits for the producer to come back. The recording so far sits behind a mutex that the
+  drain thread holds while it appends: `ChainRecorder::copy_from(n)` copies the blocks from the nth on while it runs (the
+  quality echo test's calibration reads its marker so, every 20 ms). Neither thread is the audio thread, which only pushes into
+  the ring.
 - **Rerunning it offline:** the engine builds its chain as `nf_stages::build_chain` does and warms it up with three dithered
   silent blocks (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recorded mic and
   reference are dithered already. So a chain built with the run's processing settings, warmed up and fed the recording block by

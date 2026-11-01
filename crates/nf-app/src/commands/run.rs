@@ -70,8 +70,9 @@ pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig) -> Result<()
 }
 
 /// What the status line's columns are.
-pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency median/p95 (mic capture to cable play-out); \
-     CPU p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic \
+pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency median/p95 (mic capture to cable play-out), \
+     then its budget's means in ms [mic delivery+wait+output queue+render side] (the chain's offset, given at the start, \
+     isn't in it); CPU p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic \
      block it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not \
      cover); dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse \
      corrections, output/reference (whole blocks dropped to catch up; on the reference, jumps of its timeline); \
@@ -95,7 +96,18 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool) -> String {
         ""
     };
     let latency = if t.latency_valid {
-        format!("{}/{} ms", fixed(f64::from(t.latency_ms_median), 1), fixed(f64::from(t.latency_ms_p95), 1))
+        // The budget's means, compact (engine.md, "The latency budget").
+        let b = &t.budget_mean;
+        let part = |v: f32| fixed(f64::from(v), 1);
+        format!(
+            "{}/{} ms [{}+{}+{}+{}]",
+            fixed(f64::from(t.latency_ms_median), 1),
+            fixed(f64::from(t.latency_ms_p95), 1),
+            part(b.mic_ms),
+            part(b.wait_ms),
+            part(b.queue_ms),
+            part(b.render_ms)
+        )
     } else {
         "--".into()
     };
@@ -217,6 +229,7 @@ mod tests {
             latency_valid: true,
             latency_ms_median: 21.26,
             latency_ms_p95: 23.0,
+            budget_mean: nf_engine::LatencyBudget { mic_ms: 10.71, wait_ms: 0.04, chain_ms: 10.0, queue_ms: 6.02, render_ms: 4.96 },
             block_us_p99: 131.4,
             output_drift_ppm: 12.4,
             reference_drift_ppm: -3.2,
@@ -229,8 +242,10 @@ mod tests {
         };
         assert_eq!(
             status_line(&t, false),
-            "running  in -12.3/-30.0 dBFS CLIP  out -inf/--  lat 21.3/23.0 ms  cpu 131 µs  drift +12/-3 ppm  drops 1/2/3  rt 0 (4300/s)"
+            "running  in -12.3/-30.0 dBFS CLIP  out -inf/--  lat 21.3/23.0 ms [10.7+0.0+6.0+5.0]  cpu 131 µs  drift +12/-3 ppm  \
+             drops 1/2/3  rt 0 (4300/s)"
         );
+        assert!(LEGEND.contains("[mic delivery+wait+output queue+render side]"));
         let idle = TelemetrySnapshot { state: EngineState::Error, near_clip: true, output_drift_ppm: f32::NAN, ..Default::default() };
         let line = status_line(&idle, false);
         assert!(line.starts_with("error    in 0.0/0.0 dBFS near-clip"), "{line}");

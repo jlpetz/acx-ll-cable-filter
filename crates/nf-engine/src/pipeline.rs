@@ -19,11 +19,12 @@ use nf_core::dsp::slip::{Slip, SlipResampler};
 use nf_core::latency::stats::RollingStats;
 use nf_core::rt::Dither;
 use nf_core::stage::StageStats;
-use nf_core::telemetry::Telemetry;
+use nf_core::telemetry::{LatencyBudget, Telemetry};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
 use crate::api::ChainBlock;
+use crate::budget::{self, BudgetStats, WakeLog};
 use crate::fifo::Fifo;
 use crate::recorder::ChainTx;
 use crate::reference::{MicTime, Reference};
@@ -153,6 +154,10 @@ pub(crate) trait BlockProcessor {
     fn params(&self) -> ChainParams {
         ChainParams::default()
     }
+    /// The chain's stream offset in samples, for the latency budget (the tests' stand-ins have none).
+    fn latency(&self) -> u32 {
+        0
+    }
 }
 
 impl BlockProcessor for Chain {
@@ -167,6 +172,10 @@ impl BlockProcessor for Chain {
     fn params(&self) -> ChainParams {
         self.controls().load()
     }
+    #[inline]
+    fn latency(&self) -> u32 {
+        Chain::latency(self)
+    }
 }
 
 /// One tapped mic block for the latency test: the QPC time of its first sample (hns; NaN when
@@ -175,6 +184,15 @@ impl BlockProcessor for Chain {
 pub(crate) struct TapItem {
     pub qpc_hns: f64,
     pub samples: Block,
+}
+
+/// What a block's latency readout and its budget need (budget.rs): its first sample's capture time (hns, by the mic's
+/// stamps), the wake that delivered that sample, and the chain's offset in samples.
+#[derive(Clone, Copy, Debug)]
+struct BlockTimes {
+    capture_hns: f64,
+    wake_hns: Option<f64>,
+    chain: u32,
 }
 
 /// Counters the pipeline keeps (published once a second).
@@ -243,6 +261,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     /// (the chain recorder's `mic_discarded` and `mic_skipped`).
     mic_discarded: u64,
     mic_skipped: i64,
+    /// The wakes that delivered the FIFO's samples: the latency budget's mic delivery.
+    mic_wakes: WakeLog,
     packet: Box<[f32]>,
     // Reference.
     has_reference: bool,
@@ -283,6 +303,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     // Statistics.
     pub(crate) counters: Counters,
     latency_ms: RollingStats<100>,
+    /// The readout's budget over the same blocks (budget.rs).
+    budget: BudgetStats,
     block_us: RollingStats<100>,
     aec_us: RollingStats<100>,
     noise_us: RollingStats<100>,
@@ -290,6 +312,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     near_clip_period: bool,
     last_pool_allocs: Option<u64>,
     pub(crate) last_latency_ms: Option<f32>,
+    /// This block's latency budget, while the readout is on and it had one (the chain recorder's).
+    pub(crate) last_budget: Option<LatencyBudget>,
 }
 
 impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
@@ -304,6 +328,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             mic_last_hns: 0.0,
             mic_discarded: 0,
             mic_skipped: 0,
+            mic_wakes: WakeLog::new(),
             packet: vec![0.0; cfg.max_packet.max(BLOCK)].into_boxed_slice(),
             has_reference: cfg.ref_period.is_some(),
             reference: Reference::new(cfg.ref_target(), cfg.ref_period.unwrap_or(BLOCK)),
@@ -331,6 +356,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             out_meter: MeterBallistics::new(),
             counters: Counters::default(),
             latency_ms: RollingStats::new(),
+            budget: BudgetStats::new(),
             block_us: RollingStats::new(),
             aec_us: RollingStats::new(),
             noise_us: RollingStats::new(),
@@ -338,6 +364,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             near_clip_period: false,
             last_pool_allocs: None,
             last_latency_ms: None,
+            last_budget: None,
         }
     }
 
@@ -382,8 +409,10 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 
     /// Drains every ready mic packet into the mic FIFO. Detects gaps by device position (the
     /// driver's discontinuity flag is rarely set), zero-filling short ones, and keeps the QPC time
-    /// of the FIFO's samples from the packet stamps. Returns the frames read.
+    /// of the FIFO's samples from the packet stamps, and the wake that delivered them (the latency budget's). Returns the
+    /// frames read.
     pub(crate) fn drain_mic<C: CaptureSource>(&mut self, src: &mut C, now_hns: f64) -> Result<usize, Hr> {
+        let from = self.mic_abs;
         let mut total = 0;
         while let Some(p) = src.read_packet(&mut self.packet)? {
             let n = p.frames.min(self.packet.len());
@@ -420,6 +449,9 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             }
             self.mic_abs += n as u64;
             total += n;
+        }
+        if self.mic_abs > from {
+            self.mic_wakes.delivered(from, now_hns);
         }
         Ok(total)
     }
@@ -477,6 +509,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let mic_moved = (std::mem::take(&mut self.mic_discarded), std::mem::take(&mut self.mic_skipped));
         let head = self.mic_abs - self.mic.len() as u64;
         let t_capture = self.mic_stamps.time_of(head);
+        // Every block, so the log keeps only the wakes still in the FIFO.
+        let wake_hns = self.mic_wakes.wake_of(head);
         self.mic.pop_into(&mut self.mic_blk[..]);
         if let Some(tap) = self.tap.as_mut() {
             let item = TapItem { qpc_hns: t_capture.unwrap_or(f64::NAN), samples: *self.mic_blk };
@@ -488,11 +522,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.take_reference(head, t_capture);
 
         let report = proc.process(&self.mic_blk, &self.ref_blk, &mut self.out_blk, ticks);
+        let times = t_capture.filter(|_| readout).map(|capture_hns| BlockTimes { capture_hns, wake_hns, chain: proc.latency() });
+        // Recorded after the write, with the block's budget, whether or not the write failed (as before the budget).
+        let pushed = self.push_output(sink, times);
         self.record(proc, head, t_capture, mic_moved);
-
-        self.push_output(sink, if readout { t_capture } else { None })?;
+        pushed?;
         if !readout {
             self.latency_ms.clear();
+            self.budget.clear();
         }
 
         let t1 = ticks.ticks();
@@ -556,12 +593,13 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             aec_delay_ms: aec.map_or(f32::NAN, |a| a.echo_delay_ms),
             aec_erle_db: aec.map_or(f32::NAN, |a| a.erle_db),
             settings: proc.params(),
+            budget: self.last_budget,
         };
         rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
     }
 
     /// Slips `out_blk` to the output clock, queues it, writes what fits, and applies the coarse
-    /// corrections. `t_capture` (when the readout is on) is the block's first-sample capture time.
+    /// corrections. `times` (when the readout is on) are the block's, for the readout and its budget.
     ///
     /// The drift loop holds [`Self::output_fill`] (interpolated below a packet) at the target. The
     /// coarse corrections also count this wake's backlog, the whole mic blocks still queued, which
@@ -580,7 +618,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     ///
     /// After a correction the loop restarts from the fill the next wake will read: the corrected
     /// fill with this wake's queued blocks written.
-    fn push_output<S: RenderSink>(&mut self, sink: &mut S, t_capture: Option<f64>) -> Result<(), Hr> {
+    fn push_output<S: RenderSink>(&mut self, sink: &mut S, times: Option<BlockTimes>) -> Result<(), Hr> {
+        self.last_budget = None;
         let mut padding = sink.padding()?;
         // One clock reading per block, for the fill and the readout. An error costs only this
         // block's estimate and readout; the next write reports a dead stream.
@@ -650,13 +689,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             if slip != Slip::None {
                 self.counters.output_slips += 1;
             }
-            // Where this block's first sample lands in the device stream.
+            // Where this block's first sample lands in the device stream, and what's queued ahead of it.
             let index = self.written_total + self.pending_len as u64;
+            let ahead = self.queue_ahead(clock, index, padding + self.pending_len);
             let m = slip.produced_len().min(BLOCK + 1);
             self.out_rs.resample(&self.out_blk[..], &mut self.slipped[..m]);
             self.append_pending(m);
-            if let (Some(t_cap), Some(c)) = (t_capture, clock) {
-                self.readout(c, index, t_cap);
+            if let (Some(times), Some(c)) = (times, clock) {
+                self.readout(c, index, ahead, times);
             }
         }
         self.flush_pending(sink, padding)?;
@@ -690,12 +730,32 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
     }
 
-    /// Pushes one latency sample: the block's predicted play-out time minus its capture time.
-    fn readout(&mut self, clock: ClockReading, index: u64, t_capture: f64) {
+    /// What's queued ahead of device-stream frame `index` (samples), read as [`Self::output_fill`] reads the fill but without
+    /// calibrating: the frames up to `index` less the device position now, less the calibration's offset; `device_fill` (the
+    /// padding and the pending samples ahead of `index`) without a clock reading or a calibration. With no correction at this
+    /// block it's the fill the drift loop saw; after one, the zeros written or the pending samples dropped count.
+    fn queue_ahead(&self, clock: Option<ClockReading>, index: u64, device_fill: usize) -> f64 {
+        let Some(c) = clock else { return device_fill as f64 };
+        let est = index as f64 - c.position_now(self.out_period as f64);
+        match self.fill_offset.offset() {
+            Some(o) if est.is_finite() => est - o,
+            _ => device_fill as f64,
+        }
+    }
+
+    /// Pushes one latency sample, the block's predicted play-out time minus its capture time, and its budget (budget.rs): the
+    /// mic's delivery to the wake that read the block's first sample, the wait from there to this write (the clock's
+    /// reading), the queue `ahead` of it, and the render side, the rest.
+    fn readout(&mut self, clock: ClockReading, index: u64, ahead: f64, times: BlockTimes) {
         let t_play = play_time_hns(clock, index, SAMPLE_RATE as f64);
-        if let Some(ms) = readout_ms(t_play, t_capture) {
+        if let Some(ms) = readout_ms(t_play, times.capture_hns) {
             self.latency_ms.push(ms);
             self.last_latency_ms = Some(ms);
+            // A first sample no wake delivered can't be; it would be timed as delivered at the write (no wait).
+            let wake = times.wake_hns.unwrap_or(clock.now_hns);
+            let b = budget::split(times.capture_hns, wake, clock.now_hns, t_play, ahead, times.chain);
+            self.budget.push(&b);
+            self.last_budget = Some(b);
         }
     }
 
@@ -797,6 +857,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             tel.latency_ms_median.store(self.latency_ms.median());
             tel.latency_ms_p95.store(self.latency_ms.percentile(0.95));
         }
+        self.budget.publish(tel);
 
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
@@ -2253,6 +2314,7 @@ mod tests {
         }
     }
 
+    mod budget;
     mod events;
     mod recorder;
     mod timeline;

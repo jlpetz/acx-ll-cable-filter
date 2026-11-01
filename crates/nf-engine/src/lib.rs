@@ -8,6 +8,7 @@
 //! - `pipeline`: the audio thread's per-block bookkeeping (FIFOs, slips, coarse corrections, the
 //!   latency readout, statistics) behind stream traits, so tests drive it with fakes.
 //! - `reference`: the reference's timeline, read in step with the mic so the echo path holds still.
+//! - `budget`: the latency readout's budget, block by block: where its first sample spent the time.
 //! - `audio`: the audio thread itself.
 //! - `control`: start/stop/apply/status, the device listener, user-worded errors (`errors`).
 //! - `latency_test`: the sweep tests (through the engine, and through a cable alone) and their analysis.
@@ -19,6 +20,7 @@
 
 mod api;
 mod audio;
+mod budget;
 mod control;
 mod convert;
 mod devices;

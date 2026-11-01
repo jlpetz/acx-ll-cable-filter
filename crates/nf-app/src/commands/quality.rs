@@ -7,29 +7,38 @@
 //! engine's counters over the take and the recording's own gaps. Exit 0 when the recording lined up with the scene, 3 when it
 //! didn't (or the test was cancelled), 2 when something failed.
 //!
-//! With `--save` it also arms the engine's chain recorder before the start (`Engine::record_chain`), so the recording holds the
-//! run from its first block, and writes what the chain got and gave live beside the scene's WAVs: `chain_mic.wav`,
-//! `chain_ref.wav`, `chain_out.wav`, a row a block in `chain_blocks.csv`, and the config in `chain_config.json`. `process
-//! chain_mic.wav OUT.wav --ref chain_ref.wav --config chain_config.json --warm-up` reruns that chain into `chain_out.wav`
-//! exactly (TODO 10).
+//! The echo test places its far voice so that the echo reaches the mic `--echo-delay` after the far end's loopback taps it
+//! (`quality::echo_delay`): the take starts with a marker on both devices, a thread beside `play_record` times it in the chain
+//! recording as it grows ([`calibrate`]) and sets the far voice's start (an `nf_engine::LatePart`), and after the take the
+//! chain recording says where the echo landed: the report's "echo delay" and "calibration" lines.
+//!
+//! The engine's chain recorder runs in every echo take, and with `--save`: armed before the start (`Engine::record_chain`), so
+//! the recording holds the run from its first block. `--save` writes what the chain got and gave live beside the scene's WAVs:
+//! `chain_mic.wav`, `chain_ref.wav`, `chain_out.wav`, a row a block in `chain_blocks.csv`, and the config in
+//! `chain_config.json`. `process chain_mic.wav OUT.wav --ref chain_ref.wav --config chain_config.json --warm-up` reruns that
+//! chain into `chain_out.wav` exactly (TODO 10).
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 
-use nf_core::SAMPLE_RATE;
+use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_engine::{
-    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, Flow, MAX_CHAIN_RECORDING_S,
-    PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, TrackRole,
+    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, Flow, LatePart, LateStart, LatencyBudget,
+    MAX_CHAIN_RECORDING_S, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, TrackRole,
 };
 
 use super::run::stream_text;
-use super::{db, fixed, list_devices};
+use super::{budget_text, db, fixed, list_devices};
 use crate::cli::{EngineArgs, QualityArgs};
 use crate::config::{self, resolve_device};
 use crate::exit::Failure;
 use crate::quality::QualityTest;
 use crate::quality::analysis::{self, AlignmentFailure, Analysis, Levels, MIN_REGION_S, Metrics, SpeechLevels, WINDOW_S};
+use crate::quality::echo_delay::{self, Calibration, EchoDelay, FarStart, MAX_RIG_OFFSET_MS, Marker, Plan};
 use crate::quality::signals::{self, Scene};
 use crate::{console, wav};
 
@@ -39,10 +48,12 @@ const SETTLE: Duration = Duration::from_millis(1500);
 const RUNNING_TIMEOUT: Duration = Duration::from_secs(5);
 /// The report shows levels at or below this as -inf (as [`db`] does).
 const FLOOR_DBFS: f32 = -120.0;
+/// How often the echo test's calibration looks at the chain recording (the recorder drains its ring as often).
+const CALIBRATION_POLL: Duration = Duration::from_millis(20);
 
 pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     let user = signals::read_user_audio(args.speech.as_deref(), args.noise.as_deref(), args.far_speech.as_deref())?;
-    let scene = signals::build(args.test, args.seconds, args.snr_db, &user).map_err(Failure::error)?;
+    let scene = signals::build(args.test, args.seconds, args.snr_db, args.echo_delay_ms, &user).map_err(Failure::error)?;
     say!("{}", scene.description);
     let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
     let cfg = config::engine_config(&engine_args(args), || Ok(devices.clone()))?;
@@ -53,25 +64,31 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     let route = route(&devices, &probe, far.as_deref(), &capture);
 
     let engine = Engine::new();
-    // Armed before the start, the chain recorder holds the run from its first block (its whole history, for a rerun).
-    let recorder = match args.save {
-        Some(_) => Some(
-            engine.record_chain(recording_limit(&scene)).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?,
-        ),
-        None => None,
+    let plan = (scene.test == QualityTest::Echo).then(|| Plan::new(f64::from(args.echo_delay_ms)));
+    // Armed before the start, the chain recorder holds the run from its first block (its whole history, for a rerun). The echo
+    // test times its marker in it, and measures where the echo landed.
+    let recorder = if args.save.is_some() || plan.is_some() {
+        let limit = recording_limit(&scene, plan.as_ref());
+        Some(engine.record_chain(limit).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?)
+    } else {
+        None
     };
     super::run::start_engine(&engine, &cfg)?;
-    let take = play(&engine, &cfg, &scene, Route { probe, capture, far, text: route });
+    let take = play(&engine, &cfg, &scene, plan.as_ref(), recorder.as_ref(), Route { probe, capture, far, text: route });
     // Before the engine stops, so the recording ends with the take rather than with the run.
     let chain = recorder.map(ChainRecorder::stop);
     engine.stop();
     console::finished();
-    let take = take?;
+    let mut take = take?;
     say!("Analysing the recording...");
-    let result = analysis::analyse(&scene, &take.recorded.recording, take.recorded.lead_frames);
+    if let (Some(echo), Some(chain)) = (take.echo.as_mut(), &chain) {
+        echo.measure(chain, &scene);
+    }
+    let result = analysis::analyse(&scene, &take.recorded.recording, take.scene_at);
     say!("{}", format_report(scene.test, &result, &take));
     if let Some(dir) = &args.save {
-        let names = save(dir, &scene, &take.recorded.recording, result.as_ref().ok().map(|a| a.aligned.as_slice()))?;
+        let far = take.echo.as_ref().and_then(|e| Some(e.plan.far_as_played(scene.far.as_deref()?, e.far_start?.frames)));
+        let names = save(dir, &scene, far.as_deref(), &take.recorded.recording, result.as_ref().ok().map(|a| a.aligned.as_slice()))?;
         say!("Wrote {} to {}.", names.join(", "), dir.display());
         if let Some(chain) = &chain {
             let names = save_chain(dir, &cfg, chain)?;
@@ -138,11 +155,12 @@ fn route(devices: &[DeviceInfo], probe: &str, far: Option<&str>, capture: &str) 
     format!("playing on {}{far}, recording {}", name(probe), name(capture))
 }
 
-/// The chain recorder's limit: the take (the settle, the lead, the scene and the tail) and a minute to spare, within the
-/// engine's 15 minutes.
-fn recording_limit(scene: &Scene) -> f64 {
+/// The chain recorder's limit: the take (the settle, the lead, the echo test's calibration, the scene and the tail) and a minute
+/// to spare, within the engine's 15 minutes.
+fn recording_limit(scene: &Scene, plan: Option<&Plan>) -> f64 {
     let r = PlayRecordRequest::default();
-    let take = scene.input.len() as f64 / f64::from(SAMPLE_RATE) + SETTLE.as_secs_f64() + f64::from(r.lead_s + r.tail_s);
+    let calibration = plan.map_or(0.0, |p| p.latest.max(p.scene_at) as f64 / f64::from(SAMPLE_RATE));
+    let take = scene.input.len() as f64 / f64::from(SAMPLE_RATE) + calibration + SETTLE.as_secs_f64() + f64::from(r.lead_s + r.tail_s);
     (take + 60.0).min(MAX_CHAIN_RECORDING_S)
 }
 
@@ -157,26 +175,170 @@ struct Route {
 /// What one take gave.
 pub struct Take {
     pub recorded: PlayRecordResult,
+    /// Where the scene's input starts in the recording: the lead, and the echo test's calibration before it.
+    pub scene_at: usize,
     pub dropouts: Dropouts,
     pub engine: EngineReadings,
+    /// The latency readout's budget over the take: each part's mean (engine.md, "The latency budget"); `None` with the
+    /// readout off.
+    pub budget: Option<LatencyBudget>,
+    /// The echo test's echo delay: how it was placed and where it landed.
+    pub echo: Option<EchoTake>,
     pub warnings: Vec<String>,
 }
 
-fn play(engine: &Engine, cfg: &EngineConfig, scene: &Scene, route: Route) -> Result<Take, Failure> {
+/// The echo test's echo delay (`quality::echo_delay`): the take's plan, what the calibration did, where the far voice started,
+/// and where the echo landed by the take's chain recording.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EchoTake {
+    pub plan: Plan,
+    /// Where the marker is looked for in the chain recording (`echo_delay::search_from`: from the take's start).
+    pub search_from: usize,
+    /// The marker as the calibration found it and the start it asked for the far voice, or why there was none.
+    pub calibration: Result<(Calibration, FarStart), String>,
+    /// Where the far voice started (`play_record`'s late start; `None` if it never did).
+    pub far_start: Option<LateStart>,
+    /// The echo's delay measured in the chain recording (filled in once the recorder has stopped), or why it wasn't.
+    pub delay: Result<EchoDelay, String>,
+}
+
+impl EchoTake {
+    /// Measures where the echo landed, in the take's whole chain recording: from where the calibration found the marker (the
+    /// same recording: its copies were of this one's first blocks), or where it is in the whole recording when the calibration
+    /// didn't find it in time; and the echo in the far-only turns after it.
+    fn measure(&mut self, chain: &ChainRecording, scene: &Scene) {
+        let marker = match &self.calibration {
+            Ok((c, _)) => Ok(*c),
+            Err(_) => match echo_delay::find_marker(chain, &self.plan.marker, self.search_from) {
+                Marker::Found(c) => Ok(c),
+                Marker::Failed(why) => Err(why),
+                Marker::NotYet { .. } => Err("the marker isn't in the chain recording".to_owned()),
+            },
+        };
+        self.delay = match (marker, self.far_start) {
+            (_, None) => Err("the far voice didn't play".into()),
+            (Ok(cal), Some(start)) => echo_delay::measure(chain, scene, &self.plan, &cal, start.frames),
+            (Err(why), _) => Err(why),
+        };
+    }
+
+    /// The report's lines: the delay asked and measured, and the calibration.
+    fn lines(&self) -> [String; 2] {
+        let ms = |v: f64| fixed(v, 1);
+        let mut delay = format!("{:<26} asked {} ms, ", "echo delay", ms(self.plan.delay_ms));
+        match &self.delay {
+            Ok(d) => {
+                let turns = if d.turns == d.turns_held { format!("{}", d.turns) } else { format!("{} of {}", d.turns, d.turns_held) };
+                let plural = if d.turns_held == 1 { "turn" } else { "turns" };
+                let when = if d.seen_ms < 0.0 { format!("{} ms before", ms(-d.seen_ms)) } else { format!("{} ms after", ms(d.seen_ms)) };
+                let _ = write!(
+                    delay,
+                    "measured {} ms after the reference's tap ({turns} far-only {plural}, {} to {} ms); AEC3 sees it {when} the \
+                     reference it's given (the lead {} ms)",
+                    ms(d.measured_ms),
+                    ms(d.low_ms),
+                    ms(d.high_ms),
+                    ms(d.lead_ms)
+                );
+            }
+            Err(why) => {
+                let _ = write!(delay, "not measured: {why}");
+            }
+        }
+        let played = match self.far_start {
+            Some(s) => {
+                let a = self.plan.advance_ms(s.frames);
+                if a < 0.0 {
+                    format!("the far voice played {} ms behind its echo", ms(-a))
+                } else {
+                    format!("the far voice played {} ms ahead of its echo", ms(a))
+                }
+            }
+            None => "the far voice didn't play".into(),
+        };
+        let calibration = match &self.calibration {
+            Ok((c, _)) => {
+                let side = if c.rig_ms < 0.0 { format!("{} ms before", ms(-c.rig_ms)) } else { format!("{} ms after", ms(c.rig_ms)) };
+                format!(
+                    "{:<26} on these devices an echo with no delay of its own reaches the mic {side} its reference's tap (the \
+                     marker, at a lead of {} ms{}), so {played}",
+                    "calibration",
+                    ms(c.lead_ms),
+                    if c.stamped { "" } else { " by delivery" }
+                )
+            }
+            Err(why) => format!("{:<26} none ({why}): {played}, as for devices that add no delay", "calibration"),
+        };
+        [delay, calibration]
+    }
+
+    /// What the report warns about: the measured delay's own warnings, and a calibration that didn't place the far voice
+    /// where it asked.
+    fn warnings(&self) -> Vec<String> {
+        let mut w = self.delay.as_ref().map(echo_delay::warnings).unwrap_or_default();
+        match (&self.calibration, self.far_start) {
+            (Err(why), _) => w.push(format!(
+                "The echo delay wasn't calibrated ({why}), so the echo came where the devices put it: the measured delay is the \
+                 one AEC3 had."
+            )),
+            (Ok((c, asked)), Some(s)) => {
+                if asked.clamped {
+                    w.push(format!(
+                        "On these devices an echo with no delay of its own reaches the mic {} ms from its reference's tap, past the \
+                         {MAX_RIG_OFFSET_MS:.0} ms either way a take makes up for: the far voice started as near as it could, so the \
+                         delay isn't the one asked.",
+                        fixed(c.rig_ms, 1)
+                    ));
+                }
+                match s.set {
+                    None => w.push(
+                        "The calibration came too late: the far voice had started at its default (as for devices that add no \
+                         delay) before the marker was found."
+                            .to_owned(),
+                    ),
+                    Some(set) if s.frames > set => w.push(format!(
+                        "The calibration came {} ms too late for the far voice's start, which started that much later than it \
+                         should have: its echo came that much sooner.",
+                        fixed((s.frames - set) as f64 * 1000.0 / f64::from(SAMPLE_RATE), 1)
+                    )),
+                    Some(_) => {}
+                }
+            }
+            (Ok(_), None) => {}
+        }
+        w
+    }
+}
+
+fn play(
+    engine: &Engine, cfg: &EngineConfig, scene: &Scene, plan: Option<&Plan>, recorder: Option<&ChainRecorder>, route: Route,
+) -> Result<Take, Failure> {
     wait_running(engine)?;
     if console::sleep_unless_stopped(SETTLE) {
         return Err(Failure::no_result("Cancelled before the test started."));
     }
     let before = engine.telemetry();
-    let mut play = vec![PlayTrack { device: route.probe, role: TrackRole::Probe, samples: &scene.input }];
-    let far = scene.far_played();
-    if let (Some(device), Some(samples)) = (route.far, far.as_deref()) {
-        play.push(PlayTrack { device, role: TrackRole::FarEnd, samples });
+    // The echo test: the marker on both tracks, the scene's input after it on the probe, and the far voice where the
+    // calibration puts it (its default until then).
+    let probe_track = plan.map_or(Cow::Borrowed(&scene.input[..]), |p| Cow::Owned(p.probe_track(&scene.input)));
+    let start = AtomicU64::new(LatePart::UNSET);
+    let late = plan.zip(scene.far.as_deref()).map(|(p, far)| LatePart {
+        samples: far,
+        start: &start,
+        default: p.default_start(),
+        latest: p.latest,
+    });
+    let mut play = vec![PlayTrack { device: route.probe, role: TrackRole::Probe, samples: &probe_track, late: None }];
+    let far_track = plan.zip(route.far).zip(late);
+    if let Some(((p, device), late)) = far_track {
+        play.push(PlayTrack { device, role: TrackRole::FarEnd, samples: &p.marker, late: Some(late) });
     }
     let request = PlayRecordRequest { play, capture_device: route.capture, cancel: Some(console::stop_flag()), ..Default::default() };
+    let seconds = |frames: u64| fixed(frames as f64 / f64::from(SAMPLE_RATE), 1);
+    let calibration = plan.map_or(String::new(), |p| format!(" and {} s of calibration", seconds(p.scene_at)));
     say!(
-        "Playing the scene: {} s, after {} s of silence, recording {} s past its end. Ctrl+C cancels.",
-        fixed(scene.input.len() as f64 / f64::from(SAMPLE_RATE), 1),
+        "Playing the scene: {} s, after {} s of silence{calibration}, recording {} s past its end. Ctrl+C cancels.",
+        seconds(scene.input.len() as u64),
         fixed(f64::from(request.lead_s), 0),
         fixed(f64::from(request.tail_s), 0)
     );
@@ -184,7 +346,23 @@ fn play(engine: &Engine, cfg: &EngineConfig, scene: &Scene, route: Route) -> Res
     if let Some(w) = console::CtrlCWatch::default().check() {
         say!("{w}");
     }
-    let recorded = nf_engine::play_record(&request).map_err(|e| {
+    // Echo cancellation's reference is the only timing of the far end there is: without it, the far voice plays at its default.
+    let calibrate = match (plan, recorder, late) {
+        (Some(p), Some(r), Some(l)) if cfg.processing.aec_enabled => Some((p, r, l)),
+        _ => None,
+    };
+    // The marker plays after the lead: it's looked for only from just before then in the chain recording, which holds the run.
+    let lead = (f64::from(request.lead_s) * f64::from(SAMPLE_RATE)).round() as usize;
+    let search_from = echo_delay::search_from(recorder.map_or(0, |r| r.blocks() as usize * BLOCK), lead);
+    let done = AtomicBool::new(false);
+    let (recorded, calibrated) = std::thread::scope(|s| {
+        let done = &done;
+        let helper = calibrate.map(|(p, r, l)| s.spawn(move || self::calibrate(r, p, &l, search_from, done)));
+        let recorded = nf_engine::play_record(&request);
+        done.store(true, Release);
+        (recorded, helper.map(|h| h.join().unwrap_or_else(|_| Err("its thread failed".into()))))
+    });
+    let recorded = recorded.map_err(|e| {
         if console::stop_requested() {
             Failure::no_result("The quality test was cancelled.")
         } else {
@@ -208,7 +386,74 @@ fn play(engine: &Engine, cfg: &EngineConfig, scene: &Scene, route: Route) -> Res
         ));
     }
     let readings = EngineReadings::of(cfg, &before, &after);
-    Ok(Take { dropouts: Dropouts::between(&before, &after, &recorded), recorded, engine: readings, warnings })
+    let budget = after.budget_totals.means_since(&before.budget_totals);
+    let echo = plan.map(|p| EchoTake {
+        plan: p.clone(),
+        search_from,
+        calibration: calibrated.unwrap_or_else(|| {
+            Err(if cfg.processing.aec_enabled {
+                "no far end".into()
+            } else {
+                "echo cancellation is off, so nothing times the far end".into()
+            })
+        }),
+        far_start: recorded.late_starts.get(1).copied().flatten(),
+        delay: Err("no chain recording".into()),
+    });
+    let scene_at = recorded.lead_frames + plan.map_or(0, |p| p.scene_at as usize);
+    Ok(Take { dropouts: Dropouts::between(&before, &after, &recorded), recorded, scene_at, engine: readings, budget, echo, warnings })
+}
+
+/// The echo test's calibration, beside the take: every [`CALIBRATION_POLL`] it copies what the chain recorder has added, and
+/// once the marker has arrived in both the filter's mic and its reference (looked for from `from` on, `echo_delay::search_from`)
+/// it sets the far voice's start for the rig's offset (`Plan::far_start`). It gives up when the far end's player has taken its
+/// default start (the marker came too late), when the take ends, or when the marker can't be found.
+fn calibrate(
+    recorder: &ChainRecorder, plan: &Plan, late: &LatePart<'_>, from: usize, done: &AtomicBool,
+) -> Result<(Calibration, FarStart), String> {
+    let mut chain = ChainRecording::default();
+    let mut found = Marker::NotYet { mic: false, reference: false };
+    loop {
+        // Read before the look: a marker found in this look counts even if the player gets there meanwhile (its set fails then,
+        // and the report says so).
+        let too_late = late.get().is_some() || done.load(Acquire);
+        let more = recorder.copy_from(chain.blocks.len());
+        if !more.blocks.is_empty() {
+            append(&mut chain, more);
+            found = echo_delay::find_marker(&chain, &plan.marker, from);
+        }
+        match &found {
+            Marker::Found(c) => {
+                let start = plan.far_start(c.rig_ms);
+                // False when the player took its default first: the far start says so.
+                let _ = late.set(start.frames);
+                return Ok((*c, start));
+            }
+            Marker::Failed(why) => return Err(why.clone()),
+            Marker::NotYet { mic, reference } if too_late => {
+                return Err(match (mic, reference) {
+                    (false, true) => "the marker reached the echo reference but not the filter's mic in time: check that --probe feeds \
+                                      the mic"
+                        .into(),
+                    (true, false) => "the marker reached the filter's mic but not its echo reference in time".into(),
+                    _ => "the marker didn't reach the filter's mic and its echo reference in time".into(),
+                });
+            }
+            Marker::NotYet { .. } => {}
+        }
+        std::thread::sleep(CALIBRATION_POLL);
+    }
+}
+
+/// `more` (a copy of the blocks after `chain`'s) appended to `chain`.
+fn append(chain: &mut ChainRecording, more: ChainRecording) {
+    chain.mic.extend_from_slice(&more.mic);
+    chain.reference.extend_from_slice(&more.reference);
+    chain.output.extend_from_slice(&more.output);
+    chain.blocks.extend_from_slice(&more.blocks);
+    chain.lost_blocks = more.lost_blocks;
+    chain.truncated = more.truncated;
+    chain.run_ended = more.run_ended;
 }
 
 /// `run::start` returns once the streams are open; this checks the engine says so.
@@ -331,14 +576,14 @@ impl Dropouts {
     }
 }
 
-/// Writes the scene's signals, the recording and (when it lined up) the aligned recording into `dir` as 48 kHz mono float
-/// WAVs, and returns their names.
-fn save(dir: &Path, scene: &Scene, recording: &[f32], aligned: Option<&[f32]>) -> Result<Vec<&'static str>, Failure> {
+/// Writes the scene's signals, the far voice as played (the echo test), the recording and (when it lined up) the aligned
+/// recording into `dir` as 48 kHz mono float WAVs, and returns their names.
+fn save(dir: &Path, scene: &Scene, far: Option<&[f32]>, recording: &[f32], aligned: Option<&[f32]>) -> Result<Vec<&'static str>, Failure> {
     std::fs::create_dir_all(dir).map_err(|e| Failure::error(format!("Couldn't create {}: {e}", dir.display())))?;
     let mut files: Vec<(&'static str, &[f32])> = vec![("input.wav", &scene.input), ("clean.wav", &scene.clean)];
-    // As played: ahead of its echo in input.wav, as `process --ref` would get it from a speaker's loopback.
-    let far = scene.far_played();
-    if let Some(far) = &far {
+    // As played against input.wav: the far voice moved by the advance the take used, as `process --ref` would get it from a
+    // loopback that the probe's cable delivers in step with (the echo delay AEC3 had live is in chain_ref.wav).
+    if let Some(far) = far {
         files.push(("far.wav", far));
     }
     files.push(("recording.wav", recording));
@@ -358,11 +603,15 @@ const CHAIN_FILES: [&str; 5] = ["chain_mic.wav", "chain_ref.wav", "chain_out.wav
 /// (samples its FIFO discarded, device position it skipped unfilled); the reference's take (`ReferenceFacts`; empty without a
 /// reference), with `path`, the mic's index less the reference's, the echo path as the engine holds it (it moves by
 /// `mic_discarded` on the mic's side, and on the reference's by a slip, `consumed` other than 480, and a jump, `jumped`);
-/// AEC3's own estimates; and 1 where the chain's settings changed from the block before. Times are QPC in 100 ns units; a
-/// number that's unknown is empty.
+/// AEC3's own estimates; 1 where the chain's settings changed from the block before; and the latency readout's budget
+/// (`nf_engine::LatencyBudget`; empty without one): mic delivery, wait, the chain's offset, the output queue and the render
+/// side in ms, and the readout, which is mic delivery + wait + queue + render side (the chain's offset isn't in it). Times are
+/// QPC in 100 ns units; a number that's unknown is empty.
 const CHAIN_COLUMNS: &str = "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,\
                              ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,\
-                             consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed";
+                             consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed,\
+                             mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms";
+const CHAIN_BUDGET_COLUMNS: usize = 6;
 const CHAIN_REFERENCE_COLUMNS: usize = 15;
 
 /// Writes the chain recording into `dir`: what the chain got (mic and reference) and gave, as 48 kHz mono float WAVs, a CSV
@@ -428,7 +677,16 @@ fn chain_csv(chain: &ChainRecording) -> String {
             None => s.push_str(&",".repeat(CHAIN_REFERENCE_COLUMNS)),
         }
         let changed = last.is_some_and(|l: &ChainBlock| !b.settings.same(&l.settings));
-        let _ = writeln!(s, ",{},{},{}", num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
+        let _ = write!(s, ",{},{},{}", num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
+        match &b.budget {
+            Some(t) => {
+                for v in [t.mic_ms, t.wait_ms, t.chain_ms, t.queue_ms, t.render_ms, t.readout_ms()] {
+                    let _ = write!(s, ",{}", num(f64::from(v), 3));
+                }
+            }
+            None => s.push_str(&",".repeat(CHAIN_BUDGET_COLUMNS)),
+        }
+        s.push('\n');
         last = Some(b);
     }
     s
@@ -481,27 +739,30 @@ fn chain_line(names: &[&str], chain: &ChainRecording) -> String {
 /// The report: the alignment, each region's levels, the engine's readings, the dropouts, the streams, notes and warnings.
 pub fn format_report(test: QualityTest, result: &Result<Analysis, AlignmentFailure>, take: &Take) -> String {
     let seconds = |samples: i64| fixed(samples as f64 / f64::from(SAMPLE_RATE), 4);
-    let lead = take.recorded.lead_frames;
+    // The scene's start in the recording: after the lead, and the echo test's calibration.
+    let scene_at = take.scene_at;
     let mut s = String::new();
     let mut notes = Vec::new();
     let mut warnings = take.warnings.clone();
     match result {
         Ok(a) => {
             let al = &a.alignment;
-            let ms = |samples: f64| fixed((samples - lead as f64) * 1000.0 / f64::from(SAMPLE_RATE), 2);
+            let ms = |samples: f64| fixed((samples - scene_at as f64) * 1000.0 / f64::from(SAMPLE_RATE), 2);
             let _ = write!(
                 s,
-                "Quality, {} test: the recording lines up {} s in ({} ms after the lead), correlation {} (confidence {} dB)",
+                "Quality, {} test: the recording lines up {} s in ({} ms after the scene's start), correlation {} (confidence {} \
+                 dB)",
                 test.name(),
                 seconds(al.delay),
-                fixed(al.path_ms(lead), 1),
+                fixed(al.path_ms(scene_at), 1),
                 fixed(f64::from(al.correlation), 2),
                 fixed(f64::from(al.confidence_db), 1)
             );
             let drift = if al.drift_ppm.is_finite() { format!(", drift {:+.1} ppm", al.drift_ppm) } else { String::new() };
             let _ = write!(
                 s,
-                "\n  {:<26} {} of {} windows of {WINDOW_S:.0} s lined up, the lowest at {}; delay {} to {} ms after the lead{drift}",
+                "\n  {:<26} {} of {} windows of {WINDOW_S:.0} s lined up, the lowest at {}; delay {} to {} ms after the scene's \
+                 start{drift}",
                 "alignment",
                 al.windows_aligned,
                 al.windows,
@@ -534,6 +795,15 @@ pub fn format_report(test: QualityTest, result: &Result<Analysis, AlignmentFailu
         }
     }
     let _ = write!(s, "\n  {}", take.engine.line());
+    if let Some(echo) = &take.echo {
+        for line in echo.lines() {
+            let _ = write!(s, "\n  {line}");
+        }
+        warnings.extend(echo.warnings());
+    }
+    if let Some(b) = &take.budget {
+        let _ = write!(s, "\n  {:<26} {}, means over the take", "latency budget", budget_text(b));
+    }
     let _ = write!(s, "\n  {}", take.dropouts.line());
     let played: Vec<String> = take.recorded.playback.iter().map(stream_text).collect();
     let _ = write!(s, "\n  played on {}; recorded from {}", played.join(" and "), stream_text(&take.recorded.capture));
@@ -644,6 +914,7 @@ mod tests {
     use super::*;
     use crate::cli::Processing;
     use crate::quality::analysis::{Alignment, EchoLevels};
+    use crate::quality::echo_delay::DEFAULT_ECHO_DELAY_MS;
     use crate::quality::signals::UserAudio;
 
     fn args(test: QualityTest, far: Option<&str>, aec: Option<bool>) -> QualityArgs {
@@ -658,6 +929,7 @@ mod tests {
             capture: "CABLE Output".into(),
             test,
             far: far.map(Into::into),
+            echo_delay_ms: DEFAULT_ECHO_DELAY_MS,
             seconds: 30.0,
             snr_db: None,
             speech: None,
@@ -749,9 +1021,13 @@ mod tests {
                 playback_underruns: 0,
                 playback: playback.iter().map(|n| stream(n)).collect(),
                 capture: stream("CABLE Output"),
+                late_starts: vec![None; playback.len()],
             },
+            scene_at: 48_000,
             dropouts: Dropouts { capture_glitches: 2, capture_gaps: 1, gap_frames: 480, ..Default::default() },
             engine,
+            budget: None,
+            echo: None,
             warnings: vec!["The filter restarted during the test, so its dropout counts cover only the time since.".into()],
         }
     }
@@ -788,8 +1064,10 @@ mod tests {
         let readings = EngineReadings { noise_filter: true, output_drift_ppm: 1.24, ..Default::default() };
         assert_eq!(
             format_report(QualityTest::Noise, &ok, &take(&["CABLE-A Input"], readings)),
-            "Quality, noise test: the recording lines up 1.1830 s in (183.0 ms after the lead), correlation 0.97 (confidence 39.2 dB)\n  \
-             alignment                  14 of 14 windows of 2 s lined up, the lowest at 0.94; delay 182.99 to 183.02 ms after the lead, \
+            "Quality, noise test: the recording lines up 1.1830 s in (183.0 ms after the scene's start), correlation 0.97 (confidence \
+             39.2 dB)\n  \
+             alignment                  14 of 14 windows of 2 s lined up, the lowest at 0.94; delay 182.99 to 183.02 ms after the \
+             scene's start, \
              drift +0.1 ppm\n  \
              noise in pauses            input -30.0 dBFS, output -51.2 dBFS: change -21.2 dB over 9.8 s\n  \
              \x20 200 ms from speech       input -30.0 dBFS, output -52.5 dBFS: change -22.5 dB over 4.2 s\n  \
@@ -871,6 +1149,126 @@ mod tests {
         let silent = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
         let report = format_report(QualityTest::Echo, &silent, &take(&["A"], readings));
         assert!(report.starts_with("Quality, echo test: the recording didn't line up with the scene\n"), "{report}");
+    }
+
+    /// The latency readout's budget over the take, after the engine's readings, when the readout ran.
+    #[test]
+    fn the_report_shows_the_latency_budget_over_the_take() {
+        let readings = EngineReadings { output_drift_ppm: 1.24, ..Default::default() };
+        let failed = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
+        let b = LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44 };
+        let report = format_report(QualityTest::Noise, &failed, &Take { budget: Some(b), ..take(&["A"], readings) });
+        assert!(
+            report.contains(
+                "\n  engine                     output drift +1.2 ppm\n  \
+                 latency budget             mic delivery 16.2 + wait 0.1 + output queue 22.0 + render side 23.4 = readout 61.8 ms; \
+                 the chain's 10.0 ms on top: 71.8 ms, means over the take\n  dropouts"
+            ),
+            "{report}"
+        );
+        assert!(!format_report(QualityTest::Noise, &failed, &take(&["A"], readings)).contains("latency budget"));
+    }
+
+    fn calibration(rig_ms: f64) -> Calibration {
+        Calibration {
+            mic_at: 117_400.0,
+            ref_at: 120_000.0,
+            mic_confidence_db: 52.0,
+            ref_confidence_db: 61.0,
+            lead_ms: 14.06,
+            stamped: true,
+            rig_ms,
+        }
+    }
+
+    fn delay(measured_ms: f64, seen_ms: f64) -> EchoDelay {
+        EchoDelay {
+            asked_ms: 25.0,
+            measured_ms,
+            seen_ms,
+            lead_ms: measured_ms - seen_ms,
+            low_ms: measured_ms - 0.1,
+            high_ms: measured_ms + 0.2,
+            turns: 6,
+            turns_held: 6,
+        }
+    }
+
+    /// The echo delay's lines, after the engine's: asked and measured (and AEC3's lag behind its reference, and the lead),
+    /// and the calibration: the devices' own offset and how far ahead of its echo the far voice played; with the warnings a
+    /// non-causal echo, a missing calibration or a late one earn.
+    #[test]
+    fn the_report_gives_the_echo_delay_and_its_calibration() {
+        let plan = Plan::new(25.0);
+        let asked = plan.far_start(-40.0);
+        let echo = EchoTake {
+            plan: plan.clone(),
+            search_from: 0,
+            calibration: Ok((calibration(-40.0), asked)),
+            far_start: Some(LateStart { frames: asked.frames, set: Some(asked.frames) }),
+            delay: Ok(delay(25.04, 11.0)),
+        };
+        let failed = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
+        let report = |e: EchoTake| {
+            let mut t = take(&["A", "B"], EngineReadings::default());
+            t.warnings.clear();
+            format_report(QualityTest::Echo, &failed, &Take { echo: Some(e), ..t })
+        };
+        let r = report(echo.clone());
+        assert!(
+            r.contains(
+                "\n  echo delay                 asked 25.0 ms, measured 25.0 ms after the reference's tap (6 far-only turns, 24.9 to \
+                 25.2 ms); AEC3 sees it 11.0 ms after the reference it's given (the lead 14.0 ms)\n  \
+                 calibration                on these devices an echo with no delay of its own reaches the mic 40.0 ms before its \
+                 reference's tap (the marker, at a lead of 14.1 ms), so the far voice played 65.0 ms ahead of its echo\n  dropouts"
+            ),
+            "{r}"
+        );
+        assert!(!r.contains("warning:"), "{r}");
+        // The echo before its reference: said in the line and warned about
+        let r = report(EchoTake { delay: Ok(delay(5.0, -9.0)), ..echo.clone() });
+        assert!(r.contains("AEC3 sees it 9.0 ms before the reference it's given (the lead 14.0 ms)"), "{r}");
+        assert!(r.contains("warning: AEC3 got the echo 9.0 ms before the reference it's given"), "{r}");
+        assert!(r.contains("warning: The echo came 5.0 ms after its reference's tap, -20.0 ms off the 25.0 ms asked"), "{r}");
+        // Devices that put the echo after its tap: the far voice behind its echo
+        let late_rig = plan.far_start(40.0);
+        let r = report(EchoTake {
+            calibration: Ok((calibration(40.0), late_rig)),
+            far_start: Some(LateStart { frames: late_rig.frames, set: Some(late_rig.frames) }),
+            ..echo.clone()
+        });
+        assert!(
+            r.contains(
+                "40.0 ms after its reference's tap (the marker, at a lead of 14.1 ms), so the far voice played 15.0 ms behind its echo"
+            ),
+            "{r}"
+        );
+        // No calibration: the default, said and warned about; nothing measured
+        let r = report(EchoTake {
+            calibration: Err("echo cancellation is off, so nothing times the far end".into()),
+            far_start: Some(LateStart { frames: plan.default_start(), set: None }),
+            delay: Err("the filter has no echo reference, so nothing times the far end".into()),
+            ..echo.clone()
+        });
+        assert!(
+            r.contains(
+                "echo delay                 asked 25.0 ms, not measured: the filter has no echo reference, so nothing times the far end\n  \
+                 calibration                none (echo cancellation is off, so nothing times the far end): the far voice played 25.0 \
+                 ms ahead of its echo, as for devices that add no delay"
+            ),
+            "{r}"
+        );
+        assert!(r.contains("warning: The echo delay wasn't calibrated (echo cancellation is off"), "{r}");
+        // Found too late for the player, and set after the player had passed it
+        let r = report(EchoTake { far_start: Some(LateStart { frames: plan.default_start(), set: None }), ..echo.clone() });
+        assert!(r.contains("warning: The calibration came too late: the far voice had started at its default"), "{r}");
+        let r = report(EchoTake { far_start: Some(LateStart { frames: asked.frames + 480, set: Some(asked.frames) }), ..echo.clone() });
+        assert!(r.contains("warning: The calibration came 10.0 ms too late for the far voice's start"), "{r}");
+        assert!(r.contains("so the far voice played 55.0 ms ahead of its echo"), "{r}");
+        // Devices past what a take makes up for
+        let r = report(EchoTake { calibration: Ok((calibration(-300.0), plan.far_start(-300.0))), ..echo });
+        assert!(r.contains("warning: On these devices an echo with no delay of its own reaches the mic -300.0 ms from its"), "{r}");
+        assert!(r.contains("past the 250 ms either way a take makes up for"), "{r}");
     }
 
     #[test]
@@ -982,9 +1380,9 @@ mod tests {
             r.extend(std::iter::repeat_n(0.0, 2 * FS));
             r
         };
-        let noise = |snr| signals::build(QualityTest::Noise, 30.0, Some(snr), &UserAudio::default()).unwrap();
+        let noise = |snr| signals::build(QualityTest::Noise, 30.0, Some(snr), DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let (n10, n0) = (noise(10.0), noise(0.0));
-        let echo = signals::build(QualityTest::Echo, 30.0, None, &UserAudio::default()).unwrap();
+        let echo = signals::build(QualityTest::Echo, 30.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         // The mic hears the echo 40 ms after the reference plays it, as through a cable
         let mic = delayed(&echo.input, 1_920);
         let far = echo.far.as_deref().unwrap();
@@ -1025,7 +1423,7 @@ mod tests {
             }
         }
         // A long take drifting: 15 ms over 300 s, which one lag for the whole take lost
-        let long = signals::build(QualityTest::Noise, 300.0, None, &UserAudio::default()).unwrap();
+        let long = signals::build(QualityTest::Noise, 300.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let processed = delayed_by(&chain(&long.input, &[], false, true), |n| n as f64 * 50e-6);
         let a = analyse(&long, &recording(&processed, 9_000), FS).expect("the long take lines up").alignment;
         println!(
@@ -1074,6 +1472,13 @@ mod tests {
             aec_delay_ms: f32::NAN,
             aec_erle_db: 3.25,
             settings: ChainParams { passthrough: index >= 1, ..ChainParams::default() },
+            budget: (index == 0).then_some(LatencyBudget {
+                mic_ms: 19.5,
+                wait_ms: 0.125,
+                chain_ms: 10.0,
+                queue_ms: 21.25,
+                render_ms: 22.0,
+            }),
         }
     }
 
@@ -1123,9 +1528,10 @@ mod tests {
         assert!(lines.iter().all(|l| l.split(',').count() == columns), "{csv}");
         assert_eq!(
             lines[1],
-            "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,,3.25,0"
+            "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,,3.25,0,\
+             19.500,0.125,10.000,21.250,22.000,62.875"
         );
-        assert_eq!(lines[2], "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1");
+        assert_eq!(lines[2], "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1,,,,,,");
         let back = crate::config::load(&dir.join("chain_config.json")).unwrap();
         assert_eq!(back, cfg, "process --config reads it");
         let _ = std::fs::remove_dir_all(dir);
@@ -1167,28 +1573,36 @@ mod tests {
         assert!(chain_line(&CHAIN_FILES, &ChainRecording::default()).contains("got no blocks"));
     }
 
-    /// The chain recorder covers the take: the settle, the lead, the scene and the tail, and a minute more.
+    /// The chain recorder covers the take: the settle, the lead, the echo test's calibration, the scene and the tail, and a
+    /// minute more.
     #[test]
     fn the_recorder_covers_the_take() {
-        let scene = signals::build(QualityTest::Noise, 30.0, None, &UserAudio::default()).unwrap();
-        assert!((recording_limit(&scene) - (30.0 + 1.5 + 3.0 + 60.0)).abs() < 0.1, "{}", recording_limit(&scene));
-        assert!(recording_limit(&scene) <= MAX_CHAIN_RECORDING_S);
+        let scene = signals::build(QualityTest::Noise, 30.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
+        assert!((recording_limit(&scene, None) - (30.0 + 1.5 + 3.0 + 60.0)).abs() < 0.1, "{}", recording_limit(&scene, None));
+        assert!(recording_limit(&scene, None) <= MAX_CHAIN_RECORDING_S);
+        let plan = Plan::new(25.0);
+        let with = recording_limit(&scene, Some(&plan));
+        assert!((with - recording_limit(&scene, None) - plan.latest as f64 / 48_000.0).abs() < 1e-9, "{with}");
     }
 
     #[test]
     fn saving_writes_the_scene_and_the_recordings() {
         let dir = crate::test_dir("quality-save");
         let out = dir.join("take");
-        let scene = signals::build(QualityTest::Echo, 5.0, None, &UserAudio::default()).unwrap();
+        let scene = signals::build(QualityTest::Echo, 5.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let recording = vec![0.25f32; 1000];
-        let names = save(&out, &scene, &recording, Some(&scene.clean)).unwrap();
+        let plan = Plan::new(25.0);
+        let far = plan.far_as_played(scene.far.as_deref().unwrap(), plan.far_start(-40.0).frames);
+        let names = save(&out, &scene, Some(&far), &recording, Some(&scene.clean)).unwrap();
         assert_eq!(names, ["input.wav", "clean.wav", "far.wav", "recording.wav", "aligned.wav"]);
         let read = |name: &str| wav::read_mono_48k(&out.join(name)).unwrap().samples;
         assert_eq!(read("recording.wav"), recording);
-        assert_eq!(read("far.wav"), scene.far_played().unwrap());
+        assert_eq!(read("far.wav"), far);
+        // 65 ms ahead of its echo in input.wav
+        assert_eq!(far[..far.len() - 3_120], scene.far.as_deref().unwrap()[3_120..]);
         assert_eq!(read("aligned.wav"), scene.clean);
-        let noise = signals::build(QualityTest::Noise, 5.0, None, &UserAudio::default()).unwrap();
-        let names = save(&out, &noise, &recording, None).unwrap();
+        let noise = signals::build(QualityTest::Noise, 5.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
+        let names = save(&out, &noise, None, &recording, None).unwrap();
         assert_eq!(names, ["input.wav", "clean.wav", "recording.wav"], "no far end, and no alignment to save");
         let _ = std::fs::remove_dir_all(dir);
     }

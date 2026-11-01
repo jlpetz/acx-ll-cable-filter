@@ -2,11 +2,12 @@
 //! implementation behind it lives in the crate's private modules.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
 pub use nf_core::controls::{ChainParams, GateParams};
-pub use nf_core::telemetry::{EngineState, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot};
+pub use nf_core::telemetry::{BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot};
 
 /// Endpoint direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -173,6 +174,9 @@ pub struct LatencyReport {
     pub end_to_end_ms_median: Option<f64>,
     /// The live readout (layer 1) during the test, for comparison.
     pub readout_ms_median: Option<f32>,
+    /// The readout's budget during the test: each part's mean over the blocks from the sweeps' start to their end (engine.md,
+    /// "The latency budget"). The readout leaves the chain's offset out; `app_ms` holds it.
+    pub budget: Option<LatencyBudget>,
     /// The chain's own stream offset during the test (passthrough: the enabled stages' latency).
     pub chain_ms: f32,
     /// Lowest arrival confidence among valid repetitions, in dB.
@@ -258,8 +262,54 @@ pub struct PlayTrack<'a> {
     /// Endpoint id.
     pub device: String,
     pub role: TrackRole,
+    /// 48 kHz mono in ±1, played from the end of the lead.
+    pub samples: &'a [f32],
+    /// A second signal, placed while the take runs ([`LatePart`]); `None` for none.
+    pub late: Option<LatePart<'a>>,
+}
+
+/// A track's second signal, whose start the caller sets while the take runs: `noise-filter quality`'s echo test places the far
+/// voice this way, once it has timed a marker in the track's first signal (`samples`). Until the part starts, the track plays
+/// silence after its first signal.
+#[derive(Clone, Copy, Debug)]
+pub struct LatePart<'a> {
     /// 48 kHz mono in ±1.
     pub samples: &'a [f32],
+    /// Where it starts, in frames after the lead: [`LatePart::UNSET`] until it's set, and it's set once ([`LatePart::set`],
+    /// a compare-exchange from UNSET). The caller sets it when it knows. The track's player sets `default` if it gets there
+    /// first. A start the player has already written past starts the part where the player is (later than asked), and
+    /// [`PlayRecordResult::late_starts`] says where it went. Starts are clamped to the first signal's end..=`latest`.
+    pub start: &'a AtomicU64,
+    /// The start the player takes when it gets there with none set: at or after the first signal's end, and at most `latest`.
+    pub default: u64,
+    /// The latest start that counts (a later one is taken as this).
+    pub latest: u64,
+}
+
+impl LatePart<'_> {
+    /// `start` before anything has set it.
+    pub const UNSET: u64 = u64::MAX;
+
+    /// Sets the part's start, `frames` after the lead, unless it's set already (by an earlier call, or by the player at
+    /// `default`): true when this call set it.
+    pub fn set(&self, frames: u64) -> bool {
+        frames != Self::UNSET && self.start.compare_exchange(Self::UNSET, frames, AcqRel, Acquire).is_ok()
+    }
+
+    /// The start set so far, if any.
+    pub fn get(&self) -> Option<u64> {
+        Some(self.start.load(Acquire)).filter(|&v| v != Self::UNSET)
+    }
+}
+
+/// Where a track's [`LatePart`] started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LateStart {
+    /// Frames after the lead.
+    pub frames: u64,
+    /// The start the caller set (clamped as [`LatePart`] says), or `None` when the player got to the default first. Less
+    /// than `frames`: it was set after the player had written past it, and the part started that much late.
+    pub set: Option<u64>,
 }
 
 /// What [`play_record`] plays and records.
@@ -299,6 +349,8 @@ pub struct PlayRecordResult {
     /// The playback streams, in the request's order, and the capture stream.
     pub playback: Vec<StreamInfo>,
     pub capture: StreamInfo,
+    /// Where each track's [`LatePart`] started, in the request's order (`None` for a track without one).
+    pub late_starts: Vec<Option<LateStart>>,
 }
 
 /// The longest chain recording, in seconds (15 minutes, as [`play_record`]'s).
@@ -410,6 +462,10 @@ pub struct ChainBlock {
     /// The chain's live settings as they stood after this block (on/off, passthrough, floor, gate): an [`Engine::apply`] or a
     /// latency test that changed them shows here, and a rerun with one config matches only while they don't change.
     pub settings: ChainParams,
+    /// The block's latency readout split into where its first sample spent the time (engine.md, "The latency budget"): its
+    /// `readout_ms()` is the readout. `None` while the readout is off, without the mic's stamps or the output's clock (its
+    /// first few ms), or for a block the output dropped.
+    pub budget: Option<LatencyBudget>,
 }
 
 /// What [`ChainRecorder::stop`] gives: every block the chain processed while it recorded, the chain's input and output.
@@ -473,6 +529,13 @@ impl ChainRecorder {
     /// Blocks lost so far because the recorder's ring was full.
     pub fn lost_blocks(&self) -> u64 {
         self.inner.lost_blocks()
+    }
+
+    /// A copy of the blocks recorded so far from the `from`th on (0 is the recording's first block; none past its end), as
+    /// [`ChainRecorder::stop`] would give them, with its counts and flags as they stand: a look at the recording while it
+    /// runs (`noise-filter quality` times its echo test's marker so). About 6 KB a block; the recording carries on.
+    pub fn copy_from(&self, from: usize) -> ChainRecording {
+        self.inner.copy_from(from)
     }
 
     /// Stops recording (the recording ends at about this moment) and returns it. It waits up to about half a second for

@@ -44,8 +44,9 @@ minimise for now; the tray comes later (TODO #15, #16).
      noise stage took off, its floor and gate included; both read "—" while the stage isn't
      reporting (off, or in passthrough).
 5. **Latency** (ToggleSwitch "Live readout"):
-   - Line 1: "Pipeline: 12.3 ms (p95 14.1)", or "—" when invalid, plus "Drift out/ref: +12/-40 ppm ·
-     Fill out/ref: 15.0/12.0 ms (target 15.5/12.0)".
+   - Line 1: "Pipeline: 12.3 ms (p95 14.1)", or "—" when invalid; under it its budget, "Budget (means): mic 16.2 + wait
+     0.1 + output queue 22.0 + render 23.4 ms, chain 10.0 ms on top" (engine.md, "The latency budget"); then "Drift
+     out/ref: +12/-40 ppm · Fill out/ref: 15.0/12.0 ms (target 15.5/12.0)".
    - Line 2: "CPU per block: p50 45 µs, p99 80 µs (AEC p99 x, noise p99 y)"; then "Dropouts:
      capture n, output n, reference gaps n, mic stalls n · Coarse drops out/ref: n/n · Tap
      overflows: n" (a coarse drop is one correction that dropped whole blocks); then "RT heap

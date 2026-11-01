@@ -115,11 +115,42 @@ Notes:
       (and cable B as the output) it was 7-23 dB a turn, with 177 gaps in 30 s.
     - After #10's reference fix the gaps were gone but the echo still dropped 2 dB: the rig was non-causal (VB-CABLE's
       loopback stamps run late, so the echo pre-mixed into cable A came 10-40 ms ahead of its reference). The echo scene
-      now plays the far voice 100 ms ahead of its echo, as a speaker's output latency would, and saves `far.wav` as played.
-      Then: echo down 14.4 dB (12-18 dB a far-only turn) against 46-57 dB offline on the same scene (#10's detail file).
+      then played the far voice a fixed 100 ms ahead of its echo (`ECHO_DELAY_S`, since replaced by the calibrated delay
+      below) and saved `far.wav` as played. Then: echo down 14.4 dB (12-18 dB a far-only turn) against 46-57 dB offline on
+      the same scene (#10's detail file).
     - With the chain recorder (`--save` now also writes what the chain got and gave, rerunnable exactly offline), six
       takes: far-only turns a median of 57-60 dB each, as offline. In three of the six the analysis saw the output path's
       delay move by 11-13 ms during the take (2 ms in the others): the output side (#9), not the echo.
+  - **The echo delay, calibrated in each take (built 2026-11-01, not yet run live).** The fixed 100 ms was too generous: a
+    real speaker's echo follows the loopback tap by the output's latency and the air, often only 10-30 ms, and the engine's
+    lead (12-14 ms on the cables) has to fit under it. `--echo-delay MS` (0-300, default 25) is now the echo's delay after
+    the far voice's loopback tap, by both streams' stamps (`quality::echo_delay`):
+    - **The rig's offset moves between takes, so it's measured in each.** The six chain-recorded takes above, re-read
+      (the far-only turns' echo against `chain_ref.wav` by GCC-PHAT, plus the lead): the echo came 14.5, 24.9, 31.3, 42.0,
+      52.4 and 63.4 ms after its reference's tap (AEC3's lag 0.7-51.4 ms; its own delay estimates 0, 8, 12, 24, 36 and
+      48 ms agree), so cable B's own offset went from -86 to -37 ms, about 10 ms later each take, while each take held it
+      to 0.1 ms. In one take's first 6 s the mic's copy of the probe flipped between two places 11 ms apart (presumably
+      VB-CABLE resyncing its buffer), then held. So those 57-60 dB were at 14-63 ms, and a calibration in a take of its own
+      would miss by about 10 ms. (`echo_delay`'s ignored `a_saved_take_measures` reruns the measurement on such a take.)
+    - **The take:** a 0.2 s sweep on both devices right after `play_record`'s lead (the far end's copy as the reference, the
+      probe's as a zero-delay echo); a thread beside the take reads the chain recording every 20 ms
+      (`ChainRecorder::copy_from`), finds the sweep in the mic and the reference (matched filter), and takes their lag in
+      the chain plus the reference's lead there as the rig's offset. It looks only from half a second before the lead ends
+      (the sweep can't come sooner, less the rig's 250 ms room and a 250 ms margin), so a look correlates about a second:
+      looking from the run's start took about 220 ms a look in a dev build, most of the time the far voice's start allows.
+      The far voice (an `nf_engine::LatePart`) then starts
+      the delay less the offset ahead of its echo, either sign; the scene's input starts 0.85 s plus the delay after the
+      sweep, which leaves room for an offset of ±250 ms. Too late or with AEC off, the far voice plays at its default (as
+      for a rig that adds nothing), and the report says so.
+    - **Measured after the take** in the same chain recording, each far-only turn: the echo against its reference within
+      40 ms of where the calibration put it (AEC3's lag Z) plus the lead W gives the delay Y. The report: "echo delay:
+      asked X ms, measured Y ms after the reference's tap (turns, range); AEC3 sees it Z ms after the reference it's given
+      (the lead W ms)", and the calibration line. Warnings: Z under 2 ms or negative (the echo before its reference can't
+      be cancelled), Y over 2 ms off the asked, or moving over 2 ms between turns.
+    - Offline: on fake chain recordings the calibration finds offsets of both signs to 0.0001 ms, through a jump of the
+      reference beside the sweep; the measured delay lands within 0.03 samples of the truth at 0, 25, 40 and 300 ms, through
+      a jump mid-take. The echo regions are where the echo is in the mic (the far voice's activity in the scene's time),
+      so they don't move with the delay.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
   - **Its small first part, the chain recorder (built 2026-11-01, for #10):** `Engine::record_chain` records what the chain
     got and gave live, block by block, from the run's first block when armed before the start (engine.md, "The chain

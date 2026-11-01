@@ -624,6 +624,9 @@ fn reset_telemetry(t: &Telemetry) {
     t.latency_valid.store(false, Relaxed);
     t.latency_ms_median.store(0.0);
     t.latency_ms_p95.store(0.0);
+    t.budget_mean.store(&s.budget_mean);
+    t.budget_p95.store(&s.budget_p95);
+    t.budget_totals.store(&s.budget_totals);
     t.output_drift_ppm.store(0.0);
     t.reference_drift_ppm.store(0.0);
     t.output_fill_ms.store(0.0);

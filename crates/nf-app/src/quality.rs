@@ -1,8 +1,10 @@
 //! The quality test's pure half (`noise-filter quality`, TODO #14: Lab phase 0's live half). [`signals`] builds the scene it
-//! plays and [`analysis`] measures what comes back. Neither touches a device, so both are unit-tested here; the command
-//! (`commands/quality.rs`) runs the engine, plays the scene and records the result.
+//! plays, [`echo_delay`] places the echo test's far voice and measures where its echo landed, and [`analysis`] measures what
+//! comes back. None of them touches a device, so all are unit-tested here; the command (`commands/quality.rs`) runs the
+//! engine, plays the scene and records the result.
 
 pub mod analysis;
+pub mod echo_delay;
 pub mod signals;
 
 /// Which scene the quality test plays.

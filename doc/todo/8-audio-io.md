@@ -49,3 +49,19 @@ Facts and sources: `doc/research-2026-10.md` (Windows audio I/O).
 - With WASAPI periods of `p`: capture-to-output = `N + L + p − gcd(p, H)`.
 - 10 ms-hop models (RNNoise, DFN3) align with 10 ms periods.
 - UL-UNAS (16 ms hop) and FastEnhancer-48k (512-sample hop) pay up to ~8-9 ms unless the period divides the hop.
+
+## Delivery on VB-CABLE (measured 2026-11-01)
+On the dev VM (EC2, Windows Server 2025) VB-CABLE delivers in bursts: its capture side gives 0, 480 or 960 frames per
+10 ms event (often a fifth to a third each), the data 19-21 ms old when read (10 ms for a packet that has just filled);
+its loopback is sometimes steady, sometimes 0-1440 a wake. The traces are in `%LOCALAPPDATA%\noise-filter\traces`
+(`live_probe.rs`, built with `--features live-probe`).
+- **Not the VM's timer.** The system timer ran at its default 15.6 ms, with nothing asking for finer; holding 0.5 ms
+  from another process (`NtSetTimerResolution`) left the pattern and the age unchanged.
+- **Most likely VB-CABLE's own schedule** beating against the audio engine's: a virtual cable has no hardware clock, so
+  the driver moves audio on its own timer (its statistics show 128-1024-sample buffers) while the engine reads each
+  endpoint every 10 ms, and two unlocked 10 ms schedules give 0, 1 or 2 packets a wake as their phases drift (the pattern
+  changes from run to run). A sound card's DMA usually runs in step with the engine, so real devices should deliver
+  steadily: checking that on real hardware is open. Bluetooth and some USB devices are bursty too, so the engine keeps
+  handling bursts either way.
+- **What it costs:** about 6 ms of mic age on average beyond a block, and the output target's spare block (10 ms) exists
+  to absorb it (#13's budget). Our own driver (#19) can deliver on the engine's schedule instead.

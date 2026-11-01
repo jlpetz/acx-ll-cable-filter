@@ -103,7 +103,8 @@ pub struct Alignment {
 }
 
 impl Alignment {
-    /// The delay past the lead, in ms: about the probe-to-capture latency (the capture starts just before the tracks).
+    /// The delay past `lead` (where the scene starts in the recording: the lead, and the echo test's calibration), in ms: about
+    /// the probe-to-capture latency (the capture starts just before the tracks).
     pub fn path_ms(&self, lead: usize) -> f64 {
         (self.delay_exact - lead as f64) * 1000.0 / f64::from(SAMPLE_RATE)
     }
@@ -551,6 +552,7 @@ mod tests {
     use nf_stages::synth::{Voice, pink_noise, speech_like};
 
     use super::*;
+    use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, MAX_ECHO_DELAY_MS};
     use crate::quality::signals::{DEFAULT_NOISE_SNR_DB, SPEECH_DBFS, UserAudio, build};
 
     const FS: usize = 48_000;
@@ -577,7 +579,7 @@ mod tests {
     /// -6 dB. The delay comes out to the sample and each level change to within 0.01 dB.
     #[test]
     fn the_noise_test_finds_a_known_delay_gain_and_noise_cut() {
-        let scene = build(QualityTest::Noise, 12.0, None, &UserAudio::default()).unwrap();
+        let scene = build(QualityTest::Noise, 12.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let len = scene.clean.len();
         let g = 0.5f32;
         let g_db = 20.0 * g.log10();
@@ -611,7 +613,7 @@ mod tests {
 
     /// A 21 s echo scene: far-only turns at 0, 9 and 18 s, double talk at 3 and 12 s, near only at 6 and 15 s.
     fn echo_scene() -> Scene {
-        build(QualityTest::Echo, 21.0, None, &UserAudio::default()).unwrap()
+        build(QualityTest::Echo, 21.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap()
     }
 
     /// An "echo canceller" that scales the echo and the noise at sample `i` by `cut(i, near)` (`near`: within 20 ms of the near
@@ -666,6 +668,32 @@ mod tests {
         assert!(double_talk.rest_dbfs > double_talk.clean_dbfs - 12.0, "{double_talk:?}");
     }
 
+    /// The echo's regions are where the echo is in the mic: the far voice's activity in the scene's time, widened by the
+    /// margins and the room's tail. The echo delay moves only when the far end plays the far voice, not the echo, so the
+    /// regions hold the echo whatever the delay: the scene is the same at 0 and 300 ms, all but a trace of the echo's energy is
+    /// inside the far end's busy region, and the same recording measures the same.
+    #[test]
+    fn the_echo_regions_hold_the_echo_whatever_the_delay() {
+        let (soon, late) = (
+            build(QualityTest::Echo, 21.0, None, 0.0, &UserAudio::default()).unwrap(),
+            build(QualityTest::Echo, 21.0, None, MAX_ECHO_DELAY_MS, &UserAudio::default()).unwrap(),
+        );
+        assert_eq!((&soon.input, &soon.clean, &soon.far), (&late.input, &late.clean, &late.far));
+        assert_eq!((&soon.far_activity, &soon.near_activity), (&late.far_activity, &late.near_activity));
+        let echo = soon.echo.as_deref().unwrap();
+        let fs = f64::from(SAMPLE_RATE);
+        let busy = mark(echo.len(), &soon.far_activity, (MARGIN_S * fs) as usize, ((MARGIN_S + RIR_S) * fs) as usize);
+        let (inside, outside) = echo.iter().zip(&busy).fold((0.0f64, 0.0f64), |(i, o), (&v, &b)| {
+            let e = f64::from(v) * f64::from(v);
+            if b { (i + e, o) } else { (i, o + e) }
+        });
+        assert!(10.0 * (outside / inside).log10() < -40.0, "the echo outside the far end's busy region: {outside} of {inside}");
+        let processed = cancel(&soon, 1.0, |_, _| 0.1);
+        let (a, b) =
+            (analyse(&soon, &recording(&processed, 4_000), LEAD).unwrap(), analyse(&late, &recording(&processed, 4_000), LEAD).unwrap());
+        assert_eq!(a.metrics, b.metrics);
+    }
+
     /// A canceller that is still converging in the first turn, and does worse in double talk, leaves the far-only figure
     /// where it was: it counts only far-only turns after the first. The first turn is reported on its own.
     #[test]
@@ -698,7 +726,7 @@ mod tests {
     /// speech: the drop is the scene's ceiling, and that's said.
     #[test]
     fn an_erle_at_the_scenes_noise_ceiling_is_flagged() {
-        let scene = build(QualityTest::Echo, 12.0, Some(30.0), &UserAudio::default()).unwrap();
+        let scene = build(QualityTest::Echo, 12.0, Some(30.0), DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let processed: Vec<f32> = scene.clean.iter().zip(&scene.noise).map(|(c, n)| c + n).collect();
         let a = analyse(&scene, &recording(&processed, 2_000), LEAD).unwrap();
         let Metrics::Echo { far_only, .. } = a.metrics else { panic!() };
@@ -723,7 +751,7 @@ mod tests {
     /// the drift is measured, a move over 2 ms is warned about, and the levels barely move.
     #[test]
     fn a_drifting_or_stepping_delay_is_followed() {
-        let scene = build(QualityTest::Noise, 24.0, None, &UserAudio::default()).unwrap();
+        let scene = build(QualityTest::Noise, 24.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         let processed: Vec<f32> = scene.clean.iter().zip(&scene.noise).map(|(c, n)| 0.5 * (c + 0.1 * n)).collect();
         let still = analyse(&scene, &recording(&processed, 2_500), LEAD).unwrap();
         let Metrics::Noise { pauses: p0, speech: s0, .. } = still.metrics else { panic!() };
@@ -752,7 +780,7 @@ mod tests {
 
     #[test]
     fn a_recording_without_the_scene_doesnt_align() {
-        let scene = build(QualityTest::Noise, 6.0, None, &UserAudio::default()).unwrap();
+        let scene = build(QualityTest::Noise, 6.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         // Silence
         let e = analyse(&scene, &vec![0.0; 9 * FS], LEAD).unwrap_err();
         assert_eq!(e.alignment, None);
@@ -772,7 +800,7 @@ mod tests {
 
     #[test]
     fn a_recording_that_leads_the_scene_fails_and_a_short_one_is_measured_as_far_as_it_goes() {
-        let scene = build(QualityTest::Noise, 8.0, None, &UserAudio::default()).unwrap();
+        let scene = build(QualityTest::Noise, 8.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
         // The scene starts 4000 samples before the recording does
         let e = analyse(&scene, &scene.input[4_000..], LEAD).unwrap_err();
         assert_eq!(e.alignment.map(|a| a.delay), Some(-4_000));

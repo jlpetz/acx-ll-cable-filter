@@ -55,6 +55,23 @@ fn fixed(v: f64, places: usize) -> String {
     if v.is_finite() { format!("{v:.places$}") } else { "--".into() }
 }
 
+/// A latency budget in one line (engine.md, "The latency budget"): "mic delivery 16.2 + wait 0.1 + output queue 22.0 + render
+/// side 23.4 = readout 61.7 ms; the chain's 10.0 ms on top: 71.7 ms". The readout holds the four parts; the chain's offset
+/// comes on top of it for the first sample's whole way.
+fn budget_text(b: &nf_engine::LatencyBudget) -> String {
+    let ms = |v: f32| fixed(f64::from(v), 1);
+    format!(
+        "mic delivery {} + wait {} + output queue {} + render side {} = readout {} ms; the chain's {} ms on top: {} ms",
+        ms(b.mic_ms),
+        ms(b.wait_ms),
+        ms(b.queue_ms),
+        ms(b.render_ms),
+        ms(b.readout_ms()),
+        ms(b.chain_ms),
+        ms(b.total_ms())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +86,17 @@ mod tests {
         assert_eq!(fixed(1.234, 2), "1.23");
         assert_eq!(fixed(f64::NAN, 1), "--");
         assert_eq!(fixed(f64::INFINITY, 1), "--");
+    }
+
+    #[test]
+    fn a_budget_reads_as_its_parts_the_readout_and_the_chain_on_top() {
+        let b = nf_engine::LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44 };
+        assert_eq!(
+            budget_text(&b),
+            "mic delivery 16.2 + wait 0.1 + output queue 22.0 + render side 23.4 = readout 61.8 ms; the chain's 10.0 ms on top: 71.8 ms"
+        );
+        let none = nf_engine::LatencyBudget { mic_ms: f32::NAN, ..b };
+        assert!(budget_text(&none).starts_with("mic delivery -- + wait 0.1") && budget_text(&none).contains("readout -- ms"));
     }
 
     #[test]

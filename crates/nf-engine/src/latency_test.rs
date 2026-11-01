@@ -369,6 +369,8 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     restore.tap_sent = true;
     let mut tap = Recording { samples: Vec::with_capacity(capacity * BLOCK), stamps: Vec::with_capacity(capacity) };
 
+    // The readout's budget over the test: its totals now and after the sweeps (published each second).
+    let budget_before = inner.telemetry.snapshot().budget_totals;
     let take = play_train(&mut probe, &mut cap, &train, |fraction| {
         if shared.cancelled() {
             return Err(TestError::Cancelled);
@@ -382,6 +384,7 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
         Ok(())
     })?;
     drain_tap(&mut tap_rx, &mut tap);
+    let budget = inner.telemetry.snapshot().budget_totals.means_since(&budget_before);
     // The analysis is seconds of CPU for a long test (FFTs of 10 M points and more): at MMCSS
     // "Pro Audio" priority (or the TIME_CRITICAL fallback) it would starve other apps' audio and
     // the UI. Back to normal priority first; nothing below needs it, nor COM's real-time state.
@@ -402,6 +405,7 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
 
     let tel = inner.telemetry.snapshot();
     report.readout_ms_median = tel.latency_valid.then_some(tel.latency_ms_median);
+    report.budget = budget;
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
     report.conditions =
@@ -561,6 +565,7 @@ pub(crate) fn build_report(
         input_path_ms_median: median(&inputs),
         end_to_end_ms_median: median(&e2e),
         readout_ms_median: None,
+        budget: None,
         chain_ms: 0.0,
         confidence_db_min: kept.iter().map(|r| r.confidence).fold(f32::NAN, f32::min),
         conditions: String::new(),

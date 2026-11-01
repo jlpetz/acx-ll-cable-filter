@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
-use crate::atomic::AtomicF32;
+use crate::atomic::{AtomicF32, AtomicF64};
 
 /// A reference lead target above this (ms) may be longer than the echo path's own delay: the loopback taps the mix ahead
 /// of the speakers, whose output latency can be as little as 10-30 ms, and a lead past the echo's delay puts the echo
@@ -67,6 +67,148 @@ impl MeterCell {
     }
 }
 
+/// The latency readout's budget (engine.md, "The latency budget"; TODO 13): where a block's first sample spends its time
+/// between its capture and its play-out, in ms. The readout is `mic + wait + queue + render`, block for block. The chain's
+/// offset isn't in it: the readout times the block's first output sample, which carries the input from the chain's offset
+/// before the block's first input sample, so that sample's own way through the app is the readout plus `chain_ms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LatencyBudget {
+    /// Mic delivery (measured): the first sample's capture time by the mic's stamps to the wake that read it. At least the
+    /// packet's length (a block-sized packet: the block's own 10 ms), plus how late the device and its driver delivered it.
+    pub mic_ms: f32,
+    /// Wait (measured): that wake (its time, taken before the mic's packets are read) to the block's write (its clock reading):
+    /// all the audio thread does in between. The wake's own work first: reading the mic's packets, servicing the reference
+    /// (the keep-alive's top-up and, with AEC on, the loopback's drain) and the tap's and the recorder's hand-overs. Then the
+    /// blocks before this one in the same wake, whole, and this block up to its write: its reference, its chain, the output's
+    /// padding. And, when the block's last samples came at a later wake than its first, the wakes between.
+    pub wait_ms: f32,
+    /// The chain's stream offset (its stages' latency, as they report it): not in the readout.
+    pub chain_ms: f32,
+    /// Output queue (measured): what was queued ahead of the block's first sample when it was written, in the device's buffer
+    /// and our pending samples: the output fill the drift loop holds, interpolated as it sees it (frames written less the
+    /// device position now, calibrated to the padding), or the padding before the calibration.
+    pub queue_ms: f32,
+    /// Render side (derived, the rest of the readout): from the moment the queue would have drained to the play-out the
+    /// output's AudioClock predicts. Half a device period when the device takes whole periods (the queue is calibrated to the
+    /// middle of the padding's steps), plus what the shared-mode engine and the device hold after taking a sample, as the
+    /// clock reports it.
+    pub render_ms: f32,
+}
+
+impl LatencyBudget {
+    /// The parts the readout holds: mic delivery + wait + output queue + render side.
+    #[inline]
+    pub fn readout_ms(&self) -> f32 {
+        self.mic_ms + self.wait_ms + self.queue_ms + self.render_ms
+    }
+
+    /// The readout and the chain's offset: the first sample's whole way, from its capture to its play-out.
+    #[inline]
+    pub fn total_ms(&self) -> f32 {
+        self.readout_ms() + self.chain_ms
+    }
+}
+
+/// The budget's totals over a run: the blocks that had one, and each part's sum (ms). Two snapshots give the means between
+/// them ([`Self::means_since`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BudgetTotals {
+    pub blocks: u64,
+    pub mic_ms: f64,
+    pub wait_ms: f64,
+    pub chain_ms: f64,
+    pub queue_ms: f64,
+    pub render_ms: f64,
+}
+
+impl BudgetTotals {
+    #[inline]
+    pub fn add(&mut self, b: &LatencyBudget) {
+        self.blocks += 1;
+        self.mic_ms += f64::from(b.mic_ms);
+        self.wait_ms += f64::from(b.wait_ms);
+        self.chain_ms += f64::from(b.chain_ms);
+        self.queue_ms += f64::from(b.queue_ms);
+        self.render_ms += f64::from(b.render_ms);
+    }
+
+    /// Each part's mean over the blocks since `before` (an earlier snapshot's totals); `None` when no block had a budget
+    /// since. Totals lower than `before`'s are a new run's, counted from its start.
+    pub fn means_since(&self, before: &BudgetTotals) -> Option<LatencyBudget> {
+        let base = if self.blocks < before.blocks { BudgetTotals::default() } else { *before };
+        let n = (self.blocks - base.blocks) as f64;
+        let mean = |now: f64, then: f64| ((now - then) / n) as f32;
+        (n > 0.0).then(|| LatencyBudget {
+            mic_ms: mean(self.mic_ms, base.mic_ms),
+            wait_ms: mean(self.wait_ms, base.wait_ms),
+            chain_ms: mean(self.chain_ms, base.chain_ms),
+            queue_ms: mean(self.queue_ms, base.queue_ms),
+            render_ms: mean(self.render_ms, base.render_ms),
+        })
+    }
+}
+
+/// A [`LatencyBudget`]'s atomics.
+#[derive(Debug, Default)]
+pub struct BudgetCell {
+    pub mic_ms: AtomicF32,
+    pub wait_ms: AtomicF32,
+    pub chain_ms: AtomicF32,
+    pub queue_ms: AtomicF32,
+    pub render_ms: AtomicF32,
+}
+
+impl BudgetCell {
+    pub fn store(&self, b: &LatencyBudget) {
+        self.mic_ms.store(b.mic_ms);
+        self.wait_ms.store(b.wait_ms);
+        self.chain_ms.store(b.chain_ms);
+        self.queue_ms.store(b.queue_ms);
+        self.render_ms.store(b.render_ms);
+    }
+    pub fn load(&self) -> LatencyBudget {
+        LatencyBudget {
+            mic_ms: self.mic_ms.load(),
+            wait_ms: self.wait_ms.load(),
+            chain_ms: self.chain_ms.load(),
+            queue_ms: self.queue_ms.load(),
+            render_ms: self.render_ms.load(),
+        }
+    }
+}
+
+/// [`BudgetTotals`]' atomics.
+#[derive(Debug, Default)]
+pub struct BudgetTotalsCell {
+    pub blocks: AtomicU64,
+    pub mic_ms: AtomicF64,
+    pub wait_ms: AtomicF64,
+    pub chain_ms: AtomicF64,
+    pub queue_ms: AtomicF64,
+    pub render_ms: AtomicF64,
+}
+
+impl BudgetTotalsCell {
+    pub fn store(&self, t: &BudgetTotals) {
+        self.blocks.store(t.blocks, Relaxed);
+        self.mic_ms.store(t.mic_ms);
+        self.wait_ms.store(t.wait_ms);
+        self.chain_ms.store(t.chain_ms);
+        self.queue_ms.store(t.queue_ms);
+        self.render_ms.store(t.render_ms);
+    }
+    pub fn load(&self) -> BudgetTotals {
+        BudgetTotals {
+            blocks: self.blocks.load(Relaxed),
+            mic_ms: self.mic_ms.load(),
+            wait_ms: self.wait_ms.load(),
+            chain_ms: self.chain_ms.load(),
+            queue_ms: self.queue_ms.load(),
+            render_ms: self.render_ms.load(),
+        }
+    }
+}
+
 /// The shared telemetry block. One per engine; `Arc`-shared with the UI.
 #[derive(Debug, Default)]
 pub struct Telemetry {
@@ -85,6 +227,12 @@ pub struct Telemetry {
     pub latency_valid: AtomicBool,
     pub latency_ms_median: AtomicF32,
     pub latency_ms_p95: AtomicF32,
+    /// The readout's budget over the same last 100 blocks (about a second; valid with `latency_valid`): each part's mean (the
+    /// means add up to the readout's mean, not its median), and each part's own 95th percentile (those don't add up).
+    pub budget_mean: BudgetCell,
+    pub budget_p95: BudgetCell,
+    /// The budget over the run so far, for the means between two snapshots (published each second).
+    pub budget_totals: BudgetTotalsCell,
     pub output_drift_ppm: AtomicF32,
     /// The reference loop's drift estimate: positive when the loopback's clock runs fast against the mic's.
     pub reference_drift_ppm: AtomicF32,
@@ -149,6 +297,9 @@ pub struct TelemetrySnapshot {
     pub latency_valid: bool,
     pub latency_ms_median: f32,
     pub latency_ms_p95: f32,
+    pub budget_mean: LatencyBudget,
+    pub budget_p95: LatencyBudget,
+    pub budget_totals: BudgetTotals,
     pub output_drift_ppm: f32,
     pub reference_drift_ppm: f32,
     pub output_fill_ms: f32,
@@ -209,6 +360,9 @@ impl Telemetry {
             latency_valid: self.latency_valid.load(Relaxed),
             latency_ms_median: self.latency_ms_median.load(),
             latency_ms_p95: self.latency_ms_p95.load(),
+            budget_mean: self.budget_mean.load(),
+            budget_p95: self.budget_p95.load(),
+            budget_totals: self.budget_totals.load(),
             output_drift_ppm: self.output_drift_ppm.load(),
             reference_drift_ppm: self.reference_drift_ppm.load(),
             output_fill_ms: self.output_fill_ms.load(),
@@ -237,5 +391,45 @@ impl Telemetry {
             mic_period_ms: self.mic_period_ms.load(),
             output_period_ms: self.output_period_ms.load(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget(mic_ms: f32, wait_ms: f32, chain_ms: f32, queue_ms: f32, render_ms: f32) -> LatencyBudget {
+        LatencyBudget { mic_ms, wait_ms, chain_ms, queue_ms, render_ms }
+    }
+
+    /// The readout is the four parts on the sample's way; the chain's offset comes on top of it.
+    #[test]
+    fn the_readout_is_the_parts_less_the_chain() {
+        let b = budget(16.0, 0.25, 10.0, 22.0, 23.5);
+        assert_eq!(b.readout_ms(), 61.75);
+        assert_eq!(b.total_ms(), 71.75);
+    }
+
+    /// Two snapshots' totals give each part's mean between them; a new run's (lower) totals count from its start, and no
+    /// block between them gives none.
+    #[test]
+    fn totals_give_the_means_between_two_snapshots() {
+        let mut t = BudgetTotals::default();
+        t.add(&budget(10.0, 0.0, 10.0, 22.0, 20.0));
+        let before = t;
+        assert_eq!(t.means_since(&before), None);
+        t.add(&budget(20.0, 1.0, 10.0, 12.0, 20.0));
+        t.add(&budget(10.0, 0.0, 10.0, 22.0, 21.0));
+        assert_eq!(t.means_since(&before), Some(budget(15.0, 0.5, 10.0, 17.0, 20.5)));
+        assert_eq!(t.means_since(&BudgetTotals::default()), Some(budget(40.0 / 3.0, 1.0 / 3.0, 10.0, 56.0 / 3.0, 61.0 / 3.0)));
+        let mut restarted = BudgetTotals::default();
+        restarted.add(&budget(12.0, 0.0, 0.0, 22.0, 20.0));
+        assert_eq!(restarted.means_since(&t), Some(budget(12.0, 0.0, 0.0, 22.0, 20.0)), "from the new run's start");
+
+        let tel = Telemetry::new();
+        tel.budget_totals.store(&t);
+        tel.budget_mean.store(&budget(1.0, 2.0, 3.0, 4.0, 5.0));
+        let s = tel.snapshot();
+        assert_eq!((s.budget_totals, s.budget_mean), (t, budget(1.0, 2.0, 3.0, 4.0, 5.0)));
     }
 }

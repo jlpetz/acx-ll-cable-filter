@@ -118,8 +118,10 @@ existing tools). Sources are Microsoft Learn, the Chromium and wasapi 0.26.0 sou
   17 ms spread between sweeps.
 - After a Latency change both cables passed only silence ("peak silent" in the report) until `pnputil /restart-device` on
   their devices.
-- The app's live readout (56-66 ms) is above its design (about 32-42 ms: a block of input, the chain's 10 ms, the 22 ms
-  output target). The cable-only runs below show the readout is right: the excess is the engine's.
+- The app's live readout (56-66 ms) is above its design: 32 ms, a block of input and the 22 ms output target, plus a render
+  side the design left out. (First written here as 32-42 ms, with the chain's 10 ms in it; the readout doesn't hold the
+  chain, "Budget" below, so it's 24-34 ms over, and the app's own path is the readout plus the chain.) The cable-only runs
+  below show the readout is right: the excess is the engine's.
 
 **Cable only** (2026-11-01): `latency --cable-only --reps 5`, each cable's Input to its own Output, both streams at a 10 ms
 period (as the engine's mic was). Each figure is one run's median; the sweeps within a run spread by 1-2 ms.
@@ -131,8 +133,9 @@ period (as the engine's mic was). Each figure is one run's median; the sweeps wi
 | B (7168, the default) | 61.7 ms |
 
 - Each cable costs 52-62 ms by itself: all of the virtual loop's input path (52-62 ms). So the engine's own part of app +
-  output cable (118-127 ms) is about 60-65 ms, which is what its readout says. VB-CABLE's stamps don't inflate the readout;
-  the engine holds about 20-30 ms more than its design.
+  output cable (118-127 ms) is about 60-65 ms, near what its readout says (though that part is the readout plus the chain's
+  10 ms, so it's 5-10 ms short of them: "Budget" below). VB-CABLE's stamps don't inflate the readout; the readout holds
+  about 24-34 ms more than its 32 ms design.
 - Not yet explained. Candidates: the shared-mode audio engine's period on each side (a capture packet waits up to a period
   before the app is woken; the mix runs a period ahead of the device), which the design sum leaves out; and the output
   target (a period + a block + the margin, 22 ms), whose block may be more than it needs.
@@ -155,6 +158,84 @@ Reading it against the engine test (the report's "compare with" line says the sa
   shared-mode event capture at the default period, while the engine's mic opens with IAudioClient3's low-latency period and RAW
   when it can. If VB-CABLE's stamps depend on the client's period, cable(A) can differ from the input path for that alone:
   compare the periods on the two reports' conditions lines. A low-latency capture option for cable-only would test it.
+
+## Budget (built and run 2026-11-01)
+The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the
+definitions): **mic delivery + wait + output queue + render side = the readout**, block for block (`pipeline/tests/budget.rs`),
+and the chain's offset beside it. Telemetry has the means and p95s over the readout's last 100 blocks and the run's totals;
+`chain_blocks.csv` has the parts per block; the quality and latency reports print the means over the take or the test; `run`'s
+status line (`[mic+wait+queue+render]`) and the GUI show the means.
+- **Mic delivery** (measured): the first sample's capture stamp to the wake that read it. A block-sized packet read as it
+  fills gives 10 ms; the cables' 19-21 ms packets put the mean at about 16.
+- **Wait** (measured): that wake to the block's write: the wake's own work (reading the mic, servicing the reference, with
+  AEC on the loopback's drain, and the hand-overs), the blocks before it in the same wake, and its own chain (0.05-0.15 ms);
+  more only for a block whose samples came over two wakes. Expected near 0 on the cables (their packets are whole blocks).
+- **Output queue** (measured): the fill the drift loop holds. Its mean is the target, 22 ms, whatever the delivery. A late
+  block finds less queued (the device played on), so delivery + queue holds still block for block, and so does the readout.
+- **Render side** (derived, the rest): from the queue's drain to the AudioClock's play-out. Half the output's period (5 ms:
+  the queue is calibrated to the middle of the padding's steps), plus whatever the shared-mode engine and VB-CABLE hold
+  after taking a sample, by their clock.
+- **Chain** (reported): 8.96, 10 or 18.96 ms. **The readout doesn't hold it:** it times the block's first output sample,
+  which carries the input from the chain's offset before. So the readout's design was a block + the output target (32 ms),
+  not 42, and the design leaves the render side out. The sweep's "app + output cable" holds the readout, the chain and the
+  output cable, so the first run's 125.4 ms leaves 52 ms for the output cable after 63.1 + 10. Cable-only put that cable at
+  60-62 ms, 8-10 ms more: within the runs' wander, but worth a second look.
+
+**Reading for the cables:** with mic ≈ 16, wait ≈ 0 and queue ≈ 22, the render side is what's left of 56-66 ms: 18-28 ms,
+which is 13-23 ms over its half period. So most of the excess over the 32 ms design is on the render side (the engine and
+cable after the take), and about 6 ms is the bursty mic. A live take will say. The output opens at the cable's default
+10 ms shared-mode period (no IAudioClient3), so a smaller render period is a candidate if the render side is the engine's.
+
+**Steady delivery** would take the mic's ~6 ms of bursts off delivery and the readout. The queue's mean is the target
+whatever the delivery, and the render side doesn't depend on it, so neither shrinks unless the target changes.
+
+**The spare block.** The code doesn't say what the target's block is for (engine.md left "whether one period + the margin
+is enough" to be measured), but its arithmetic shows it. The loop holds the mean of the fills read before each write, so
+the lowest fill is the target less how far a block came after the mean. Steady delivery leaves the block unused; bursts
+use it. With the target a block lower (12 ms) in the event simulation (`the_spare_block_is_what_bursts_need`, and the
+ignored `a_block_lower_target_sweep`, 1 ms wake jitter):
+- steady delivery ran clean at every phase (10.5 ms left at the lowest);
+- the cables' bursts in turn (blocks 20.7 and 10.7 ms old) left 5 ms, with one underrun at one phase;
+- one wake in five missed left nothing, with 2-28 underruns a minute at the worst phases.
+
+With today's target all of them ran clean (10-16 ms left).
+
+**An adaptive output target**, like the reference's, would need:
+- A need measured from the bursts: how far a block's mic delivery runs above its mean, or how far the queue dips under the
+  target. Take a high percentile over long enough to see a drifting cable's phases.
+- A target of the device's own need (half a period at its worst phase in the simulation; the design reasons a whole one)
+  + the margin + that need. Start at today's, lower it only after the need has stayed under for minutes, and raise it at
+  once when the queue runs short (zeros refill to the target, as now).
+- Moves without a click: the drift loop's slips (`DriftController::set_target`; at 1500 ppm, about 7 s per 10 ms).
+- The deficit and drop thresholds following it, and its target published each second (today only at the start).
+
+The cables' need is about 5 ms (delivery 21 ms at most against a mean of 16), so it would take 5-10 ms off there (a whole
+or half period for the device), and 10-15 ms with steady delivery. Which device need holds is for a live run to show.
+
+**Found on the way: a dry spell moves the readout for good.** In the simulation, after the output runs dry, the device's
+clock has counted the silence it played, so the readout reads low by that silence for the rest of the run. A 40 ms mic
+stall took it from 37.7 to 16.1 ms. A 60 ms one put the play-out before the capture, and there was no readout at all for
+5.6 s in one run and for the 20 s left in another. The real latency was back where it was, and the budget shows the drop
+all on the render side (5 to -16 ms). `FillOffset` re-anchors the fill after a dry device; the readout has nothing like
+it. Whether WASAPI's clock counts an underrun's silence is unverified. A live render side that goes negative after
+`render_underruns` grows would show it.
+
+**Measured live** (2026-11-01, the cables, release build):
+
+| Run | Mic delivery | Wait | Output queue | Render side | Readout | Chain on top | App path |
+|---|---|---|---|---|---|---|---|
+| `latency --mode virtual`, passthrough | 16.4 | 0.0 | 22.2 | 25.7 | 64.2 | 10.0 | 74.2 ms |
+| `quality --test echo --no-ns` (AEC3) | 17.0 | 0.1 | 21.9 | 25.6 | 64.6 | 9.0 | 73.6 ms |
+
+The render side is the largest part: about 20 ms beyond its half-period convention, between leaving our buffer and the
+output's play-out by its clock (the shared-mode engine's period and VB-CABLE's own render side). Candidates, largest
+first:
+1. **The render side:** exclusive mode on the output cable (only the app plays into it; untested on VB-CABLE), or a
+   smaller engine period (VB-CABLE offers none below 10 ms; our own driver, #19, can).
+2. **The output queue's spare block:** an adaptive output target (above), 5-10 ms on the cables, 10-15 with steady
+   delivery.
+3. **Mic delivery's 6 ms beyond a block:** VB-CABLE's bursts (#8's detail file); a device matter.
+The chain's 9-19 ms belongs to the algorithms (#5, #7).
 
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI

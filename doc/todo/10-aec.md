@@ -144,9 +144,12 @@ RT60 0.15 s at 25/40/60/100 ms behind the loopback by the traces' own stamps, ag
   the base cable's (3072). VB-CABLE's loopback stamps run late by part of its Latency. On real speakers the echo comes out
   of the device the loopback taps, so it always follows the tap; only this rig puts it ahead. Offline AEC3 on that
   stamp-aligned live pair removed 2-8 dB; with the mic 100 ms later, 23-56 dB.
-- So the quality test's echo scene now plays the far voice 100 ms ahead of its echo (`ECHO_DELAY_S`, a speaker's output
+- So the quality test's echo scene then played the far voice 100 ms ahead of its echo (`ECHO_DELAY_S`, a speaker's output
   latency; `far.wav` is saved as played). Live: the echo drops 14.4 dB (far-only turns 12-18 dB; the first, converging
-  turn 21 dB), the lead 14.5 ms, 3 slips, 0 jumps, 3 start-up gaps.
+  turn 21 dB), the lead 14.5 ms, 3 slips, 0 jumps, 3 start-up gaps. (Since replaced by `--echo-delay`, 25 ms after the
+  reference's tap by default, with the rig's offset calibrated in each take and the delay measured after it: #14's detail
+  file. Re-read, the six chain-recorded takes below ran at echo delays of 14-63 ms: AEC3 got the echo 0.7-51 ms after its
+  reference.)
 - Still short of offline: the same saved scene through `process --ref far.wav` drops 46-57 dB a turn once converged (22
   dB in the first), and the live mic and loopback recorded together (aligned by stamps at a 14 ms lead) got 49-56 dB. So
   the signals can be cancelled, and something in the engine's live path still differs. AEC3's own figures live: delay
@@ -173,9 +176,36 @@ f-quality`, outside the repo), `--no-ns`: the far-only turns after the first dro
    engine now cancels live as well as offline (46-57 dB on the same scene). The earlier 14 dB take (`echo-4`, without the
    recorder; 3 reference gaps and 3 slips in its start-up, AEC3's delay estimate 0) didn't recur in the six: unexplained,
    possibly a bad start-up. If it does recur, its chain recording will show why.
+   **Since then** the echo test calibrates a realistic echo delay in each take (`quality --echo-delay MS`, default 25 ms
+   after the reference's tap, measured afterwards from the chain recording). The old fixed 100 ms gave 14-63 ms in
+   practice: cable B's offset moved about 10 ms a take. The sweep below maps the shortest echo that cancels.
 2. On real speakers in phase 2, check that the lead stays under the echo path's delay (12 ms expected with steady
    delivery; a target over 30 ms is flagged). A bursty device needing more lead than its echo path has can only be owed
    blocks or be non-causal: AEC3's delay estimate near 0 with a low ERLE would say so, and could cap the target (not done).
+
+## Echo delay sweep (2026-11-01)
+`quality --test echo --no-ns --seconds 30 --echo-delay D`, cable B as the far end (the base cable at 25 ms: 56 dB, offset
+-17 ms). Each row one take; the drop is the median far-only turn (the noise caps the figure near 55 dB). The lead was
+12.0-14.8 ms. The rig's own offset (where an undelayed echo lands against its reference's tap) was -72 to -96 ms on cable
+B, found by the calibration each take.
+
+| Echo delay (asked / measured) | AEC3 sees it after its reference | Drop, median (lowest) | AEC3's ERLE |
+|---|---|---|---|
+| 0 / 0.0 ms | -14.1 ms | 11.0 (7.9) dB | 6.6 dB |
+| 5 / 4.9 ms | -9.8 ms | 16.7 (12.4) dB | 6.7 dB |
+| 10 / 10.0 ms | -4.0 ms | 38.6 (33.5) dB | 8.5 dB |
+| 13 / 13.0 ms | -0.8 ms | 44.9 (39.5) dB | 10.7 dB |
+| 15 / 15.0 ms | +1.1 ms | 52.9 (52.7) dB | 17.9 dB |
+| 20 / 20.0 ms | +5.3 ms | 52.5 (51.5) dB | 16.7 dB |
+| 25 / 25.0 ms (three takes) | +10.9 to +13.0 ms | 51.1-52.8 (45.3-51.1) dB | 16.9-17.8 dB |
+| 40 / 40.0 ms | +25.9 ms | 52.2 (52.0) dB | 16.3 dB |
+| 100 / 99.9 ms | +85.3 ms | 52.0 (45.4) dB | 16.0 dB |
+
+So the echo cancels fully once it reaches the mic at least the lead (12-14 ms) after its reference's tap, and falls off
+below: the lead is the floor on the echo path the engine can serve. Shared-mode speakers are usually past it (an engine
+period plus the device's buffer), but low-latency ones may not be. Lowering it means a smaller loopback period (the lead
+starts at one loopback period + 2 ms, the newest reference a mic block can be sure of), or letting the mic wait for the
+reference only when the echo path is that short, which costs that wait in latency.
 
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).

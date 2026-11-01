@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use nf_engine::{CableLatencyReport, CableLatencyRequest, Flow, LatencyMode, LatencyProgress, LatencyReport, LatencyTestRequest};
 
-use super::{fixed, list_devices};
+use super::{budget_text, fixed, list_devices};
 use crate::cli::LatencyArgs;
 use crate::config::{self, resolve_device};
 use crate::console;
@@ -172,6 +172,9 @@ pub fn format_report(r: &LatencyReport) -> String {
     if let Some(v) = r.readout_ms_median {
         let _ = write!(s, "\n  live readout        {} median", ms(f64::from(v)));
     }
+    if let Some(b) = &r.budget {
+        let _ = write!(s, "\n  latency budget      {}, means over the test", budget_text(b));
+    }
     let _ = write!(s, "\n  chain offset        {}", ms(f64::from(r.chain_ms)));
     if !r.conditions.is_empty() {
         let _ = write!(s, "\n  conditions: {}", r.conditions);
@@ -197,6 +200,7 @@ mod tests {
             input_path_ms_median: Some(3.2),
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.0),
+            budget: Some(nf_engine::LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
             chain_ms: 10.0,
             confidence_db_min: 31.26,
             conditions: "mic 10 ms".into(),
@@ -208,6 +212,8 @@ mod tests {
              app + output cable  12.33 ms median, spread 0.10 ms [12.30, 12.35, 12.40, 12.31]\n  \
              input path          3.20 ms median (probe play-out to the app's input)\n  \
              live readout        12.00 ms median\n  \
+             latency budget      mic delivery 10.5 + wait 0.0 + output queue 22.0 + render side 5.0 = readout 37.5 ms; the chain's \
+             10.0 ms on top: 47.5 ms, means over the test\n  \
              chain offset        10.00 ms\n  \
              conditions: mic 10 ms\n  \
              warning: one repetition was weak"

@@ -66,6 +66,16 @@ impl<const N: usize> RollingStats<N> {
         self.percentile(0.5)
     }
 
+    /// The mean of the stored values (summed in f64); `NaN` when empty.
+    pub fn mean(&self) -> f32 {
+        let n = self.len.min(N);
+        if n == 0 {
+            return f32::NAN;
+        }
+        let sum: f64 = self.buf[..n].iter().map(|&v| f64::from(v)).sum();
+        (sum / n as f64) as f32
+    }
+
     pub fn max(&self) -> f32 {
         if self.len == 0 {
             return f32::NAN;
@@ -85,6 +95,7 @@ mod tests {
             s.push(i as f32);
         }
         assert_eq!(s.median(), 51.0);
+        assert_eq!(s.mean(), 50.5);
         assert_eq!(s.percentile(0.99), 99.0);
         assert_eq!(s.max(), 100.0);
         s.push(1000.0); // evicts 1
@@ -96,15 +107,15 @@ mod tests {
     #[test]
     fn partial_fill_wraps_and_clear() {
         let mut s = RollingStats::<4>::new();
-        assert!(s.is_empty() && s.median().is_nan() && s.max().is_nan());
+        assert!(s.is_empty() && s.median().is_nan() && s.max().is_nan() && s.mean().is_nan());
         for v in [5.0, 1.0, 3.0] {
             s.push(v);
         }
-        assert_eq!((s.len(), s.median(), s.max()), (3, 3.0, 5.0));
+        assert_eq!((s.len(), s.median(), s.max(), s.mean()), (3, 3.0, 5.0, 3.0));
         for v in [7.0, 8.0, 9.0] {
             s.push(v); // wraps: holds 7, 8, 9, 3
         }
-        assert_eq!((s.len(), s.percentile(0.0), s.max()), (4, 3.0, 9.0));
+        assert_eq!((s.len(), s.percentile(0.0), s.max(), s.mean()), (4, 3.0, 9.0, 6.75));
         assert_eq!(s.percentile(f32::NAN), 3.0, "NaN quantile reads as the minimum, no panic");
         s.clear();
         assert!(s.is_empty());

@@ -108,13 +108,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
-**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal, and a chain recorder added: six live takes drop the echo by a median 57-60 dB a far-only turn, as offline (one earlier take: 14 dB, unexplained).
+**Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal, and a chain recorder added. With a calibrated, realistic echo delay (`quality --echo-delay`, default 25 ms) the echo drops 45-62 dB a far-only turn, as offline; an echo arriving sooner than the reference's lead (12-14 ms) after its tap cancels less (13 ms 45 dB, 10 ms 39, 5 ms 17, 0 ms 11). One earlier take, 14 dB, stays unexplained.
 - `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: recorded pairs in #2; real speakers in phase 2 (the lead must stay under the echo path's delay). If a take comes in low again, its chain recording (`quality --save`) shows why.
+**Next**: lower the lead's floor for short echo paths (a smaller loopback period, or a mic wait only when the path is that short); recorded pairs in #2; real speakers in phase 2. A low take's chain recording (`quality --save`) shows why.
 **Detail**: `doc/todo/10-aec.md`
 
 ---
@@ -140,11 +140,11 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 13. [lab] Latency measurement
-**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0, layer 2 run on the dev VM's VB-CABLE loop and a cable-only mode built and run (2026-11-01): each cable is 52-62 ms by itself, so the readout is right and the engine holds about 60 ms against a 32-42 ms design.
+**Priority**: High (phases 0-2) | **Status**: layers 1 (readout) and 2 (sweep test, virtual or acoustic) built in v0, layer 2 run on the dev VM's VB-CABLE loop and a cable-only mode built and run (2026-11-01): each cable is 52-62 ms by itself. A per-block latency budget built and run the same day: readout 64 ms = mic delivery 16 + output queue 22 + render side 26 (the design was 32: a block + the queue), the chain's 9-19 ms on top.
 - Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
-**Next**: find the engine's extra 20-30 ms (the shared-mode engine's periods? the output target's block?) and try the target a block lower. Layer 3 in phase 2.
+**Next**: cut the render side (exclusive mode on the output cable, or a smaller engine period: our driver, #19) and the output queue's spare block (an adaptive target, #9). Layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---

@@ -4,7 +4,9 @@
 //! Numbers come from atomics the audio thread writes, so any of them can be NaN or infinite. They
 //! print as "—" (or "-∞" for a silent level), never as "NaN", and -0.0 prints as "0".
 
-use nf_engine::{EngineState, EngineStatus, LatencyReport, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot};
+use nf_engine::{
+    EngineState, EngineStatus, LatencyBudget, LatencyReport, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot,
+};
 
 use crate::settings::{FLOOR_DB, TestMode};
 use crate::window::Job;
@@ -127,6 +129,29 @@ pub(crate) fn pipeline(t: &TelemetrySnapshot) -> String {
         format!("Pipeline: {} ms (p95 {})", fixed(t.latency_ms_median, 1), fixed(t.latency_ms_p95, 1))
     } else {
         format!("Pipeline: {DASH}")
+    }
+}
+
+/// A latency budget's parts (engine.md, "The latency budget"): "mic 16.2 + wait 0.1 + output queue 22.0 + render 23.4 ms,
+/// chain 10.0 ms on top". The readout holds the four parts; the chain's offset isn't in it.
+fn budget_parts(b: &LatencyBudget) -> String {
+    format!(
+        "mic {} + wait {} + output queue {} + render {} ms, chain {} ms on top",
+        fixed(b.mic_ms, 1),
+        fixed(b.wait_ms, 1),
+        fixed(b.queue_ms, 1),
+        fixed(b.render_ms, 1),
+        fixed(b.chain_ms, 1)
+    )
+}
+
+/// Readout line 1a's budget, under it: "Budget (means): mic 16.2 + wait 0.1 + output queue 22.0 + render 23.4 ms, chain
+/// 10.0 ms on top", or "Budget: —" while the readout isn't valid.
+pub(crate) fn budget(t: &TelemetrySnapshot) -> String {
+    if t.latency_valid && t.budget_mean.readout_ms().is_finite() {
+        format!("Budget (means): {}", budget_parts(&t.budget_mean))
+    } else {
+        format!("Budget: {DASH}")
     }
 }
 
@@ -264,6 +289,9 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     if let Some(readout) = r.readout_ms_median {
         lines.push(format!("Live readout during the test: {}", ms(Some(f64::from(readout)))));
     }
+    if let Some(b) = &r.budget {
+        lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
+    }
     if r.valid > 0 {
         lines.push(format!("Confidence: {} dB (lowest)", fixed(r.confidence_db_min, 1)));
     }
@@ -396,6 +424,7 @@ mod tests {
             latency_valid: true,
             latency_ms_median: 12.34,
             latency_ms_p95: 14.06,
+            budget_mean: LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44 },
             output_drift_ppm: 12.2,
             reference_drift_ppm: -40.4,
             output_fill_ms: 15.0,
@@ -427,6 +456,7 @@ mod tests {
     fn the_readout_lines() {
         let t = telemetry();
         assert_eq!(pipeline(&t), "Pipeline: 12.3 ms (p95 14.1)");
+        assert_eq!(budget(&t), "Budget (means): mic 16.2 + wait 0.1 + output queue 22.0 + render 23.4 ms, chain 10.0 ms on top");
         assert_eq!(clocks(&t), "Drift out/ref: +12/-40 ppm · Output fill: 15.0 ms (target 15.5) · Reference lead: 12.0 ms (target 12.0)");
         // Timed by delivery, and a target that may pass a speaker's echo path, are said.
         let odd = TelemetrySnapshot { reference_stamped: false, reference_target_ms: 31.0, ..t };
@@ -442,6 +472,7 @@ mod tests {
         assert_eq!(reduction_and_speech(&t), "Reduction: -12.0 dB · Speech: 0.87");
         let invalid = TelemetrySnapshot { latency_valid: false, ..t };
         assert_eq!(pipeline(&invalid), "Pipeline: —");
+        assert_eq!(budget(&invalid), "Budget: —");
         let nan = TelemetrySnapshot {
             latency_ms_median: f32::NAN,
             speech_probability: f32::NAN,
@@ -513,6 +544,7 @@ mod tests {
             input_path_ms_median: Some(3.24),
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.1),
+            budget: Some(LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
             chain_ms: 10.0,
             confidence_db_min: 18.04,
             conditions: "mic 10 ms, RAW".to_owned(),
@@ -524,6 +556,7 @@ mod tests {
             "End to end: —",
             "Chain: 10.0 ms",
             "Live readout during the test: 12.1 ms",
+            "Its budget (means over the test): mic 10.5 + wait 0.0 + output queue 22.0 + render 5.0 ms, chain 10.0 ms on top",
             "Confidence: 18.0 dB (lowest)",
             "Warning: One repetition was too quiet",
             "Conditions: mic 10 ms, RAW",

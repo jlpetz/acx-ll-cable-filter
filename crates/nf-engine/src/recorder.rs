@@ -11,10 +11,13 @@
 //! (`run_failed`) for the next. Armed during a live run, it goes straight to that run's command ring. Stopping drops the
 //! ring's consumer; the audio thread sees the producer abandoned at its next wake and hands it back, and the control side
 //! frees it.
+//!
+//! The recording so far sits behind a mutex the drain thread holds while it appends (a few blocks every 20 ms), so the control
+//! side can copy from it while it runs (`Handle::copy_from`). Neither is the audio thread, which only pushes into the ring.
 
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -74,6 +77,7 @@ impl ChainItem {
                     use_vad: false,
                 },
             },
+            budget: None,
         },
         lost: 0,
         mic: [0.0; BLOCK],
@@ -178,13 +182,15 @@ struct DrainState {
     stop: AtomicBool,
     blocks: AtomicU64,
     lost: AtomicU64,
+    /// The recording so far: the thread appends to it, the handle copies from it and takes it at the end.
+    rec: Mutex<ChainRecording>,
 }
 
 /// The recorder's handle (`ChainRecorder`): its thread, and the engine it records.
 pub(crate) struct Handle {
     inner: Weak<Inner>,
     state: Arc<DrainState>,
-    thread: Option<JoinHandle<ChainRecording>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 /// Arms a recorder for up to `max_seconds`: allocates the ring (touching its pages, so the audio thread never faults on
@@ -241,6 +247,11 @@ impl Handle {
         self.state.lost.load(Relaxed)
     }
 
+    /// The blocks recorded so far from position `from` on, copied (`ChainRecorder::copy_from`).
+    pub(crate) fn copy_from(&self, from: usize) -> ChainRecording {
+        copy_from(&lock(&self.state.rec), from)
+    }
+
     pub(crate) fn stop(mut self) -> ChainRecording {
         self.finish(true)
     }
@@ -250,7 +261,9 @@ impl Handle {
     fn finish(&mut self, handed: bool) -> ChainRecording {
         let Some(thread) = self.thread.take() else { return ChainRecording::default() };
         self.state.stop.store(true, Release);
-        let rec = thread.join().unwrap_or_default();
+        // A thread that panicked leaves what it had appended.
+        let _ = thread.join();
+        let rec = std::mem::take(&mut *lock(&self.state.rec));
         if let Some(inner) = self.inner.upgrade() {
             if handed && !rec.run_ended {
                 reclaim(&inner);
@@ -295,42 +308,64 @@ fn reclaim(inner: &Inner) {
     }
 }
 
-/// The recorder's thread: moves the ring's blocks into the recording every [`DRAIN_EVERY`] until it's stopped, the limit is
-/// reached, or the producer has gone (the run ended). `lost` is the audio thread's count of blocks the ring had no room for.
-fn drain(mut rx: Consumer<ChainItem>, lost: &AtomicU64, state: &DrainState, max_blocks: usize) -> ChainRecording {
-    let mut rec = ChainRecording::default();
-    let reserve = max_blocks.min(RESERVE_BLOCKS);
-    for v in [&mut rec.mic, &mut rec.reference, &mut rec.output] {
-        v.reserve(reserve * BLOCK);
+/// The recorder's thread: moves the ring's blocks into the recording (`state.rec`) every [`DRAIN_EVERY`] until it's stopped,
+/// the limit is reached, or the producer has gone (the run ended). `lost` is the audio thread's count of blocks the ring had no
+/// room for.
+fn drain(mut rx: Consumer<ChainItem>, lost: &AtomicU64, state: &DrainState, max_blocks: usize) {
+    {
+        let mut guard = lock(&state.rec);
+        let rec = &mut *guard;
+        let reserve = max_blocks.min(RESERVE_BLOCKS);
+        for v in [&mut rec.mic, &mut rec.reference, &mut rec.output] {
+            v.reserve(reserve * BLOCK);
+        }
+        rec.blocks.reserve(reserve);
     }
-    rec.blocks.reserve(reserve);
     loop {
         // Read before draining: once the producer has gone, or the recorder is stopped, this drain takes every block pushed
         // before, and the count every block lost before.
         let (stop, ended, lost_now) = (state.stop.load(Acquire), rx.is_abandoned(), lost.load(Acquire));
-        while let Ok(item) = rx.pop() {
-            if rec.blocks.len() >= max_blocks {
-                rec.truncated = true;
-                break;
+        {
+            let mut rec = lock(&state.rec);
+            while let Ok(item) = rx.pop() {
+                if rec.blocks.len() >= max_blocks {
+                    rec.truncated = true;
+                    break;
+                }
+                add(&mut rec, &item);
             }
-            add(&mut rec, &item);
-        }
-        // The blocks' own counts cover the losses before the last block; those since show only in the audio thread's count.
-        // Cut at the limit, those are past the recording's end.
-        let lost = if rec.truncated { rec.lost_blocks } else { rec.lost_blocks.max(lost_now) };
-        state.blocks.store(rec.blocks.len() as u64, Relaxed);
-        state.lost.store(lost, Relaxed);
-        if rec.truncated {
-            break;
-        }
-        if stop || ended {
-            rec.lost_blocks = lost;
-            rec.run_ended = !stop;
-            break;
+            // The blocks' own counts cover the losses before the last block; those since show only in the audio thread's
+            // count. Cut at the limit, those are past the recording's end.
+            let lost = if rec.truncated { rec.lost_blocks } else { rec.lost_blocks.max(lost_now) };
+            state.blocks.store(rec.blocks.len() as u64, Relaxed);
+            state.lost.store(lost, Relaxed);
+            if rec.truncated {
+                return;
+            }
+            if stop || ended {
+                rec.lost_blocks = lost;
+                rec.run_ended = !stop;
+                return;
+            }
         }
         std::thread::sleep(DRAIN_EVERY);
     }
-    rec
+}
+
+/// `rec`'s blocks from position `from` on (none past its end), with its counts and flags.
+fn copy_from(rec: &ChainRecording, from: usize) -> ChainRecording {
+    let from = from.min(rec.blocks.len());
+    let at = from * BLOCK;
+    let tail = |v: &Vec<f32>| v.get(at..).unwrap_or_default().to_vec();
+    ChainRecording {
+        mic: tail(&rec.mic),
+        reference: tail(&rec.reference),
+        output: tail(&rec.output),
+        blocks: rec.blocks[from..].to_vec(),
+        lost_blocks: rec.lost_blocks,
+        truncated: rec.truncated,
+        run_ended: rec.run_ended,
+    }
 }
 
 /// Appends one block, and the count of blocks lost before it.
@@ -459,6 +494,43 @@ mod tests {
         assert!(run.blocks.load(Acquire) >= 30);
     }
 
+    /// While it records, a copy from any position gives the blocks recorded so far from there, as the recording holds them,
+    /// and leaves the recording whole.
+    #[test]
+    fn a_copy_while_it_records_gives_the_blocks_so_far() {
+        let inner = Inner::new();
+        let h = arm(&inner, 60.0).unwrap();
+        assert!(h.copy_from(0).blocks.is_empty(), "nothing yet");
+        let (port, end) = run_channel(&inner);
+        let run = Arc::new(Run::default());
+        let thread = fake_run(end, run.clone());
+        run_started(&inner, port);
+        wait_for_recorded(&h, 20);
+        let all = h.copy_from(0);
+        assert!(all.blocks.len() >= 20 && all.from_first_block() && !all.run_ended, "{}", all.blocks.len());
+        check_contents(&all);
+        // From a position: the rest, its samples with it; past the end, nothing.
+        let rest = h.copy_from(12);
+        assert_eq!(rest.blocks[0].index, 12);
+        assert_eq!(rest.mic.len(), rest.blocks.len() * BLOCK);
+        assert!(rest.mic[..BLOCK].iter().all(|&x| x == 12.0) && rest.reference[0] == 12.25 && rest.output[0] == 12.5);
+        assert!(h.copy_from(1_000_000).blocks.is_empty());
+        // Copies, built up as a reader would, agree with what the stop gives.
+        let mut built = h.copy_from(0);
+        wait_for_recorded(&h, built.blocks.len() as u64 + 10);
+        let more = h.copy_from(built.blocks.len());
+        assert!(!more.blocks.is_empty() && more.blocks[0].index == built.blocks.len() as u64);
+        built.mic.extend_from_slice(&more.mic);
+        built.blocks.extend_from_slice(&more.blocks);
+        let rec = h.stop();
+        check_contents(&rec);
+        assert!(rec.blocks.len() >= built.blocks.len());
+        assert_eq!(rec.blocks[..built.blocks.len()], built.blocks[..]);
+        assert_eq!(rec.mic[..built.mic.len()], built.mic[..]);
+        run.stop.store(true, Release);
+        thread.join().unwrap();
+    }
+
     /// Armed while a run is live, the run takes it at its next wake: the recording starts later than block 0, and isn't
     /// reproducible offline.
     #[test]
@@ -582,7 +654,8 @@ mod tests {
         }
         // Blocks 3-5 were lost before block 6, and 9 after the last: the stop's drain takes 6-8 and counts all four.
         state.stop.store(true, Release);
-        let rest = drain(rx.take().unwrap(), &lost, &state, 100);
+        drain(rx.take().unwrap(), &lost, &state, 100);
+        let rest = std::mem::take(&mut *lock(&state.rec));
         assert_eq!(rest.lost_blocks, 4);
         let first: Vec<u64> = rec.blocks.iter().map(|b| b.index).collect();
         assert_eq!((first.as_slice(), rec.lost_blocks), ([0, 1, 2].as_slice(), 0));
@@ -595,7 +668,9 @@ mod tests {
         for i in 0..5 {
             push(&mut tx, i);
         }
-        let cut = drain(rx, &tx.lost(), &DrainState::default(), 2);
+        let state = DrainState::default();
+        drain(rx, &tx.lost(), &state, 2);
+        let cut = std::mem::take(&mut *lock(&state.rec));
         assert!(cut.truncated && cut.blocks.len() == 2 && cut.lost_blocks == 0, "{cut:?}");
         assert_eq!(tx.lost().load(Acquire), 2, "3 and 4, after the limit");
     }

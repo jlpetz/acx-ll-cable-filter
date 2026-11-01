@@ -43,7 +43,9 @@ impl LiveInput {
 }
 
 pub(crate) enum LiveMsg {
-    Tick(TelemetrySnapshot),
+    /// A fresh snapshot, boxed: it's about 300 bytes, and the message is moved through the UI's queue (one small allocation
+    /// a tick, on the UI side).
+    Tick(Box<TelemetrySnapshot>),
     /// The CLIP badge was clicked.
     ResetClip,
 }
@@ -70,7 +72,7 @@ impl Live {
             // std's sleep is a high-resolution waitable timer on Windows: 50 ms isn't rounded up to the 15.6 ms tick
             std::thread::sleep(tick);
             // Cancelled when the window closes: the result is discarded, so skip the read
-            LiveMsg::Tick(if cancel.is_cancelled() { TelemetrySnapshot::default() } else { engine.telemetry() })
+            LiveMsg::Tick(Box::new(if cancel.is_cancelled() { TelemetrySnapshot::default() } else { engine.telemetry() }))
         }));
     }
 
@@ -103,6 +105,7 @@ impl Live {
         }
         StackPanel::new().spacing(4.0).children((
             TextBlock::new().text(format::pipeline(t)).font_weight(FontWeight::SEMI_BOLD),
+            TextBlock::new().text(format::budget(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::clocks(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::cpu(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::dropouts(t)).text_wrapping(TextWrapping::Wrap),
@@ -177,7 +180,7 @@ impl Component for Live {
 
     fn update(&mut self, message: LiveMsg, context: &ComponentContext<Self>) {
         match message {
-            LiveMsg::Tick(telemetry) => self.telemetry = telemetry,
+            LiveMsg::Tick(telemetry) => self.telemetry = *telemetry,
             LiveMsg::ResetClip => {
                 // Cheap: one atomic store. Cleared here too, so the badge doesn't wait for the next tick.
                 self.engine.reset_clip();

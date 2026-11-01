@@ -8,8 +8,10 @@
 //!   (the synthetic high voice, or `--far-speech`) in the far-only and double-talk turns. The mic gets the near speech, the far
 //!   voice through a room impulse response (RT60 0.15 s, 150 ms long) at 6 dB below the near speech's active level, and pink
 //!   noise 60 dB below it (or `--snr`): low, so the noise doesn't cap the ERLE the analysis can see. The far voice itself, at
-//!   -20 dBFS active level, goes to the far-end device: the engine's echo reference. It's played 100 ms ahead of its echo in
-//!   the mic, as a speaker's output latency would put it ([`ECHO_DELAY_S`]).
+//!   -20 dBFS active level, goes to the far-end device: the engine's echo reference. The echo is mixed into the mic in step with
+//!   [`Scene::far`] (its regions are where the far voice is active, in the mic's time); when the far end plays it is the take's
+//!   business: the command places it so the echo reaches the mic `--echo-delay` after the far end's loopback taps the far
+//!   voice (25 ms by default, [`super::echo_delay`]), as a speaker's output latency and the air would.
 //! - **Recordings** (`--speech`, `--noise`, `--far-speech`) replace the synthetic speech, noise or far voice. They must be
 //!   48 kHz (mono, or downmixed); they're looped or trimmed to the scene's length, and speech is set to the same active level.
 //!   Their speech activity comes from a frame-energy detector ([`detect_activity`]) plus a 200 ms hangover (ITU-T P.56's), so
@@ -40,11 +42,6 @@ pub const DEFAULT_ECHO_SNR_DB: f32 = 60.0;
 pub const TURN_S: f64 = 3.0;
 /// The room impulse response's length: the echo outlasts the far voice by this much.
 pub const RIR_S: f64 = 0.15;
-/// The far voice is played this much ahead of its echo in the mic, as a speaker's output latency would put it. The cables
-/// need it: their loopback stamps run late, so an echo mixed into the mic's cable reached the mic 40 ms before cable B's
-/// loopback stamp for it at its default Latency, and 10 ms before the base cable's (2026-11-01, doc/todo/10-aec.md). An
-/// echo ahead of its reference can't be cancelled.
-pub const ECHO_DELAY_S: f64 = 0.1;
 const RIR_RT60_S: f32 = 0.15;
 /// The fades where a recording is gated to its turns.
 const GATE_FADE_S: f64 = 0.01;
@@ -89,10 +86,13 @@ pub struct Scene {
     pub clean: Vec<f32>,
     /// The noise alone, as mixed in.
     pub noise: Vec<f32>,
-    /// Echo test: the echo alone as mixed in, and the far voice in step with it ([`Scene::far_played`] is what the far-end
-    /// device plays).
+    /// Echo test: the echo alone as mixed in, and the far voice in step with it: the echo is `far` through the room, with its
+    /// direct sound at the same index. The far-end device plays `far` [`Scene::echo_delay_ms`] ahead of its echo by the
+    /// streams' stamps (`super::echo_delay::Plan` places it).
     pub echo: Option<Vec<f32>>,
     pub far: Option<Vec<f32>>,
+    /// Echo test: how long after the far end's loopback taps the far voice its echo is to reach the mic (`--echo-delay`).
+    pub echo_delay_ms: Option<f32>,
     /// Where the near speech, and the far voice, are active (sample ranges in time order).
     pub near_activity: Vec<Range<usize>>,
     pub far_activity: Vec<Range<usize>>,
@@ -101,15 +101,16 @@ pub struct Scene {
 }
 
 /// Builds the scene: `seconds` long, the noise `snr_db` below the speech (or the test's default), with the user's recordings
-/// in place of the synthetic parts they replace.
-pub fn build(test: QualityTest, seconds: f32, snr_db: Option<f32>, user: &UserAudio) -> Result<Scene, String> {
+/// in place of the synthetic parts they replace; for the echo test, its echo `echo_delay_ms` after the far voice's tap (the
+/// description says so; the command plays it so).
+pub fn build(test: QualityTest, seconds: f32, snr_db: Option<f32>, echo_delay_ms: f32, user: &UserAudio) -> Result<Scene, String> {
     let len = (f64::from(seconds) * f64::from(SAMPLE_RATE)).round() as usize;
     if len < SAMPLE_RATE as usize {
         return Err("The scene must be at least 1 s long.".into());
     }
     match test {
         QualityTest::Noise => noise_scene(len, snr_db.unwrap_or(DEFAULT_NOISE_SNR_DB), user),
-        QualityTest::Echo => echo_scene(len, snr_db.unwrap_or(DEFAULT_ECHO_SNR_DB), user),
+        QualityTest::Echo => echo_scene(len, snr_db.unwrap_or(DEFAULT_ECHO_SNR_DB), echo_delay_ms, user),
     }
 }
 
@@ -124,6 +125,7 @@ fn noise_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, Strin
         noise,
         echo: None,
         far: None,
+        echo_delay_ms: None,
         near_activity: near.activity,
         far_activity: Vec::new(),
         description: String::new(),
@@ -139,7 +141,7 @@ fn noise_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, Strin
     Ok(scene)
 }
 
-fn echo_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, String> {
+fn echo_scene(len: usize, snr_db: f32, echo_delay_ms: f32, user: &UserAudio) -> Result<Scene, String> {
     let (near_turns, far_turns) = turns(len);
     let mut near = near_track(len, user)?.within(&near_turns, "--speech")?;
     near.set_level(SPEECH_DBFS);
@@ -168,6 +170,7 @@ fn echo_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, String
         noise,
         echo: Some(echo),
         far: Some(far.samples),
+        echo_delay_ms: Some(echo_delay_ms),
         near_activity: near.activity,
         far_activity: far.activity,
         description: String::new(),
@@ -177,26 +180,20 @@ fn echo_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, String
     scene.description = format!(
         "Echo test, {} s in {TURN_S:.0} s turns of far only, double talk and near only: near {} at {SPEECH_DBFS:.1} dBFS active level, \
          the far voice's echo {ECHO_BELOW_DB:.1} dB below it (RT60 {RIR_RT60_S:.2} s), {} {snr_db:.1} dB below it{scaled}; \
-         the far voice ({}) at {SPEECH_DBFS:.1} dBFS active level on the far-end device{far_scaled}, {:.0} ms ahead of its echo.",
+         the far voice ({}) at {SPEECH_DBFS:.1} dBFS active level on the far-end device{far_scaled}, played so that its echo \
+         reaches the mic {} ms after the far end's loopback taps it (a speaker's output latency and the air; calibrated in the take).",
         seconds_text(len),
         speech_name(user.speech.is_some(), "--speech"),
         noise_name(user),
         speech_name(user.far_speech.is_some(), "--far-speech"),
-        ECHO_DELAY_S * 1000.0,
+        delay_text(echo_delay_ms),
     );
     Ok(scene)
 }
 
-impl Scene {
-    /// Echo test: the far voice as the far-end device plays it, [`ECHO_DELAY_S`] ahead of its echo in the mic (its start
-    /// cut by that much, silence at its end).
-    pub fn far_played(&self) -> Option<Vec<f32>> {
-        let far = self.far.as_ref()?;
-        let lead = ((ECHO_DELAY_S * f64::from(SAMPLE_RATE)) as usize).min(far.len());
-        let mut x = far[lead..].to_vec();
-        x.resize(far.len(), 0.0);
-        Some(x)
-    }
+/// A delay in ms as the description gives it: "25", "12.5".
+fn delay_text(ms: f32) -> String {
+    if (ms - ms.round()).abs() < 1e-3 { format!("{ms:.0}") } else { format!("{ms:.1}") }
 }
 
 fn near_track(len: usize, user: &UserAudio) -> Result<Track, String> {
@@ -459,12 +456,15 @@ mod tests {
         hit as f64 / total as f64
     }
 
+    /// The echo delay the tests build with (the command's default).
+    const DELAY: f32 = 25.0;
+
     #[test]
     fn the_noise_scene_has_the_levels_and_snr_asked_for() {
-        let s = build(QualityTest::Noise, 10.0, None, &UserAudio::default()).unwrap();
+        let s = build(QualityTest::Noise, 10.0, None, DELAY, &UserAudio::default()).unwrap();
         assert_eq!(s.input.len(), 10 * FS);
         assert_eq!((s.clean.len(), s.noise.len()), (10 * FS, 10 * FS));
-        assert!(s.far.is_none() && s.far_played().is_none() && s.echo.is_none() && s.far_activity.is_empty());
+        assert!(s.far.is_none() && s.echo.is_none() && s.far_activity.is_empty() && s.echo_delay_ms.is_none());
         assert!((level_db(&s.clean, &s.near_activity) - SPEECH_DBFS).abs() < 0.01);
         assert!((db(rms(&s.noise)) - (SPEECH_DBFS - DEFAULT_NOISE_SNR_DB)).abs() < 0.01);
         // The input is exactly the two parts
@@ -473,15 +473,15 @@ mod tests {
         assert!(s.description.starts_with("Noise test, 10 s: synthetic speech at -20.0 dBFS"), "{}", s.description);
         assert!(s.description.contains("pink noise 10.0 dB below it."), "{}", s.description);
         // Another SNR, and the same scene every time
-        let t = build(QualityTest::Noise, 10.0, Some(25.0), &UserAudio::default()).unwrap();
+        let t = build(QualityTest::Noise, 10.0, Some(25.0), DELAY, &UserAudio::default()).unwrap();
         assert!((db(rms(&t.noise)) - (SPEECH_DBFS - 25.0)).abs() < 0.01);
         assert_eq!(t.clean, s.clean);
-        assert!(build(QualityTest::Noise, 0.5, None, &UserAudio::default()).is_err());
+        assert!(build(QualityTest::Noise, 0.5, None, DELAY, &UserAudio::default()).is_err());
     }
 
     #[test]
     fn the_echo_scene_takes_turns_and_sets_the_echo_6_db_down() {
-        let s = build(QualityTest::Echo, 18.0, None, &UserAudio::default()).unwrap();
+        let s = build(QualityTest::Echo, 18.0, None, DELAY, &UserAudio::default()).unwrap();
         let (far, echo) = (s.far.as_ref().unwrap(), s.echo.as_ref().unwrap());
         assert_eq!((far.len(), echo.len(), s.input.len()), (18 * FS, 18 * FS, 18 * FS));
         // Turns of 3 s: far only, double talk, near only, twice. Near talks in 3-9 s and 12-18 s, far in 0-6 s and 9-15 s.
@@ -504,13 +504,25 @@ mod tests {
         assert!(echo[..FS].iter().any(|&v| v != 0.0));
         let tail_end = 6 * FS + (RIR_S * FS as f64) as usize;
         assert!(echo[tail_end..9 * FS].iter().all(|&v| v.abs() < 1e-6));
-        // The far-end device plays the far voice 100 ms ahead of its echo, the same length
-        let lead = (ECHO_DELAY_S * FS as f64) as usize;
-        let played = s.far_played().unwrap();
-        assert_eq!((lead, played.len()), (4_800, far.len()));
-        assert_eq!(played[..far.len() - lead], far[lead..]);
-        assert!(played[far.len() - lead..].iter().all(|&v| v == 0.0));
-        assert!(s.description.ends_with("on the far-end device, 100 ms ahead of its echo."), "{}", s.description);
+        // The echo's direct sound is the far voice itself, at the same index: the scene is in the mic's time, and the far end
+        // is placed by the take (`echo_delay`), whatever the delay
+        let (direct, _) = nf_core::latency::analysis::gcc_phat(far, echo, 2_400, 1.0).unwrap();
+        assert!(direct.abs() < 0.1, "the echo's direct sound {direct} samples after the far voice");
+        assert!(
+            s.description.ends_with(
+                "on the far-end device, played so that its echo reaches the mic 25 ms after the far end's loopback taps it (a \
+                 speaker's output latency and the air; calibrated in the take)."
+            ),
+            "{}",
+            s.description
+        );
+        assert_eq!(s.echo_delay_ms, Some(DELAY));
+        let other = build(QualityTest::Echo, 18.0, None, 12.5, &UserAudio::default()).unwrap();
+        assert!(other.description.contains("reaches the mic 12.5 ms after"), "{}", other.description);
+        assert_eq!(
+            (&other.input, &other.far, &other.far_activity, &other.near_activity),
+            (&s.input, &s.far, &s.far_activity, &s.near_activity)
+        );
         let input_parts = s.input.iter().zip(&s.clean).zip(s.noise.iter().zip(echo.iter()));
         assert!(input_parts.into_iter().all(|((i, c), (n, e))| (i - (c + n + e)).abs() < 1e-6));
         assert!(s.description.starts_with("Echo test, 18 s in 3 s turns"), "{}", s.description);
@@ -524,7 +536,7 @@ mod tests {
         let speech = add(&voice.samples, &hiss);
         let hum: Vec<f32> = (0..FS).map(|i| (i as f32 * 0.01).sin()).collect();
         let user = UserAudio { speech: Some(speech.clone()), noise: Some(hum), far_speech: None };
-        let s = build(QualityTest::Noise, 10.0, Some(15.0), &user).unwrap();
+        let s = build(QualityTest::Noise, 10.0, Some(15.0), DELAY, &user).unwrap();
         assert_eq!(s.clean.len(), 10 * FS);
         assert!((level_db(&s.clean, &s.near_activity) - SPEECH_DBFS).abs() < 0.01);
         assert!((db(rms(&s.noise)) - (SPEECH_DBFS - 15.0)).abs() < 0.01);
@@ -544,17 +556,19 @@ mod tests {
         assert!(s.near_activity.iter().flat_map(|r| r.clone()).all(near_speech), "activity in a pause");
 
         // In the echo test the recording is gated to its turns
-        let e = build(QualityTest::Echo, 9.0, None, &UserAudio { far_speech: Some(speech), ..UserAudio::default() }).unwrap();
+        let e = build(QualityTest::Echo, 9.0, None, DELAY, &UserAudio { far_speech: Some(speech), ..UserAudio::default() }).unwrap();
         assert!(e.far_activity.iter().all(|r| r.end <= 6 * FS + FRAME), "{:?}", e.far_activity);
         assert!(e.far.as_ref().unwrap()[6 * FS..].iter().all(|&v| v == 0.0));
         assert!(e.description.contains("the far voice (the --far-speech recording)"), "{}", e.description);
 
         // Empty or silent recordings are refused, by name
-        let err = build(QualityTest::Noise, 5.0, None, &UserAudio { speech: Some(Vec::new()), ..UserAudio::default() }).unwrap_err();
+        let err = build(QualityTest::Noise, 5.0, None, DELAY, &UserAudio { speech: Some(Vec::new()), ..UserAudio::default() }).unwrap_err();
         assert_eq!(err, "The --speech recording is empty.");
-        let err = build(QualityTest::Noise, 5.0, None, &UserAudio { speech: Some(vec![0.0; FS]), ..UserAudio::default() }).unwrap_err();
+        let err =
+            build(QualityTest::Noise, 5.0, None, DELAY, &UserAudio { speech: Some(vec![0.0; FS]), ..UserAudio::default() }).unwrap_err();
         assert_eq!(err, "The --speech recording is silent.");
-        let err = build(QualityTest::Noise, 5.0, None, &UserAudio { noise: Some(vec![0.0; FS]), ..UserAudio::default() }).unwrap_err();
+        let err =
+            build(QualityTest::Noise, 5.0, None, DELAY, &UserAudio { noise: Some(vec![0.0; FS]), ..UserAudio::default() }).unwrap_err();
         assert_eq!(err, "The --noise recording is silent.");
     }
 
@@ -565,7 +579,7 @@ mod tests {
         for (i, v) in x.iter_mut().enumerate().skip(FS / 2).take(FS) {
             *v = if (i / 40) % 240 == 0 { 0.9 } else { 0.05 * ((i as f32) * 0.3).sin() };
         }
-        let s = build(QualityTest::Noise, 4.0, Some(0.0), &UserAudio { speech: Some(x), ..UserAudio::default() }).unwrap();
+        let s = build(QualityTest::Noise, 4.0, Some(0.0), DELAY, &UserAudio { speech: Some(x), ..UserAudio::default() }).unwrap();
         let peak = s.input.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(peak <= MAX_PEAK + 1e-6, "{peak}");
         assert!(s.description.contains("to keep the mic from clipping"), "{}", s.description);
