@@ -6,7 +6,7 @@ use std::path::Path;
 
 use nf_engine::{DeviceInfo, EngineConfig, Flow, GateMode, ProcessingConfig};
 
-use crate::cli::{EngineArgs, Processing};
+use crate::cli::{EngineArgs, IoOptions, Processing};
 use crate::exit::Failure;
 
 /// Reads `--config FILE`.
@@ -50,6 +50,21 @@ impl Processing {
     }
 }
 
+impl IoOptions {
+    /// Applies the options given over `io`.
+    pub fn apply(&self, io: &mut nf_engine::IoConfig) {
+        if let Some(v) = self.output_exclusive {
+            io.output_exclusive = v;
+        }
+        if let Some(v) = self.mic_exclusive {
+            io.mic_exclusive = v;
+        }
+        if let Some(v) = self.adaptive_output {
+            io.adaptive_output = v;
+        }
+    }
+}
+
 /// The endpoint id `query` names among `devices` of `flow`: an id, else a name equal to it (any
 /// case), else the first name containing it. `what` names the option for the error.
 pub fn resolve_device(devices: &[DeviceInfo], query: &str, flow: Flow, what: &str) -> Result<String, String> {
@@ -79,6 +94,7 @@ pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Ve
         None => EngineConfig::default(),
     };
     args.processing.apply(&mut cfg.processing);
+    args.io.apply(&mut cfg.io);
     if args.mic.is_some() || args.output.is_some() || args.reference.is_some() {
         let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
         let resolve = |q: &Option<String>, flow, what| -> Result<Option<String>, Failure> {
@@ -175,6 +191,26 @@ mod tests {
         // An explicit --gate wins over --threshold's implied static gate
         Processing { gate: Some(GateMode::Auto), threshold_db: Some(-40.0), ..Default::default() }.apply(&mut p);
         assert_eq!((p.gate.mode, p.gate.threshold_db), (GateMode::Auto, -40.0));
+    }
+
+    /// The latency options go over the config's: given ones win, the rest keep the file's (or the defaults: all off).
+    #[test]
+    fn the_latency_options_override_the_config() {
+        let mut io = nf_engine::IoConfig::default();
+        assert!(!io.output_exclusive && !io.mic_exclusive && !io.adaptive_output, "off by default");
+        IoOptions { output_exclusive: Some(true), mic_exclusive: None, adaptive_output: Some(true) }.apply(&mut io);
+        assert!(io.output_exclusive && !io.mic_exclusive && io.adaptive_output);
+        IoOptions { output_exclusive: Some(false), ..Default::default() }.apply(&mut io);
+        assert!(!io.output_exclusive && io.adaptive_output);
+        let c = parse(r#"{"io": {"mic_exclusive": true}}"#).unwrap();
+        assert!(c.io.mic_exclusive && !c.io.output_exclusive, "from a settings file");
+        let args = EngineArgs {
+            output: Some("{ren-3}".into()),
+            io: IoOptions { output_exclusive: Some(true), ..Default::default() },
+            ..Default::default()
+        };
+        let c = engine_config(&args, || Ok(devices())).unwrap();
+        assert!(c.io.output_exclusive && !c.io.adaptive_output);
     }
 
     #[test]

@@ -107,6 +107,7 @@ impl Live {
             TextBlock::new().text(format::pipeline(t)).font_weight(FontWeight::SEMI_BOLD),
             TextBlock::new().text(format::budget(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::clocks(t)).text_wrapping(TextWrapping::Wrap),
+            TextBlock::new().text(format::streams(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::cpu(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::dropouts(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::allocations(t)).text_wrapping(TextWrapping::Wrap),

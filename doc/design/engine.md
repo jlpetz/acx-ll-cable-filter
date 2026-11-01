@@ -8,7 +8,7 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
   `DeviceInfo` mix formats.
 - `stream`: wrappers that open one stream and convert at the edge.
   - `CaptureStream`:
-    - event-driven shared mode;
+    - event-driven shared mode, or exclusive mode when `io.mic_exclusive` asks ("Exclusive mode" below);
     - optional IAudioClient3 minimum period;
     - optional RAW (`StreamOption::Raw` when the device supports it);
     - autoconvert to 48 kHz when the mix rate isn't 48 kHz (no IAudioClient3 then);
@@ -20,9 +20,14 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
     - event-driven or polled shared mode;
     - `padding()`, `write(mono)` upmixing to the device's channels;
     - `AudioClock` position for the play-out time.
+  - `Output`: the output, a polled shared `RenderStream`, or with `io.output_exclusive` an event-driven exclusive stream
+    (`ExclusiveRenderDevice` behind `exclusive::EventRender`), either way a `RenderSink` to the pipeline.
   - `LoopbackStream`: shared-mode loopback capture of a render endpoint.
   - `KeepAlive`: a silent render stream on the reference endpoint at its default period, so its
     loopback never stops.
+- `exclusive`: exclusive mode apart from WASAPI: the period and format choices, the fall-back to shared mode, and the
+  event-driven output's ring (below, "Exclusive mode").
+- `out_target`: the adaptive output target (below, "The output target").
 - `reference`: the reference's timeline (below, "The reference").
 - `audio`: the audio thread (below).
 - `control`: `Inner` (telemetry, status, the command channel, the audio-thread handle),
@@ -73,8 +78,11 @@ For each run:
 - Record `nf_mem::thread_scope_allocs()` as the baseline.
 - Signal "running" to `start()` through a one-shot channel (or report the error).
 
-Loop (wait on the mic's event handle, timeout 100 ms → treat as a stall: count it and continue;
-after 2 s with no packets, report an error and stop):
+Loop (wait on the mic's event handle, and an exclusive output's with it (`WaitForMultipleObjects`, the output's first),
+timeout 100 ms; 100 ms without the mic's event is a stall: count it and continue; after 2 s with no packets, report an
+error and stop):
+0. **An exclusive output's event**, when it fired (or has since: a zero-timeout check): move one period from its ring to
+   the device ("Exclusive mode" below). Again after each block of the wake, so the longest answer is a block's work.
 1. **Mic:** drain every available capture packet into the mic FIFO (a fixed `Box<[f32]>` ring,
    about 200 ms), remembering the QPC time of the first un-consumed sample (from packet
    `timestamp` + offset/fs).
@@ -135,18 +143,133 @@ Never allocate, lock, log or make blocking calls inside the loop:
 
 **Targets:**
 - Output render target = one render period + one block + `io.output_margin_ms`, measured before
-  each block's write. (Whether one period + the margin is enough is to be measured on a real
-  cable: it would take a block, 10 ms, off the latency. In the event simulation it is for steady
-  delivery and isn't for a bursty mic's missed wakes: TODO 13's detail, "Budget".)
+  each block's write: 22 ms at a shared 10 ms period, 14 ms at an exclusive 2 ms one. (Whether one period + the margin
+  is enough is to be measured on a real cable: it would take a block, 10 ms, off the latency. In the event simulation
+  it is for steady delivery and isn't for a bursty mic's missed wakes: TODO 13's detail, "Budget".) With
+  `io.adaptive_output` it moves: "The output target" below.
 - Reference lead target: one loopback period + 2 ms to start with; it can rise in the first 2.5 s
   and when underflows persist, up to 50 ms, and comes back down after five minutes under ("The
   reference" below).
 - Both are visible in telemetry (`reference_fill_ms` is the reference's lead, against
-  `reference_target_ms`).
+  `reference_target_ms`; `output_fill_ms` against `output_target_ms`, both published each second).
 
 **Stop:** set the flag and wait for the run to end (≤ 1 s); the run stops and releases its streams
 in reverse order and the thread goes back to waiting. MMCSS and COM stay with the thread until the
 engine is dropped.
+
+## Exclusive mode (`exclusive.rs`, `stream.rs`; TODO 13)
+Opt-in, each side on its own: `io.output_exclusive` (`--exclusive-output`) and `io.mic_exclusive` (`--exclusive-mic`).
+The aim is the render side and the mic's delivery: in shared mode the audio engine's pass sits between us and the device
+on each side (the cables' render side read 26 ms, the mic 16), and exclusive mode reaches the driver directly.
+- **Opening:** the first of 32-bit float, 24 bits in 32, 16-bit that the device takes at 48 kHz and its mix's channel
+  count (`is_supported_exclusive_with_quirks`, which also tries a plain `WAVEFORMATEX` and other channel masks), and
+  `EventsExclusive` at `exclusive_period`: the smallest period from the device's minimum (`GetDevicePeriod`; never under
+  2 ms) that divides the block, up to its default, else that minimum. VB-CABLE (the probe of 2026-11-01): 16-bit only,
+  2 ms on its render side (96 frames), 3 ms on its capture side, which becomes 3.33 ms (160 frames: three to a block,
+  where 144-frame packets would finish a block 1 ms late on average). A refused period (`AUDCLNT_E_INVALID_DEVICE_PERIOD`,
+  `AUDCLNT_E_BUFFER_SIZE_ERROR`, `E_INVALIDARG`) tries the device's minimum next (VB-CABLE's capture side: the 3 ms the
+  probe saw it take, should it refuse 3.33) and then its default; a format `IsFormatSupported` took and the initialise
+  refused tries the next format (`exclusive::first_exclusive`). Each try is on a fresh client, and a driver that wants its
+  buffer aligned (`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`) is retried once at the size its failed client gives.
+- **Falling back:** a refusal (no format, the device in use, exclusive control not allowed, every period tried) opens the
+  stream in shared mode as without the option, with `Warning::ExclusiveUnavailable` saying which and why in the status
+  (the window's warnings, `run`'s "warning:" line; for the periods, "it refused every period tried, 2.00 ms to 10.00 ms
+  (error ...)"). A shared open that fails then is the start's failure, as before.
+- **The output is event-driven** (`EventRender`): WASAPI gives it two buffers of one period, and at each device event the
+  client hands over a whole period while the device plays the other. The pipeline writes into a ring (100 ms) as it
+  writes into a shared stream's buffer, and each event moves a period from the ring to the device. The ring is the
+  padding, so to the pipeline it is a device that takes a period a pass, as the shared engine is, with a 2 ms period:
+  the fill, `FillOffset`'s sawtooth (one period wide: the device holds one to two periods), the drift loop, the deficit
+  and drop rules and the readout hold as they are, and the target follows the period. Polling with a buffer of a few
+  periods would keep the one-event loop, but VB-CABLE was seen to take event-driven exclusive streams only, a polled
+  exclusive buffer that runs dry replays stale audio, and how its padding moves is the driver's affair.
+- **A short ring** at an event hands what it has and silence after it: an underrun the sink reports
+  (`RenderSink::take_underruns`), and the silence is taken off the clock's position, so the pipeline's stream indices stay
+  the frames it wrote and the readout stays right after a dry spell (which the shared path's clock can't promise). The
+  pipeline counts the sink's underruns once a block however many events ran short, as the shared path counts a dry
+  spell: a 40 ms mic stall, a dozen short 2 ms events, is one (not before the first block; the adaptive target rises).
+  **A late answer** (the clock past everything handed, and 1.5 periods since the last answer: both, so a clock that leads
+  its buffers can't make every event late) is an underrun too: the device played whatever its other buffer held, and
+  those periods are taken off the clock the same way, as for a device whose stream moves on by them (one that writes the
+  late buffer over the one playing instead would read a period high per late answer; unverified on VB-CABLE). The gap is
+  timed on QPC from the stream's start (`EventRender::started`), so the first answer, which waits on the rest of the
+  start, is caught late as any other is; counted from the device clock's first reading it was missed, and the stale
+  periods then read as 2 ms each off the readout and the render side for the whole run. The start also answers the first
+  event as soon as the streams are started, before the status is built. A device clock that can't say yet (its
+  position reads 0 for a while after the start) leaves the check to the next answer it can, whatever that one's gap. The counts saturate and a late answer counts at most
+  10 s of stale periods, so a garbage position can't overflow them.
+- **The thread's second deadline:** a render event must be answered within a period (2 ms). The wait lists the output's
+  event first, and the loop answers it at the top of each wake and after each block (0.1-0.3 ms of work), so the longest
+  answer is one block's work plus the wake's own (reading the mic, servicing the reference). A stall is now timed by the
+  mic's events (`StallWatch`: 100 ms without one), since the output's wake the thread every 2 ms.
+- **The mic** in exclusive mode is an event-driven exclusive `CaptureStream`: a packet a period, read into the mic FIFO
+  as any packet is; its stamps and device positions are GetBuffer's as in shared mode, so the reference's lead (read
+  against the mic's capture stamps), the stamps' trust, the budget's mic delivery and the gap filling hold as they are.
+  No RAW (exclusive mode has no Windows effects) and no IAudioClient3. The budget splits differently: a block's first
+  sample is delivered with its 3.33 ms packet and waits for the other two, so mic delivery reads about 3.6 ms and the
+  wait about 6.7; together they're the block and the driver's lateness, as before.
+- **The mic's deadline:** an event-driven exclusive capture buffer is one period (WASAPI double-buffers it in the
+  driver), so a packet not read within about a period (3.33 ms) is overwritten: mic audio lost, a capture glitch (the
+  next packet's discontinuity or position gap, zero-filled). Shared mode's 40 ms capture buffer rides out the same
+  delay. The thread reads the mic at each wake, and its work between the mic's events is a block (0.1-0.3 ms) and the
+  output's answers, so what can miss it is the thread itself being held up (preempted, a page fault, a slow driver
+  call): MMCSS's priority is what keeps it on time, the window minimised included.
+- **Formats at the edge** (convert.rs): 16-bit and 24-bit are written at the scale they're read at, rounded to the
+  nearest step: a 16-bit mic passes a 16-bit cable unchanged in passthrough. No dither: the shared engine converts our
+  float to a 16-bit cable without one too, the rounding error (-101 dBFS RMS) is under any mic's own noise, and a dither
+  would put a -96 dBFS hiss on the gate's silence.
+- **What it costs others:** an exclusive stream has the endpoint to itself. On the output cable that's nothing (only the
+  filter plays into it, and the apps read the cable's other side); on the mic, no other app can record from that mic while
+  the filter runs, so they should use the filtered mic. A start whose device is held by another app (exclusive or
+  shared) falls back, and the next start tries again. The options' help says both, and the mic's deadline.
+- Telemetry `mic_exclusive`, `output_exclusive` (set at the start, cleared at the stop); `StreamInfo::exclusive` names
+  the format, and `StreamInfo::exclusive_refused` why a stream asked for in exclusive mode runs shared (the reports'
+  conditions say it with the stream).
+
+## The output target (`out_target.rs`, TODO 13)
+Fixed by default: one period + one block + `io.output_margin_ms`. The block is spare for steady delivery and is what
+bursts use: the drift loop holds the mean of the fills read before each write at the target, so a block that comes
+later than the others finds that much less queued. With `io.adaptive_output` (`--adaptive-output`) the target follows
+what the delivery needs:
+- **Measured:** each ordinary block's dip, how far its fill (before the calibration to the padding: frames written less
+  the device position now, or the padding without a clock) is under its 1 s mean; each second's largest, kept for 120 s.
+  The need is the largest over that window: a high percentile would let the rarest bursts through, and each costs an
+  underrun. After a correction the mean starts again from the plain mean of 300 blocks, which aren't counted.
+- **Lowered slowly:** once 120 s have passed since the last move was decided, the goal is the floor (one period + the
+  margin: what the device's period requires) + the need + 1 ms, when that's at least 1 ms lower. The target walks down to
+  it a tenth of the way each second (at most 0.5 ms a second, at least a sample: 9 ms takes 53 s, all but the last
+  0.25 ms in the first 41), through `DriftController::set_target`, and the loop slips the fill after it, so nothing
+  clicks. A walk, not a step: set in one step, the PI loop ran at its 1500 ppm limit, wound its integral up as the fill
+  neared the target and carried it past, 1.4 ms under the new target for 10 s (under the floor, in exclusive mode),
+  just when the target is least proven; a steady walk overshoots when it stops (0.8 ms at 0.25 ms/s). The walk's slowing
+  end lets the loop's integral wind down with it: in the simulations the queue's 1 s means stay above where the walk ends
+  (within 0.1 ms; they run up to 1 ms ahead of or behind the moving target meanwhile).
+- **Raised at once:** an underrun (the device or the exclusive ring ran dry, or a deficit) puts it back to the fixed
+  target, and the deficit's zeros fill the device to it at that block. Under the fixed target that's a **strike**: the
+  fixed target might have covered it. Its need (its dip, and at least how far under the fixed target it ran) holds the
+  target up for 10 minutes after the first strike, 20 after the second, and after the third it stays fixed for the run.
+  An underrun at the fixed target (a stall longer than the spare block) isn't one: it puts the next lowering a window off.
+  It never goes over the fixed target: a stall longer than the spare block underruns once either way, and a target
+  raised past it would carry the stall as latency for minutes.
+- **The trade:** under the fixed target, a rare hiccup that its spare block would have covered (a missed wake, 10-15 ms
+  late) runs the device dry. The strikes bound it: at most three underruns a run more than the fixed target's. Without
+  them the need was forgotten with the window, and hiccups rarer than it came back each time (a wake 15 ms late every
+  150 s underran 7 times in 1000 s where the fixed target never did).
+- The deficit and drop thresholds are on the target, so they follow it; `output_target_ms` is published each second,
+  and `run`'s status line, the window's budget and fill lines and the reports' conditions show it.
+- In the first 120 s of a run it is the fixed target, and then it walks for up to a minute, so `latency` and `quality`
+  with `--adaptive-output` wait for it to settle (to move and then hold still for 3 s; up to 188 s) before they measure.
+
+In the event simulations, with the events at 200 s, after it has come down (`pipeline/tests/events.rs`,
+`the_adaptive_target_after_it_has_come_down`, and `budget.rs`'s scenes; `events.rs`'s ignored `adaptive_sweep` prints
+them): steady delivery with 1 ms of wake jitter brings a 10 ms device's 22 ms down to about 13.5-14 and the latency by
+8 ms (37.7 to 29.0 ms in `budget.rs`), the cables' bursts to about 18 (3.4 ms off), and one wake in five missed keeps it
+at 21-22, all with no underrun at any phase. At the event: a wake 15 ms late, which the fixed target covers, runs it dry
+once in half the phases and drifts tried (and one wake 10 ms late, at the worst phase and 300 ppm), and the strike puts it back to the fixed
+target; a wake 35 ms late, a 50 ms mic loss and a 50 ms cable stall cost what they cost the fixed target (one underrun,
+one drop; the dry spells 400 frames longer). A wake 15 ms late every 150 s for 50 minutes: the fixed target never
+underruns, the adaptive one three times (the strikes) and is fixed from the third. With the exclusive output
+(`pipeline/tests/exclusive.rs`) and steady 3.33 ms packets it comes down from 14 ms to 5, the queue never under it.
 
 ## The latency budget (`budget.rs`, TODO 13)
 Each block's readout split along its first sample's way, into parts that add up to it exactly, block by block
@@ -177,7 +300,8 @@ Each block's readout split along its first sample's way, into parts that add up 
   still block for block, and the readout with it: it's set by the output's clock.
 - **Render side:** half the device period for a device that takes a period at a time and whose clock plays a sample as it
   takes it (the queue is calibrated to the middle of the padding's steps), plus whatever the shared-mode engine and the
-  device hold after taking a sample, as their clock reports it. A device whose clock counts the silence it played after
+  device hold after taking a sample, as their clock reports it. In exclusive mode the queue is the ring, and the render
+  side the device's two buffers (one and a half periods: 3 ms at 2 ms) plus what the driver holds past its clock. A device whose clock counts the silence it played after
   running dry reads that far ahead from then on: the readout drops by the silence for the rest of the run, and the render
   side shows it (it can go negative; TODO 13's detail, "Budget").
 - **The chain isn't in the readout:** the block's first output sample carries the input from the chain's offset before the
@@ -305,7 +429,8 @@ or noisy; `NF_SEED` plays them with another seed.
   short restart is acceptable.
 - Call `set_ducking_preference(true)` on every session we open.
 - Format: request 48 kHz f32 at the device's channel count. With the mix rate at 48 kHz, use it
-  directly (low-latency path allowed). Otherwise use autoconvert (no IAudioClient3).
+  directly (low-latency path allowed). Otherwise use autoconvert (no IAudioClient3). In exclusive mode, 48 kHz in the
+  best format the device takes (32-bit float, 24-in-32, 16-bit), or shared mode ("Exclusive mode").
 
 ## Latency test (`latency_test.rs`)
 Preconditions: the engine is running. `probe_device` and `capture_device` exist, and
@@ -436,3 +561,7 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   device's delivery for the reference's replays.
 - The audio loop's logic should be split so its per-block bookkeeping can be driven by a fake
   stream in a test: a trait over capture/render that the WASAPI wrappers implement.
+- Exclusive mode the same way: `EventRender` over a `PeriodDevice` (the WASAPI one is `ExclusiveRenderDevice`), the
+  period and format choices, the retries and the fall-back as pure functions; `pipeline/tests/exclusive.rs` drives a
+  2 ms device on its own clock against steady and bursty mic delivery, a thread stalled mid-run and before its first
+  answer, a mic stall's dry spell, and 3 ms and 3.33 ms mic packets.

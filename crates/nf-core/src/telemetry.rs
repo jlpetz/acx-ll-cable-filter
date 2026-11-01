@@ -273,7 +273,7 @@ pub struct Telemetry {
     /// Latency-test tap blocks lost because the tap ring was full.
     pub tap_overflows: AtomicU64,
     /// The targets the drift loops hold, in ms (0 while stopped or without a reference): the output's
-    /// fill, and the reference's lead (published each second: it can move).
+    /// fill, and the reference's lead (both published each second: they can move).
     pub output_target_ms: AtomicF32,
     pub reference_target_ms: AtomicF32,
     /// The reference's lead is timed by both streams' QPC stamps; false: by when their packets were delivered (a stream
@@ -281,6 +281,12 @@ pub struct Telemetry {
     pub reference_stamped: AtomicBool,
     pub mic_period_ms: AtomicF32,
     pub output_period_ms: AtomicF32,
+    /// The run's mic and output streams are in WASAPI exclusive mode (asked for in `IoConfig` and granted; a refused one
+    /// runs shared, with a warning), set at the start and cleared at the stop.
+    pub mic_exclusive: AtomicBool,
+    pub output_exclusive: AtomicBool,
+    /// The output's target adapts to the delivery (`IoConfig::adaptive_output`): `output_target_ms` moves.
+    pub output_adaptive: AtomicBool,
 }
 
 /// A plain copy of [`Telemetry`] for the UI.
@@ -327,6 +333,9 @@ pub struct TelemetrySnapshot {
     pub reference_stamped: bool,
     pub mic_period_ms: f32,
     pub output_period_ms: f32,
+    pub mic_exclusive: bool,
+    pub output_exclusive: bool,
+    pub output_adaptive: bool,
 }
 
 impl Telemetry {
@@ -390,6 +399,9 @@ impl Telemetry {
             reference_stamped: self.reference_stamped.load(Relaxed),
             mic_period_ms: self.mic_period_ms.load(),
             output_period_ms: self.output_period_ms.load(),
+            mic_exclusive: self.mic_exclusive.load(Relaxed),
+            output_exclusive: self.output_exclusive.load(Relaxed),
+            output_adaptive: self.output_adaptive.load(Relaxed),
         }
     }
 }

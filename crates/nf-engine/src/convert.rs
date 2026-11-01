@@ -9,6 +9,14 @@
 //! both edges (DSP-7), so the meters, the tap, the bypass paths, the slip resampler and the stages
 //! all see finite data, and nothing non-finite reaches the cable. Integer formats can't carry
 //! them. Above-full-scale floats are legal and pass (downstream clips them).
+//!
+//! Integers are written at the scale they're read at (2^15, 2^23, 2^31 to full scale), rounded to
+//! the nearest step and saturated at the top, so a 16-bit or 24-bit sample read and written again
+//! comes back exactly: in exclusive mode a 16-bit mic passes a 16-bit cable unchanged in
+//! passthrough. No dither: the shared-mode engine converts our float output to a 16-bit cable
+//! without one as well, the rounding error (-101 dBFS RMS) is far under any mic's own noise, which
+//! dithers the quantiser by itself, and a dither would put a -96 dBFS hiss on the gate's silence
+//! (doc/todo/8-audio-io.md, "Exclusive mode").
 
 /// A device sample encoding (little-endian, interleaved).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +41,10 @@ impl SampleFormat {
 
 const I16_SCALE: f32 = 1.0 / 32_768.0;
 const I32_SCALE: f32 = 1.0 / 2_147_483_648.0;
+/// Full scale for writing: the inverses of the read scales, so that integers round-trip.
+const I16_FULL: f32 = 32_768.0;
+const I24_FULL: f32 = 8_388_608.0;
+const I32_FULL: f32 = 2_147_483_648.0;
 
 /// Converts interleaved `channels`-channel frames in `src` to mono in `dst`, frame by frame, for
 /// as many frames as both hold. Returns the frames converted.
@@ -59,8 +71,8 @@ pub(crate) fn to_mono(format: SampleFormat, channels: usize, src: &[u8], dst: &m
 }
 
 /// Writes mono `src` into interleaved `channels`-channel frames in `dst` (every channel gets the
-/// sample), for as many frames as both hold. Integer formats are clamped to full scale. Returns
-/// the frames written.
+/// sample), for as many frames as both hold. Integer formats are rounded to the nearest step and
+/// clamped to full scale. Returns the frames written.
 pub(crate) fn from_mono(format: SampleFormat, channels: usize, src: &[f32], dst: &mut [u8]) -> usize {
     if channels == 0 {
         return 0;
@@ -74,12 +86,14 @@ pub(crate) fn from_mono(format: SampleFormat, channels: usize, src: &[f32], dst:
         (SampleFormat::F32, 6) => upmix_f32::<6>(src, dst),
         (SampleFormat::F32, 8) => upmix_f32::<8>(src, dst),
         (SampleFormat::F32, c) => upmix_generic::<4>(c, src, dst, |x| finite_or_zero(x).to_le_bytes()),
-        (SampleFormat::I16, c) => upmix_generic::<2>(c, src, dst, |x| ((clip(x) * 32_767.0) as i16).to_le_bytes()),
+        (SampleFormat::I16, 1) => upmix_i16::<1>(src, dst),
+        (SampleFormat::I16, 2) => upmix_i16::<2>(src, dst),
+        (SampleFormat::I16, c) => upmix_generic::<2>(c, src, dst, |x| i16_of(x).to_le_bytes()),
         (SampleFormat::I24, c) => upmix_generic::<3>(c, src, dst, |x| {
-            let b = ((clip(x) * 8_388_607.0) as i32).to_le_bytes();
+            let b = (scaled(x, I24_FULL) as i32).min(8_388_607).to_le_bytes();
             [b[0], b[1], b[2]]
         }),
-        (SampleFormat::I32, c) => upmix_generic::<4>(c, src, dst, |x| ((clip(x) * 2_147_483_647.0) as i32).to_le_bytes()),
+        (SampleFormat::I32, c) => upmix_generic::<4>(c, src, dst, |x| (scaled(x, I32_FULL) as i32).to_le_bytes()),
     }
     frames
 }
@@ -89,6 +103,19 @@ pub(crate) fn from_mono(format: SampleFormat, channels: usize, src: &[f32], dst:
 #[inline(always)]
 fn clip(x: f32) -> f32 {
     x.clamp(-1.0, 1.0)
+}
+
+/// `x` clipped to ±1, at `full` to full scale, rounded to the nearest step (ties to even: one
+/// rounding instruction at x86-64-v3). The caller's saturating cast takes +full scale to the top
+/// step, and NaN to 0.
+#[inline(always)]
+fn scaled(x: f32, full: f32) -> f32 {
+    (clip(x) * full).round_ties_even()
+}
+
+#[inline(always)]
+fn i16_of(x: f32) -> i16 {
+    scaled(x, I16_FULL) as i16
 }
 
 /// NaN and ±inf become 0; everything else passes. A compare and a branch per sample in the
@@ -143,6 +170,15 @@ fn upmix_f32<const C: usize>(src: &[f32], dst: &mut [u8]) {
     let (frames, _) = samples.as_chunks_mut::<C>();
     for (f, &x) in frames.iter_mut().zip(src) {
         *f = [finite_or_zero(x).to_le_bytes(); C];
+    }
+}
+
+/// 16-bit, the format exclusive mode gets on VB-CABLE: the common layouts with fixed shapes.
+fn upmix_i16<const C: usize>(src: &[f32], dst: &mut [u8]) {
+    let (samples, _) = dst.as_chunks_mut::<2>();
+    let (frames, _) = samples.as_chunks_mut::<C>();
+    for (f, &x) in frames.iter_mut().zip(src) {
+        *f = [i16_of(x).to_le_bytes(); C];
     }
 }
 
@@ -287,7 +323,18 @@ mod tests {
         let mut dst = vec![0u8; src.len() * 2 * 2];
         from_mono(SampleFormat::I16, 2, &src, &mut dst);
         let v: Vec<i16> = dst.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
-        assert_eq!(v, vec![32_767, 32_767, -32_767, -32_767, 16_383, 16_383, 0, 0]);
+        assert_eq!(v, vec![32_767, 32_767, -32_768, -32_768, 16_384, 16_384, 0, 0]);
+        // Every layout clamps alike (the fixed shapes and the generic path).
+        for ch in [1usize, 2, 3] {
+            let mut dst = vec![0u8; src.len() * ch * 2];
+            from_mono(SampleFormat::I16, ch, &src, &mut dst);
+            let v: Vec<i16> = dst.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
+            let expect: Vec<i16> = [32_767, -32_768, 16_384, 0].iter().flat_map(|&x| std::iter::repeat_n(x, ch)).collect();
+            assert_eq!(v, expect, "{ch} ch");
+        }
+        let mut b24 = [0u8; 6];
+        from_mono(SampleFormat::I24, 1, &[1.0, -1.0], &mut b24);
+        assert_eq!(b24, [0xFF, 0xFF, 0x7F, 0x00, 0x00, 0x80], "24-bit: the top step, and -full scale exactly");
 
         for fmt in [SampleFormat::I16, SampleFormat::I24, SampleFormat::I32, SampleFormat::F32] {
             let src = [0.5f32, -0.25, 0.0];
@@ -299,5 +346,41 @@ mod tests {
                 assert!((a - b).abs() < 1e-4, "{fmt:?}: {a} vs {b}");
             }
         }
+    }
+
+    /// Exclusive mode's 16-bit path (VB-CABLE takes nothing else there): every 16-bit value read from a device and written
+    /// back comes back exactly, at 1, 2 and 3 channels, so a 16-bit mic passes a 16-bit cable unchanged in passthrough; a
+    /// float between the steps lands on the nearest, half a step off at most. 24-bit round-trips exactly too.
+    #[test]
+    fn sixteen_bit_round_trips_exactly() {
+        let all: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        for ch in [1usize, 2, 3] {
+            let bytes: Vec<u8> = all.iter().flat_map(|v| std::iter::repeat_n(v.to_le_bytes(), ch)).flatten().collect();
+            let mut mono = vec![0.0f32; all.len()];
+            assert_eq!(to_mono(SampleFormat::I16, ch, &bytes, &mut mono), all.len());
+            let mut out = vec![0u8; bytes.len()];
+            assert_eq!(from_mono(SampleFormat::I16, ch, &mono, &mut out), all.len());
+            assert!(out == bytes, "{ch} ch: a 16-bit sample changed on the way through");
+        }
+        for k in 0..10_000 {
+            let x = (k as f32 / 10_000.0) * 1.9 - 0.95 + 1.3e-6;
+            let mut b = [0u8; 2];
+            from_mono(SampleFormat::I16, 1, &[x], &mut b);
+            let back = f32::from(i16::from_le_bytes(b)) * I16_SCALE;
+            assert!((back - x).abs() <= 0.5 * I16_SCALE + 1e-9, "{x}: {back}");
+        }
+        let all24: Vec<i32> = (-8_388_608..8_388_608).step_by(997).chain([8_388_607]).collect();
+        let bytes: Vec<u8> = all24
+            .iter()
+            .flat_map(|v| {
+                let b = v.to_le_bytes();
+                [b[0], b[1], b[2]]
+            })
+            .collect();
+        let mut mono = vec![0.0f32; all24.len()];
+        to_mono(SampleFormat::I24, 1, &bytes, &mut mono);
+        let mut out = vec![0u8; bytes.len()];
+        from_mono(SampleFormat::I24, 1, &mono, &mut out);
+        assert!(out == bytes, "24-bit");
     }
 }

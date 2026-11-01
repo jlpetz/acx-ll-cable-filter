@@ -408,8 +408,16 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.budget = budget;
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
-    report.conditions =
-        conditions(st.mic.as_ref(), st.output.as_ref(), &probe.info.stream_info(), &cap.info.stream_info(), req.mode, !req.through_model);
+    let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive };
+    report.conditions = conditions(
+        st.mic.as_ref(),
+        st.output.as_ref(),
+        &probe.info.stream_info(),
+        &cap.info.stream_info(),
+        req.mode,
+        !req.through_model,
+        target,
+    );
     report.warnings.extend(mode_warnings(req, inner.controls.aec.enabled.load(Relaxed)));
     shared.running(1.0, "Done");
     Ok(report)
@@ -657,9 +665,17 @@ pub(crate) fn mode_warnings(req: &LatencyTestRequest, aec_enabled: bool) -> Vec<
     w
 }
 
-/// The record of how the test ran: engine periods, RAW, autoconvert and the devices.
+/// The output's target at the end of a test, and whether it adapts (`IoConfig::adaptive_output`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OutputTarget {
+    pub(crate) ms: f32,
+    pub(crate) adaptive: bool,
+}
+
+/// The record of how the test ran: engine periods, RAW, autoconvert, exclusive mode, the output's target and the devices.
 pub(crate) fn conditions(
     mic: Option<&StreamInfo>, output: Option<&StreamInfo>, probe: &StreamInfo, capture: &StreamInfo, mode: LatencyMode, passthrough: bool,
+    target: OutputTarget,
 ) -> String {
     let mut parts = vec![format!(
         "{} ({})",
@@ -674,6 +690,10 @@ pub(crate) fn conditions(
     }
     if let Some(o) = output {
         parts.push(describe_stream("output", o));
+    }
+    if target.ms > 0.0 {
+        let how = if target.adaptive { "adaptive, at the end" } else { "fixed" };
+        parts.push(format!("output target {:.1} ms ({how})", target.ms));
     }
     parts.push(describe_stream("probe", probe));
     parts.push(describe_stream("capture", capture));
@@ -695,6 +715,12 @@ fn describe_stream(label: &str, s: &StreamInfo) -> String {
     }
     if s.autoconvert {
         flags.push_str(", autoconvert");
+    }
+    if let Some(format) = s.exclusive {
+        flags.push_str(&format!(", exclusive {format}"));
+    }
+    if let Some(why) = &s.exclusive_refused {
+        flags.push_str(&format!(", shared: exclusive refused ({why})"));
     }
     format!("{label}: {} ({} Hz, {} ch, {:.2} ms period{flags})", s.device_name, s.sample_rate, s.channels, s.period_ms)
 }
@@ -861,6 +887,8 @@ mod tests {
             low_latency: false,
             autoconvert: false,
             raw: false,
+            exclusive: None,
+            exclusive_refused: None,
         };
         assert_eq!(
             cable_conditions(&s("CABLE-A Input"), &s("CABLE-A Output")),
@@ -914,6 +942,8 @@ mod tests {
             low_latency: ll,
             autoconvert: ac,
             raw,
+            exclusive: None,
+            exclusive_refused: None,
         };
         let c = conditions(
             Some(&s("CABLE-A Output", true, true, false)),
@@ -922,13 +952,37 @@ mod tests {
             &s("CABLE-B Output", false, false, false),
             LatencyMode::VirtualLoop,
             true,
+            OutputTarget { ms: 22.0, adaptive: false },
         );
         assert_eq!(
             c,
             "virtual loop (passthrough); mic: CABLE-A Output (48000 Hz, 2 ch, 10.00 ms period, IAudioClient3, RAW); \
-             output: CABLE-B Input (48000 Hz, 2 ch, 10.00 ms period, autoconvert); \
+             output: CABLE-B Input (48000 Hz, 2 ch, 10.00 ms period, autoconvert); output target 22.0 ms (fixed); \
              probe: CABLE-A Input (48000 Hz, 2 ch, 10.00 ms period); capture: CABLE-B Output (48000 Hz, 2 ch, 10.00 ms period)"
         );
+        // Exclusive streams name their format, and an adaptive target says it's where it ended.
+        let excl = |name: &str, period_ms| StreamInfo { exclusive: Some("16-bit"), period_ms, ..s(name, false, false, false) };
+        let c = conditions(
+            Some(&excl("CABLE-A Output", 3.33)),
+            Some(&excl("CABLE Input", 2.0)),
+            &s("CABLE-A Input", false, false, false),
+            &s("CABLE Output", false, false, false),
+            LatencyMode::VirtualLoop,
+            true,
+            OutputTarget { ms: 5.0, adaptive: true },
+        );
+        assert!(c.contains("mic: CABLE-A Output (48000 Hz, 2 ch, 3.33 ms period, exclusive 16-bit)"), "{c}");
+        assert!(
+            c.contains(
+                "output: CABLE Input (48000 Hz, 2 ch, 2.00 ms period, exclusive 16-bit); output target 5.0 ms (adaptive, at the end)"
+            ),
+            "{c}"
+        );
+        // Asked for in exclusive mode and refused: shared, and why.
+        let refused = StreamInfo { exclusive_refused: Some("another app is using it".into()), ..s("CABLE Input", false, false, false) };
+        let target = OutputTarget { ms: 22.0, adaptive: false };
+        let c = conditions(None, Some(&refused), &refused, &refused, LatencyMode::VirtualLoop, true, target);
+        assert!(c.contains("CABLE Input (48000 Hz, 2 ch, 10.00 ms period, shared: exclusive refused (another app is using it))"), "{c}");
     }
 
     #[test]

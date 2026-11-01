@@ -1,5 +1,8 @@
-//! WASAPI stream wrappers (engine.md "stream"). Each opens one shared-mode stream and converts at
-//! the edge to the app's 48 kHz mono f32.
+//! WASAPI stream wrappers (engine.md "stream"). Each opens one stream and converts at the edge to the
+//! app's 48 kHz mono f32. Shared mode, but for the mic and the output when they're asked for in
+//! exclusive mode (`IoConfig::mic_exclusive`, `output_exclusive`; engine.md, "Exclusive mode"):
+//! event-driven at the device's smallest suitable period, in the best format it takes, falling back
+//! to shared mode with a warning when it refuses (exclusive.rs has the choices and the fall-back).
 //!
 //! Format rule: with the mix format at 48 kHz, use it as is (we downmix or upmix the channels, and
 //! the mic may use IAudioClient3's small periods); otherwise ask for 48 kHz f32 at the mix's
@@ -12,16 +15,19 @@
 use nf_core::{BLOCK, SAMPLE_RATE};
 use wasapi::{
     AudioCaptureClient, AudioClient, AudioClientProperties, AudioClock, AudioRenderClient, AudioSessionControl, BufferFlags, Device,
-    Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError, WaveFormat,
+    Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError, WaveFormat, calculate_period_100ns,
 };
-use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Foundation::{HANDLE, PROPERTYKEY};
 use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToBoolean};
 use windows::core::GUID;
 
 use crate::api::StreamInfo;
 use crate::convert::{SampleFormat, from_mono, to_mono};
-use crate::errors::hr;
+use crate::errors::{StreamRole, Warning, describe_refusal, hr};
+use crate::exclusive::{
+    EventRender, ExclusiveFormat, ExclusiveRefusal, PeriodDevice, RING_FRAMES, exclusive_or_shared, exclusive_periods, first_exclusive,
+};
 use crate::pipeline::{CaptureSource, ClockReading, Hr, Packet, RenderSink};
 use crate::timing::Qpc;
 
@@ -133,6 +139,10 @@ pub(crate) struct OpenInfo {
     pub low_latency: bool,
     pub autoconvert: bool,
     pub raw: bool,
+    /// In exclusive mode, in this format; `None` in shared mode.
+    pub exclusive: Option<ExclusiveFormat>,
+    /// Asked for in exclusive mode, refused for this (it runs shared).
+    pub refused: Option<ExclusiveRefusal>,
 }
 
 impl OpenInfo {
@@ -145,6 +155,8 @@ impl OpenInfo {
             low_latency: self.low_latency,
             autoconvert: self.autoconvert,
             raw: self.raw,
+            exclusive: self.exclusive.map(ExclusiveFormat::label),
+            exclusive_refused: self.refused.map(describe_refusal),
         }
     }
 }
@@ -154,9 +166,11 @@ impl OpenInfo {
 pub(crate) struct MicOptions {
     pub low_latency: bool,
     pub raw: bool,
+    /// Exclusive mode first (`IoConfig::mic_exclusive`); RAW and IAudioClient3 are shared mode's.
+    pub exclusive: bool,
 }
 
-/// One shared-mode capture stream: the mic (event-driven), the latency test's output capture
+/// One capture stream, in shared mode (or the mic in exclusive mode): the mic (event-driven), the latency test's output capture
 /// (event-driven) or the speakers' loopback (polled from the mic loop: loopback events stop
 /// during silence).
 pub(crate) struct CaptureStream {
@@ -172,23 +186,44 @@ pub(crate) struct CaptureStream {
 }
 
 impl CaptureStream {
-    /// The mic: RAW where supported (and asked), IAudioClient3's smallest suitable period where the
-    /// driver allows (and asked, and the mix is 48 kHz), each falling back.
-    pub(crate) fn open_mic(device: &Device, opts: MicOptions) -> Result<Self, WasapiError> {
+    /// The mic. Asked for in exclusive mode, that first (event-driven at its period: exclusive.rs), and shared mode with the
+    /// warning saying why when the device refuses. In shared mode, RAW where supported (and asked), IAudioClient3's smallest
+    /// suitable period where the driver allows (and asked, and the mix is 48 kHz), each falling back.
+    pub(crate) fn open_mic(device: &Device, opts: MicOptions) -> Result<(Self, Option<Warning>), WasapiError> {
         let name = device.get_friendlyname().unwrap_or_default();
         let mix = device.get_iaudioclient()?.get_mixformat()?;
+        let (mut mic, warning) = exclusive_or_shared(
+            opts.exclusive,
+            StreamRole::Mic,
+            &name,
+            || Self::open_mic_exclusive(device, &name, &mix),
+            || Self::open_mic_shared(device, &name, &mix, opts),
+        )?;
+        if let Some(Warning::ExclusiveUnavailable { why, .. }) = &warning {
+            mic.info.refused = Some(*why);
+        }
+        Ok((mic, warning))
+    }
+
+    fn open_mic_exclusive(device: &Device, name: &str, mix: &WaveFormat) -> Result<Self, ExclusiveRefusal> {
+        let (client, fmt, kind, frames) = open_exclusive(device, Direction::Capture, mix)?;
+        let info = exclusive_info(name, &fmt, frames, kind);
+        Self::finish(client, &fmt, true, info).map_err(|e| ExclusiveRefusal::Refused(hr_of(&e)))
+    }
+
+    fn open_mic_shared(device: &Device, name: &str, mix: &WaveFormat, opts: MicOptions) -> Result<Self, WasapiError> {
         let raw_options: &[bool] = if opts.raw && raw_supported(device) { &[true, false] } else { &[false] };
         let mut last = WasapiError::UnsupportedFormat;
         for &raw in raw_options {
             if opts.low_latency
-                && let Some((client, period)) = open_low_latency(device, &mix, raw)
+                && let Some((client, period)) = open_low_latency(device, mix, raw)
             {
-                let info = info_for(&name, &mix, period as usize, true, false, raw);
-                return Self::finish(client, &mix, true, info);
+                let info = info_for(name, mix, period as usize, true, false, raw);
+                return Self::finish(client, mix, true, info);
             }
-            match open_shared(device, &mix, Direction::Capture, raw, true, 400_000) {
+            match open_shared(device, mix, Direction::Capture, raw, true, 400_000) {
                 Ok((client, fmt, autoconvert, period_hns)) => {
-                    let info = info_for(&name, &mix, hns_to_frames(period_hns, SAMPLE_RATE), false, autoconvert, raw);
+                    let info = info_for(name, mix, hns_to_frames(period_hns, SAMPLE_RATE), false, autoconvert, raw);
                     return Self::finish(client, &fmt, true, info);
                 }
                 // A refused initialise leaves the client unusable; the next attempt makes a new one.
@@ -261,6 +296,11 @@ impl CaptureStream {
             Some(e) => e.wait_for_event(ms).is_ok(),
             None => false,
         }
+    }
+
+    /// The stream's event, for a wait on it and the output's together; `None` for a polled stream. Valid while it lives.
+    pub(crate) fn event(&self) -> Option<HANDLE> {
+        self.event.as_ref().map(Handle::as_handle)
     }
 }
 
@@ -399,14 +439,241 @@ impl RenderSink for RenderStream {
     }
 
     fn clock(&mut self) -> Result<Option<ClockReading>, Hr> {
-        let Some(clock) = &self.clock else { return Ok(None) };
-        let (pos, qpc) = clock.get_position().map_err(hr)?;
-        let now = self.qpc.now_hns();
-        if pos == 0 {
-            // The position reads 0 for a few ms after start.
-            return Ok(None);
+        read_clock(self.clock.as_ref(), self.rate, self.clock_freq, &self.qpc)
+    }
+}
+
+/// One `AudioClock` reading in frames at `rate`, stamped with the time it was taken; `None` without a clock, and while the
+/// position reads 0 (it does for a few ms after start).
+fn read_clock(clock: Option<&AudioClock>, rate: f64, freq: f64, qpc: &Qpc) -> Result<Option<ClockReading>, Hr> {
+    let Some(clock) = clock else { return Ok(None) };
+    let (pos, at) = clock.get_position().map_err(hr)?;
+    let now = qpc.now_hns();
+    if pos == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ClockReading { pos_frames: pos as f64 * rate / freq, qpc_hns: at as f64, now_hns: now as f64 }))
+}
+
+/// An event-driven exclusive-mode render stream's device end (exclusive.rs, [`EventRender`]): its two buffers of one
+/// period, the one the device doesn't play handed over whole at each of its events.
+pub(crate) struct ExclusiveRenderDevice {
+    client: AudioClient,
+    render: AudioRenderClient,
+    event: Handle,
+    clock: Option<AudioClock>,
+    clock_freq: f64,
+    qpc: Qpc,
+    _session: Option<AudioSessionControl>,
+    format: SampleFormat,
+    channels: usize,
+    period: usize,
+    scratch: Box<[u8]>,
+    pub(crate) info: OpenInfo,
+}
+
+impl ExclusiveRenderDevice {
+    /// The output in exclusive mode, or why not (the caller falls back to shared mode).
+    pub(crate) fn open(device: &Device) -> Result<Self, ExclusiveRefusal> {
+        let refused = |e: WasapiError| ExclusiveRefusal::Refused(hr_of(&e));
+        let name = device.get_friendlyname().unwrap_or_default();
+        let mix = device.get_iaudioclient().and_then(|c| c.get_mixformat()).map_err(refused)?;
+        let (client, fmt, kind, period) = open_exclusive(device, Direction::Render, &mix)?;
+        let format = sample_format(&fmt).ok_or(ExclusiveRefusal::NoFormat)?;
+        // After initialise, before start.
+        let event = client.set_get_eventhandle().map_err(refused)?;
+        let render = client.get_audiorenderclient().map_err(refused)?;
+        let session = session_without_ducking(&client);
+        let clock = client.get_audioclock().ok();
+        let clock_freq = clock.as_ref().and_then(|c| c.get_frequency().ok()).unwrap_or(0) as f64;
+        let block_align = fmt.get_blockalign() as usize;
+        Ok(Self {
+            client,
+            render,
+            event,
+            clock: clock.filter(|_| clock_freq > 0.0),
+            clock_freq,
+            qpc: Qpc::new(),
+            _session: session,
+            format,
+            channels: fmt.get_nchannels().max(1) as usize,
+            period,
+            scratch: vec![0u8; period * block_align].into_boxed_slice(),
+            info: exclusive_info(&name, &fmt, period, kind),
+        })
+    }
+
+    pub(crate) fn start(&self) -> Result<(), Hr> {
+        self.client.start_stream().map_err(hr)
+    }
+
+    pub(crate) fn stop(&self) {
+        let _ = self.client.stop_stream();
+    }
+
+    /// The device's event (it wants its next buffer). Valid while the device lives.
+    pub(crate) fn event(&self) -> HANDLE {
+        self.event.as_handle()
+    }
+
+    /// Whether the event has fired since it was last waited on (and resets it: it's an auto-reset event).
+    pub(crate) fn signalled(&self) -> bool {
+        self.event.wait_for_event(0).is_ok()
+    }
+}
+
+impl PeriodDevice for ExclusiveRenderDevice {
+    fn period(&self) -> usize {
+        self.period
+    }
+
+    fn hand(&mut self, frames: &[f32]) -> Result<(), Hr> {
+        let frames = frames.get(..self.period).unwrap_or(frames);
+        from_mono(self.format, self.channels, frames, &mut self.scratch);
+        // A whole buffer, as exclusive mode wants each event (`EventRender` hands exactly a period).
+        self.render.write_to_device(self.period, &self.scratch, None).map_err(hr)
+    }
+
+    fn clock(&mut self) -> Result<Option<ClockReading>, Hr> {
+        read_clock(self.clock.as_ref(), SAMPLE_RATE as f64, self.clock_freq, &self.qpc)
+    }
+
+    fn now_hns(&mut self) -> f64 {
+        self.qpc.now_hns() as f64
+    }
+}
+
+/// The output stream: shared mode (polled, written at the mic's wakes), or exclusive mode (event-driven: the pipeline
+/// fills [`EventRender`]'s ring, and each device event moves a period from it to the device).
+pub(crate) enum Output {
+    Shared(RenderStream),
+    Exclusive(EventRender<ExclusiveRenderDevice>),
+}
+
+impl Output {
+    /// The output as `IoConfig` asks for it: exclusive mode first when asked, else (or when the device refuses, with the
+    /// warning) shared mode.
+    pub(crate) fn open(device: &Device, exclusive: bool, buffer_hns: i64) -> Result<(Self, Option<Warning>), WasapiError> {
+        let name = device.get_friendlyname().unwrap_or_default();
+        let (mut out, warning) = exclusive_or_shared(
+            exclusive,
+            StreamRole::Output,
+            &name,
+            || ExclusiveRenderDevice::open(device).map(|d| Output::Exclusive(EventRender::new(d, RING_FRAMES))),
+            || RenderStream::open(device, buffer_hns).map(Output::Shared),
+        )?;
+        if let (Output::Shared(s), Some(Warning::ExclusiveUnavailable { why, .. })) = (&mut out, &warning) {
+            s.info.refused = Some(*why);
         }
-        Ok(Some(ClockReading { pos_frames: pos as f64 * self.rate / self.clock_freq, qpc_hns: qpc as f64, now_hns: now as f64 }))
+        Ok((out, warning))
+    }
+
+    pub(crate) fn info(&self) -> &OpenInfo {
+        match self {
+            Output::Shared(s) => &s.info,
+            Output::Exclusive(e) => &e.device().info,
+        }
+    }
+
+    /// The device period in frames: the shared engine's pass, or the exclusive buffer.
+    pub(crate) fn period_frames(&self) -> usize {
+        match self {
+            Output::Shared(s) => s.period_frames(),
+            Output::Exclusive(e) => e.period(),
+        }
+    }
+
+    pub(crate) fn is_exclusive(&self) -> bool {
+        matches!(self, Output::Exclusive(_))
+    }
+
+    /// Starts the stream. In exclusive mode the first buffer (the prefill's zeros) goes in before the start, as WASAPI wants,
+    /// and the first event's answer is timed from the start.
+    pub(crate) fn start(&mut self) -> Result<(), Hr> {
+        match self {
+            Output::Shared(s) => s.start(),
+            Output::Exclusive(e) => {
+                e.preroll()?;
+                e.device().start()?;
+                e.started();
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        match self {
+            Output::Shared(s) => s.stop(),
+            Output::Exclusive(e) => e.device().stop(),
+        }
+    }
+
+    /// The event the audio thread waits on besides the mic's: the exclusive device's. `None` in shared mode (polled).
+    pub(crate) fn event(&self) -> Option<HANDLE> {
+        match self {
+            Output::Shared(_) => None,
+            Output::Exclusive(e) => Some(e.device().event()),
+        }
+    }
+
+    /// Answers the exclusive device's event: when the wait said it fired (`signalled`), or it has since. A no-op in shared
+    /// mode.
+    pub(crate) fn service(&mut self, signalled: bool) -> Result<(), Hr> {
+        match self {
+            Output::Shared(_) => Ok(()),
+            Output::Exclusive(e) => {
+                if signalled || e.device().signalled() {
+                    e.service()
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+impl RenderSink for Output {
+    #[inline]
+    fn buffer_frames(&self) -> usize {
+        match self {
+            Output::Shared(s) => s.buffer_frames(),
+            Output::Exclusive(e) => e.buffer_frames(),
+        }
+    }
+    #[inline]
+    fn padding(&mut self) -> Result<usize, Hr> {
+        match self {
+            Output::Shared(s) => s.padding(),
+            Output::Exclusive(e) => e.padding(),
+        }
+    }
+    #[inline]
+    fn write(&mut self, mono: &[f32]) -> Result<(), Hr> {
+        match self {
+            Output::Shared(s) => s.write(mono),
+            Output::Exclusive(e) => e.write(mono),
+        }
+    }
+    #[inline]
+    fn write_silence(&mut self, frames: usize) -> Result<(), Hr> {
+        match self {
+            Output::Shared(s) => s.write_silence(frames),
+            Output::Exclusive(e) => e.write_silence(frames),
+        }
+    }
+    #[inline]
+    fn clock(&mut self) -> Result<Option<ClockReading>, Hr> {
+        match self {
+            Output::Shared(s) => s.clock(),
+            Output::Exclusive(e) => e.clock(),
+        }
+    }
+    #[inline]
+    fn take_underruns(&mut self) -> u64 {
+        match self {
+            Output::Shared(_) => 0,
+            Output::Exclusive(e) => e.take_underruns(),
+        }
     }
 }
 
@@ -448,6 +715,78 @@ fn info_for(name: &str, mix: &WaveFormat, period_frames: usize, low_latency: boo
         low_latency,
         autoconvert,
         raw,
+        exclusive: None,
+        refused: None,
+    }
+}
+
+/// How an exclusive stream was opened: at 48 kHz in `fmt`, with a buffer (the period) of `period_frames`.
+fn exclusive_info(name: &str, fmt: &WaveFormat, period_frames: usize, kind: ExclusiveFormat) -> OpenInfo {
+    OpenInfo {
+        name: name.to_owned(),
+        sample_rate: fmt.get_samplespersec(),
+        channels: fmt.get_nchannels(),
+        period_frames,
+        period_ms: period_frames as f32 * 1000.0 / SAMPLE_RATE as f32,
+        low_latency: false,
+        autoconvert: false,
+        raw: false,
+        exclusive: Some(kind),
+        refused: None,
+    }
+}
+
+/// The formats tried in exclusive mode (exclusive.rs, best first), at 48 kHz and the mix's channel count and mask.
+fn exclusive_candidates(mix: &WaveFormat) -> impl Iterator<Item = (WaveFormat, ExclusiveFormat)> + '_ {
+    let channels = mix.get_nchannels().max(1) as usize;
+    let mask = mix.get_dwchannelmask();
+    ExclusiveFormat::ALL.into_iter().map(move |kind| {
+        let (store, valid, float) = kind.bits();
+        let st = if float { SampleType::Float } else { SampleType::Int };
+        (WaveFormat::new(store, valid, &st, SAMPLE_RATE as usize, channels, (mask != 0).then_some(mask)), kind)
+    })
+}
+
+/// An event-driven exclusive-mode client on `device` (exclusive.rs): each format of [`ExclusiveFormat::ALL`] it takes, best
+/// first, at each of [`exclusive_periods`] (the choice, the device's minimum, its default), until one initialises
+/// ([`first_exclusive`]: a refused period tries the next period, a refused format the next format, anything else ends it).
+/// Returns the client, its format, which one that is, and the period in frames (its buffer). Not real-time.
+fn open_exclusive(
+    device: &Device, dir: Direction, mix: &WaveFormat,
+) -> Result<(AudioClient, WaveFormat, ExclusiveFormat, usize), ExclusiveRefusal> {
+    let refused = |e: WasapiError| ExclusiveRefusal::Refused(hr_of(&e));
+    let probe = device.get_iaudioclient().map_err(refused)?;
+    // The quirks retry a format as a plain WAVEFORMATEX and with other channel masks; the accepted one comes back.
+    let formats: Vec<(WaveFormat, ExclusiveFormat)> = exclusive_candidates(mix)
+        .filter_map(|(want, kind)| probe.is_supported_exclusive_with_quirks(&want).ok().map(|f| (f, kind)))
+        .collect();
+    let (default_hns, min_hns) = probe.get_device_period().map_err(refused)?;
+    drop(probe);
+    first_exclusive(&formats, &exclusive_periods(default_hns, min_hns), |(fmt, kind), period_hns| {
+        init_exclusive(device, fmt, &dir, period_hns).map(|(client, frames)| (client, fmt.clone(), *kind, frames))
+    })
+}
+
+/// One event-driven exclusive client in `fmt` at `period_hns`, on a fresh client, retried once at the size the driver gives
+/// when it wants its buffer aligned (Microsoft's recovery: the failed client's `GetBufferSize`, and a fresh client).
+/// Returns the client and its buffer (the period) in frames.
+fn init_exclusive(device: &Device, fmt: &WaveFormat, dir: &Direction, mut period_hns: i64) -> Result<(AudioClient, usize), Hr> {
+    let code = |e: WasapiError| hr_of(&e);
+    let mut realigned = false;
+    loop {
+        let mut client = device.get_iaudioclient().map_err(code)?;
+        match client.initialize_client(fmt, dir, &StreamMode::EventsExclusive { period_hns }) {
+            Ok(()) => {
+                let frames = client.get_buffer_size().map_err(code)? as usize;
+                return Ok((client, frames));
+            }
+            Err(e) if hr_of(&e) == hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && !realigned => {
+                let frames = client.get_buffer_size().map_err(code)?;
+                period_hns = calculate_period_100ns(i64::from(frames), i64::from(SAMPLE_RATE));
+                realigned = true;
+            }
+            Err(e) => return Err(hr_of(&e)),
+        }
     }
 }
 
@@ -544,10 +883,34 @@ mod tests {
         assert!((i.period_ms - 10.0).abs() < 1e-6);
         let s = i.stream_info();
         assert_eq!(s.device_name, "Speakers");
-        assert!(s.autoconvert && !s.raw && !s.low_latency);
+        assert!(s.autoconvert && !s.raw && !s.low_latency && s.exclusive.is_none());
         let at48 = WaveFormat::new(32, 32, &SampleType::Float, 48_000, 2, None);
         let i = info_for("Mic", &at48, 144, true, false, true);
         assert!((i.period_ms - 3.0).abs() < 1e-6);
+        // Exclusive: the device format is the stream's, and the status names it.
+        let s16 = WaveFormat::new(16, 16, &SampleType::Int, 48_000, 2, None);
+        let e = exclusive_info("CABLE Input", &s16, 96, ExclusiveFormat::I16);
+        assert!((e.period_ms - 2.0).abs() < 1e-6 && !e.raw && !e.low_latency && !e.autoconvert);
+        assert_eq!(e.stream_info().exclusive, Some("16-bit"));
+        let refused = OpenInfo { refused: Some(ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE)), ..i };
+        assert!(refused.stream_info().exclusive_refused.is_some_and(|r| r.starts_with("another app is using it")));
+        assert_eq!(sample_format(&s16), Some(SampleFormat::I16));
+    }
+
+    /// Exclusive mode tries 32-bit float, 24 bits in 32 and 16-bit, at 48 kHz and the mix's channels and mask, whatever the
+    /// mix's rate (exclusive mode can't convert), and each reads as the converter's format.
+    #[test]
+    fn exclusive_formats_are_48_khz_at_the_mix_channels() {
+        let mix = WaveFormat::new(32, 32, &SampleType::Float, 44_100, 2, Some(0x3));
+        let c: Vec<(WaveFormat, ExclusiveFormat)> = exclusive_candidates(&mix).collect();
+        assert_eq!(c.iter().map(|(_, k)| *k).collect::<Vec<_>>(), ExclusiveFormat::ALL);
+        for (f, _) in &c {
+            assert_eq!((f.get_samplespersec(), f.get_nchannels(), f.get_dwchannelmask()), (48_000, 2, 0x3));
+        }
+        assert_eq!(sample_format(&c[0].0), Some(SampleFormat::F32));
+        assert_eq!((c[1].0.get_bitspersample(), c[1].0.get_validbitspersample()), (32, 24));
+        assert_eq!(sample_format(&c[1].0), Some(SampleFormat::I32), "24-in-32 is written as i32");
+        assert_eq!(sample_format(&c[2].0), Some(SampleFormat::I16));
     }
 
     #[test]

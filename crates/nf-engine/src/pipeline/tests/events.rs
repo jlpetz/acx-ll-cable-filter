@@ -118,11 +118,18 @@ struct Case {
     /// Each wake is late by a uniform 0..jitter ms.
     jitter_ms: f64,
     event: Event,
+    /// The adaptive output target (out_target.rs) instead of the fixed one.
+    adaptive: bool,
+    /// The event happens at this time (s), and again every `repeat_s` (a `LateWake` only); the steady latency is the mean
+    /// over the 10 s before it. The run lasts `run_s`.
+    event_s: f64,
+    repeat_s: Option<f64>,
+    run_s: f64,
 }
 
 /// Faults are counted from this time (s), after the start-up.
 const START_S: f64 = 1.0;
-/// The event happens at this time (s); the steady latency is the mean over the 10 s before it.
+/// The event's time and the run's length (s), unless a case says otherwise.
 const EVENT_S: f64 = 40.0;
 const RUN_S: f64 = 100.0;
 
@@ -141,11 +148,18 @@ struct Outcome {
     underruns_before: u64,
     underruns_after: u64,
     drops_after: u64,
+    /// The output target just before the event and at the end (samples), and the adaptive target's strikes.
+    target_before: usize,
+    target_end: usize,
+    strikes: u32,
 }
 
 fn run(c: Case) -> Outcome {
     let cfg = PipelineConfig { out_period: c.out_period, out_margin: 96, ref_period: None, max_packet: 4800 };
     let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new());
+    if c.adaptive {
+        p = p.with_adaptive_target();
+    }
     let t0 = 1e10;
     let mut sink = VSink::new(c.out_period, c.ppm, c.phase, t0);
     p.prefill(&mut sink).unwrap();
@@ -154,14 +168,15 @@ fn run(c: Case) -> Outcome {
     let mut ticks = FakeTicks(0);
     let pkt_hns = c.mic_packet as f64 * 1e7 / 48_000.0;
     let mut at_start = None;
-    let ev_t = t0 + EVENT_S * 1e7;
+    let ev_t = t0 + c.event_s * 1e7;
+    let mut next_repeat = c.repeat_s.map(|r| ev_t + r * 1e7);
     let mut rng: u64 = 0x1234_5678_9abc_def1;
     let mut lat: Vec<(f64, f64)> = Vec::new();
     let mut at_event = None;
     let mut lost_until: Option<f64> = None;
     let mut j: u64 = 0;
     let mut wake = t0 + pkt_hns + 5_000.0;
-    while wake < t0 + RUN_S * 1e7 {
+    while wake < t0 + c.run_s * 1e7 {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
@@ -170,8 +185,15 @@ fn run(c: Case) -> Outcome {
         if at_start.is_none() && now >= t0 + START_S * 1e7 {
             at_start = Some((sink.silence, sink.dry, p.counters.render_underruns));
         }
+        if let (Some(at), Some(every), Event::LateWake(ms)) = (next_repeat, c.repeat_s, c.event)
+            && at_event.is_some()
+            && now >= at
+        {
+            now += ms * 1e4;
+            next_repeat = Some(at + every * 1e7);
+        }
         if at_event.is_none() && now >= ev_t {
-            at_event = Some((sink.silence, sink.dry, p.counters.render_underruns, p.counters.output_drops));
+            at_event = Some((sink.silence, sink.dry, p.counters.render_underruns, p.counters.output_drops, p.out_target()));
             match c.event {
                 Event::LateWake(ms) => now += ms * 1e4,
                 Event::MicLost(ms) => {
@@ -205,16 +227,20 @@ fn run(c: Case) -> Outcome {
             {
                 lat.push(((now - t0) / 1e7, (sink.take_time(after - 480) - tc) / 1e4));
             }
+            // Once a second, as the audio loop does: where the adaptive target moves.
+            if p.second_due() {
+                p.publish_second(&tel, &CopyChain, 0, 0, 0);
+            }
         }
         wake = t0 + (j + 1) as f64 * pkt_hns + 5_000.0;
     }
-    let (z, d, u, dr) = at_event.unwrap();
+    let (z, d, u, dr, target_before) = at_event.unwrap();
     let (z0, d0, u0) = at_start.unwrap();
-    let pre: Vec<f64> = lat.iter().filter(|(t, _)| *t > EVENT_S - 10.0 && *t < EVENT_S).map(|x| x.1).collect();
+    let pre: Vec<f64> = lat.iter().filter(|(t, _)| *t > c.event_s - 10.0 && *t < c.event_s).map(|x| x.1).collect();
     let steady = pre.iter().sum::<f64>() / pre.len() as f64;
-    let post: Vec<&(f64, f64)> = lat.iter().filter(|(t, _)| *t >= EVENT_S).collect();
-    let settle = post.iter().filter(|(_, l)| (l - steady).abs() > 1.0).map(|x| x.0).fold(EVENT_S, f64::max) - EVENT_S;
-    let end: Vec<f64> = lat.iter().filter(|(t, _)| *t > RUN_S - 1.0).map(|x| x.1 - steady).collect();
+    let post: Vec<&(f64, f64)> = lat.iter().filter(|(t, _)| *t >= c.event_s).collect();
+    let settle = post.iter().filter(|(_, l)| (l - steady).abs() > 1.0).map(|x| x.0).fold(c.event_s, f64::max) - c.event_s;
+    let end: Vec<f64> = lat.iter().filter(|(t, _)| *t > c.run_s - 1.0).map(|x| x.1 - steady).collect();
     Outcome {
         steady_ms: steady,
         settle_s: settle,
@@ -226,11 +252,25 @@ fn run(c: Case) -> Outcome {
         underruns_before: u - u0,
         underruns_after: p.counters.render_underruns - u,
         drops_after: p.counters.output_drops - dr,
+        target_before,
+        target_end: p.out_target(),
+        strikes: p.adaptive.as_ref().map_or(0, AdaptiveTarget::strikes),
     }
 }
 
 fn case(event: Event, ppm: f64, phase: f64) -> Case {
-    Case { mic_packet: 480, out_period: 480, ppm, phase, jitter_ms: 1.0, event }
+    Case {
+        mic_packet: 480,
+        out_period: 480,
+        ppm,
+        phase,
+        jitter_ms: 1.0,
+        event,
+        adaptive: false,
+        event_s: EVENT_S,
+        repeat_s: None,
+        run_s: RUN_S,
+    }
 }
 
 /// Nothing goes wrong before the event in any of these runs.
@@ -305,7 +345,7 @@ fn lost_mic_packets_leave_the_output_steady() {
 #[test]
 fn two_blocks_per_wake_with_jitter_never_pad() {
     for ppm in [0.0, 300.0] {
-        let c = Case { mic_packet: 960, out_period: 480, ppm, phase: 0.37, jitter_ms: 8.0, event: Event::None };
+        let c = Case { mic_packet: 960, jitter_ms: 8.0, ..case(Event::None, ppm, 0.37) };
         let o = run(c);
         assert_clean_start(&c, &o);
         assert_eq!((o.zeros_after, o.dry_after, o.underruns_after), (0, 0, 0), "{c:?}: {o:?}");
@@ -316,7 +356,7 @@ fn two_blocks_per_wake_with_jitter_never_pad() {
 #[test]
 fn a_long_device_period_runs_clean_at_every_phase() {
     for phase in [0.05, 0.25, 0.5, 0.75, 0.95] {
-        let c = Case { mic_packet: 480, out_period: 1024, ppm: 0.0, phase, jitter_ms: 1.0, event: Event::None };
+        let c = Case { out_period: 1024, ..case(Event::None, 0.0, phase) };
         let o = run(c);
         assert_clean_start(&c, &o);
         assert_eq!((o.zeros_after, o.dry_after, o.underruns_after), (0, 0, 0), "{c:?}: {o:?}");
@@ -331,6 +371,77 @@ fn the_steady_latency_varies_by_less_than_a_period_with_the_phase() {
     let steady: Vec<f64> = [0.05, 0.37, 0.8].iter().map(|&ph| run(case(Event::None, 0.0, ph)).steady_ms).collect();
     let spread = steady.iter().cloned().fold(f64::MIN, f64::max) - steady.iter().cloned().fold(f64::MAX, f64::min);
     assert!(spread < 10.0, "{steady:?}");
+}
+
+/// The adaptive output target (out_target.rs) in these scenes, with the event at 200 s, after the target has come down (it
+/// walks down from 120 s), against the fixed target in the same scenes:
+/// - up to the event it runs clean, as the fixed target does, and at a lower latency wherever it came down (by 7-9 ms with
+///   this delivery's 1 ms of jitter; the 1024-frame device and the 8 ms jitter keep it near the fixed target);
+/// - at the event it underruns at most once more than the fixed target. That's the trade: a wake 10-15 ms late, which the
+///   fixed target's spare block covers, runs the lowered target dry once. The strike puts the target back to the fixed one
+///   at that block and holds it there (the need it showed: 10 minutes), so nothing more follows, and the latency is then the
+///   fixed target's;
+/// - the device never runs dry without an underrun counted, and the coarse drops are the fixed target's.
+#[test]
+fn the_adaptive_target_after_it_has_come_down() {
+    let later = |c: Case| Case { event_s: 200.0, run_s: 260.0, ..c };
+    let mut cases = Vec::new();
+    for ppm in [0.0, 300.0] {
+        for ev in [
+            Event::None,
+            Event::LateWake(10.0),
+            Event::LateWake(15.0),
+            Event::LateWake(35.0),
+            Event::CableStall(50.0),
+            Event::MicLost(50.0),
+        ] {
+            cases.push(later(case(ev, ppm, 0.37)));
+        }
+        cases.push(later(case(Event::LateWake(10.0), ppm, 0.05)));
+        cases.push(later(Case { mic_packet: 960, jitter_ms: 8.0, ..case(Event::None, ppm, 0.8) }));
+    }
+    cases.push(later(Case { out_period: 1024, ..case(Event::None, 0.0, 0.5) }));
+    let mut extra = Vec::new();
+    for c in cases {
+        let (fixed, adaptive) = (run(c), run(Case { adaptive: true, ..c }));
+        let tag = format!("{c:?}: adaptive {adaptive:?} against fixed {fixed:?}");
+        assert_clean_start(&c, &fixed);
+        assert_clean_start(&c, &adaptive);
+        assert!(adaptive.target_before <= fixed.target_before, "{tag}");
+        assert!(adaptive.steady_ms < fixed.steady_ms + 0.5, "{tag}");
+        if c.mic_packet == 480 && c.out_period == 480 {
+            assert!(adaptive.target_before < fixed.target_before - 288, "{tag}: came down");
+            assert!(adaptive.steady_ms < fixed.steady_ms - 5.0, "{tag}: and the latency with it");
+        }
+        assert!(adaptive.underruns_after <= fixed.underruns_after + 1, "{tag}");
+        assert!(adaptive.dry_after == 0 || adaptive.underruns_after > 0, "{tag}: dry without an underrun");
+        assert!(adaptive.drops_after <= fixed.drops_after, "{tag}");
+        if adaptive.underruns_after > fixed.underruns_after {
+            assert_eq!((adaptive.strikes, adaptive.target_end), (1, fixed.target_end), "{tag}: a strike, back to the fixed target");
+            extra.push(format!("{:?} {} ppm phase {}", c.event, c.ppm, c.phase));
+        }
+    }
+    // The trade, as measured: the 15 ms late wakes, and the 10 ms one at the worst phase.
+    assert!(extra.iter().any(|e| e.starts_with("LateWake(15.0)")), "{extra:?}");
+    assert!(extra.iter().all(|e| e.starts_with("LateWake(15.0)") || e.starts_with("LateWake(10.0)")), "{extra:?}");
+}
+
+/// A wake 15 ms late every 150 s, which the fixed target's spare block covers each time: the fixed target never
+/// underruns. The adaptive one underruns at the first after it has come down, and the strike's need holds it at the fixed
+/// target through the next for 10 minutes, then (the second strike) 20; the third keeps it fixed for the run. Over 50
+/// minutes that's 3 underruns, and none after the third. Without the strikes' memory (the need forgotten with the
+/// two-minute window) it underran at every other hiccup: 7 times in 1000 s.
+#[test]
+fn rare_hiccups_cost_the_adaptive_target_at_most_three_underruns() {
+    for ppm in [0.0, 300.0] {
+        let c = Case { event_s: 150.0, repeat_s: Some(150.0), run_s: 3000.0, ..case(Event::LateWake(15.0), ppm, 0.37) };
+        let (fixed, adaptive) = (run(c), run(Case { adaptive: true, ..c }));
+        assert_eq!((fixed.underruns_before, fixed.underruns_after, fixed.dry_after), (0, 0, 0), "{ppm} ppm: {fixed:?}");
+        assert_eq!(adaptive.underruns_before, 0, "{ppm} ppm: {adaptive:?}");
+        assert!(adaptive.underruns_after >= 1 && adaptive.underruns_after <= 3, "{ppm} ppm: {adaptive:?}");
+        assert_eq!(u64::from(adaptive.strikes), adaptive.underruns_after, "{ppm} ppm: {adaptive:?}");
+        assert!(adaptive.strikes < 3 || adaptive.target_end == fixed.target_end, "{ppm} ppm: fixed after the third: {adaptive:?}");
+    }
 }
 
 /// The full sweep the tests above sample; `--ignored --nocapture` prints every outcome.
@@ -353,7 +464,7 @@ fn event_sweep() {
         ] {
             for ppm in [0.0, 5.0, 50.0, 300.0] {
                 for phase in [0.05, 0.37, 0.8] {
-                    let c = Case { mic_packet: mp, out_period: op, ppm, phase, jitter_ms: 1.0, event: ev };
+                    let c = Case { mic_packet: mp, out_period: op, ..case(ev, ppm, phase) };
                     eprintln!("{c:?}\n    {:?}", run(c));
                 }
             }
@@ -468,5 +579,43 @@ fn the_reference_aligns_at_the_start() {
     for lead in [15.0, 40.0, 100.0] {
         let o = ref_run(0.0, lead, 0.0, 0.2);
         assert!(o.start_settle_s < 5.0, "lead {lead} ms: {o:?}");
+    }
+}
+
+/// [`the_adaptive_target_after_it_has_come_down`] and the repeated hiccups, printed: `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn adaptive_sweep() {
+    for ppm in [0.0, 300.0] {
+        for phase in [0.05, 0.37, 0.8] {
+            for ev in [
+                Event::None,
+                Event::LateWake(10.0),
+                Event::LateWake(15.0),
+                Event::LateWake(35.0),
+                Event::CableStall(50.0),
+                Event::MicLost(50.0),
+            ] {
+                let c = Case { event_s: 200.0, run_s: 260.0, ..case(ev, ppm, phase) };
+                let (f, a) = (run(c), run(Case { adaptive: true, ..c }));
+                eprintln!(
+                    "{ev:?} {ppm} ppm phase {phase}: steady {:.2} / {:.2} ms; underruns {} / {}, dry {} / {}, drops {} / {}; target {} -> {} (strikes {})",
+                    f.steady_ms,
+                    a.steady_ms,
+                    f.underruns_after,
+                    a.underruns_after,
+                    f.dry_after,
+                    a.dry_after,
+                    f.drops_after,
+                    a.drops_after,
+                    a.target_before,
+                    a.target_end,
+                    a.strikes
+                );
+            }
+        }
+        let c = Case { event_s: 150.0, repeat_s: Some(150.0), run_s: 3000.0, ..case(Event::LateWake(15.0), ppm, 0.37) };
+        let (f, a) = (run(c), run(Case { adaptive: true, ..c }));
+        eprintln!("every 150 s, {ppm} ppm: fixed {f:?}\n    adaptive {a:?}");
     }
 }

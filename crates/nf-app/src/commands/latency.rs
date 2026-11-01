@@ -30,14 +30,16 @@ pub fn latency(args: &LatencyArgs) -> Result<(), Failure> {
     let probe = resolve_device(&devices, &args.probe, Flow::Render, "--probe").map_err(Failure::error)?;
     let capture = resolve_device(&devices, &args.capture, Flow::Capture, "--capture").map_err(Failure::error)?;
     let engine = super::run::start(&cfg)?;
-    let result = measure(&engine, args, probe, capture);
+    let result = measure(&engine, &cfg, args, probe, capture);
     engine.stop();
     console::finished();
     result
 }
 
-fn measure(engine: &nf_engine::Engine, args: &LatencyArgs, probe: String, capture: String) -> Result<(), Failure> {
-    if console::sleep_unless_stopped(SETTLE) {
+fn measure(
+    engine: &nf_engine::Engine, cfg: &nf_engine::EngineConfig, args: &LatencyArgs, probe: String, capture: String,
+) -> Result<(), Failure> {
+    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg) {
         return Err(Failure::no_result("Cancelled before the test started."));
     }
     let request = LatencyTestRequest {

@@ -146,13 +146,31 @@ fn budget_parts(b: &LatencyBudget) -> String {
 }
 
 /// Readout line 1a's budget, under it: "Budget (means): mic 16.2 + wait 0.1 + output queue 22.0 + render 23.4 ms, chain
-/// 10.0 ms on top", or "Budget: —" while the readout isn't valid.
+/// 10.0 ms on top", or "Budget: —" while the readout isn't valid. With the adaptive output target, the target the queue
+/// holds now (it moves): "... · output target 9.5 ms (adaptive)".
 pub(crate) fn budget(t: &TelemetrySnapshot) -> String {
     if t.latency_valid && t.budget_mean.readout_ms().is_finite() {
-        format!("Budget (means): {}", budget_parts(&t.budget_mean))
+        let target =
+            if t.output_adaptive { format!(" · output target {} ms (adaptive)", fixed(t.output_target_ms, 1)) } else { String::new() };
+        format!("Budget (means): {}{target}", budget_parts(&t.budget_mean))
     } else {
         format!("Budget: {DASH}")
     }
+}
+
+/// The streams' modes, under the clocks: "Streams: mic shared, 10.0 ms period · output exclusive, 2.0 ms period · output
+/// target fixed". Exclusive is WASAPI exclusive mode, as asked for and granted (a refused one runs shared, with a
+/// warning); the target is fixed (a period + a block + the margin) or adaptive.
+pub(crate) fn streams(t: &TelemetrySnapshot) -> String {
+    let mode = |exclusive: bool| if exclusive { "exclusive" } else { "shared" };
+    format!(
+        "Streams: mic {}, {} ms period · output {}, {} ms period · output target {}",
+        mode(t.mic_exclusive),
+        fixed(t.mic_period_ms, 1),
+        mode(t.output_exclusive),
+        fixed(t.output_period_ms, 1),
+        if t.output_adaptive { "adaptive" } else { "fixed" }
+    )
 }
 
 /// A fill target: "—" when there's none (0 while stopped, or without a reference).
@@ -166,11 +184,12 @@ fn target(ms: f32) -> String {
 /// the echo path's own delay, and the echo come before its reference.
 pub(crate) fn clocks(t: &TelemetrySnapshot) -> String {
     let mut s = format!(
-        "Drift out/ref: {}/{} ppm · Output fill: {} ms (target {}) · Reference lead: {} ms (target {})",
+        "Drift out/ref: {}/{} ppm · Output fill: {} ms (target {}{}) · Reference lead: {} ms (target {})",
         signed(t.output_drift_ppm, 0),
         signed(t.reference_drift_ppm, 0),
         fixed(t.output_fill_ms, 1),
         target(t.output_target_ms),
+        if t.output_adaptive { ", adaptive" } else { "" },
         fixed(t.reference_fill_ms, 1),
         target(t.reference_target_ms)
     );
@@ -234,6 +253,12 @@ pub(crate) fn stream(label: &str, s: Option<&StreamInfo>) -> String {
     if s.raw {
         line.push_str(" · RAW");
     }
+    if let Some(format) = s.exclusive {
+        line.push_str(&format!(" · exclusive, {format}"));
+    }
+    if let Some(why) = &s.exclusive_refused {
+        line.push_str(&format!(" · shared: exclusive refused ({why})"));
+    }
     line
 }
 
@@ -248,6 +273,8 @@ pub(crate) fn diagnostics(status: &EngineStatus) -> Vec<String> {
     };
     let raw = match &status.mic {
         Some(mic) if mic.raw => "in effect",
+        // Exclusive mode reaches the driver past Windows' effects: RAW has nothing to turn off.
+        Some(mic) if mic.exclusive.is_some() => "not needed (exclusive mode)",
         Some(_) => "not in effect",
         None => DASH,
     };
@@ -490,6 +517,15 @@ mod tests {
         let no_reference = TelemetrySnapshot { reference_target_ms: 0.0, reference_fill_ms: 0.0, ..t };
         let line = clocks(&no_reference);
         assert!(line.ends_with("Reference lead: 0.0 ms (target —)"), "{line}");
+        // The latency options: the streams' modes, and an adaptive target with the budget and the fill.
+        let t = TelemetrySnapshot { mic_period_ms: 10.0, output_period_ms: 10.0, ..t };
+        assert_eq!(streams(&t), "Streams: mic shared, 10.0 ms period · output shared, 10.0 ms period · output target fixed");
+        let x = TelemetrySnapshot { output_exclusive: true, output_period_ms: 2.0, output_adaptive: true, output_target_ms: 5.0, ..t };
+        assert_eq!(streams(&x), "Streams: mic shared, 10.0 ms period · output exclusive, 2.0 ms period · output target adaptive");
+        assert!(budget(&x).ends_with("chain 10.0 ms on top · output target 5.0 ms (adaptive)"), "{}", budget(&x));
+        assert!(clocks(&x).contains("Output fill: 15.0 ms (target 5.0, adaptive)"), "{}", clocks(&x));
+        let m = TelemetrySnapshot { mic_exclusive: true, mic_period_ms: 10.0 / 3.0, ..t };
+        assert!(streams(&m).starts_with("Streams: mic exclusive, 3.3 ms period"), "{}", streams(&m));
     }
 
     fn stream_info() -> StreamInfo {
@@ -501,6 +537,8 @@ mod tests {
             low_latency: true,
             autoconvert: true,
             raw: true,
+            exclusive: None,
+            exclusive_refused: None,
         }
     }
 
@@ -513,6 +551,10 @@ mod tests {
         );
         let plain = StreamInfo { low_latency: false, autoconvert: false, raw: false, period_ms: 10.0, ..stream_info() };
         assert_eq!(stream("Output", Some(&plain)), "Output: USB Mic · 44100 Hz, 1 ch · 10.0 ms period");
+        let excl = StreamInfo { sample_rate: 48_000, channels: 2, period_ms: 2.0, exclusive: Some("16-bit"), ..plain.clone() };
+        assert_eq!(stream("Output", Some(&excl)), "Output: USB Mic · 48000 Hz, 2 ch · 2.0 ms period · exclusive, 16-bit");
+        let refused = StreamInfo { exclusive_refused: Some("another app is using it".into()), ..plain.clone() };
+        assert!(stream("Output", Some(&refused)).ends_with("10.0 ms period · shared: exclusive refused (another app is using it)"));
 
         let stopped = diagnostics(&EngineStatus::default());
         assert_eq!(stopped[0], "Memory: —");
@@ -531,6 +573,10 @@ mod tests {
         assert_eq!(lines[..3], ["Memory: large pages (16 MiB)", "MMCSS \"Pro Audio\": registered", "RAW mic: in effect"]);
         assert_eq!(lines[4], "Output: not open");
         assert_eq!(lines[6], "Chain latency: 10.0 ms");
+        let exclusive = StreamInfo { raw: false, exclusive: Some("16-bit"), ..stream_info() };
+        let lines = diagnostics(&EngineStatus { mic: Some(exclusive), ..running });
+        assert_eq!(lines[2], "RAW mic: not needed (exclusive mode)");
+        assert!(lines[3].ends_with(" · exclusive, 16-bit"), "{}", lines[3]);
     }
 
     #[test]

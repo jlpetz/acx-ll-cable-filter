@@ -653,6 +653,9 @@ fn clear_targets(t: &Telemetry) {
     t.output_target_ms.store(0.0);
     t.reference_target_ms.store(0.0);
     t.reference_stamped.store(false, Relaxed);
+    for f in [&t.mic_exclusive, &t.output_exclusive, &t.output_adaptive] {
+        f.store(false, Relaxed);
+    }
 }
 
 pub(crate) fn start(inner: &Arc<Inner>, config: &EngineConfig) -> Result<(), EngineError> {
@@ -1233,6 +1236,8 @@ mod tests {
             low_latency: false,
             autoconvert: false,
             raw: true,
+            exclusive: None,
+            exclusive_refused: None,
         };
         let o = Opened {
             mic: info.clone(),

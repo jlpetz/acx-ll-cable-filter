@@ -136,10 +136,30 @@ pub struct IoConfig {
     pub output_margin_ms: f32,
     /// Keep a silent render stream open on the reference endpoint so its loopback never stops.
     pub keep_alive_reference: bool,
+    /// Open the output in WASAPI exclusive mode, event-driven at the device's smallest period (2 ms or more), falling back
+    /// to shared mode with a warning when the device refuses. It locks the endpoint: no other app can play into it, which
+    /// suits the output cable (only the filter plays into it). Off by default.
+    pub output_exclusive: bool,
+    /// Open the mic in WASAPI exclusive mode, event-driven on its own small period, falling back to shared mode with a
+    /// warning. While the filter runs no other app can record from that mic: they should use the filtered mic (the
+    /// cable). Off by default.
+    pub mic_exclusive: bool,
+    /// Let the output's fill target follow the delivery it sees: down, slowly (after two minutes), to one period + the
+    /// margin + the largest lateness measured; up at once after an underrun. Off by default: the target is then one
+    /// period + one block + the margin.
+    pub adaptive_output: bool,
 }
 
 impl Default for IoConfig {
     fn default() -> Self {
-        Self { low_latency_periods: true, raw_mic: true, output_margin_ms: 2.0, keep_alive_reference: true }
+        Self {
+            low_latency_periods: true,
+            raw_mic: true,
+            output_margin_ms: 2.0,
+            keep_alive_reference: true,
+            output_exclusive: false,
+            mic_exclusive: false,
+            adaptive_output: false,
+        }
     }
 }

@@ -55,6 +55,18 @@ pub struct Processing {
     pub threshold_db: Option<f32>,
 }
 
+/// The streams' options (`IoConfig`'s latency options), shared by `run`, `latency` and `quality`. `None` keeps the config's
+/// value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IoOptions {
+    /// `--exclusive-output`: the output in WASAPI exclusive mode.
+    pub output_exclusive: Option<bool>,
+    /// `--exclusive-mic`: the mic in WASAPI exclusive mode.
+    pub mic_exclusive: Option<bool>,
+    /// `--adaptive-output`: the output's target follows the delivery.
+    pub adaptive_output: Option<bool>,
+}
+
 /// `run`'s options, which `latency` and `quality` take too.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineArgs {
@@ -64,6 +76,7 @@ pub struct EngineArgs {
     pub output: Option<String>,
     pub reference: Option<String>,
     pub processing: Processing,
+    pub io: IoOptions,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -293,6 +306,22 @@ impl Processing {
     }
 }
 
+impl IoOptions {
+    /// Takes one of the streams' options. `Ok(false)`: not one of them.
+    fn take(&mut self, flag: &str, inline: Option<&str>) -> Result<bool, UsageError> {
+        match flag {
+            "--exclusive-output" => self.output_exclusive = Some(switch(flag, inline)?),
+            "--no-exclusive-output" => self.output_exclusive = Some(!switch(flag, inline)?),
+            "--exclusive-mic" => self.mic_exclusive = Some(switch(flag, inline)?),
+            "--no-exclusive-mic" => self.mic_exclusive = Some(!switch(flag, inline)?),
+            "--adaptive-output" => self.adaptive_output = Some(switch(flag, inline)?),
+            "--no-adaptive-output" => self.adaptive_output = Some(!switch(flag, inline)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
 impl EngineArgs {
     /// Takes one of `run`'s options. `Ok(false)`: not one of them.
     fn take<'a>(&mut self, p: &mut Parser<'a>, flag: &str, inline: Option<&'a str>) -> Result<bool, UsageError> {
@@ -301,7 +330,7 @@ impl EngineArgs {
             "--mic" => self.mic = Some(text(flag, p.value(flag, inline)?)?),
             "--output" => self.output = Some(text(flag, p.value(flag, inline)?)?),
             "--reference" => self.reference = Some(text(flag, p.value(flag, inline)?)?),
-            _ => return self.processing.take(p, flag, inline),
+            _ => return Ok(self.io.take(flag, inline)? || self.processing.take(p, flag, inline)?),
         }
         Ok(true)
     }
@@ -559,6 +588,25 @@ OPTIONS (run, latency, quality):
   --reference DEV    Speakers whose sound AEC removes (default: the default playback device)
   DEV is a device id or part of its name (exact name first, then the first match, any case).
 
+LATENCY OPTIONS (run, latency, quality; each off by default, --no-... turns one off):
+  --exclusive-output Open the output in exclusive mode at the device's smallest period (2 ms
+                     on VB-CABLE), past Windows' audio engine. Nothing else can play into
+                     that device while the filter runs: fine for the output cable, which only
+                     the filter plays into. If the device refuses, the output runs in shared
+                     mode and a warning says why
+  --exclusive-mic    Open the microphone in exclusive mode at its smallest period. No other app
+                     can record from that microphone while the filter runs: they should use
+                     the filtered mic (the cable). Windows' effects on it don't run. Its
+                     buffer is one period (3.3 ms on VB-CABLE, against shared mode's 40 ms),
+                     so a filter thread held up longer than that loses mic audio (a mic
+                     glitch). If it refuses, shared mode, with a warning
+  --adaptive-output  Let the output's buffer target follow the delivery: after two minutes it
+                     walks down to a period + the margin + the lateness measured (up to a
+                     minute). An underrun puts it back to the fixed one (a period + a block +
+                     the margin) and holds it there for 10 minutes, 20 after a second; after
+                     a third it stays fixed. So a rare hiccup the fixed target would ride out
+                     can cost a glitch, up to three in a run
+
 PROCESSING (run, latency, quality, process):
   --aec, --no-aec    Echo cancellation on or off (default off; on in quality's echo test)
   --ns, --no-ns      Noise filter on or off (default on)
@@ -672,12 +720,40 @@ mod tests {
                     gate: Some(GateMode::Auto),
                     threshold_db: Some(-45.5),
                 },
+                io: IoOptions::default(),
             }))
         );
         assert_eq!(p(&["run"]), Ok(Command::Run(EngineArgs::default())));
         // The last of a pair wins
         let Ok(Command::Run(e)) = p(&["run", "--aec", "--no-aec", "--no-ns", "--ns"]) else { panic!() };
         assert_eq!((e.processing.aec, e.processing.noise), (Some(false), Some(true)));
+    }
+
+    /// The latency options: each on, off, or (unless given) the config's; `latency` and `quality` take them too, and
+    /// `latency --cable-only` refuses them like the filter's other options.
+    #[test]
+    fn the_latency_options_turn_exclusive_mode_and_the_adaptive_target_on_and_off() {
+        let Ok(Command::Run(e)) = p(&["run", "--exclusive-output", "--exclusive-mic", "--adaptive-output"]) else { panic!() };
+        assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: Some(true) });
+        let Ok(Command::Run(e)) = p(&["run", "--exclusive-output", "--no-exclusive-output", "--no-adaptive-output"]) else { panic!() };
+        assert_eq!(e.io, IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) });
+        assert_eq!(err(&["run", "--exclusive-mic=yes"]), "--exclusive-mic takes no value");
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--exclusive-output"]) else { panic!() };
+        assert_eq!(l.engine.io.output_exclusive, Some(true));
+        let Ok(Command::Quality(q)) = p(&["quality", "--probe", "a", "--capture", "b", "--adaptive-output", "--exclusive-mic"]) else {
+            panic!()
+        };
+        assert_eq!((q.engine.io.adaptive_output, q.engine.io.mic_exclusive), (Some(true), Some(true)));
+        assert!(
+            err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--exclusive-output"]).ends_with("drop --exclusive-output")
+        );
+        assert_eq!(err(&["process", "a.wav", "b.wav", "--exclusive-output"]), "'process' has no option '--exclusive-output'");
+        let help = help_text();
+        for flag in ["--exclusive-output", "--exclusive-mic", "--adaptive-output"] {
+            assert!(help.contains(flag), "{flag}");
+        }
+        assert!(help.contains("Nothing else can play into") && help.contains("No other app") && help.contains("filtered mic"));
+        assert!(help.contains("loses mic audio") && help.contains("up to three in a run"));
     }
 
     #[test]

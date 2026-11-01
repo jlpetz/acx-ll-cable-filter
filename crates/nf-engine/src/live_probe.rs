@@ -91,7 +91,8 @@ fn live_probe() {
     let mic_dev = device(&mic_id, Direction::Capture, StreamRole::Mic);
     let feed_dev = device(&feed_id, Direction::Render, StreamRole::Probe);
     let ref_dev = device(&ref_id, Direction::Render, StreamRole::Reference);
-    let mut mic = CaptureStream::open_mic(&mic_dev, MicOptions { low_latency: true, raw: true }).expect("open the mic");
+    let (mut mic, _) =
+        CaptureStream::open_mic(&mic_dev, MicOptions { low_latency: true, raw: true, exclusive: false }).expect("open the mic");
     let mut feed = RenderStream::open(&feed_dev, 2_000_000).expect("open the feed");
     let mut far = RenderStream::open(&ref_dev, 2_000_000).expect("open the far end");
     let mut ka = KeepAlive::open(&ref_dev).expect("open the keep-alive");

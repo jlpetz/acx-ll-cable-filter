@@ -1,6 +1,6 @@
 //! The audio thread (engine.md "The audio thread"): one MMCSS "Pro Audio" thread, woken by the
-//! mic's capture events, running capture → chain → render. It is kept between runs ([`Worker`]):
-//! a restart or a retry hands it the next run instead of spawning a thread.
+//! mic's capture events (and an exclusive output's), running capture → chain → render. It is kept
+//! between runs ([`Worker`]): a restart or a retry hands it the next run instead of spawning a thread.
 //!
 //! Set-up (stages, streams, warm-up) happens on this thread inside an `RtScope`, so everything it
 //! allocates comes from the locked pool. The loop itself never allocates, locks, logs, formats or
@@ -25,6 +25,8 @@ use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_stages::{Aec3Stage, RnnoiseStage};
 use rtrb::Producer;
 use wasapi::{DeviceEnumerator, Direction, Role};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::api::{BufferTargets, StreamInfo};
 use crate::devices::resolve;
@@ -34,13 +36,13 @@ use crate::latency_test::TapEnd;
 use crate::pipeline::{CaptureSource, DITHER, DriftControl, Hr, Pipeline, PipelineConfig, Resampler, TapItem, Ticks};
 use crate::recorder::ChainTx;
 use crate::sched::{Com, Mmcss, MmcssPriority};
-use crate::stream::{CaptureStream, KeepAlive, MicOptions, RenderStream, hr_of};
+use crate::stream::{CaptureStream, KeepAlive, MicOptions, Output, hr_of};
 use crate::timing::Qpc;
 
 pub(crate) const CMD_RUN: u8 = 0;
 pub(crate) const CMD_STOP: u8 = 1;
 
-/// Event wait; a timeout counts as a stall.
+/// Event wait; this long without the mic's event counts as a stall.
 const WAIT_MS: u32 = 100;
 /// No mic packets for this long stops the run (100 ns units).
 const STALL_LIMIT_HNS: i64 = 20_000_000;
@@ -196,7 +198,7 @@ struct Run<'a> {
 /// (mic, output, loopback, keep-alive) and then releases them in the same order.
 struct Session {
     mic: CaptureStream,
-    out: RenderStream,
+    out: Output,
     lb: Option<CaptureStream>,
     ka: Option<KeepAlive>,
     chain: Chain,
@@ -249,6 +251,7 @@ fn run(r: Run<'_>) {
     }
 
     let margin_ms = if config.io.output_margin_ms.is_finite() { config.io.output_margin_ms.clamp(0.0, 100.0) } else { 0.0 };
+    // The output's period: the shared engine's pass, or (exclusive) the device's buffer; the target follows it.
     let pcfg = PipelineConfig {
         out_period: session.out.period_frames(),
         out_margin: (margin_ms * SAMPLE_RATE as f32 / 1000.0).round() as usize,
@@ -256,11 +259,14 @@ fn run(r: Run<'_>) {
         max_packet: session.mic.max_packet_frames().max(session.lb.as_ref().map_or(0, |l| l.max_packet_frames())),
     };
     let (out_target, ref_target) = (pcfg.out_target(), pcfg.ref_target());
+    let mut pipe: Pipeline = Pipeline::new(pcfg, DriftController::new(out_target as f32), SlipResampler::new(), SlipResampler::new());
+    if config.io.adaptive_output {
+        pipe = pipe.with_adaptive_target();
+    }
     let mut targets = BufferTargets {
-        output_ms: out_target as f32 * 1000.0 / SAMPLE_RATE as f32,
+        output_ms: pipe.out_target() as f32 * 1000.0 / SAMPLE_RATE as f32,
         reference_ms: ref_target as f32 * 1000.0 / SAMPLE_RATE as f32,
     };
-    let mut pipe: Pipeline = Pipeline::new(pcfg, DriftController::new(out_target as f32), SlipResampler::new(), SlipResampler::new());
 
     // Prefill the output to its target, warm the chain up with 3 silent blocks (so the stages'
     // first-block set-up is behind us), then take the allocation baseline.
@@ -279,6 +285,12 @@ fn run(r: Run<'_>) {
         let _ = ready.send(Err(f));
         return;
     }
+    // An exclusive output's first event, answered before the rest of the start (the status, the hand-over): it wants its
+    // next period within one (a late first answer is caught and counted all the same: exclusive.rs).
+    if let Err(hr) = session.out.service(false) {
+        let _ = ready.send(Err(StartFailure::Open { role: StreamRole::Output, hr }));
+        return;
+    }
     if session.lb.is_none() && ref_target > 0 {
         // The reference wouldn't start: running without it.
         pipe.drop_reference();
@@ -286,13 +298,16 @@ fn run(r: Run<'_>) {
     }
 
     telemetry.mic_period_ms.store(session.mic.info.period_ms);
-    telemetry.output_period_ms.store(session.out.info.period_ms);
+    telemetry.output_period_ms.store(session.out.info().period_ms);
+    telemetry.mic_exclusive.store(session.mic.info.exclusive.is_some(), Relaxed);
+    telemetry.output_exclusive.store(session.out.is_exclusive(), Relaxed);
+    telemetry.output_adaptive.store(config.io.adaptive_output, Relaxed);
     telemetry.output_target_ms.store(targets.output_ms);
     telemetry.reference_target_ms.store(targets.reference_ms);
     shared.chain_latency.store(session.chain.latency(), Relaxed);
     let opened = Opened {
         mic: session.mic.info.stream_info(),
-        output: session.out.info.stream_info(),
+        output: session.out.info().stream_info(),
         reference: session.lb.as_ref().map(|l| l.info.stream_info()),
         mic_id: ids.mic,
         output_id: ids.output,
@@ -366,9 +381,11 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
     chain.activate().map_err(|e| StartFailure::Stage(e.0))?;
 
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
-    let mic = CaptureStream::open_mic(&mic_dev, MicOptions { low_latency: config.io.low_latency_periods, raw: config.io.raw_mic })
-        .map_err(open(StreamRole::Mic))?;
-    let out = RenderStream::open(&out_dev, RENDER_BUFFER_HNS).map_err(open(StreamRole::Output))?;
+    // Exclusive mode where asked (engine.md, "Exclusive mode"): a device that refuses it runs shared, with a warning.
+    let mic_options = MicOptions { low_latency: config.io.low_latency_periods, raw: config.io.raw_mic, exclusive: config.io.mic_exclusive };
+    let (mic, mic_warning) = CaptureStream::open_mic(&mic_dev, mic_options).map_err(open(StreamRole::Mic))?;
+    let (out, out_warning) = Output::open(&out_dev, config.io.output_exclusive, RENDER_BUFFER_HNS).map_err(open(StreamRole::Output))?;
+    warnings.extend(mic_warning.into_iter().chain(out_warning));
     let (mut lb, mut ka, mut ref_id) = (None, None, None);
     if let Some((dev, id)) = reference {
         match CaptureStream::open_loopback(&dev) {
@@ -503,6 +520,48 @@ fn start_reference(ka: Option<&mut KeepAlive>, lb: Option<&CaptureStream>) -> Re
     Ok(())
 }
 
+/// Counts the mic's stalls: [`WAIT_MS`] without its event is one, whether the wait timed out (the thread waits on the mic
+/// alone) or an exclusive output's events woke the thread meanwhile (every 2 ms: they'd never let the wait time out).
+#[derive(Clone, Copy, Debug)]
+struct StallWatch {
+    /// The mic's last event, or the last stall counted (hns).
+    since_hns: i64,
+}
+
+impl StallWatch {
+    fn new(now_hns: i64) -> Self {
+        Self { since_hns: now_hns }
+    }
+
+    /// A wake at `now_hns`, by the mic's event or not: whether it counts a stall.
+    #[inline]
+    fn wake(&mut self, mic_event: bool, now_hns: i64) -> bool {
+        let stall = !mic_event && now_hns - self.since_hns >= i64::from(WAIT_MS) * 10_000;
+        if mic_event || stall {
+            self.since_hns = now_hns;
+        }
+        stall
+    }
+}
+
+/// What woke the audio thread: the mic's event, the exclusive output's, or neither (the wait timed out).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Wake {
+    mic: bool,
+    out: bool,
+}
+
+/// Waits up to `ms` for the mic's event, and for an exclusive output's as well (listed first: when both have fired it's
+/// the one reported, as it has a period to be answered in; the mic's stays set for the next wait).
+fn wait(mic: &CaptureStream, out: &Output, ms: u32) -> Wake {
+    let (Some(out_event), Some(mic_event)) = (out.event(), mic.event()) else {
+        return Wake { mic: mic.wait(ms), out: false };
+    };
+    // SAFETY: both are the streams' own event handles, which live as long as the streams, and so for the call.
+    let r = unsafe { WaitForMultipleObjects(&[out_event, mic_event], false, ms) };
+    Wake { out: r.0 == WAIT_OBJECT_0.0, mic: r.0 == WAIT_OBJECT_0.0 + 1 }
+}
+
 /// The audio thread's ends of the run's hand-overs: the latency test's tap and the chain recorder.
 struct Ends<'a> {
     tap: &'a mut TapEnd,
@@ -516,16 +575,22 @@ fn audio_loop(
     let qpc = Qpc::new();
     let mut ticks = QpcTicks(qpc);
     let mut last_packet = qpc.now_hns();
+    let mut stalls = StallWatch::new(last_packet);
+    let output_fault = |hr| Some(Fault::Stream { role: StreamRole::Output, hr });
     let mut returning: Option<Producer<TapItem>> = None;
     let mut returning_recorder: Option<ChainTx> = None;
     let mut reference_live = s.lb.is_some();
     loop {
-        let signalled = s.mic.wait(WAIT_MS);
+        let wake = wait(&s.mic, &s.out, WAIT_MS);
         if shared.command.load(Relaxed) != CMD_RUN {
             return None;
         }
         let now = qpc.now_hns();
-        if !signalled {
+        // 0. An exclusive output's event first: the device wants its next period within one.
+        if let Err(hr) = s.out.service(wake.out) {
+            return output_fault(hr);
+        }
+        if stalls.wake(wake.mic, now) {
             shared.stalls.fetch_add(1, Relaxed);
             tel.stalls.fetch_add(1, Relaxed);
         }
@@ -577,9 +642,13 @@ fn audio_loop(
                         shared.chain_latency.store(s.chain.latency(), Relaxed);
                         shared.tap_overflows.store(pipe.counters.tap_overflows, Relaxed);
                     }
+                    // An exclusive output's event that fired during the block: answered before the next.
+                    if let Err(hr) = s.out.service(false) {
+                        return output_fault(hr);
+                    }
                 }
                 Ok(false) => break,
-                Err(hr) => return Some(Fault::Stream { role: StreamRole::Output, hr }),
+                Err(hr) => return output_fault(hr),
             }
         }
     }
@@ -754,6 +823,27 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A stall is 100 ms without the mic's event: each timed-out wait when the thread waits on the mic alone, and once in
+    /// each 100 ms when an exclusive output's events wake it every 2 ms meanwhile; the mic's events (3.33 ms packets) between
+    /// the output's count none, and a mic event 99 ms after the last none either.
+    #[test]
+    fn stalls_are_timed_by_the_mic_s_events() {
+        let ms = |t: f64| (t * 1e4) as i64;
+        let mut w = StallWatch::new(0);
+        let timeouts: Vec<bool> = (1..=5).map(|k| w.wake(false, ms(100.05 * k as f64))).collect();
+        assert_eq!(timeouts, [true; 5], "each timed-out wait");
+        let mut w = StallWatch::new(0);
+        let n = (1..=500).filter(|&k| w.wake(false, ms(2.0 * k as f64))).count();
+        assert_eq!(n, 10, "1 s of the output's events without the mic's: ten stalls");
+        let mut w = StallWatch::new(0);
+        let mut events: Vec<(f64, bool)> = (1..=500).map(|k| (2.0 * k as f64, false)).collect();
+        events.extend((1..=300).map(|k| (10.0 / 3.0 * k as f64, true)));
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(events.iter().all(|&(t, mic)| !w.wake(mic, ms(t))), "the mic delivers: no stall");
+        let mut w = StallWatch::new(0);
+        assert!(!w.wake(true, ms(99.0)) && !w.wake(false, ms(198.0)) && w.wake(false, ms(199.5)));
     }
 
     #[test]

@@ -79,6 +79,10 @@ fn rare_bursts(j: u64) -> f64 {
 fn mic_stall(j: u64) -> f64 {
     if (5000..5004).contains(&j) { (5004 - j) as f64 * 10.0 + 0.5 } else { 0.5 }
 }
+/// The same stall at 200 s (packets 20000-20003), after the adaptive target has come down.
+fn mic_stall_at_200(j: u64) -> f64 {
+    if (20_000..20_004).contains(&j) { (20_004 - j) as f64 * 10.0 + 0.5 } else { 0.5 }
+}
 
 #[derive(Clone, Copy)]
 struct Sim {
@@ -102,6 +106,10 @@ struct Sim {
     seconds: f64,
     /// An experiment: the output target this many samples under the engine's (which isn't changed).
     target_less: usize,
+    /// The adaptive output target (out_target.rs), from the engine's fixed one.
+    adaptive: bool,
+    /// Arm the chain recorder (its ring holds the whole run: 150 MB for four minutes, so the long runs go without).
+    record: bool,
 }
 
 const BASE: Sim = Sim {
@@ -119,6 +127,8 @@ const BASE: Sim = Sim {
     ppm: 300.0,
     seconds: 60.0,
     target_less: 0,
+    adaptive: false,
+    record: true,
 };
 
 /// One block's budget and readout, at its wake (s).
@@ -133,6 +143,8 @@ struct Out {
     rows: Vec<Row>,
     /// Blocks processed.
     blocks: usize,
+    /// The output target after each block (samples), at its wake (s).
+    targets: Vec<(f64, usize)>,
     p: Pipeline,
     tel: Telemetry,
     /// What the chain recorder got.
@@ -146,15 +158,20 @@ fn run(s: Sim) -> Out {
         p.out_target -= s.target_less;
         p.out_drift = DriftController::new(p.out_target as f32);
     }
-    let (tx, mut rx) = RingBuffer::<ChainItem>::new((s.seconds * 100.0) as usize + 100);
-    p.recorder = Some(ChainTx::new(tx));
+    if s.adaptive {
+        p = p.with_adaptive_target();
+    }
+    let (tx, mut rx) = RingBuffer::<ChainItem>::new(if s.record { (s.seconds * 100.0) as usize + 100 } else { 1 });
+    if s.record {
+        p.recorder = Some(ChainTx::new(tx));
+    }
     let mut sink = Lagged { sink: VSink::new(s.out_period, s.ppm, s.device_phase, T0), lag: s.lag };
     p.prefill(&mut sink).unwrap();
     let tel = Telemetry::new();
     let mut mic = FakeCapture::default();
     let mut proc = Offset(s.chain);
     let mut ticks = FakeTicks(0);
-    let (mut rows, mut blocks) = (Vec::new(), 0);
+    let (mut rows, mut blocks, mut targets) = (Vec::new(), 0, Vec::new());
     let (mut j, mut k, mut last) = (0u64, 1u64, f64::MIN);
     let mut late_wake = s.late_wake;
     let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
@@ -191,6 +208,7 @@ fn run(s: Sim) -> Out {
         p.drain_mic(&mut mic, now).unwrap();
         while p.process_block(&mut proc, &mut sink, &mut ticks, &tel, true).unwrap() {
             blocks += 1;
+            targets.push(((now - T0) / 1e7, p.out_target()));
             if let (Some(b), Some(readout)) = (p.last_budget, p.last_latency_ms) {
                 rows.push(Row { t_s: (now - T0) / 1e7, b, readout });
             }
@@ -203,7 +221,7 @@ fn run(s: Sim) -> Out {
     while let Ok(item) = rx.pop() {
         recorded.push(item.block);
     }
-    Out { rows, blocks, p, tel, recorded }
+    Out { rows, blocks, targets, p, tel, recorded }
 }
 
 /// The parts' means over the rows from `from_s` on.
@@ -445,4 +463,125 @@ fn a_block_lower_target_sweep() {
             }
         }
     }
+}
+
+/// The faults: underruns and coarse drops.
+fn faults(o: &Out) -> (u64, u64) {
+    (o.p.counters.render_underruns, o.p.counters.output_drops)
+}
+
+/// The adaptive output target (out_target.rs) in this file's scenes, with their events at 200 s, after it has come down
+/// (it walks down from 120 s), against the fixed target in the same scenes. Its budget adds up block for block as the
+/// fixed one's does, it is at or under the fixed target before the event (wherever the delivery lets it), and it
+/// underruns at most once more than the fixed target and drops no more. The once more is the trade: a wake 15 ms late,
+/// which the fixed target's spare block covers, runs the lowered target dry (and the strike puts it back to the fixed
+/// target; events.rs has the strikes over many hiccups).
+#[test]
+fn the_adaptive_target_in_these_scenes_after_it_has_come_down() {
+    let long = Sim { seconds: 260.0, record: false, ..BASE };
+    #[rustfmt::skip]
+    let cases: [(&str, Sim); 13] = [
+        ("steady", long),
+        ("steady, no drift", Sim { ppm: 0.0, ..long }),
+        ("bursty", Sim { late: bursty, ..long }),
+        ("rare bursts, -300 ppm", Sim { late: rare_bursts, ppm: -300.0, ..long }),
+        ("half-block packets", Sim { packet: 240, wake_ms: 5.0, ..long }),
+        ("a 1024-frame device", Sim { out_period: 1024, ..long }),
+        ("a wake 15 ms late", Sim { late_wake: Some((200.0, 15.0)), ..long }),
+        ("a wake 35 ms late: the device runs dry", Sim { late_wake: Some((200.0, 35.0)), ..long }),
+        ("a mic stall: dry, then overfull", Sim { late: mic_stall_at_200, seconds: 270.0, ..long }),
+        ("a lagging clock and a chain", Sim { lag: 700.0, chain: 912, ..long }),
+        ("steady, wake jitter", Sim { jitter_ms: 1.0, ..long }),
+        ("bursty, wake jitter", Sim { late: bursty, jitter_ms: 1.0, ..long }),
+        ("rare bursts, wake jitter", Sim { late: rare_bursts, jitter_ms: 1.0, ..long }),
+    ];
+    let mut extra = Vec::new();
+    for (what, sim) in cases {
+        let (fixed, adaptive) = (run(sim), run(Sim { adaptive: true, ..sim }));
+        let (f, a) = (faults(&fixed), faults(&adaptive));
+        assert!(a.0 <= f.0 + 1 && a.1 <= f.1, "{what}: adaptive {a:?} against fixed {f:?}");
+        if a.0 > f.0 {
+            extra.push(what);
+        }
+        for r in &adaptive.rows {
+            assert!(near(r.b.readout_ms(), r.readout, 1e-3), "{what}: {r:?}");
+        }
+        let before = |o: &Out| o.targets.iter().rev().find(|(t, _)| *t < 199.0).map_or(0, |x| x.1);
+        assert!(before(&adaptive) <= before(&fixed), "{what}: never over the fixed target");
+        if sim.out_period == 480 && !what.starts_with("rare bursts") {
+            assert!(before(&adaptive) < before(&fixed) - 96, "{what}: down by 2 ms or more: {}", before(&adaptive));
+        }
+    }
+    assert_eq!(extra, ["a wake 15 ms late"], "the trade, as measured");
+}
+
+/// Steady delivery (1 ms of wake jitter): for its two-minute window the target is the fixed one (22 ms); then it walks
+/// down (a tenth of the way a second, at most 0.5 ms) to the floor (a period + the margin, 12 ms) + the dips it saw +
+/// 1 ms, the drift loop slips the queue down after it without going under where it ends (a target set in one step took
+/// the queue 1.4 ms under it), and the readout comes down by as much. Nothing underruns.
+#[test]
+fn the_adaptive_target_comes_down_after_steady_delivery() {
+    let sim = Sim { jitter_ms: 1.0, seconds: 240.0, record: false, ..BASE };
+    for ppm in [0.0, 300.0] {
+        let (fixed, o) = (run(Sim { ppm, ..sim }), run(Sim { adaptive: true, ppm, ..sim }));
+        let at = |t: f64| o.targets.iter().rev().find(|(s, _)| *s <= t).map_or(0, |x| x.1);
+        assert_eq!(at(119.0), 1056, "the fixed target for the window");
+        let target_ms = o.p.out_target() as f32 / 48.0;
+        assert!(target_ms > 13.0 && target_ms < 15.5, "{ppm} ppm: {target_ms}");
+        let first = at(121.5);
+        assert!(first < 1056 && first > o.p.out_target() + 240, "{ppm} ppm: a walk, not a step: {first}");
+        assert_eq!(at(180.0), o.p.out_target(), "{ppm} ppm: there within a minute");
+        let targets: Vec<usize> = o.targets.iter().map(|x| x.1).collect();
+        assert!(targets.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 24), "{ppm} ppm: down only, 0.5 ms a second at most");
+        let lowest = (120..240)
+            .map(|s| {
+                let rows: Vec<Row> = o.rows.iter().filter(|r| r.t_s >= f64::from(s) && r.t_s < f64::from(s + 1)).copied().collect();
+                means(&rows, 0.0).0.queue_ms
+            })
+            .fold(f32::MAX, f32::min);
+        assert!(lowest > target_ms - 0.15, "{ppm} ppm: the queue's lowest 1 s mean {lowest} against {target_ms}");
+        let ((late, readout), (_, fixed_readout)) = (means(&o.rows, 200.0), means(&fixed.rows, 200.0));
+        assert!(near(late.queue_ms, target_ms, 0.4), "{ppm} ppm: {late:?}");
+        if ppm != 0.0 {
+            assert!((readout - (fixed_readout - f64::from(22.0 - target_ms))).abs() < 0.6, "{readout} against {fixed_readout}");
+        }
+        assert_eq!(faults(&o), (0, 0));
+        assert!(near(o.tel.output_target_ms.load(), target_ms, 1e-3), "published");
+    }
+}
+
+/// Bursts hold the target up by what they need, and nothing underruns at any phase (300 ppm sweeps the wakes through
+/// the device's phases every 33 s): the cables' bursts (every other block a wake late) need 5 ms and bring it down to
+/// about 18 ms; one wake in five missed needs 8 ms, which leaves the spare block about where it was.
+#[test]
+fn bursts_hold_the_adaptive_target_at_what_they_need() {
+    for (what, late, lo, hi) in [("bursty", bursty as Late, 17.0f32, 20.0f32), ("rare bursts", rare_bursts, 20.5, 22.01)] {
+        let o = run(Sim { late, jitter_ms: 1.0, adaptive: true, seconds: 300.0, record: false, ..BASE });
+        let target_ms = o.p.out_target() as f32 / 48.0;
+        assert!(target_ms > lo && target_ms < hi, "{what}: {target_ms}");
+        assert_eq!(faults(&o), (0, 0), "{what}");
+        let low = o.rows.iter().filter(|r| r.t_s >= 180.0).map(|r| r.b.queue_ms).fold(f32::MAX, f32::min);
+        assert!(low > 10.5, "{what}: the queue's lowest {low} ms, over the period");
+    }
+}
+
+/// Once the target has come down (steady delivery against a 5 ms device: from 17 ms to about 9), a wake 13 ms late, which
+/// the fixed target's spare block covers at every phase, runs the device dry once; the target goes back to the fixed one
+/// at that block (a strike), the zeros fill the device to it, and it stays there (the strike's need holds it for 10
+/// minutes): nothing underruns again.
+#[test]
+fn an_underrun_raises_the_adaptive_target_at_once() {
+    let sim = Sim { out_period: 240, jitter_ms: 1.0, late_wake: Some((240.0, 13.0)), seconds: 300.0, record: false, ..BASE };
+    let fixed_target = 240 + 480 + 96;
+    let (fixed, o) = (run(sim), run(Sim { adaptive: true, ..sim }));
+    assert_eq!(faults(&fixed), (0, 0), "the spare block covers it");
+    assert_eq!(faults(&o), (1, 0), "the lowered target doesn't");
+    let at = |t: f64| o.targets.iter().rev().find(|(s, _)| *s <= t).map_or(0, |x| x.1);
+    assert!(at(239.0) < fixed_target - 240, "down before: {}", at(239.0));
+    let up = o.targets.iter().find(|(s, _)| *s >= 240.0).map_or(0, |x| x.1);
+    assert_eq!(up, fixed_target, "up at the block that ran dry");
+    let (after, _) = means(&o.rows, 250.0);
+    assert!(after.queue_ms >= fixed_target as f32 / 48.0 - 0.5, "{after:?}");
+    assert_eq!(o.p.out_target(), fixed_target, "held");
+    assert_eq!(o.p.adaptive.as_ref().map(|a| a.strikes()), Some(1));
 }

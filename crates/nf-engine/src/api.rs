@@ -60,6 +60,13 @@ pub struct StreamInfo {
     pub autoconvert: bool,
     /// RAW mode is in effect (mic only).
     pub raw: bool,
+    /// In WASAPI exclusive mode (`IoConfig::mic_exclusive`, `output_exclusive`, granted: a refused one runs shared, with a
+    /// warning), in this sample format: "32-bit float", "24-bit" or "16-bit". `None` in shared mode. The period is then
+    /// the exclusive buffer's, and no Windows effects run.
+    pub exclusive: Option<&'static str>,
+    /// Asked for in exclusive mode and refused: why, as a clause ("another app is using it, ..."). It runs in shared mode;
+    /// the status's warnings say so too.
+    pub exclusive_refused: Option<String>,
 }
 
 /// Slow-changing engine status, for the UI's status and diagnostics lines.
@@ -114,13 +121,21 @@ impl Remedy {
 /// The buffer fills the engine holds (engine.md "Targets"), for diagnostics. Zero while stopped.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BufferTargets {
-    /// Output render-buffer target: one render period + one block + `io.output_margin_ms`.
+    /// Output render-buffer target at the start: one render period + one block + `io.output_margin_ms`. With
+    /// `io.adaptive_output` it moves (telemetry's `output_target_ms` has the current one).
     pub output_ms: f32,
     /// The reference's starting lead target: one loopback period + 2 ms (0 without a reference). It can rise in the first
     /// seconds and when underflows persist, and come back down after five minutes under; telemetry's `reference_target_ms`
     /// has the current one (engine.md, "The reference").
     pub reference_ms: f32,
 }
+
+/// With `IoConfig::adaptive_output`, how long a run measures the delivery at the fixed output target before the target can
+/// come down, in seconds (engine.md, "The output target").
+pub const ADAPTIVE_OUTPUT_WINDOW_S: u64 = crate::out_target::WINDOW_S as u64;
+/// The longest the adaptive output target's walk down takes once it has started, in seconds (it moves a tenth of the way a
+/// second, so the queue follows without overshooting).
+pub const ADAPTIVE_OUTPUT_WALK_S: u64 = crate::out_target::RAMP_MAX_S as u64;
 
 /// Which loop the latency test measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

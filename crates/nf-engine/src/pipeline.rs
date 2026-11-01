@@ -26,6 +26,7 @@ use rtrb::Producer;
 use crate::api::ChainBlock;
 use crate::budget::{self, BudgetStats, WakeLog};
 use crate::fifo::Fifo;
+use crate::out_target::AdaptiveTarget;
 use crate::recorder::ChainTx;
 use crate::reference::{MicTime, Reference};
 use crate::timing::{HNS_PER_S, StampMap};
@@ -103,6 +104,11 @@ pub(crate) trait RenderSink {
     fn write_silence(&mut self, frames: usize) -> Result<(), Hr>;
     /// `Ok(None)` while the position isn't running yet (it reads 0 for a few ms after start).
     fn clock(&mut self) -> Result<Option<ClockReading>, Hr>;
+    /// Underruns the sink saw itself since the last call: an event-driven exclusive output whose ring was short of a period
+    /// at a device event, or that answered one late (`exclusive::EventRender`). 0 for a stream the device drains by itself.
+    fn take_underruns(&mut self) -> u64 {
+        0
+    }
 }
 
 /// The output's drift loop, as nf-core's `DriftController` provides it (the reference has its own:
@@ -111,6 +117,8 @@ pub(crate) trait DriftControl {
     fn update(&mut self, fill_samples: f32) -> Slip;
     fn ppm(&self) -> f32;
     fn reset(&mut self, fill_samples: f32);
+    /// Moves the fill it holds (the adaptive output target: out_target.rs).
+    fn set_target(&mut self, target_samples: f32);
 }
 
 impl DriftControl for DriftController {
@@ -125,6 +133,10 @@ impl DriftControl for DriftController {
     #[inline]
     fn reset(&mut self, fill_samples: f32) {
         DriftController::reset(self, fill_samples)
+    }
+    #[inline]
+    fn set_target(&mut self, target_samples: f32) {
+        DriftController::set_target(self, target_samples)
     }
 }
 
@@ -200,9 +212,11 @@ struct BlockTimes {
 pub(crate) struct Counters {
     /// Mic packets flagged discontinuous or missing by device position.
     pub capture_glitches: u64,
-    /// Output underruns: zeros written because the padding was under a period and the fill, with
-    /// this block and the wake's backlog, fell short of the target; or the device found empty (it
-    /// ran dry). Not counted at the first block, which sets the starting fill.
+    /// Output underruns, at most one a block: zeros written because the padding was under a period
+    /// and the fill, with this block and the wake's backlog, fell short of the target; or the device
+    /// found empty (it ran dry); or, since the last block, an exclusive output's ring short of a
+    /// period at a device event, or an event answered late (`exclusive::EventRender`; however many
+    /// events). Not counted at the first block, which sets the starting fill, nor before it.
     pub render_underruns: u64,
     /// Output coarse drops: times the fill ran over target + 2 blocks and whole blocks were dropped
     /// back to within half a block (one per event), plus pending overflows.
@@ -273,6 +287,9 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     out_rs: R,
     out_target: usize,
     out_period: usize,
+    out_margin: usize,
+    /// The output target follows the delivery (`IoConfig::adaptive_output`; out_target.rs); `None`: it's fixed.
+    adaptive: Option<AdaptiveTarget>,
     pending: Box<[f32]>,
     pending_len: usize,
     /// Frames ever written to the device, prefill and padding included: the device-stream index of
@@ -337,6 +354,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             out_rs,
             out_target: cfg.out_target(),
             out_period: cfg.out_period,
+            out_margin: cfg.out_margin,
+            adaptive: None,
             pending: vec![0.0; PENDING].into_boxed_slice(),
             pending_len: 0,
             written_total: 0,
@@ -368,9 +387,22 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
     }
 
-    #[cfg(test)]
+    /// The output target follows the delivery (`IoConfig::adaptive_output`; out_target.rs): it starts at the fixed target
+    /// (one period + one block + the margin) and goes down to one period + the margin + the blocks' measured lateness.
+    pub(crate) fn with_adaptive_target(mut self) -> Self {
+        self.adaptive = Some(AdaptiveTarget::new(self.out_period + self.out_margin, self.out_target));
+        self
+    }
+
+    /// The output target now, in samples.
     pub(crate) fn out_target(&self) -> usize {
         self.out_target
+    }
+
+    /// Moves the output target: the drift loop slips the fill to it, and the deficit and drop thresholds follow it.
+    fn set_out_target(&mut self, target: usize) {
+        self.out_target = target;
+        self.out_drift.set_target(target as f32);
     }
 
     /// The reference's lead target now, in samples.
@@ -616,10 +648,18 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     ///   blocks are dropped, pending samples first and then this block, until it's within half a
     ///   block of the target (later blocks of the same burst drop themselves).
     ///
+    /// An exclusive output's own underruns since the last block (its ring short at a device event,
+    /// or an event answered late) count too, once a block with the rest. Any underrun puts an
+    /// adaptive target back to the fixed one first, so the deficit's zeros fill to that
+    /// (out_target.rs); ordinary blocks give it their lateness.
+    ///
     /// After a correction the loop restarts from the fill the next wake will read: the corrected
     /// fill with this wake's queued blocks written.
     fn push_output<S: RenderSink>(&mut self, sink: &mut S, times: Option<BlockTimes>) -> Result<(), Hr> {
         self.last_budget = None;
+        // What the sink saw itself (an exclusive output's ring short at an event). Before the first block it's the output
+        // running before the mic, as a shared device's dry start is.
+        let sink_dry = sink.take_underruns();
         let mut padding = sink.padding()?;
         // One clock reading per block, for the fill and the readout. An error costs only this
         // block's estimate and readout; the next write reports a dead stream.
@@ -634,6 +674,20 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // Published as the fill the drift loop sees (before this block), comparable to the target.
         self.last_out_fill = fill;
         let queued = fill + backlog as f64;
+        // An underrun, counted once a block (not at the first, which sets the starting fill): the sink ran short, the
+        // device was found empty, or a real deficit (below). The adaptive target rises at once, and the deficit's zeros
+        // below fill the device to it.
+        let short = low && queued + (BLOCK as f64) < self.out_target as f64;
+        let dry = self.out_started && (sink_dry > 0 || (low && padding == 0) || short);
+        // What the adaptive target measures a block's lateness on: the fill before its calibration (out_target.rs).
+        let (raw, clocked) = self.raw_fill(clock, padding + self.pending_len);
+        if dry {
+            // Once a block, as the shared path counts one: a dry spell of many short device events is one underrun.
+            self.counters.render_underruns += 1;
+            if let Some(t) = self.adaptive.as_mut().and_then(|a| a.underrun(raw, clocked)) {
+                self.set_out_target(t);
+            }
+        }
         let target = self.out_target as f64;
         // At the start the target is set exactly; after it, this block counts as well.
         let (deficit, this_block) = if self.out_started {
@@ -644,9 +698,6 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let mut slip = Slip::None;
         let mut drop_block = false;
         if deficit {
-            if self.out_started {
-                self.counters.render_underruns += 1;
-            }
             padding = self.flush_pending(sink, padding)?;
             let mut added = 0;
             if self.pending_len == 0 {
@@ -662,9 +713,13 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             // Zeros raise the estimate and the padding alike; moving pending to the device neither.
             self.out_drift.reset((queued + added as f64) as f32);
             self.out_draining = false;
+            if let Some(a) = self.adaptive.as_mut() {
+                a.reseed();
+            }
         } else if low {
-            if padding == 0 && self.out_started {
-                self.counters.render_underruns += 1;
+            // A late wake its backlog covers: its block's lateness is what the adaptive target measures.
+            if let Some(a) = self.adaptive.as_mut().filter(|_| !dry) {
+                a.observe(raw, clocked);
             }
             slip = self.out_drift.update(fill as f32);
         } else if queued > target + (2 * BLOCK) as f64 || (self.out_draining && queued > target + (BLOCK / 2) as f64) {
@@ -679,8 +734,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             let removed = from_pending + if drop_block { BLOCK } else { 0 };
             self.out_draining = excess - removed as f64 > (BLOCK / 2) as f64;
             self.out_drift.reset((queued - removed as f64) as f32);
+            if let Some(a) = self.adaptive.as_mut() {
+                a.reseed();
+            }
         } else {
             self.out_draining = false;
+            if let Some(a) = self.adaptive.as_mut().filter(|_| self.out_started) {
+                a.observe(raw, clocked);
+            }
             slip = self.out_drift.update(fill as f32);
         }
         self.out_started = true;
@@ -727,6 +788,19 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         match self.fill_offset.offset() {
             Some(o) => est - o,
             None => device_fill as f64,
+        }
+    }
+
+    /// The output fill before its calibration (samples), and whether the device's clock gave it: the frames written (and
+    /// pending) less the device position now, carried forward; the padding and pending without a clock reading. Smooth
+    /// where the padding steps, and free of the calibration's own steps: the adaptive target's measure (out_target.rs).
+    fn raw_fill(&self, clock: Option<ClockReading>, device_fill: usize) -> (f64, bool) {
+        match clock {
+            Some(c) => {
+                let est = (self.written_total + self.pending_len as u64) as f64 - c.position_now(self.out_period as f64);
+                if est.is_finite() { (est, true) } else { (device_fill as f64, false) }
+            }
+            None => (device_fill as f64, false),
         }
     }
 
@@ -859,6 +933,11 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
         self.budget.publish(tel);
 
+        // The adaptive output target may come down once a second (out_target.rs); the target is published either way.
+        if let Some(t) = self.adaptive.as_mut().and_then(AdaptiveTarget::second) {
+            self.set_out_target(t);
+        }
+        tel.output_target_ms.store(self.out_target as f32 * (1000.0 / SAMPLE_RATE as f32));
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
         if self.has_reference {
@@ -1086,6 +1165,9 @@ mod tests {
             self.filt = Some(fill);
             self.acc = 0.0;
             self.resets += 1;
+        }
+        fn set_target(&mut self, target: f32) {
+            self.target = target;
         }
     }
 
@@ -2067,6 +2149,9 @@ mod tests {
         let (allocs, frees) = wake_ups(&mut p, 1_000, 10);
         assert_eq!((allocs, frees), (0, 0), "allocations and frees in 1000 wake-ups");
         assert!(p.counters.reference_gaps <= 1 && p.counters.render_underruns == 0, "{:?}", p.counters);
+        // With the adaptive output target too (exclusive mode's path: pipeline/tests/exclusive.rs).
+        let mut p = pipe(true).with_adaptive_target();
+        assert_eq!(wake_ups(&mut p, 1_000, 10), (0, 0), "with the adaptive target");
     }
 
     /// The same with nf-core's real drift loop and resampler; run with `--ignored`.
@@ -2316,6 +2401,7 @@ mod tests {
 
     mod budget;
     mod events;
+    mod exclusive;
     mod recorder;
     mod timeline;
 }

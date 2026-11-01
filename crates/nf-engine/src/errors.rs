@@ -5,6 +5,7 @@
 
 /// HRESULTs we word specially (values from `windows::Win32::Media::Audio` / `Foundation`).
 use crate::api::Remedy;
+use crate::exclusive::ExclusiveRefusal;
 
 pub(crate) mod hr {
     pub(crate) const E_FAIL: i32 = 0x8000_4005_u32 as i32;
@@ -22,6 +23,9 @@ pub(crate) mod hr {
     pub(crate) const AUDCLNT_E_ENDPOINT_CREATE_FAILED: i32 = 0x8889_000F_u32 as i32;
     pub(crate) const AUDCLNT_E_SERVICE_NOT_RUNNING: i32 = 0x8889_0010_u32 as i32;
     pub(crate) const AUDCLNT_E_BUFFER_SIZE_ERROR: i32 = 0x8889_0016_u32 as i32;
+    /// Exclusive mode: the buffer the period makes isn't aligned as the driver needs; `GetBufferSize` says the next that is.
+    pub(crate) const AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED: i32 = 0x8889_0019_u32 as i32;
+    pub(crate) const AUDCLNT_E_INVALID_DEVICE_PERIOD: i32 = 0x8889_0020_u32 as i32;
     pub(crate) const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026_u32 as i32;
     /// COM is already initialised on this thread in another apartment: an STA (a UI thread) asked for the MTA.
     pub(crate) const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
@@ -116,6 +120,9 @@ pub(crate) enum Warning {
     /// The output cable is also the default playback device (this endpoint name), so every app's
     /// sound goes into the filtered mic.
     CableIsDefaultPlayback(String),
+    /// The mic or the output was asked for in exclusive mode and runs in shared mode: the device (this endpoint name)
+    /// refused it.
+    ExclusiveUnavailable { role: StreamRole, device: String, why: ExclusiveRefusal },
 }
 
 impl StartFailure {
@@ -297,6 +304,37 @@ pub(crate) fn describe_warning(w: &Warning) -> String {
         Warning::CableIsDefaultPlayback(name) => format!(
             "The output cable ({name}) is also Windows' default playback device, so every app's sound goes into your filtered microphone. Make your speakers or headphones the default playback device in Sound settings."
         ),
+        Warning::ExclusiveUnavailable { role, device, why } => format!(
+            "{} ({device}) couldn't be opened in exclusive mode: {}. It runs in shared mode, without exclusive mode's lower latency.",
+            role.noun(),
+            describe_refusal(*why)
+        ),
+    }
+}
+
+/// Why exclusive mode was refused, as a clause.
+pub(crate) fn describe_refusal(why: ExclusiveRefusal) -> String {
+    match why {
+        ExclusiveRefusal::NoFormat | ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT) => {
+            "it takes none of the formats the filter can use there (48 kHz in 32-bit float, 24-bit or 16-bit)".to_owned()
+        }
+        ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE) => {
+            "another app is using it, and exclusive mode needs it to itself (close that app, or start the filter first)".to_owned()
+        }
+        ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) => "Windows doesn't allow it (turn on \"Allow applications to take exclusive control of this device\" in Sound settings > the device > Advanced)".to_owned(),
+        ExclusiveRefusal::Refused(
+            code @ (hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED | hr::AUDCLNT_E_INVALID_DEVICE_PERIOD | hr::AUDCLNT_E_BUFFER_SIZE_ERROR),
+        ) => format!("it refused the short period (error 0x{:08X})", code as u32),
+        ExclusiveRefusal::Refused(code) => format!("error 0x{:08X}", code as u32),
+        ExclusiveRefusal::Periods { hr: code, shortest_hns, longest_hns } => {
+            let ms = |hns: i64| format!("{:.2} ms", hns as f64 / 10_000.0);
+            let tried = if shortest_hns == longest_hns {
+                format!("the {} period", ms(shortest_hns))
+            } else {
+                format!("every period tried, {} to {}", ms(shortest_hns), ms(longest_hns))
+            };
+            format!("it refused {tried} (error 0x{:08X})", code as u32)
+        }
     }
 }
 
@@ -399,6 +437,17 @@ mod tests {
         assert!(r.starts_with("Echo cancellation lost its reference:") && r.contains("keeps running"), "{r}");
         assert!(describe_warning(&Warning::OutputIsSpeakers("Speakers (Realtek(R) Audio)".into())).contains("plays out loud"));
         assert!(describe_warning(&Warning::CableIsDefaultPlayback("CABLE Input".into())).contains("default playback"));
+        let excl = |why| describe_warning(&Warning::ExclusiveUnavailable { role: StreamRole::Output, device: "CABLE Input".into(), why });
+        let w = excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED));
+        assert!(w.starts_with("The output device (CABLE Input) couldn't be opened in exclusive mode: Windows doesn't allow it"), "{w}");
+        assert!(w.ends_with("It runs in shared mode, without exclusive mode's lower latency."), "{w}");
+        assert!(excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)).contains("short period (error 0x88890019)"));
+        assert!(excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT)).contains("32-bit float, 24-bit or 16-bit"));
+        assert!(excl(ExclusiveRefusal::Refused(hr::E_FAIL)).contains(": error 0x80004005."));
+        let periods = ExclusiveRefusal::Periods { hr: hr::AUDCLNT_E_INVALID_DEVICE_PERIOD, shortest_hns: 30_000, longest_hns: 100_000 };
+        assert!(excl(periods).contains(": it refused every period tried, 3.00 ms to 10.00 ms (error 0x88890020)."), "{}", excl(periods));
+        let one = ExclusiveRefusal::Periods { hr: hr::E_INVALIDARG, shortest_hns: 20_000, longest_hns: 20_000 };
+        assert!(excl(one).contains(": it refused the 2.00 ms period (error 0x80070057)."), "{}", excl(one));
         assert!(describe_hr(StreamRole::Mic, hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED).contains("disconnected"));
         assert!(describe_hr(StreamRole::FarEnd, hr::AUDCLNT_E_DEVICE_INVALIDATED).starts_with("The far-end device was disconnected"));
         assert_eq!(StreamRole::from_u8(StreamRole::FarEnd as u8), StreamRole::FarEnd);

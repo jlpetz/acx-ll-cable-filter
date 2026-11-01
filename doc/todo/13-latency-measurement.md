@@ -230,12 +230,68 @@ it. Whether WASAPI's clock counts an underrun's silence is unverified. A live re
 The render side is the largest part: about 20 ms beyond its half-period convention, between leaving our buffer and the
 output's play-out by its clock (the shared-mode engine's period and VB-CABLE's own render side). Candidates, largest
 first:
-1. **The render side:** exclusive mode on the output cable (only the app plays into it; untested on VB-CABLE), or a
-   smaller engine period (VB-CABLE offers none below 10 ms; our own driver, #19, can).
-2. **The output queue's spare block:** an adaptive output target (above), 5-10 ms on the cables, 10-15 with steady
-   delivery.
+1. **The render side:** exclusive mode on the output cable (only the app plays into it; built as `--exclusive-output`,
+   below), or a smaller engine period (VB-CABLE offers none below 10 ms in shared mode; our own driver, #19, can).
+2. **The output queue's spare block:** an adaptive output target (above; built as `--adaptive-output`, below), 3-4 ms
+   on the cables' bursts, 8 with steady delivery.
 3. **Mic delivery's 6 ms beyond a block:** VB-CABLE's bursts (#8's detail file); a device matter.
 The chain's 9-19 ms belongs to the algorithms (#5, #7).
+
+**The options, A/B live** (2026-11-01, the same day, `latency --mode virtual --reps 5`, passthrough; the options are
+opt-in: `--exclusive-output`, `--exclusive-mic`, `--adaptive-output`):
+
+| Options | Mic + wait | Queue | Render side | Readout | App path (+ chain 10) | App + output cable | Spread |
+|---|---|---|---|---|---|---|---|
+| none (shared) | 17.1 | 21.9 | 25.9 | 64.9 | 74.9 | 126.3 | 3.2 |
+| exclusive output (2 ms, 16-bit) | 18.1 | 13.8 | 2.8 | 34.6 | 44.6 | 73.9 | 6.1 |
+| exclusive mic (3.33 ms, 16-bit) | 0.8 + 6.7 | 22.6 | 16.1 | 46.1 | 56.1 | 107.9 | 1.3 |
+| both exclusive | 0.8 + 6.7 | 14.1 | 3.2 | 24.8 | 34.8 | 63.7 | 1.3 |
+| both + adaptive (target 14 to 6.8 ms in 169 s) | 0.8 + 6.7 | 6.8 | 3.8 | 18.1 | 28.1 | 52.0 | 1.2 |
+
+- Exclusive output removes the shared engine's render side (26 to 3 ms) and the output cable gets faster too: app + output
+  cable fell 52 ms against the readout's 30.
+- The exclusive mic delivers every 3.33 ms with no bursts (mic delivery 0.8 ms; the wait is the block filling), and the
+  spread between sweeps fell to about 1 ms.
+- Glitches: none. `quality --test noise` with both exclusive (30 s) and with all three (60 s, after the target came
+  down): 0 mic glitches, 0 underruns, 0 stalls; the noise filter's figures unchanged (-25 to -27 dB in pauses, speech
+  -0.3 to -0.4 dB). `quality --test echo` at 25 ms with both exclusive: a median 54.5 dB a far-only turn, no dropouts.
+- The trade-offs: exclusive mode locks the endpoint (fine for the output cable, which only the app plays into; with the
+  mic, other apps can't open it directly), 16-bit only on VB-CABLE, and a fresher mic needs a longer reference lead (18.3
+  ms with the exclusive mic against 12-14 shared), which raises the shortest echo AEC3 can cancel by about as much (#10).
+  The adaptive target trades the spare block for at most three extra underruns a run on rare 10-15 ms hiccups.
+
+**The latency options** (built 2026-11-01, each opt-in so a live A/B can compare them; engine.md, "Exclusive mode" and
+"The output target"). What each should take off the cables' readout of 64 ms (mic 16.4 + wait 0 + queue 22.2 + render
+25.7), by the event simulations and the design; the live runs will say:
+
+| Option | Mic + wait | Output queue | Render side | Readout | What it cuts |
+|---|---|---|---|---|---|
+| none (today) | 16.4 | 22.2 | 25.7 | 64 | |
+| `--exclusive-output` (2 ms, 16-bit) | 16.4 | 14 | 3 + the cable's own | 33-43 | the target's period (10 → 2 ms: 8 ms), and the render side's engine pass: 23 ms if the 20 ms over the half period is all the engine's, 13 if half is VB-CABLE's |
+| `--exclusive-mic` (3.33 ms) | 10.5-16 | 22.2 | 25.7 | 58-64 | the mic's bursts (6 ms), if they're VB-CABLE's schedule beating against the engine's pass; nothing if the cable bursts by itself |
+| `--adaptive-output` (shared) | 16.4 | 18-19 | 25.7 | 60-61 | the spare block, as far as the bursts allow (they need 5-6 ms over a 12 ms floor), after its 2-minute window and a walk down of up to a minute |
+| all three, steady delivery | 10.5 | 5-6 | 3 + the cable's own | 19-29 | up to 45 ms |
+
+- The budget shows each cut where it lands: the queue's mean is the target (14 ms exclusive, the adaptive one where it
+  settled); the exclusive render side is the device's two buffers (1.5 periods: 3 ms at 2 ms) plus what VB-CABLE holds past
+  its clock; with the exclusive mic, mic delivery reads about 3.6 ms and the wait about 6.7 (a block's first sample comes
+  with its 3.33 ms packet and waits for the other two).
+- The adaptive target takes two minutes to move and then walks down (a tenth of the way a second, at most 0.5 ms: a
+  step drove the queue 1.4 ms under the new target for 10 s, under the floor in exclusive mode), so `latency` and
+  `quality` with `--adaptive-output` wait for it to settle (up to 188 s) before they measure; in a shorter run it is the
+  fixed one. Its floor is a whole period + the margin (12 ms shared, 4 ms exclusive), the design's reasoning rather than
+  the simulation's half period, plus 1 ms of headroom over the largest dip in two minutes; it never goes over the fixed
+  target.
+- **What the adaptive target costs:** below the fixed target, a rare hiccup of 10-15 ms that the spare block covered (a
+  missed wake) runs the device dry: a glitch. In the event simulations, with the event after the target has come down,
+  a wake 15 ms late did so in half the phases and drifts tried, and one 10 ms late at the worst phase. An underrun under
+  the fixed target is a strike: back to the fixed target at once, held there by the need it showed for 10 minutes (20
+  after a second strike), and fixed for the run after a third, so a run has at most three underruns more than with the
+  fixed target. Without that memory hiccups rarer than the two-minute window came back each time (a wake 15 ms late every
+  150 s: 7 underruns in 1000 s, none with the fixed target); with it, three in 50 minutes and none after. The live runs
+  should watch the output underruns over a long `run` (and the target in its status line jumping back to 22 or 14 ms).
+- The chain's 9-10 ms comes on top of all of these; the cable's own transit (52-62 ms, cable-only) isn't in the readout,
+  and the latency test's "app + output cable" says whether exclusive mode changes it.
 
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI

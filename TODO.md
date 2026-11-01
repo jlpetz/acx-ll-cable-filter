@@ -144,7 +144,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
-**Next**: cut the render side (exclusive mode on the output cable, or a smaller engine period: our driver, #19) and the output queue's spare block (an adaptive target, #9). Layer 3 in phase 2.
+- Opt-in latency options built and run live (2026-11-01): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
+**Next**: the owner decides the defaults (exclusive locks the endpoint; the exclusive mic lengthens the reference lead, #10); longer soak runs for glitches; layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---

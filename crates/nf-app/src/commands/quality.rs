@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_engine::{
-    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, Flow, LatePart, LateStart, LatencyBudget,
-    MAX_CHAIN_RECORDING_S, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, TrackRole,
+    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, EngineStatus, Flow, LatePart, LateStart,
+    LatencyBudget, MAX_CHAIN_RECORDING_S, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot,
+    TrackRole,
 };
 
 use super::run::stream_text;
@@ -68,7 +69,7 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     // Armed before the start, the chain recorder holds the run from its first block (its whole history, for a rerun). The echo
     // test times its marker in it, and measures where the echo landed.
     let recorder = if args.save.is_some() || plan.is_some() {
-        let limit = recording_limit(&scene, plan.as_ref());
+        let limit = recording_limit(&scene, plan.as_ref(), cfg.io.adaptive_output);
         Some(engine.record_chain(limit).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?)
     } else {
         None
@@ -155,12 +156,14 @@ fn route(devices: &[DeviceInfo], probe: &str, far: Option<&str>, capture: &str) 
     format!("playing on {}{far}, recording {}", name(probe), name(capture))
 }
 
-/// The chain recorder's limit: the take (the settle, the lead, the echo test's calibration, the scene and the tail) and a minute
-/// to spare, within the engine's 15 minutes.
-fn recording_limit(scene: &Scene, plan: Option<&Plan>) -> f64 {
+/// The chain recorder's limit: the take (the settle, the adaptive target's wait with `--adaptive-output`, the lead, the echo
+/// test's calibration, the scene and the tail) and a minute to spare, within the engine's 15 minutes.
+fn recording_limit(scene: &Scene, plan: Option<&Plan>, adaptive: bool) -> f64 {
     let r = PlayRecordRequest::default();
     let calibration = plan.map_or(0.0, |p| p.latest.max(p.scene_at) as f64 / f64::from(SAMPLE_RATE));
-    let take = scene.input.len() as f64 / f64::from(SAMPLE_RATE) + calibration + SETTLE.as_secs_f64() + f64::from(r.lead_s + r.tail_s);
+    let wait = if adaptive { super::run::ADAPTIVE_WAIT_S as f64 } else { 0.0 };
+    let take =
+        scene.input.len() as f64 / f64::from(SAMPLE_RATE) + calibration + SETTLE.as_secs_f64() + wait + f64::from(r.lead_s + r.tail_s);
     (take + 60.0).min(MAX_CHAIN_RECORDING_S)
 }
 
@@ -184,6 +187,8 @@ pub struct Take {
     pub budget: Option<LatencyBudget>,
     /// The echo test's echo delay: how it was placed and where it landed.
     pub echo: Option<EchoTake>,
+    /// How the filter's streams ran (exclusive mode and its format, the periods) and its output target at the take's end.
+    pub conditions: String,
     pub warnings: Vec<String>,
 }
 
@@ -314,7 +319,7 @@ fn play(
     engine: &Engine, cfg: &EngineConfig, scene: &Scene, plan: Option<&Plan>, recorder: Option<&ChainRecorder>, route: Route,
 ) -> Result<Take, Failure> {
     wait_running(engine)?;
-    if console::sleep_unless_stopped(SETTLE) {
+    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg) {
         return Err(Failure::no_result("Cancelled before the test started."));
     }
     let before = engine.telemetry();
@@ -401,7 +406,26 @@ fn play(
         delay: Err("no chain recording".into()),
     });
     let scene_at = recorded.lead_frames + plan.map_or(0, |p| p.scene_at as usize);
-    Ok(Take { dropouts: Dropouts::between(&before, &after, &recorded), recorded, scene_at, engine: readings, budget, echo, warnings })
+    let conditions = conditions(&engine.status(), &after);
+    let dropouts = Dropouts::between(&before, &after, &recorded);
+    Ok(Take { dropouts, recorded, scene_at, engine: readings, budget, echo, conditions, warnings })
+}
+
+/// The filter's streams as they ran (shared or exclusive, and its format; the periods; RAW) and its output target at the
+/// take's end, fixed or adaptive: "filter mic CABLE-A Output (48000 Hz, 2 ch, period 3.33 ms, exclusive 16-bit); output
+/// CABLE Input (...); output target 14.0 ms (fixed)".
+pub fn conditions(status: &EngineStatus, t: &TelemetrySnapshot) -> String {
+    let stream = |label: &str, s: Option<&nf_engine::StreamInfo>| match s {
+        Some(s) => format!("{label} {}", stream_text(s)),
+        None => format!("{label} --"),
+    };
+    let how = if t.output_adaptive { "adaptive, at the end" } else { "fixed" };
+    format!(
+        "filter {}; {}; output target {} ms ({how})",
+        stream("mic", status.mic.as_ref()),
+        stream("output", status.output.as_ref()),
+        fixed(f64::from(t.output_target_ms), 1)
+    )
 }
 
 /// The echo test's calibration, beside the take: every [`CALIBRATION_POLL`] it copies what the chain recorder has added, and
@@ -807,6 +831,9 @@ pub fn format_report(test: QualityTest, result: &Result<Analysis, AlignmentFailu
     let _ = write!(s, "\n  {}", take.dropouts.line());
     let played: Vec<String> = take.recorded.playback.iter().map(stream_text).collect();
     let _ = write!(s, "\n  played on {}; recorded from {}", played.join(" and "), stream_text(&take.recorded.capture));
+    if !take.conditions.is_empty() {
+        let _ = write!(s, "\n  conditions: {}", take.conditions);
+    }
     for n in &notes {
         let _ = write!(s, "\n  note: {n}");
     }
@@ -1008,6 +1035,8 @@ mod tests {
             low_latency: false,
             autoconvert: false,
             raw: false,
+            exclusive: None,
+            exclusive_refused: None,
         }
     }
 
@@ -1028,6 +1057,9 @@ mod tests {
             engine,
             budget: None,
             echo: None,
+            conditions: "filter mic CABLE-A Output (48000 Hz, 2 ch, period 10.00 ms); output CABLE Input (48000 Hz, 2 ch, period \
+                         10.00 ms); output target 22.0 ms (fixed)"
+                .into(),
             warnings: vec!["The filter restarted during the test, so its dropout counts cover only the time since.".into()],
         }
     }
@@ -1053,6 +1085,22 @@ mod tests {
         drift_ppm: 0.12,
     };
 
+    /// The conditions line: the filter's streams as they ran, exclusive ones with their format, and its output target,
+    /// fixed or adaptive.
+    #[test]
+    fn the_conditions_say_how_the_filter_s_streams_ran() {
+        let excl = StreamInfo { exclusive: Some("16-bit"), period_ms: 2.0, ..stream("CABLE Input") };
+        let status = EngineStatus { mic: Some(stream("CABLE-A Output")), output: Some(excl), ..Default::default() };
+        let t = TelemetrySnapshot { output_target_ms: 5.0, output_adaptive: true, ..Default::default() };
+        assert_eq!(
+            conditions(&status, &t),
+            "filter mic CABLE-A Output (48000 Hz, 2 ch, period 10.00 ms); output CABLE Input (48000 Hz, 2 ch, period 2.00 ms, \
+             exclusive 16-bit); output target 5.0 ms (adaptive, at the end)"
+        );
+        let none = conditions(&EngineStatus::default(), &TelemetrySnapshot { output_target_ms: 22.0, ..Default::default() });
+        assert_eq!(none, "filter mic --; output --; output target 22.0 ms (fixed)");
+    }
+
     #[test]
     fn the_report_shows_the_alignment_each_region_the_engine_the_dropouts_and_the_streams() {
         let metrics = Metrics::Noise {
@@ -1076,6 +1124,8 @@ mod tests {
              dropouts                   filter: mic glitches 2, output underruns 0, reference gaps 0, stalls 0; test streams: \
              capture gaps 1 (480 frames), playback underruns 0\n  \
              played on CABLE-A Input (48000 Hz, 2 ch, period 10.00 ms); recorded from CABLE Output (48000 Hz, 2 ch, period 10.00 ms)\n  \
+             conditions: filter mic CABLE-A Output (48000 Hz, 2 ch, period 10.00 ms); output CABLE Input (48000 Hz, 2 ch, period \
+             10.00 ms); output target 22.0 ms (fixed)\n  \
              warning: The filter restarted during the test, so its dropout counts cover only the time since.\n  \
              warning: a short region"
         );
@@ -1573,16 +1623,19 @@ mod tests {
         assert!(chain_line(&CHAIN_FILES, &ChainRecording::default()).contains("got no blocks"));
     }
 
-    /// The chain recorder covers the take: the settle, the lead, the echo test's calibration, the scene and the tail, and a
-    /// minute more.
+    /// The chain recorder covers the take: the settle, the adaptive target's wait (with `--adaptive-output`), the lead, the
+    /// echo test's calibration, the scene and the tail, and a minute more.
     #[test]
     fn the_recorder_covers_the_take() {
         let scene = signals::build(QualityTest::Noise, 30.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
-        assert!((recording_limit(&scene, None) - (30.0 + 1.5 + 3.0 + 60.0)).abs() < 0.1, "{}", recording_limit(&scene, None));
-        assert!(recording_limit(&scene, None) <= MAX_CHAIN_RECORDING_S);
+        let plain = recording_limit(&scene, None, false);
+        assert!((plain - (30.0 + 1.5 + 3.0 + 60.0)).abs() < 0.1, "{plain}");
+        assert!(plain <= MAX_CHAIN_RECORDING_S);
         let plan = Plan::new(25.0);
-        let with = recording_limit(&scene, Some(&plan));
-        assert!((with - recording_limit(&scene, None) - plan.latest as f64 / 48_000.0).abs() < 1e-9, "{with}");
+        let with = recording_limit(&scene, Some(&plan), false);
+        assert!((with - plain - plan.latest as f64 / 48_000.0).abs() < 1e-9, "{with}");
+        let adaptive = recording_limit(&scene, None, true);
+        assert!((adaptive - plain - super::super::run::ADAPTIVE_WAIT_S as f64).abs() < 1e-9, "{adaptive}");
     }
 
     #[test]

@@ -5,6 +5,9 @@
 //!
 //! - `devices`: enumeration, by-id and default lookup.
 //! - `stream`: the WASAPI wrappers (capture, render, loopback, keep-alive), converting at the edge.
+//! - `exclusive`: exclusive mode apart from WASAPI: its period and formats, the fall-back to shared mode, and the
+//!   event-driven output's ring.
+//! - `out_target`: the adaptive output target.
 //! - `pipeline`: the audio thread's per-block bookkeeping (FIFOs, slips, coarse corrections, the
 //!   latency readout, statistics) behind stream traits, so tests drive it with fakes.
 //! - `reference`: the reference's timeline, read in step with the mic so the echo path holds still.
@@ -25,11 +28,13 @@ mod control;
 mod convert;
 mod devices;
 mod errors;
+mod exclusive;
 mod fifo;
 mod handover;
 mod latency_test;
 #[cfg(all(test, feature = "live-probe"))]
 mod live_probe;
+mod out_target;
 mod pipeline;
 mod play_record;
 mod recorder;
