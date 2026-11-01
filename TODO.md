@@ -221,3 +221,13 @@ oise-filter	est-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-cata
 - The stale pre-move copy `C:\Users\Administrator\Downloads\TMR\noise-filter` (awaiting the owner's OK).
 **Next**: delete them once v0's live tests are done, asking first.
 **Detail**: none (this entry is the list).
+
+---
+
+### 21. [engine] Device health and calibration
+**Priority**: Medium (phase 1-2) | **Status**: asked by the owner (2026-11-01); proposal ours, not started.
+- Owner: tell the user when a device or driver delivers in bursts or late, so they can fix it; and a calibration that sizes the buffers to the devices, not too big or small.
+- Proposed: a health readout per stream (steady or bursty, how late, drift, glitches, with a plain verdict and what to try), and a calibration (passive: measure delivery and set the starting targets; active with speakers: time the echo path and check it against the reference's lead, #10).
+- Most of the measures exist: the latency budget (#13), the reference's facts (#10), the counters, the live probe.
+**Next**: after the exclusive-mode A/B (#13): define the verdicts and thresholds, then `noise-filter devices --check`.
+**Detail**: `doc/todo/21-device-health.md`
