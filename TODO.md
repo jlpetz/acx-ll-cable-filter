@@ -26,31 +26,31 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 2. [dsp] Offline harness: WAV in, WAV out, through the whole chain
-**Priority**: High (phase 0) | **Status**: partly: `noise-filter process` runs a WAV (and `--ref`) through the chain offline, `--warm-up` reruns a live chain recording exactly, and `bench` times the stages; the conformance checks and the stage interface (#17) aren't built.
+**Priority**: High (phase 0) | **Status**: built 2026-11-02 (68b25ef): `nf_stages::harness` and the conformance tests check each stage's measured offset against its declared latency to the sample (RNNoise 480, AEC3 430, the chain in all 8 combinations), parity with the libraries driven directly, and CPU per block; `process`, `--warm-up` and `bench` run on it.
 - Runs the same chain the live app runs (AEC → noise stage with its floor/gate), through the same stage interface (#17), on WAV files, faster than real time, with no audio devices. It's the base for #3's conformance test, #13 layer 0 and #14's batch scoring.
 - Checks: the measured stream offset equals each model's declared `latency_samples − hop` to the sample (the hop of buffering only shows live, #13); output matches each model's reference; CPU per frame (p50/p99/max).
 - Runs under `cargo test`, which the project rules allow on the dev box. `cargo bench` isn't on that list: ask the owner, or time frames in an ignored test.
-**Next**: build it with RNNoise (#4) first, then the echo canceller on recorded mic+reference pairs.
+**Next**: a reusable check a new stage or pack can call, then the ONNX models (#5) through it; recorded mic+reference pairs for the echo canceller.
 **Detail**: `doc/todo/2-offline-harness.md`
 
 ---
 
 ### 3. [models] Model packs: the published format for ONNX noise models
-**Priority**: High (phase 0) | **Status**: design, fact-checked 2026-10-26; spec v0 not written.
+**Priority**: High (phase 0) | **Status**: spec v0 drafted (`doc/spec/model-pack-v0.md`, with the host profile `doc/spec/host-profile-v0.md`) and the `NoiseModel` trait built, with a re-blocker for hops other than 480 (2026-11-02, 68b25ef).
 - Effects are CLAP plugins (owner). Making the AEC and noise filter CLAP-shaped stages too is our proposal, awaiting the owner (#17). A model pack is data the noise stage loads: manifest + ONNX + licences + checksums, no code; `spectral` or `waveform`; explicit cache pairs, layout, output kind, latency; separate code/weights/data licences and patent notes; sherpa-onnx key names; the manifest wins over embedded metadata; reject custom ops and outside paths.
 - Models needing custom DSP (RNNoise, DFN3) are built into the noise stage in Rust.
 - Always output full band at 48 kHz; 16 kHz models via a 1536/768 STFT (bins 0-256, ×1/3) plus a pluggable high-band policy, A/B'd in #14.
-**Next**: write spec v0 and the noise stage's internal model trait; the conformance test in #2.
+**Next**: the first ONNX pack (UL-UNAS, #5) against the spec; settle its draft STFT keys from the exporters.
 **Detail**: `doc/todo/3-model-spec.md`
 
 ---
 
 ### 4. [models] RNNoise baseline (`nnnoiseless`)
-**Priority**: High (phase 0) | **Status**: chosen as the baseline (owner, 2026-10-26).
+**Priority**: High (phase 0) | **Status**: chosen as the baseline (owner, 2026-10-26); the noise stage's first model, through the harness (2026-11-02): offset 480 to the sample, bit-equal to nnnoiseless; on the fetched speech-in-cafe takes the noise falls 11.7-34.1 dB in pauses.
 - Pure Rust, BSD-3 code and weights, 48 kHz, 10 ms frames (matches AEC3 and WASAPI), 20 ms algorithmic latency, ~0.4% of a core. Weakest quality, so it's the bring-up model and later the eco mode. Its VAD output can drive the gate (#11).
 - Gotchas: `default-features = false`; warm up the state before streaming (first-call and reset allocations); dev-profile `opt-level` for dependencies. It can't load RNNoise 0.2 models.
-**Next**: first model through #2, then the first live model in phase 1.
-**Detail**: `doc/research-2026-10.md` (Noise models)
+**Next**: build the spare state off the audio thread (a second reset allocates, served by the real-time pool); the Lab's scores against the ONNX models (#5, #14).
+**Detail**: `doc/todo/4-rnnoise-baseline.md`; `doc/research-2026-10.md` (Noise models)
 
 ---
 
@@ -102,7 +102,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High (phase 1-2) | **Status**: built in v0; simulated against stepped device clocks (nf-engine `pipeline/tests/events.rs`).
 - Mic, speakers and cable run on three clocks. A PI controller (nf-core `DriftController`) on each FIFO's fill drives a ±1-sample-per-block slip (`SlipResampler`); a small target fill, not a big safety margin. The output fill is interpolated from the device clock and calibrated to the padding, so the latency holds still as clocks beat; coarse corrections handle stalls and late wakes.
 - Small IAudioClient3 periods rule out RATEADJUST, so drift is corrected in the app.
-**Next**: with #8; measure real drift (ppm over 30+ minutes) on the owner's device pairs. Look into the output path's delay moving 11-13 ms within a 60 s `quality` take (3 of 6 on the cables, 2026-11-01; #14's detail file): the report doesn't yet show the output's coarse drops.
+- The output path's 9-13 ms delay steps in quality takes (2026-11-01) were the output cable inserting silence, not the engine (2026-11-02, bf5534e); the output's events are now logged per block and reported.
+**Next**: with #8; measure real drift (ppm over 30+ minutes) on the owner's device pairs (`devices --check` fits it per clock).
 **Detail**: `doc/todo/8-audio-io.md`
 
 ---
@@ -131,10 +132,10 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 12. [dsp] Input level meter
-**Priority**: Medium (phase 1) | **Status**: designed (owner's request).
+**Priority**: Medium (phase 1) | **Status**: the console readout is in `run`'s status line (input and output peak/RMS dBFS), with a clip latch shown once after a clip and clipped seconds in the run's summary (2026-11-02).
 - Raw-input peak and RMS in dBFS with peak hold, before any processing; a clip light that latches at about −0.1 dBFS or on flat-topped runs.
 - Toggle on/off, about 20 Hz; auto-pause when the window closes (minimise detection is still open, #15). Later: output level and gain reduction.
-**Next**: phase 1: a console readout (peak/RMS dBFS, clip latch) from the atomics, so the owner can check levels during live runs; the GUI meter in phase 3.
+**Next**: the GUI meter in phase 3.
 **Detail**: `doc/todo/11-floor-gate-meter.md`
 
 ---
@@ -156,7 +157,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
 - Test audio (2026-11-01): `python -I tools/fetch_test_audio.py` fetches a licence-checked starter set (19 takes: speech, noise, music, an AEC pair) into `%LOCALAPPDATA%\noise-filter\test-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-catalogue-2026-11-01.md`.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
-**Next**: phase 0: the batch CLI with #2 (the echo test's live half is done: #10), playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback (the chain recorder, `quality --save`, is its first part). Phase 2: AECMOS. Later: the Lab page (#15).
+**Next**: flag rig slips in the echo test (the far track slipped 70 ms in a take, 2026-11-02; the detail file). Phase 0: the batch CLI with #2 (the echo test's live half is done: #10), playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback (the chain recorder, `quality --save`, is its first part). Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`
 
 ---
@@ -180,11 +181,11 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 17. [plugins] Stage format: CLAP for effects, the AEC and the noise filter (owner)
-**Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26); the AEC and the noise filter are CLAP-shaped stages too (owner, 2026-11-02: "the best and most modern alt to VST3"). Stage interface being built (phase 0).
+**Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26); the AEC and the noise filter are CLAP-shaped stages too (owner, 2026-11-02: "the best and most modern alt to VST3"). The stage interface built 2026-11-02 (68b25ef): descriptors, ports (the AEC's reference on a non-main input), activation, params, state and typed extensions, in-process Rust; AEC3 and the noise stage on it.
 - Every stage is CLAP-shaped. The AEC takes the mic on its main input and the speaker reference on a second input port (CLAP allows one main input plus non-main ones, the sidechain convention). The noise filter is a stage that loads model packs (#3), with the floor and gate inside it and a namespaced extension publishing its speech probability. Effects (a voice changer) come after.
 - Our own stages run in-process through the same Rust interface (no FFI). They can also be exported as `.clap` files (and VST3 via clap-wrapper) for other hosts. Third-party plugins run in an fx-host process (shared memory, a watchdog that passes clean audio through on a miss, editors as its own windows).
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
-**Next**: the stage interface in phase 0, with #2 running stages through it.
+**Next**: recheck CLAP's headers before the .clap export (doc/todo/17's list); a lock-free queue for stages' own params with the GUI (#15) or the first effect.
 **Detail**: `doc/todo/17-post-effects.md`
 
 ---
@@ -215,9 +216,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 21. [engine] Device health and calibration
-**Priority**: Medium (phase 1-2) | **Status**: asked by the owner (2026-11-01); proposal ours, not started.
+**Priority**: Medium (phase 1-2) | **Status**: asked by the owner (2026-11-01); `noise-filter devices --check` built 2026-11-02 (bf5534e): a verdict per stream with the figures and what to try, drift fitted per clock; thresholds provisional, from the cables. Calibration not started.
 - Owner: tell the user when a device or driver delivers in bursts or late, so they can fix it; and a calibration that sizes the buffers to the devices, not too big or small.
 - Proposed: a health readout per stream (steady or bursty, how late, drift, glitches, with a plain verdict and what to try), and a calibration (passive: measure delivery and set the starting targets; active with speakers: time the echo path and check it against the reference's lead, #10).
 - Most of the measures exist: the latency budget (#13), the reference's facts (#10), the counters, the live probe.
-**Next**: define the verdicts and thresholds, then `noise-filter devices --check` (real-hardware data needed for the thresholds).
+**Next**: real-hardware runs to set the thresholds; fix two wordings seen live (a false 'in bursts' for the exclusive mic's normal lead; 'delivered lately'); then the GUI's readout and the calibration.
 **Detail**: `doc/todo/21-device-health.md`

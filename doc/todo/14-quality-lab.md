@@ -155,6 +155,15 @@ Notes:
       reference beside the sweep; the measured delay lands within 0.03 samples of the truth at 0, 25, 40 and 300 ms, through
       a jump mid-take. The echo regions are where the echo is in the mic (the far voice's activity in the scene's time),
       so they don't move with the delay.
+  - **A rig slip (2026-11-02, `events-echo-2` in the dev VM's `Downloads\nf-quality`):** a 60 s echo take cancelled
+    well, then fell to 2-4 dB a far-only turn. The engine held still (its echo path 624 samples, the lead 17.78 ms, no
+    jumps or skips); the far voice in cable B's loopback came 70 ms later from about 24 s on, against `far.wav` as played,
+    while the mic (cable A) held to the sample: the test's far-end playback slipped, with nothing in the loopback's
+    positions or stamps to show it. Real speakers can't do that (the echo and its reference are the same playback). The
+    report said 40 ms because the measured delay is searched within 40 ms of the calibration's. To do: widen that search,
+    and track the far and mic content against what was played (as `Downloads\nf-scratch\which_slipped.py` did) so a take
+    that slipped is flagged as the rig's, from the second it happened. Likely what the unexplained 14 dB take of
+    2026-11-01 (#10) was.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
   - **Its small first part, the chain recorder (built 2026-11-01, for #10):** `Engine::record_chain` records what the chain
     got and gave live, block by block, from the run's first block when armed before the start (engine.md, "The chain
