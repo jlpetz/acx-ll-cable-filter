@@ -40,7 +40,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Effects are CLAP plugins (owner). Making the AEC and noise filter CLAP-shaped stages too is our proposal, awaiting the owner (#17). A model pack is data the noise stage loads: manifest + ONNX + licences + checksums, no code; `spectral` or `waveform`; explicit cache pairs, layout, output kind, latency; separate code/weights/data licences and patent notes; sherpa-onnx key names; the manifest wins over embedded metadata; reject custom ops and outside paths.
 - Models needing custom DSP (RNNoise, DFN3) are built into the noise stage in Rust.
 - Always output full band at 48 kHz; 16 kHz models via a 1536/768 STFT (bins 0-256, ×1/3) plus a pluggable high-band policy, A/B'd in #14.
-**Next**: the first ONNX pack (UL-UNAS, #5) against the spec; settle its draft STFT keys from the exporters.
+- The first ONNX pack built 2026-11-02 (88d1caa): UL-UNAS through a 48 kHz host STFT with its 16 kHz bins mapped in; the spec gained what it needed (external data refused, the high-band policy).
+**Next**: settle the draft STFT keys with a second pack (#5); the reusable conformance check (#2).
 **Detail**: `doc/todo/3-model-spec.md`
 
 ---
@@ -55,14 +56,14 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 5. [models] Candidate models: FastEnhancer, UL-UNAS, DeepFilterNet3
-**Priority**: Medium | **Status**: shortlisted, not integrated; weights licences fact-checked 2026-10-26 (#7). GTCRN dropped (owner, 2026-10-26).
+**Priority**: Medium | **Status**: UL-UNAS integrated for evaluation 2026-11-02 (88d1caa): the `onnx` build, `--model ulunas`, RNNoise the default. Latency 2400 samples (50 ms live, 2 blocks behind on its worker); on the fetched test audio it cut more noise in pauses than RNNoise on 27 of 30 takes (cafe 22.7 vs 19.9 dB, keyboard 29.9 vs 18.4, fan 29.3 vs 26.1), speech kept alike. Weights licences fact-checked 2026-10-26 (#7). GTCRN dropped (owner, 2026-10-26).
 - FastEnhancer-B 48k: 21.3 ms, full band, no resampler, the best paper fit. Its published weights can't ship without the author's grant (no weights licence; AI-Hub and non-commercial training data); our own retrain at a 10 ms hop is the alternative (#7). Asking the author waits until we get there (owner).
 - UL-UNAS: 32 ms, 16 kHz, MIT weights in the repo (probably fine to ship); a China-only patent filing probably covers it (CN119673187, unconfirmed), to be listed in the NOTICE (#18). Run it through `ort`; tract mis-carries its GRU state (tract #2629).
 - DeepFilterNet3: standard weights plausibly open; _ll is a bigger model (9.7M params) with weaker evidence. Opt-in only.
 - Open (owner): does dropping GTCRN over its patent filings also cover UL-UNAS, which probably shares the family? Until answered, UL-UNAS stays the next integration.
 - RNNoise (#4) is the fallback. Choose by #13 and #14 on the owner's own mic, not by paper scores.
-**Next**: after #2/#3, integrate UL-UNAS; FastEnhancer when its weights or our retrain allow.
-**Detail**: `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
+**Next**: the owner's patent answer for UL-UNAS; a live A/B against RNNoise on the cables and by ear (#14), with the high-band fold; FastEnhancer when its weights or our retrain allow.
+**Detail**: `doc/todo/5-candidate-models.md`; `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
 
 ---
 
@@ -72,7 +73,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - One large-page block, allocated at start-up, holds weights, state, scratch and audio buffers (TMR's direct `VirtualAlloc2` path, never placeholder-replace). Without the privilege, or without contiguous memory: 4 KB pages pinned with `VirtualLock` (which needs no privilege), plus a warning (our proposal; refusing to start is the alternative). Size the block at start-up; a model switch that doesn't fit restarts the engine.
 - Also: a hard working-set minimum (keeps code and heaps resident), pre-faulted buffers, MMCSS threads (#8). ORT path: preallocated outputs, a kept arena, optionally a pinned env allocator. Hand ports: zero allocations per frame.
 - Answered 2026-10-25: no INT8 or GPU inference; FP32 on the CPU, one thread.
-**Next**: measure ORT's per-`Run` allocations for UL-UNAS (WPR/ETW); then the port order.
+- Measured 2026-11-02 (88d1caa): each UL-UNAS run makes 3,710 C-runtime allocations and frees (about 305 KB), about 1 ms a run; building a session about 898,000. So ORT runs on an inference worker (CLAUDE.md's exception) and the audio thread allocates nothing.
+**Next**: an outside check with WPR/ETW on a desktop (admin); the port order (a hand port removes the per-run allocations).
 **Detail**: `doc/todo/6-inference-memory.md`
 
 ---
