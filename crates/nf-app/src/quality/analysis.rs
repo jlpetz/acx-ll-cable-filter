@@ -1,5 +1,5 @@
 //! The quality test's analysis: aligns the recording with the scene's clean near speech, then compares levels over regions of
-//! the scene. [`analyse`] is a pure function of the signals, so it's unit-tested on synthetic recordings.
+//! the scene. [`analyse_with`] is a pure function of the signals, so it's unit-tested on synthetic recordings.
 //!
 //! - **Alignment**, in two steps, so that a path whose delay drifts, wanders or steps during the take still lines up (one lag
 //!   for the whole take lost the scene once the delay moved by about 1.5 ms):
@@ -26,6 +26,9 @@
 //!     noise over the same samples (it caps the drop the analysis can see while it passes). The near speech's cores in
 //!     near-only turns (not far busy), in double-talk turns (far busy), and in double-talk turns where the far voice is
 //!     mid-syllable too (far cores).
+//!   - after a rig slip ([`analyse_with`]'s `slip_from`, from `echo_delay::track_rig`): the far-only turns from the one that
+//!     holds the slip on are left out of the pooled echo figure and listed apart, and the double-talk figures stop there too
+//!     (the canceller had a misaligned reference from then on): what the echo did there is the rig's.
 //! - **Levels** are RMS over each region in dBFS; a change is the output's level minus the reference's. The speech regions
 //!   measure the speech's own share of the output, so echo and noise left there don't count as speech: per 20 ms frame, the
 //!   output's least-squares projection on the clean speech (gain `<y,c>/<c,c>`). What's left over (echo, noise, and the
@@ -39,7 +42,7 @@ use nf_core::SAMPLE_RATE;
 use nf_core::latency::analysis::xcorr_peak;
 
 use super::QualityTest;
-use super::signals::{RIR_S, Scene, Turn, turn_at, turn_len};
+use super::signals::{RIR_S, Scene, Turn, far_only_from, turn_at, turn_len};
 
 /// The weakest median window coefficient that counts as aligned.
 ///
@@ -80,8 +83,9 @@ const CORE_TRIM_S: f64 = 0.04;
 pub const MIN_REGION_S: f64 = 0.25;
 /// The speech regions' projection frames (20 ms).
 const PROJECTION_FRAME: usize = 960;
-/// Near speech left in the pauses within this of the noise there earns a warning.
-const PAUSE_SPEECH_WARN_DB: f32 = 25.0;
+/// Near speech left in the pauses within this of the noise there earns a warning (and `noise-filter lab` leaves the clip's pause
+/// figures out of its summary).
+pub const PAUSE_SPEECH_WARN_DB: f32 = 25.0;
 /// An echo drop within this of the scene's ceiling (or past it) earns a warning.
 const CEILING_WARN_DB: f32 = 3.0;
 
@@ -178,6 +182,9 @@ pub enum Metrics {
     Echo {
         far_only: EchoLevels,
         far_only_turns: Vec<Levels>,
+        /// The far-only turns from a rig slip's turn on (left out of `far_only`), and the scene sample that turn starts at.
+        slipped_turns: Vec<Levels>,
+        slipped_from: Option<usize>,
         converging: Levels,
         near_only: SpeechLevels,
         double_talk: SpeechLevels,
@@ -295,8 +302,17 @@ pub struct AlignmentFailure {
     pub reason: String,
 }
 
-/// Aligns `recording` (which starts `lead` samples before the scene was played) with the scene's clean speech, and measures it.
+/// Aligns `recording` (which starts `lead` samples before the scene was played) with the scene's clean speech, and measures it
+/// ([`analyse_with`] without a rig slip: the tests' shorthand).
+#[cfg(test)]
 pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis, AlignmentFailure> {
+    analyse_with(scene, recording, lead, None)
+}
+
+/// Aligns `recording` (which starts `lead` samples before the scene was played) with the scene's clean speech, and measures it;
+/// in the echo test, with the far-only turns from the one holding scene sample `slip_from` on left out of the pooled echo
+/// figure (a rig slip there: `echo_delay::RigTrack::excluded_from`) and listed apart, and the double-talk figures stopped there.
+pub fn analyse_with(scene: &Scene, recording: &[f32], lead: usize, slip_from: Option<usize>) -> Result<Analysis, AlignmentFailure> {
     let (alignment, track) = align(scene, recording, lead)?;
     let delay_steps = delay_steps(&track, recording);
     let len = scene.clean.len();
@@ -344,11 +360,8 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
     let near_core = mark(len, &cores(&scene.near_activity, samples(CORE_TRIM_S)), 0, 0);
     let metrics = match scene.test {
         QualityTest::Noise => {
-            let scope = samples(SETTLE_S).min(covered)..covered;
-            let steady = mark(len, &scene.near_activity, samples(STEADY_MARGIN_S), samples(STEADY_MARGIN_S));
-            let pause = |i: usize| !near_busy[i];
             // A recording's reverberation or trailing speech in the pauses would be kept by the filter, and read as noise left.
-            let left = rms_dbfs(&scene.clean, scope.clone(), pause) - rms_dbfs(&scene.noise, scope.clone(), pause);
+            let left = speech_left_in_pauses_db(scene, covered);
             if left > -PAUSE_SPEECH_WARN_DB {
                 warnings.push(format!(
                     "The near speech's own sound in the pauses (its reverberation, or its recording's background) is only {:.1} dB \
@@ -356,11 +369,7 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
                     -left
                 ));
             }
-            Metrics::Noise {
-                pauses: levels(&scene.input, &aligned, scope.clone(), pause),
-                steady_pauses: levels(&scene.input, &aligned, scope.clone(), |i| !steady[i]),
-                speech: speech_levels(&scene.clean, &aligned, scope, |i| near_core[i]),
-            }
+            noise_metrics(scene, &aligned, covered)
         }
         QualityTest::Echo => {
             let turn = turn_len();
@@ -369,9 +378,13 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
             let far_core = mark(len, &cores(&scene.far_activity, samples(CORE_TRIM_S)), 0, 0);
             let far_alone = |i: usize| turn_at(i) == Turn::FarOnly && far_core[i] && !near_busy[i];
             let double_talk = |i: usize| turn_at(i) == Turn::DoubleTalk && near_core[i];
+            // The far-only turn holding a rig slip, and every one after it, are the rig's; so is double talk from there on (the
+            // near-only turns have no far voice to misalign)
+            let slipped_from = slip_from.map(far_only_from);
+            let pooled = scope.start..scope.end.min(slipped_from.unwrap_or(usize::MAX)).max(scope.start);
             let far_only = EchoLevels {
-                levels: levels(&scene.input, &aligned, scope.clone(), far_alone),
-                noise_dbfs: rms_dbfs(&scene.noise, scope.clone(), far_alone),
+                levels: levels(&scene.input, &aligned, pooled.clone(), far_alone),
+                noise_dbfs: rms_dbfs(&scene.noise, pooled.clone(), far_alone),
             };
             let (drop, ceiling) = (far_only.drop_db(), far_only.ceiling_db());
             if drop.is_finite() && ceiling.is_finite() && drop > ceiling - CEILING_WARN_DB {
@@ -381,28 +394,64 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
                      higher --snr lowers the noise); past it, the noise filter is cutting the noise too."
                 ));
             }
-            Metrics::Echo {
-                far_only,
-                far_only_turns: (3 * turn..covered)
+            let turn_levels = |slipped: bool| -> Vec<Levels> {
+                (3 * turn..covered)
                     .step_by(3 * turn)
+                    .filter(|&t0| slipped_from.is_some_and(|s| t0 >= s) == slipped)
                     .map(|t0| levels(&scene.input, &aligned, t0..(t0 + turn).min(covered), far_alone))
                     .filter(|l| l.seconds > 0.0)
-                    .collect(),
+                    .collect()
+            };
+            Metrics::Echo {
+                far_only,
+                far_only_turns: turn_levels(false),
+                slipped_turns: turn_levels(true),
+                slipped_from,
                 converging: levels(&scene.input, &aligned, samples(SETTLE_S).min(turn)..turn.min(covered), far_alone),
                 near_only: speech_levels(&scene.clean, &aligned, scope.clone(), |i| {
                     turn_at(i) == Turn::NearOnly && near_core[i] && !far_busy[i]
                 }),
-                double_talk: speech_levels(&scene.clean, &aligned, scope.clone(), |i| double_talk(i) && far_busy[i]),
-                both_talking: speech_levels(&scene.clean, &aligned, scope, |i| double_talk(i) && far_core[i]),
+                double_talk: speech_levels(&scene.clean, &aligned, pooled.clone(), |i| double_talk(i) && far_busy[i]),
+                both_talking: speech_levels(&scene.clean, &aligned, pooled, |i| double_talk(i) && far_core[i]),
             }
         }
     };
+    let slipped = matches!(metrics, Metrics::Echo { slipped_from: Some(_), .. });
     for (name, seconds) in metrics.region_seconds() {
-        if seconds < MIN_REGION_S {
+        // After a rig slip the echo and double-talk figures are short by design: the slip's warning says why
+        if seconds < MIN_REGION_S && !(slipped && (name.starts_with("echo") || name.ends_with("double talk"))) {
             warnings.push(format!("There was too little {name} ({seconds:.2} s) to measure it well; make the scene longer (--seconds)."));
         }
     }
     Ok(Analysis { alignment, aligned, metrics, delay_steps, warnings })
+}
+
+/// The noise test's regions (module notes) over `aligned`, the output in the clean signal's time, as far as `covered`: the
+/// noise in pauses (input vs output), the same 200 ms clear of speech, and the speech's share in its cores, from the first
+/// second on. [`analyse_with`] measures a live recording with it once aligned; `noise-filter lab` an offline run, aligned exactly.
+pub fn noise_metrics(scene: &Scene, aligned: &[f32], covered: usize) -> Metrics {
+    let (len, fs) = (scene.clean.len(), f64::from(SAMPLE_RATE));
+    let samples = |s: f64| (s * fs).round() as usize;
+    let near_busy = mark(len, &scene.near_activity, samples(MARGIN_S), samples(MARGIN_S));
+    let near_core = mark(len, &cores(&scene.near_activity, samples(CORE_TRIM_S)), 0, 0);
+    let steady = mark(len, &scene.near_activity, samples(STEADY_MARGIN_S), samples(STEADY_MARGIN_S));
+    let scope = samples(SETTLE_S).min(covered)..covered;
+    Metrics::Noise {
+        pauses: levels(&scene.input, aligned, scope.clone(), |i| !near_busy[i]),
+        steady_pauses: levels(&scene.input, aligned, scope.clone(), |i| !steady[i]),
+        speech: speech_levels(&scene.clean, aligned, scope, |i| near_core[i]),
+    }
+}
+
+/// The near speech's own level in the noise test's pauses against the noise's there, in dB (its reverberation, or a
+/// recording's background): near 0, the noise-in-pauses figure counts some of the speech as noise left.
+pub fn speech_left_in_pauses_db(scene: &Scene, covered: usize) -> f32 {
+    let fs = f64::from(SAMPLE_RATE);
+    let margin = (MARGIN_S * fs).round() as usize;
+    let near_busy = mark(scene.clean.len(), &scene.near_activity, margin, margin);
+    let scope = ((SETTLE_S * fs).round() as usize).min(covered)..covered;
+    let pause = |i: usize| !near_busy[i];
+    rms_dbfs(&scene.clean, scope.clone(), pause) - rms_dbfs(&scene.noise, scope, pause)
 }
 
 /// One alignment window: its centre in the clean signal, and the delay and the coefficient found there (NaN and 0 when the
@@ -726,7 +775,7 @@ mod tests {
         assert_eq!(a.alignment.delay, (LEAD + path) as i64);
         assert!(a.alignment.correlation > 0.95, "{:?}", a.alignment);
         assert!(a.warnings.is_empty(), "{:?}", a.warnings);
-        let Metrics::Echo { far_only, far_only_turns, converging, near_only, double_talk, both_talking } = a.metrics else {
+        let Metrics::Echo { far_only, far_only_turns, converging, near_only, double_talk, both_talking, .. } = a.metrics else {
             panic!("{:?}", a.metrics)
         };
         // The input where only the far end talks is the echo and a little noise: 6 dB under the speech's active level, and a
@@ -810,6 +859,49 @@ mod tests {
         // The echo left in double talk is the rest there, not the near speech
         assert!(close(gain(double_talk), 0.0, 0.3), "{double_talk:?}");
         assert!(double_talk.rest_dbfs > clean_dt.rest_dbfs + 10.0, "{double_talk:?} {clean_dt:?}");
+    }
+
+    /// A rig slip 10 s in (inside the second far-only turn, 9-12 s): a canceller that cut the echo by 40 dB before it and by
+    /// only 3 dB from then on. The pooled echo figure is the turns before the slip's (40 dB), and the turns from its turn on
+    /// (9 and 18 s) are listed apart with what they did; double talk counts only its turn before the slip (6-9 s, not 15-18 s);
+    /// without the slip, the pooled figure falls and double talk holds the echo left after it.
+    #[test]
+    fn the_far_only_turns_after_a_rig_slip_are_left_out_of_the_echo_figure() {
+        let scene = build(QualityTest::Echo, 21.0, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
+        let slip = 10 * FS;
+        let processed = cancel(&scene, 1.0, |i, _| if i < slip { 0.01 } else { 0.7 });
+        let rec = recording(&processed, 2_000);
+        let a = analyse_with(&scene, &rec, LEAD, Some(slip)).unwrap();
+        let Metrics::Echo { far_only, far_only_turns, slipped_turns, slipped_from, .. } = &a.metrics else { panic!() };
+        assert_eq!(*slipped_from, Some(9 * FS), "from the start of the turn holding the slip");
+        assert!(far_only_turns.is_empty(), "no far-only turn after the first comes before the slip: {far_only_turns:?}");
+        assert_eq!(slipped_turns.len(), 2);
+        // The turn holding the slip (9-12 s) mixes both; the one after it (18-21 s) is the 3 dB alone
+        assert!(
+            -slipped_turns[0].change_db() < 39.0 && close(-slipped_turns[1].change_db(), -20.0 * 0.7f32.log10(), 0.01),
+            "{slipped_turns:?}"
+        );
+        assert!(far_only.levels.seconds == 0.0 && far_only.drop_db().is_nan(), "{far_only:?}");
+        assert!(!a.warnings.iter().any(|w| w.contains("too little echo")), "the slip explains it: {:?}", a.warnings);
+        let unflagged = analyse(&scene, &rec, LEAD).unwrap();
+        let (Metrics::Echo { double_talk, both_talking, .. }, Metrics::Echo { double_talk: all_dt, both_talking: all_both, .. }) =
+            (&a.metrics, &unflagged.metrics)
+        else {
+            panic!()
+        };
+        assert!(double_talk.seconds > 0.25 && double_talk.seconds < 0.75 * all_dt.seconds, "{double_talk:?} {all_dt:?}");
+        assert!(both_talking.seconds < all_both.seconds, "{both_talking:?} {all_both:?}");
+        assert!(double_talk.rest_dbfs < all_dt.rest_dbfs - 10.0, "only the 40 dB part's echo: {double_talk:?} {all_dt:?}");
+        // A slip in the third far-only turn (18-21 s): the second is pooled, at its 40 dB
+        let late =
+            analyse_with(&scene, &recording(&cancel(&scene, 1.0, |i, _| if i < 19 * FS { 0.01 } else { 0.7 }), 2_000), LEAD, Some(19 * FS))
+                .unwrap();
+        let Metrics::Echo { far_only, far_only_turns, slipped_turns, .. } = &late.metrics else { panic!() };
+        assert!(close(far_only.drop_db(), 40.0, 0.01) && far_only_turns.len() == 1 && slipped_turns.len() == 1, "{far_only:?}");
+        // Unflagged, the same recording pools the slipped turn in and the figure falls
+        let plain = analyse(&scene, &recording(&cancel(&scene, 1.0, |i, _| if i < 19 * FS { 0.01 } else { 0.7 }), 2_000), LEAD).unwrap();
+        let Metrics::Echo { far_only, slipped_turns, .. } = &plain.metrics else { panic!() };
+        assert!(far_only.drop_db() < 10.0 && slipped_turns.is_empty(), "{far_only:?}");
     }
 
     /// A canceller that removes the echo exactly and passes the noise, in a scene whose noise is only 30 dB under the

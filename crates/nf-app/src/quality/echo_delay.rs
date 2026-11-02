@@ -24,15 +24,32 @@
 //!   negative). It looks only where the marker can be ([`search_from`]: from half a second before the take's lead ends), so
 //!   each look correlates about a second of the recording, not the run so far.
 //! - **The measurement** ([`measure`], on the take's whole chain recording): in each far-only turn, the lag of the echo in the
-//!   chain's mic behind the chain's reference (GCC-PHAT, within [`SEARCH_MS`] of where the calibration put it), which is what
-//!   AEC3 sees, plus the lead over the turn: the delay after the reference's tap. The median turn is reported, with the range.
+//!   chain's mic behind the chain's reference (GCC-PHAT, within [`SEARCH_MS`] of where the calibration put it: as far as the
+//!   rig's offset may be), which is what AEC3 sees, plus the lead over the turn: the delay after the reference's tap. The
+//!   median turn is reported, with the range; turns after a rig slip are reported apart.
+//! - **Rig slips** ([`track_rig`], TODO 14's note of 2026-11-02): a take whose far end's playback slipped 70 ms against its
+//!   echo mid-take, with nothing in the streams' positions or stamps to show it, read as a filter that stopped cancelling.
+//!   So each device's content is tracked against what was played: windows of the probe's track (the scene's input) in the
+//!   chain's mic, and of the far end's (the far voice where it started) in the chain's reference, each found within
+//!   [`MAX_RIG_OFFSET_MS`] of where the last one was (or, failing that, within [`RIG_REACQUIRE_MS`]: a bigger slip), and its
+//!   place turned into the device's own position (the mic's stream index and skips, the reference's timeline index), so the
+//!   engine's own moves (a discard, a skip, a read-position jump) don't count. The offset of that position from the played one
+//!   holds while the rig holds; a move of [`SLIP_MS`] or more between windows, which the next window confirms, is a slip: the
+//!   report says on which side, when and by how much, and leaves the far-only turns from its turn on out of the echo figures
+//!   (and double talk from then on), as the rig's, not the filter's. A side whose windows stop being found at all, to the end
+//!   of the take ([`RIG_LOST_WINDOWS`] or more), has lost its track, and the turns from its last window found on are left out
+//!   the same way. A step in a side's last window, with none after it to confirm it, is reported as unconfirmed and sets
+//!   nothing apart. Each side's times are its own content's place in the scene: the probe's input sample, or the far voice's
+//!   (the far end plays its sample `i` at `far_start + i`, so the far voice's times line up with the turns).
+
+use std::fmt::Write as _;
 
 use nf_core::latency::analysis::{gcc_phat, xcorr_peak};
 use nf_core::latency::sweep::exp_sweep;
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_engine::{ChainBlock, ChainRecording};
 
-use super::signals::{Scene, Turn, turn_at, turn_len};
+use super::signals::{Scene, Turn, far_only_from, turn_at, turn_len};
 
 /// `--echo-delay`'s default (typical speakers) and its range, in ms.
 pub const DEFAULT_ECHO_DELAY_MS: f32 = 25.0;
@@ -45,9 +62,25 @@ pub const EXCLUSIVE_MIC_ECHO_FLOOR_MS: f32 = 20.0;
 const _: () = assert!(DEFAULT_ECHO_DELAY_MS >= EXCLUSIVE_MIC_ECHO_FLOOR_MS + 4.0);
 /// The most the rig may put a zero-delay echo before (or after) its reference's tap for the take to make up for it.
 pub const MAX_RIG_OFFSET_MS: f64 = 250.0;
-/// The measurement looks this far either side of the delay the calibration expects: room for a jump of the reference's read
-/// position after it (a change of the lead target), or a cable that slips by a period.
-pub const SEARCH_MS: f64 = 40.0;
+/// The measurement looks this far either side of the delay the calibration expects: as far as the rig's offset may be (a 40 ms
+/// search reported a 70 ms slip as 40), so a jump of the reference's read position after it, or a slip of the rig, shows at its
+/// size.
+pub const SEARCH_MS: f64 = MAX_RIG_OFFSET_MS;
+/// The rig tracker's windows: a second of what a device played, every half second; a window counts where what was played is
+/// within [`RIG_ACTIVE_DB`] of its loudest window and its copy correlates at [`RIG_MIN_PEAK`] or more.
+const RIG_WINDOW_S: f64 = 1.0;
+const RIG_HOP_S: f64 = 0.5;
+const RIG_ACTIVE_DB: f64 = 30.0;
+const RIG_MIN_PEAK: f32 = 0.5;
+/// A window not found within [`MAX_RIG_OFFSET_MS`] of where the last one was is looked for again this far either side, so a
+/// slip bigger than the plan makes up for still shows at its size.
+pub const RIG_REACQUIRE_MS: f64 = 2_000.0;
+/// This many active windows in a row not found even there, to the end of the take, lose a side's track.
+pub const RIG_LOST_WINDOWS: usize = 2;
+/// A device's content moving by this much or more between windows (or from the marker), confirmed by the window after, is a
+/// slip. Each side runs on one clock (a cable's two ends, a device and its loopback), so between windows it holds to the
+/// sample; VB-CABLE's resyncs move it by about a period (10-11 ms), and the dev VM's far end slipped by 70 ms.
+pub const SLIP_MS: f64 = 1.0;
 /// AEC3 needs the echo at least about this long after the reference it's given: under it, the echo can come before its
 /// reference as the delay wanders by the stamps' jitter (the mic's are in 0.5 ms steps within ±1 ms on the cables).
 pub const MIN_CAUSAL_MS: f64 = 2.0;
@@ -276,8 +309,8 @@ fn lead_near(blocks: &[ChainBlock], to: f64) -> Option<f64> {
 }
 
 /// Where the echo landed over the take's far-only turns: the median turn (by its delay after the tap; the lower middle one of an
-/// even count).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// even count). With a rig slip, over the turns before it; those after it are listed apart.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EchoDelay {
     pub asked_ms: f64,
     /// The echo's delay after its reference's tap (`seen_ms + lead_ms`), the lag AEC3 sees (the echo behind the reference it's
@@ -288,21 +321,26 @@ pub struct EchoDelay {
     /// The lowest and highest delay after the tap among the turns, in ms.
     pub low_ms: f64,
     pub high_ms: f64,
-    /// Far-only turns measured, of those the recording holds.
+    /// Far-only turns measured (before a rig slip), of those the recording holds.
     pub turns: usize,
     pub turns_held: usize,
+    /// The far-only turns from the rig's slip on: each one's start in the scene (s) and its delay after the tap (ms).
+    pub slipped: Vec<(f64, f64)>,
 }
 
 /// Measures the echo's delay in `chain`, the take's whole chain recording, where `cal` found the marker and the far voice
-/// started at `far_start` (see the module notes).
-pub fn measure(chain: &ChainRecording, scene: &Scene, plan: &Plan, cal: &Calibration, far_start: u64) -> Result<EchoDelay, String> {
+/// started at `far_start` (see the module notes). `slip_from`: the scene sample from which the rig had slipped
+/// ([`RigTrack::excluded_from`]): the turns from the one holding it on are listed apart, not in the figure.
+pub fn measure(
+    chain: &ChainRecording, scene: &Scene, plan: &Plan, cal: &Calibration, far_start: u64, slip_from: Option<usize>,
+) -> Result<EchoDelay, String> {
     let turn = turn_len();
     let n = chain.mic.len().min(chain.reference.len()) as i64;
     // The lag the calibration expects in the chain, and where the scene's input starts in the chain's mic.
     let expected = (cal.mic_at - cal.ref_at + plan.scene_at as f64 - far_start as f64).round() as i64;
     let scene0 = cal.mic_at.round() as i64 + plan.scene_at as i64;
     let search = to_samples(SEARCH_MS).round() as usize;
-    let (mut turns, mut held) = (Vec::new(), 0usize);
+    let (mut turns, mut held, mut slipped) = (Vec::new(), 0usize, Vec::new());
     for t0 in (0..scene.input.len()).step_by(3 * turn) {
         debug_assert_eq!(turn_at(t0), Turn::FarOnly);
         let t1 = (t0 + turn).min(scene.input.len());
@@ -325,10 +363,17 @@ pub fn measure(chain: &ChainRecording, scene: &Scene, plan: &Plan, cal: &Calibra
         let paths: Vec<f64> = blocks.iter().filter_map(path).collect();
         let Some(lead) = median(&paths).and_then(|p| lead_near(blocks, p)) else { continue };
         let seen = to_ms(expected as f64 + lag);
-        turns.push((seen + lead, seen, lead));
+        if slip_from.is_some_and(|s| t1 > s) {
+            slipped.push((t0 as f64 / fs(), seen + lead));
+        } else {
+            turns.push((seen + lead, seen, lead));
+        }
     }
     if turns.is_empty() {
-        return Err(if held == 0 {
+        return Err(if !slipped.is_empty() {
+            let d: Vec<String> = slipped.iter().map(|(_, ms)| format!("{ms:.1}")).collect();
+            format!("every far-only turn came after the rig slipped or lost its track (their echo came {} ms after its tap)", d.join(", "))
+        } else if held == 0 {
             "the chain recording doesn't hold a far-only turn".into()
         } else {
             format!("the echo didn't stand out against its reference in any of the {held} far-only turns")
@@ -346,8 +391,352 @@ pub fn measure(chain: &ChainRecording, scene: &Scene, plan: &Plan, cal: &Calibra
         low_ms: turns[0].0,
         high_ms: turns[k - 1].0,
         turns: k,
-        turns_held: held,
+        turns_held: held - slipped.len(),
+        slipped,
     })
+}
+
+/// Which device a slip moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The probe's content in the filter's mic (the near end's cable).
+    Mic,
+    /// The far end's content in the filter's echo reference (its loopback).
+    Reference,
+}
+
+impl Side {
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Mic => "the mic (the probe's track in the filter's mic)",
+            Side::Reference => "the far end's loopback (the far voice in the filter's reference)",
+        }
+    }
+}
+
+/// One window of a device's played track, found in the chain recording.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigPoint {
+    /// The window's centre in the scene, in samples (negative before the scene starts): the probe's input sample on the mic's
+    /// side, the far voice's on the reference's.
+    pub at: i64,
+    /// The device's position of the window's copy less the window's place in the track, in samples, against the marker's.
+    pub offset: f64,
+    /// The copy's correlation coefficient.
+    pub peak: f32,
+}
+
+/// A move of a device's content against what it played.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slip {
+    pub side: Side,
+    /// Where in the scene it happened, in samples (negative before the scene): after the start of the last window that still
+    /// had the old offset (the marker, for a slip before the first window), and before the end of the first that has the new
+    /// (a window shows the offset of most of its content). A second and a half apart for neighbouring windows; far apart where
+    /// the device played nothing between them (the far voice is silent in near-only turns).
+    pub after: i64,
+    pub at: i64,
+    /// How far the content moved, in samples (positive: it came later).
+    pub samples: f64,
+    /// The window after it agreed with its new offset. A side's last window has none to: a step there is reported as
+    /// unconfirmed and sets no turns apart.
+    pub confirmed: bool,
+}
+
+/// A side's track lost: from some window on, to the end of the take, none was found even within [`RIG_REACQUIRE_MS`] of where
+/// the content had been (it moved further, or stopped).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lost {
+    pub side: Side,
+    /// The start of the last window found (the marker's place, if none was), in scene samples.
+    pub after: i64,
+    /// The active windows not found from then on.
+    pub windows: usize,
+}
+
+impl Lost {
+    pub fn after_s(&self) -> f64 {
+        self.after as f64 / fs()
+    }
+}
+
+impl Slip {
+    pub fn after_s(&self) -> f64 {
+        self.after as f64 / fs()
+    }
+
+    pub fn at_s(&self) -> f64 {
+        self.at as f64 / fs()
+    }
+
+    /// "at about 20.2 s" (neighbouring windows bound it), or "between 24.0 and 27.0 s".
+    pub fn when(&self) -> String {
+        if (self.at - self.after) as f64 <= (RIG_WINDOW_S + RIG_HOP_S) * fs() {
+            format!("at about {:.1} s", (self.after + self.at) as f64 / 2.0 / fs())
+        } else {
+            format!("between {:.1} and {:.1} s", self.after_s(), self.at_s())
+        }
+    }
+
+    pub fn ms(&self) -> f64 {
+        to_ms(self.samples)
+    }
+}
+
+/// Both devices' content against what was played over the take ([`track_rig`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RigTrack {
+    pub mic: Vec<RigPoint>,
+    pub reference: Vec<RigPoint>,
+    /// In time order, confirmed or not.
+    pub slips: Vec<Slip>,
+    /// The sides whose track was lost.
+    pub lost: Vec<Lost>,
+}
+
+impl RigTrack {
+    /// The scene sample from which the echo figures are the rig's: the earliest a confirmed slip can have come, or a lost track
+    /// was last found (0 if before the scene).
+    pub fn excluded_from(&self) -> Option<usize> {
+        let slips = self.slips.iter().filter(|s| s.confirmed).map(|s| s.after);
+        slips.chain(self.lost.iter().map(|l| l.after)).min().map(|a| a.max(0) as usize)
+    }
+
+    /// How far a side's content wandered over its windows between its slips (the widest stretch's range, ms), and how many
+    /// windows it had.
+    pub fn spread_ms(&self, side: Side) -> (f64, usize) {
+        let pts = if side == Side::Mic { &self.mic } else { &self.reference };
+        if pts.is_empty() {
+            return (f64::NAN, 0);
+        }
+        // The windows kept differ by a slip's step only where it slipped: a new stretch starts there
+        let (step, mut widest) = (to_samples(SLIP_MS), 0.0f64);
+        let (mut lo, mut hi, mut last) = (f64::INFINITY, f64::NEG_INFINITY, pts[0].offset);
+        for p in pts {
+            if (p.offset - last).abs() >= step {
+                widest = widest.max(hi - lo);
+                (lo, hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            }
+            (lo, hi, last) = (lo.min(p.offset), hi.max(p.offset), p.offset);
+        }
+        (to_ms(widest.max(hi - lo)), pts.len())
+    }
+
+    /// Whether `side` slipped (a confirmed slip).
+    pub fn slipped(&self, side: Side) -> bool {
+        self.slips.iter().any(|s| s.side == side && s.confirmed)
+    }
+
+    /// Whether `side` held: no confirmed slip, and its track not lost.
+    pub fn held(&self, side: Side) -> bool {
+        !self.slipped(side) && self.lost.iter().all(|l| l.side != side)
+    }
+}
+
+/// A chain recording's sample `n` as a position of the device behind it: the mic stream's index (and the frames its position
+/// skipped unfilled, which it doesn't count), or the reference timeline's index (at the block's rate: 479 or 481 samples at a
+/// slip). `None` where the block has no reference, or took nothing.
+struct Positions<'a> {
+    blocks: &'a [ChainBlock],
+    /// The mic's skips up to each block.
+    skipped: Vec<i64>,
+}
+
+impl<'a> Positions<'a> {
+    fn new(blocks: &'a [ChainBlock]) -> Self {
+        let skipped = blocks.iter().scan(0i64, |acc, b| {
+            *acc += b.mic_skipped;
+            Some(*acc)
+        });
+        Self { blocks, skipped: skipped.collect() }
+    }
+
+    fn at(&self, side: Side, n: f64) -> Option<f64> {
+        if n < 0.0 {
+            return None;
+        }
+        let k = (n / BLOCK as f64).floor() as usize;
+        let (b, o) = (self.blocks.get(k)?, n - (k * BLOCK) as f64);
+        match side {
+            Side::Mic => Some(b.mic_index as f64 + self.skipped[k] as f64 + o),
+            Side::Reference => {
+                b.reference.filter(|r| r.consumed > 0).map(|r| r.read_index as f64 + o * f64::from(r.consumed) / BLOCK as f64)
+            }
+        }
+    }
+}
+
+/// Tracks both devices' content in `chain` against what they played (see the module notes): the probe's track
+/// ([`Plan::probe_track`] of the scene's input) in the chain's mic, the far end's (the marker, then the scene's far voice from
+/// `far_start`) in its reference, from where `cal` found the marker. Each side's times are its own content's in the scene: the
+/// input's from `scene_at` on the probe's track, the far voice's from `far_start` on the far end's.
+pub fn track_rig(chain: &ChainRecording, scene: &Scene, plan: &Plan, cal: &Calibration, far_start: u64) -> RigTrack {
+    let pos = Positions::new(&chain.blocks);
+    let probe = plan.probe_track(&scene.input);
+    let mut far = plan.marker.clone();
+    far.resize(far_start as usize, 0.0);
+    far.extend_from_slice(scene.far.as_deref().unwrap_or(&[]));
+    let scene_at = plan.scene_at as usize;
+    let mic = track_side(&pos, Side::Mic, &chain.mic, &probe, cal.mic_at, scene_at, scene_at);
+    let reference = track_side(&pos, Side::Reference, &chain.reference, &far, cal.ref_at, far_start as usize, far_start as usize);
+    let mut slips: Vec<Slip> = mic.slips.into_iter().chain(reference.slips).collect();
+    slips.sort_by_key(|s| s.at);
+    RigTrack { mic: mic.points, reference: reference.points, slips, lost: mic.lost.into_iter().chain(reference.lost).collect() }
+}
+
+/// One side's track: the windows kept, the slips, and whether it was lost.
+struct SideTrack {
+    points: Vec<RigPoint>,
+    slips: Vec<Slip>,
+    lost: Option<Lost>,
+}
+
+/// One side of [`track_rig`]: `played` (track frames, the marker at 0) found window by window in `recorded` from track frame
+/// `from` on, the marker having arrived at `marker_at` there; window places are reported against track frame `origin` (where
+/// the side's scene content starts).
+fn track_side(pos: &Positions<'_>, side: Side, recorded: &[f32], played: &[f32], marker_at: f64, from: usize, origin: usize) -> SideTrack {
+    let ms = |v: f64| to_samples(v).round() as usize;
+    let (w, hop, search, wide) = (ms(RIG_WINDOW_S * 1000.0), ms(RIG_HOP_S * 1000.0), ms(MAX_RIG_OFFSET_MS), ms(RIG_REACQUIRE_MS));
+    let (marker, half) = (-(origin as i64), (w / 2) as i64);
+    let Some(base) = pos.at(side, marker_at) else { return SideTrack { points: Vec::new(), slips: Vec::new(), lost: None } };
+    let starts: Vec<usize> = (from..played.len().saturating_sub(w)).step_by(hop).collect();
+    let loudest = starts.iter().map(|&t| rms(&played[t..t + w])).fold(0.0f64, f64::max);
+    let quiet = loudest * 10f64.powf(-RIG_ACTIVE_DB / 20.0);
+    let mut points = Vec::new();
+    // Where the last window's copy was in the recording, and its track frame; the active windows not found since
+    let (mut last, mut misses) = ((marker_at, 0usize), 0usize);
+    for t in starts {
+        let x = &played[t..t + w];
+        if rms(x) < quiet.max(1e-6) {
+            continue;
+        }
+        let expect = last.0 + (t - last.1) as f64;
+        if expect + w as f64 > recorded.len() as f64 {
+            // The recording ends before this window's copy would
+            break;
+        }
+        // The window's copy within `reach` of where it would be at the last window's offset
+        let find = |reach: usize| -> Option<(f64, f32)> {
+            let lo = (expect - reach as f64).round().max(0.0) as usize;
+            let hi = ((expect + (w + reach) as f64).round() as usize).min(recorded.len());
+            let p = (hi > lo + w).then(|| xcorr_peak(x, &recorded[lo..hi], hi - lo - w)).flatten()?;
+            (p.delay >= 0.0 && p.peak >= RIG_MIN_PEAK).then_some((lo as f64 + p.delay, p.peak))
+        };
+        let Some((n, peak)) = find(search).or_else(|| find(wide)) else {
+            misses += 1;
+            continue;
+        };
+        let Some(at) = pos.at(side, n) else { continue };
+        points.push(RigPoint { at: (t + w / 2) as i64 - origin as i64, offset: at - t as f64 - base, peak });
+        (last, misses) = ((n, t), 0);
+    }
+    let lost = (misses >= RIG_LOST_WINDOWS).then(|| Lost { side, after: points.last().map_or(marker, |p| p.at - half), windows: misses });
+    let (points, slips) = slips_of(side, &points, marker, half);
+    SideTrack { points, slips, lost }
+}
+
+/// The slips in a side's windows (in time order, the marker's offset 0, the marker at scene sample `marker`, the windows
+/// `half` either side of their centres): a move of [`SLIP_MS`] or more from the level held so far, which the next window
+/// confirms; a window that disagrees with both of its neighbours is an outlier, left out; a step in the last window, with
+/// none after it, is an unconfirmed slip (not kept). Returns the windows kept and the slips.
+fn slips_of(side: Side, points: &[RigPoint], marker: i64, half: i64) -> (Vec<RigPoint>, Vec<Slip>) {
+    let step = to_samples(SLIP_MS);
+    let (mut level, mut since, mut slips, mut kept) = (0.0f64, marker, Vec::new(), Vec::new());
+    for (k, p) in points.iter().enumerate() {
+        if (p.offset - level).abs() < step {
+            (level, since) = (p.offset, p.at - half);
+            kept.push(*p);
+            continue;
+        }
+        let slip = |confirmed| Slip { side, after: since, at: p.at + half, samples: p.offset - level, confirmed };
+        match points.get(k + 1) {
+            Some(q) if (q.offset - p.offset).abs() < step => {
+                slips.push(slip(true));
+                (level, since) = (p.offset, p.at - half);
+                kept.push(*p);
+            }
+            Some(_) => {}
+            None => slips.push(slip(false)),
+        }
+    }
+    (kept, slips)
+}
+
+/// The report's line on the rig: each side's windows and how far its content wandered, each slip and each lost track.
+pub fn rig_line(r: &RigTrack) -> String {
+    let side = |s: Side, what: &str| {
+        let (spread, n) = r.spread_ms(s);
+        let between = if r.slipped(s) { " between slips" } else { "" };
+        if n == 0 { format!("{what} not tracked") } else { format!("{what} {n} windows, within {} ms{between}", fixed1(spread)) }
+    };
+    let mut line = format!("{}, {}", side(Side::Mic, "the mic's"), side(Side::Reference, "the reference's"));
+    if r.slips.is_empty() && r.lost.is_empty() {
+        line.push_str(": held");
+    }
+    for s in &r.slips {
+        if s.confirmed {
+            let _ = write!(line, "; {} slipped {:+.1} ms {}", short(s.side), s.ms(), s.when());
+        } else {
+            let _ = write!(line, "; {}'s last window {:+.1} ms off {}, unconfirmed", short(s.side), s.ms(), s.when());
+        }
+    }
+    for l in &r.lost {
+        let _ = write!(line, "; {}'s track lost from {:.1} s ({} windows not found)", short(l.side), l.after_s(), l.windows);
+    }
+    line
+}
+
+fn short(side: Side) -> &'static str {
+    match side {
+        Side::Mic => "the mic",
+        Side::Reference => "the reference",
+    }
+}
+
+fn fixed1(v: f64) -> String {
+    if v.is_finite() { format!("{v:.1}") } else { "--".into() }
+}
+
+/// The warnings a rig earns: a slip or a lost track (where, by how much, and that the echo figures from its turn on are the
+/// rig's), and an unconfirmed step at a side's end (reported, nothing set apart).
+pub fn slip_warnings(r: &RigTrack) -> Vec<String> {
+    let mut w = Vec::new();
+    if let Some(from) = r.excluded_from() {
+        let mut each: Vec<String> = r
+            .slips
+            .iter()
+            .filter(|s| s.confirmed)
+            .map(|s| format!("{} by {:+.1} ms {} into the scene", s.side.name(), s.ms(), s.when()))
+            .collect();
+        each.extend(r.lost.iter().map(|l| {
+            format!(
+                "{} lost from {:.1} s into the scene ({} windows not found within {RIG_REACQUIRE_MS:.0} ms of where its content \
+                 was: it moved further, or stopped)",
+                l.side.name(),
+                l.after_s(),
+                l.windows
+            )
+        }));
+        let held = [Side::Mic, Side::Reference].into_iter().filter(|&side| r.held(side)).map(short).collect::<Vec<_>>();
+        let held = if held.is_empty() { String::new() } else { format!(" ({} held)", held.join(" and ")) };
+        w.push(format!(
+            "The rig slipped: {}{held}, against what it played, with nothing in the filter's positions to show it. Real speakers \
+             can't do that (the echo and its reference are the same playback), so the far-only turns from {:.0} s on are left \
+             out of the echo figures, and double talk from then on: the rig's failure, not the filter's.",
+            each.join("; "),
+            far_only_from(from) as f64 / fs()
+        ));
+    }
+    for s in r.slips.iter().filter(|s| !s.confirmed) {
+        w.push(format!(
+            "The last window of {} was {:+.1} ms off the rest {} into the scene, with no window after it to confirm a slip: \
+             the echo figures keep the turns there.",
+            s.side.name(),
+            s.ms(),
+            s.when()
+        ));
+    }
+    w
 }
 
 /// The warnings a measured delay earns: an echo that reached AEC3 too soon after its reference (or before it), one that
@@ -457,16 +846,18 @@ mod tests {
     /// The rig a fake chain recording comes from: the engine's lead (ms) and the rig's offset (ms, either sign), the take's
     /// programme starting `start` samples into the chain's reference; and optionally a jump of the reference's read position
     /// at a block (by samples: the path that much longer, the lead readings that much more, the reference's content that much
-    /// earlier).
+    /// earlier), and a slip of one side's content from a chain sample on (by samples, later; the engine's facts unmoved: a
+    /// cable's own).
     #[derive(Clone, Copy)]
     struct Rig {
         lead_ms: f64,
         rig_ms: f64,
         start: usize,
         jump: Option<(usize, i64)>,
+        slip: Option<(usize, f64, Side)>,
     }
 
-    const RIG: Rig = Rig { lead_ms: 14.0, rig_ms: -40.0, start: 120_000, jump: None };
+    const RIG: Rig = Rig { lead_ms: 14.0, rig_ms: -40.0, start: 120_000, jump: None, slip: None };
     /// The fake take's lead (`play_record`'s 1 s), and where its marker is looked for: its programme starts at `RIG.start` in
     /// the reference, so the take started a lead before (`the_marker_is_looked_for_only_where_it_can_be` checks it).
     const LEAD: usize = 48_000;
@@ -490,7 +881,19 @@ mod tests {
             let later = place(far_track, rig.start as f64 + jump as f64);
             reference[jump_at..].copy_from_slice(&later[jump_at..]);
         }
-        let mic = place(probe_track, rig.start as f64 + (rig.rig_ms - rig.lead_ms) * 1e-3 * FS);
+        let mic_at = rig.start as f64 + (rig.rig_ms - rig.lead_ms) * 1e-3 * FS;
+        let mut mic = place(probe_track, mic_at);
+        match rig.slip {
+            Some((at, by, Side::Reference)) => {
+                let later = place(far_track, rig.start as f64 + if at >= jump_at { jump as f64 } else { 0.0 } + by);
+                reference[at..].copy_from_slice(&later[at..]);
+            }
+            Some((at, by, Side::Mic)) => {
+                let later = place(probe_track, mic_at + by);
+                mic[at..].copy_from_slice(&later[at..]);
+            }
+            None => {}
+        }
         let noise = |seed| pink_noise(len, 3e-5, seed);
         let (mic, reference) = (nf_stages::synth::add(&mic, &noise(5)), nf_stages::synth::add(&reference, &noise(6)));
         let blocks = (0..len / BLOCK)
@@ -674,7 +1077,7 @@ mod tests {
             assert!((truth - delay).abs() <= SAMPLE_MS / 2.0 + 1e-9, "{delay}: {truth}");
             let Marker::Found(again) = find_marker(&c, &plan.marker, FROM) else { panic!() };
             assert!((again.rig_ms - cal.rig_ms).abs() < 1e-6 && (again.mic_at - cal.mic_at).abs() < 1e-3, "the same marker in the take");
-            let d = measure(&c, &scene, &plan, &again, start.frames).unwrap();
+            let d = measure(&c, &scene, &plan, &again, start.frames, None).unwrap();
             assert!((d.measured_ms - truth).abs() < SAMPLE_MS, "{delay} {rig_ms}: measured {d:?}, truth {truth}");
             // Every turn: through the jump too, where the lag and the lead move by 3 ms the other ways
             assert!((d.low_ms - truth).abs() < SAMPLE_MS && (d.high_ms - truth).abs() < SAMPLE_MS, "{d:?}");
@@ -698,13 +1101,13 @@ mod tests {
         let probe = plan.probe_track(&scene.input);
         let c = chain(&far_track(&plan, scene.far.as_deref().unwrap(), start.frames), &probe, rig, RIG.start + probe.len() + 48_000);
         let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
-        let d = measure(&c, &scene, &plan, &cal, start.frames).unwrap();
+        let d = measure(&c, &scene, &plan, &cal, start.frames, None).unwrap();
         // A 5 ms echo path behind a 14 ms lead: AEC3 gets the echo 9 ms before its reference
         assert!((d.measured_ms - 5.0).abs() < SAMPLE_MS && (d.seen_ms + 9.0).abs() < SAMPLE_MS, "{d:?}");
         let w = warnings(&d);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].starts_with("AEC3 got the echo 9.0 ms before the reference it's given: the echo came 5.0 ms after"), "{}", w[0]);
-        let just = EchoDelay { measured_ms: 15.5, seen_ms: 1.5, ..d };
+        let just = EchoDelay { measured_ms: 15.5, seen_ms: 1.5, ..d.clone() };
         assert!(
             warnings(&EchoDelay { asked_ms: 15.5, low_ms: 15.5, high_ms: 15.5, ..just })[0].contains("only 1.5 ms after the reference")
         );
@@ -727,36 +1130,207 @@ mod tests {
         // Cut after the second far-only turn (9-12 s)
         let c = chain(&track, &probe, RIG, RIG.start + plan.scene_at as usize + 13 * 48_000);
         let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
-        let d = measure(&c, &scene, &plan, &cal, start.frames).unwrap();
+        let d = measure(&c, &scene, &plan, &cal, start.frames, None).unwrap();
         assert_eq!((d.turns, d.turns_held), (2, 2));
         // Without the far voice
         let c = chain(&far_track(&plan, &[], start.frames), &probe, RIG, RIG.start + probe.len());
-        let e = measure(&c, &scene, &plan, &cal, start.frames).unwrap_err();
+        let e = measure(&c, &scene, &plan, &cal, start.frames, None).unwrap_err();
         assert!(e.contains("didn't stand out") && e.contains("3 far-only turns"), "{e}");
         let short = chain(&track, &probe, RIG, RIG.start + plan.scene_at as usize + 24_000);
-        assert_eq!(measure(&short, &scene, &plan, &cal, start.frames).unwrap_err(), "the chain recording doesn't hold a far-only turn");
+        assert_eq!(
+            measure(&short, &scene, &plan, &cal, start.frames, None).unwrap_err(),
+            "the chain recording doesn't hold a far-only turn"
+        );
     }
 
-    /// The measurement on a live take saved before the calibration existed (`quality --test echo --seconds S --save DIR`, the
-    /// far voice then a fixed 100 ms ahead, no marker): the scene is found in the chain recording by its own tracks instead
-    /// (`input.wav` in `chain_mic.wav`, `far.wav` in `chain_ref.wav`), then measured as a calibrated take is. Ignored (it
-    /// reads files): `NF_QUALITY_TAKE=DIR NF_QUALITY_SECONDS=60 cargo test -p nf-app --release a_saved_take -- --ignored
-    /// --nocapture`. On the dev VM's six chain-recorded takes (2026-11-01) it gave 14.5, 24.9, 31.3, 42.0, 52.4 and 63.4 ms,
-    /// all seven far-only turns of each within 0.1 ms of each other but for the first take's first (3.3 ms: the cable flipped).
+    /// A take whose far end's playback slipped 70 ms later 20 s into the scene's probe track (the dev VM's `events-echo-2`,
+    /// 2026-11-02), the engine's facts unmoved: the tracker finds it on the reference's side, to a window, by its size, at the
+    /// far voice's own time (the far voice plays 65 ms ahead, so at its 20.065 s), and the mic held; the measured delay
+    /// (searched as far as the rig may be off) gives the turns after it their true delay, 70 ms short, listed apart from the
+    /// figure; the warning names the side, the time and the turns left out.
     #[test]
-    #[ignore]
-    fn a_saved_take_measures() {
-        let Ok(dir) = std::env::var("NF_QUALITY_TAKE") else { return };
-        let dir = std::path::Path::new(&dir);
-        let seconds: f32 = std::env::var("NF_QUALITY_SECONDS").map_or(60.0, |s| s.parse().unwrap());
+    fn a_70_ms_slip_of_the_far_end_is_found_and_its_turns_set_apart() {
+        let scene = build(QualityTest::Echo, 30.0, None, 25.0, &UserAudio::default()).unwrap();
+        let plan = Plan::new(25.0);
+        let start = plan.far_start(RIG.rig_ms);
+        let probe = plan.probe_track(&scene.input);
+        let track = far_track(&plan, scene.far.as_deref().unwrap(), start.frames);
+        let len = RIG.start + probe.len() + 48_000;
+        let slip_at = RIG.start + plan.scene_at as usize + 20 * 48_000;
+        let rig = Rig { slip: Some((slip_at, 3_360.0, Side::Reference)), ..RIG };
+        let c = chain(&track, &probe, rig, len);
+        let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
+        let r = track_rig(&c, &scene, &plan, &cal, start.frames);
+        assert_eq!(r.slips.len(), 1, "{:?}", r.slips);
+        let s = r.slips[0];
+        assert_eq!(s.side, Side::Reference);
+        assert!((s.ms() - 70.0).abs() < 0.05, "{s:?}");
+        // Between the last old window's start and the first new one's end, a second and a half apart, in the far voice's time
+        let truth = 20.0 + plan.advance_ms(start.frames) / 1000.0;
+        assert!((truth - 20.065).abs() < 1e-9, "{truth}");
+        assert!(s.after_s() <= truth && truth <= s.at_s() && s.at - s.after == 72_000 && s.confirmed, "{s:?}");
+        assert!(s.when().starts_with("at about "), "{}", s.when());
+        let (mic_spread, mic_windows) = r.spread_ms(Side::Mic);
+        let (ref_spread, ref_windows) = r.spread_ms(Side::Reference);
+        assert!(mic_spread < 0.02 && ref_spread < 0.02 && mic_windows > 50 && ref_windows > 30, "{mic_spread} {ref_spread}");
+        assert!(!r.slipped(Side::Mic) && r.slipped(Side::Reference));
+        // The far-only turns at 0 and 9 s are before it; those at 18 (which holds it) and 27 s after
+        let from = r.excluded_from().unwrap();
+        let d = measure(&c, &scene, &plan, &cal, start.frames, Some(from)).unwrap();
+        assert_eq!((d.turns, d.turns_held), (2, 2), "{d:?}");
+        assert!((d.measured_ms - 25.0).abs() < 0.05 && d.high_ms - d.low_ms < 0.05, "{d:?}");
+        assert_eq!(d.slipped.iter().map(|t| t.0).collect::<Vec<_>>(), [18.0, 27.0]);
+        // The turn holding the slip (18-21 s, two thirds before it) gives the delay it mostly had; the one after, 70 ms sooner
+        let (holding, after) = (d.slipped[0].1, d.slipped[1].1);
+        assert!((holding - 25.0).abs() < 0.05 && (after + 45.0).abs() < 0.05, "{:?}", d.slipped);
+        // Unflagged, the measurement sees the slip at its size (it searched 40 ms before, and said 40)
+        let all = measure(&c, &scene, &plan, &cal, start.frames, None).unwrap();
+        assert!((all.high_ms - all.low_ms - 70.0).abs() < 0.05, "{all:?}");
+        assert!(warnings(&all).iter().any(|w| w.contains("moved by 70.0 ms")), "{:?}", warnings(&all));
+        let w = slip_warnings(&r);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("the far end's loopback (the far voice in the filter's reference) by +70.0 ms at"), "{}", w[0]);
+        assert!(w[0].contains("(the mic held)") && w[0].contains("the far-only turns from 18 s on are left out"), "{}", w[0]);
+        assert!(w[0].contains("of the echo figures, and double talk from then on"), "{}", w[0]);
+        assert!(rig_line(&r).ends_with(&format!("; the reference slipped +70.0 ms {}", s.when())), "{}", rig_line(&r));
+    }
+
+    /// The mic's side slipping by a VB-CABLE period (11 ms, the take of 2026-11-01 whose mic flipped) is found as the mic's;
+    /// the engine's own moves (a jump of the reference's read position, which the facts show) aren't slips; nor is a window
+    /// that disagrees with both its neighbours.
+    #[test]
+    fn the_mic_s_slip_is_its_own_and_the_engine_s_moves_are_none() {
+        let scene = build(QualityTest::Echo, 21.0, None, 25.0, &UserAudio::default()).unwrap();
+        let plan = Plan::new(25.0);
+        let start = plan.far_start(RIG.rig_ms);
+        let probe = plan.probe_track(&scene.input);
+        let track = far_track(&plan, scene.far.as_deref().unwrap(), start.frames);
+        let len = RIG.start + probe.len() + 48_000;
+        let mic0 = RIG.start as f64 + (RIG.rig_ms - RIG.lead_ms) * 48.0 + plan.scene_at as f64;
+        let rig = Rig { slip: Some(((mic0 + 7.0 * 48_000.0) as usize, 528.0, Side::Mic)), ..RIG };
+        let c = chain(&track, &probe, rig, len);
+        let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
+        let r = track_rig(&c, &scene, &plan, &cal, start.frames);
+        assert_eq!(r.slips.iter().map(|s| s.side).collect::<Vec<_>>(), [Side::Mic], "{:?}", r.slips);
+        let m = r.slips[0];
+        assert!((m.ms() - 11.0).abs() < 0.05 && m.after_s() <= 7.0 && 7.0 <= m.at_s() && m.at_s() - m.after_s() <= 1.5 + 1e-9, "{m:?}");
+        // A jump of the reference's read position mid-scene (the engine's, in its facts): no slip
+        let jumped = Rig { jump: Some((((RIG.start + plan.scene_at as usize) / BLOCK) + 1_000, -144)), ..RIG };
+        let c = chain(&track, &probe, jumped, len);
+        let r = track_rig(&c, &scene, &plan, &cal, start.frames);
+        assert!(r.slips.is_empty(), "{:?}", r.slips);
+        assert!(r.spread_ms(Side::Reference).0 < 0.02, "{:?}", r.spread_ms(Side::Reference));
+        assert_eq!(r.excluded_from(), None);
+        assert!(rig_line(&r).ends_with(": held"), "{}", rig_line(&r));
+        assert!(slip_warnings(&r).is_empty());
+    }
+
+    /// The slip rule on its own: a step the next window confirms is a slip, a lone outlier isn't, and a slow drift isn't.
+    #[test]
+    fn a_slip_is_a_confirmed_step() {
+        let points = |offsets: &[f64]| -> Vec<RigPoint> {
+            offsets.iter().enumerate().map(|(k, &o)| RigPoint { at: k as i64 * 24_000, offset: o, peak: 1.0 }).collect()
+        };
+        let slips = |offsets: &[f64]| slips_of(Side::Mic, &points(offsets), -48_000, 24_000);
+        assert!(slips(&[0.0, 0.0, 500.0, 0.0, 0.0]).1.is_empty(), "an outlier");
+        let (kept, s) = slips(&[0.0, 0.0, 528.0, 528.0, 528.0]);
+        // After the last old window's start (centred at 0.5 s), before the first new one's end (centred at 1 s)
+        assert_eq!((s.len(), s[0].after, s[0].at, s[0].samples, kept.len()), (1, 0, 72_000, 528.0, 5));
+        assert_eq!(s[0].when(), "at about 0.8 s");
+        // A slip before the first window: from the marker
+        let (_, s) = slips(&[528.0, 528.0]);
+        assert_eq!((s[0].after, s[0].at), (-48_000, 24_000));
+        // Far apart (a device that played nothing between): a span
+        let far_apart = [RigPoint { at: 24_000, offset: 0.0, peak: 1.0 }, RigPoint { at: 120_000, offset: 3_360.0, peak: 1.0 }, RigPoint {
+            at: 144_000,
+            offset: 3_360.0,
+            peak: 1.0,
+        }];
+        assert_eq!(slips_of(Side::Reference, &far_apart, 0, 24_000).1[0].when(), "between 0.0 and 3.0 s");
+        let drift: Vec<f64> = (0..100).map(|k| k as f64 * 1.5).collect();
+        assert!(slips(&drift).1.is_empty(), "30 ppm-ish of drift, 1.5 samples a window, is no slip");
+        // A step in the last window: reported, unconfirmed, not kept, nothing set apart
+        let (kept, s) = slips(&[0.0, 0.0, 3_360.0]);
+        assert_eq!((s.len(), s[0].confirmed, kept.len()), (1, false, 2), "{s:?}");
+        let track = RigTrack { mic: kept, slips: s, ..RigTrack::default() };
+        assert_eq!(track.excluded_from(), None);
+        assert!(track.held(Side::Mic) && !track.slipped(Side::Mic));
+        assert!(rig_line(&track).ends_with("; the mic's last window +70.0 ms off at about 0.8 s, unconfirmed"), "{}", rig_line(&track));
+        let w = slip_warnings(&track);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("The last window of the mic (the probe's track in the filter's mic) was +70.0 ms off the rest"),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].ends_with("the echo figures keep the turns there."), "{}", w[0]);
+    }
+
+    /// A slip past the 250 ms the plan makes up for (300 ms either way, on either side) is found again by the wider look, at
+    /// its size; one past that (3 s) loses the track, and the turns from the last window found on are set apart as for a slip.
+    #[test]
+    fn a_slip_past_the_search_is_found_or_the_track_lost() {
+        let scene = build(QualityTest::Echo, 30.0, None, 25.0, &UserAudio::default()).unwrap();
+        let plan = Plan::new(25.0);
+        let start = plan.far_start(RIG.rig_ms);
+        let probe = plan.probe_track(&scene.input);
+        let track = far_track(&plan, scene.far.as_deref().unwrap(), start.frames);
+        let len = RIG.start + probe.len() + 48_000;
+        let mic0 = RIG.start as f64 + (RIG.rig_ms - RIG.lead_ms) * 48.0 + plan.scene_at as f64;
+        let at20 = |side: Side| {
+            if side == Side::Mic { (mic0 + 20.0 * 48_000.0) as usize } else { RIG.start + plan.scene_at as usize + 20 * 48_000 }
+        };
+        for (side, by) in [(Side::Reference, 14_400.0), (Side::Reference, -14_400.0), (Side::Mic, 14_400.0)] {
+            let c = chain(&track, &probe, Rig { slip: Some((at20(side), by, side)), ..RIG }, len);
+            let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
+            let r = track_rig(&c, &scene, &plan, &cal, start.frames);
+            assert!(r.lost.is_empty() && r.slips.len() == 1, "{side:?} {by}: {:?} {:?}", r.slips, r.lost);
+            let s = r.slips[0];
+            assert!(s.side == side && s.confirmed && (s.samples - by).abs() < 2.0, "{side:?} {by}: {s:?}");
+            assert!(s.after_s() <= 20.1 && 19.9 <= s.at_s(), "{s:?}");
+            assert_eq!(r.excluded_from().map(far_only_from), Some(18 * 48_000), "{side:?} {by}");
+            // The windows after it are kept at the new offset (but the two or three about it, which straddle it)
+            let (_, windows) = r.spread_ms(side);
+            let unslipped = track_rig(&chain(&track, &probe, RIG, len), &scene, &plan, &cal, start.frames).spread_ms(side).1;
+            assert!(windows + 4 >= unslipped, "{side:?} {by}: {windows} of {unslipped}");
+        }
+        // 3 s later: past the wider look too; lost from the last window found, before 20 s
+        let c = chain(&track, &probe, Rig { slip: Some((at20(Side::Reference), 144_000.0, Side::Reference)), ..RIG }, len);
+        let Marker::Found(cal) = find_marker(&c, &plan.marker, FROM) else { panic!() };
+        let r = track_rig(&c, &scene, &plan, &cal, start.frames);
+        assert!(r.slips.is_empty() && r.lost.len() == 1, "{:?} {:?}", r.slips, r.lost);
+        let l = r.lost[0];
+        assert!(l.side == Side::Reference && l.windows >= RIG_LOST_WINDOWS && l.after_s() < 20.1 && l.after_s() > 18.0, "{l:?}");
+        assert!(r.held(Side::Mic) && !r.held(Side::Reference));
+        assert_eq!(r.excluded_from(), Some(l.after as usize));
+        assert!(rig_line(&r).contains(&format!(
+            "; the reference's track lost from {:.1} s ({} windows not found)",
+            l.after_s(),
+            l.windows
+        )));
+        let w = slip_warnings(&r);
+        assert!(w.len() == 1 && w[0].contains("lost from") && w[0].contains("(the mic held)") && w[0].contains("from 18 s on"), "{w:?}");
+    }
+
+    /// A saved take's chain recording, rebuilt from `quality --save`'s files: `chain_mic.wav`, `chain_ref.wav` and the facts
+    /// the measurements read from `chain_blocks.csv`.
+    fn saved_chain(dir: &std::path::Path) -> ChainRecording {
         let read = |name: &str| crate::wav::read_mono_48k(&dir.join(name)).unwrap().samples;
-        let (mic, reference, input, far) = (read("chain_mic.wav"), read("chain_ref.wav"), read("input.wav"), read("far.wav"));
+        let (mic, reference) = (read("chain_mic.wav"), read("chain_ref.wav"));
         let csv = std::fs::read_to_string(dir.join("chain_blocks.csv")).unwrap();
         let mut rows = csv.lines();
         let header: Vec<&str> = rows.next().unwrap().split(',').collect();
         let col = |name: &str| header.iter().position(|h| *h == name).unwrap();
-        let (index, mic_index, read_index, lead, reading, stamped) =
-            (col("index"), col("mic_index"), col("ref_read_index"), col("lead_ms"), col("lead_reading_ms"), col("ref_stamped"));
+        let (index, mic_index, mic_skipped, read_index, lead, reading, stamped, consumed) = (
+            col("index"),
+            col("mic_index"),
+            col("mic_skipped"),
+            col("ref_read_index"),
+            col("lead_ms"),
+            col("lead_reading_ms"),
+            col("ref_stamped"),
+            col("consumed"),
+        );
         let blocks: Vec<ChainBlock> = rows
             .map(|line| {
                 let f: Vec<&str> = line.split(',').collect();
@@ -769,12 +1343,13 @@ mod tests {
                     mic_wake_hns: f64::NAN,
                     mic_queued: 0,
                     mic_discarded: 0,
-                    mic_skipped: 0,
+                    mic_skipped: f[mic_skipped].parse().unwrap_or(0),
                     reference: (!f[read_index].is_empty()).then(|| ReferenceFacts {
                         read_index: f[read_index].parse().unwrap(),
                         lead_reading_ms: num(reading) as f32,
                         lead_ms: num(lead) as f32,
                         stamped: f[stamped] == "1",
+                        consumed: f[consumed].parse().unwrap_or(480),
                         ..ReferenceFacts::default()
                     }),
                     aec_delay_ms: f32::NAN,
@@ -785,7 +1360,80 @@ mod tests {
                 }
             })
             .collect();
-        let chain = ChainRecording { mic, reference, blocks, ..Default::default() };
+        ChainRecording { mic, reference, blocks, ..Default::default() }
+    }
+
+    /// The rig tracker on a saved calibrated take (`quality --test echo --save DIR` from 2026-11-01's calibration on: the marker
+    /// before the scene, the far voice as played in `far.wav`, the synthetic scene): the marker found in the chain recording,
+    /// the far voice's start from `far.wav`, then both devices tracked, and the echo delay measured with and without the turns
+    /// after a slip. Ignored (it reads files): `NF_QUALITY_TAKE=DIR NF_QUALITY_SECONDS=60 NF_QUALITY_DELAY=25 cargo test -p
+    /// nf-app --release a_saved_takes_rig -- --ignored --nocapture`. On the dev VM's `events-echo-2` (2026-11-02) it finds the
+    /// far end's slip (TODO 14's detail file, "A rig slip").
+    #[test]
+    #[ignore]
+    fn a_saved_takes_rig() {
+        let Ok(dir) = std::env::var("NF_QUALITY_TAKE") else { return };
+        let dir = std::path::Path::new(&dir);
+        let seconds: f32 = std::env::var("NF_QUALITY_SECONDS").map_or(60.0, |s| s.parse().unwrap());
+        let delay: f64 = std::env::var("NF_QUALITY_DELAY").map_or(25.0, |s| s.parse().unwrap());
+        let read = |name: &str| crate::wav::read_mono_48k(&dir.join(name)).unwrap().samples;
+        let chain = saved_chain(dir);
+        let (input, played) = (read("input.wav"), read("far.wav"));
+        let scene = build(QualityTest::Echo, seconds, None, delay as f32, &UserAudio::default()).unwrap();
+        assert_eq!(scene.input.len(), input.len(), "--seconds as the take's (NF_QUALITY_SECONDS)");
+        let plan = Plan::new(delay);
+        let cal = (0..chain.mic.len())
+            .step_by(4 * 48_000)
+            .find_map(|from| match find_marker(&chain, &plan.marker, from) {
+                Marker::Found(c) => Some(c),
+                _ => None,
+            })
+            .expect("the marker in the chain recording");
+        // far.wav is the far voice as played against the input: its lag behind the scene's far voice is the advance
+        let far = scene.far.as_deref().unwrap();
+        let p = xcorr_peak(&far[..480_000], &played[..960_000.min(played.len())], 96_000).unwrap();
+        let start = (plan.scene_at as f64 + p.delay).round() as u64;
+        let rig = track_rig(&chain, &scene, &plan, &cal, start);
+        println!(
+            "{}: the marker at {:.1} / {:.1} (rig {:.2} ms); the far voice from {start} (far.wav at {:.2}, peak {:.2})",
+            dir.display(),
+            cal.mic_at,
+            cal.ref_at,
+            cal.rig_ms,
+            p.delay,
+            p.peak
+        );
+        println!("  rig: {}", rig_line(&rig));
+        for w in slip_warnings(&rig) {
+            println!("  warning: {w}");
+        }
+        let show = |what: &str, d: Result<EchoDelay, String>| match d {
+            Ok(d) => println!(
+                "  {what}: {:.2} ms after the tap ({} turns, {:.2} to {:.2}); after the slip {:?}",
+                d.measured_ms, d.turns, d.low_ms, d.high_ms, d.slipped
+            ),
+            Err(e) => println!("  {what}: {e}"),
+        };
+        show("every turn", measure(&chain, &scene, &plan, &cal, start, None));
+        show("before the slip", measure(&chain, &scene, &plan, &cal, start, rig.excluded_from()));
+    }
+
+    /// The measurement on a live take saved before the calibration existed (`quality --test echo --seconds S --save DIR`, the
+    /// far voice then a fixed 100 ms ahead, no marker): the scene is found in the chain recording by its own tracks instead
+    /// (`input.wav` in `chain_mic.wav`, `far.wav` in `chain_ref.wav`), then measured as a calibrated take is. Ignored (it
+    /// reads files): `NF_QUALITY_TAKE=DIR NF_QUALITY_SECONDS=60 cargo test -p nf-app --release a_saved_take_measures --
+    /// --ignored --nocapture`. On the dev VM's six chain-recorded takes (2026-11-01) it gave 14.5, 24.9, 31.3, 42.0, 52.4 and
+    /// 63.4 ms, all seven far-only turns of each within 0.1 ms of each other but for the first take's first (3.3 ms: the cable
+    /// flipped).
+    #[test]
+    #[ignore]
+    fn a_saved_take_measures() {
+        let Ok(dir) = std::env::var("NF_QUALITY_TAKE") else { return };
+        let dir = std::path::Path::new(&dir);
+        let seconds: f32 = std::env::var("NF_QUALITY_SECONDS").map_or(60.0, |s| s.parse().unwrap());
+        let read = |name: &str| crate::wav::read_mono_48k(&dir.join(name)).unwrap().samples;
+        let (input, far) = (read("input.wav"), read("far.wav"));
+        let chain = saved_chain(dir);
         // Where each track's first 10 s start in the chain's first 20 s.
         let start_in = |x: &[f32], y: &[f32]| xcorr_peak(&y[..480_000], &x[..960_000.min(x.len())], 960_000).unwrap().delay;
         let (probe_at, far_at) = (start_in(&chain.mic, &input), start_in(&chain.reference, &far));
@@ -802,7 +1450,7 @@ mod tests {
         };
         let scene = build(QualityTest::Echo, seconds, None, 25.0, &UserAudio::default()).unwrap();
         assert_eq!(scene.input.len(), input.len(), "--seconds as the take's (NF_QUALITY_SECONDS)");
-        let d = measure(&chain, &scene, &old, &cal, 0).unwrap();
+        let d = measure(&chain, &scene, &old, &cal, 0, None).unwrap();
         println!(
             "{}: the echo {:.2} ms after its reference's tap ({} of {} far-only turns, {:.2} to {:.2}); AEC3's lag {:.2} ms, \
              the lead {:.2} ms",

@@ -33,11 +33,16 @@ may need CC BY-SA if ShareAlike data was used, and some model families carry pat
 - `sha256` is required (64 lower-case hex digits).
 - `source`: `{url, git_commit, git_blob}`, where the file came from: `url` https only; `git_blob` the git object id
   (`sha1("blob <size>\0" + bytes)`), checked by the fetch tool. The host ignores it.
+- `source.lfs: true` (amended 2026-11-02, for SIGMOS): a file stored with Git LFS, fetched from `media.githubusercontent.com`.
+  Its blob in the commit's tree is its LFS pointer, so `git_blob` is the pointer's (`version https://git-lfs.github.com/spec/v1`,
+  `oid sha256:<sha256>`, `size <size>`), which the fetch tool rebuilds from the download's SHA-256 and size and checks.
 - Exactly one `model` file in v0, the one `graph.model` names.
 
 ### Role
 `role`:
-- `kind`: `denoise`, `dereverb`, or `aec` (loaded by the echo canceller once it takes neural models);
+- `kind`: `denoise`, `dereverb`, or `aec` (loaded by the echo canceller once it takes neural models); or `metric` (amended
+  2026-11-02): a quality metric (DNSMOS, SIGMOS) that `noise-filter lab` runs offline on whole clips, never a stage (see
+  "Metric packs");
 - `inputs`: `["mic"]` by default, or `["mic", "ref"]` for an `aec` pack only. In v0 the noise stage has one input and
   its models see only the mic, so a `denoise` or `dereverb` pack that declares `"ref"` is refused. A joint echo and
   noise model (one that needs the far end) is an `aec` pack.
@@ -150,6 +155,15 @@ With `r = 48000 / sample_rate`:
 - the model's top bins below `K` differ from its own STFT's by the window's spread across its Nyquist
   (`doc/todo/3-model-spec.md`, P3); folding them too is an A/B option, off in v0.
 
+## Metric packs (amended 2026-11-02)
+A pack of `role.kind` `metric` holds a no-reference quality metric's ONNX model (`packs/dnsmos`, `packs/sigmos`; TODO 14). It
+shares "The pack", "Files" and "Security" with the noise packs (the same checks, the same fetch tool, the same refusal of
+external data), and nothing else: `nf_ort::metric::check_metric` takes `graph.kind` `metric`, `signal.sample_rate` 16000 or
+48000 with one channel, `io.input` and `io.output` as named `float32` tensors whose dimensions are positive or `-1` (dynamic:
+a batch, or a clip's frame count), and a `metric` section, `{"kind": "dnsmos-p835" | "sigmos-v1"}`, naming the runner, which
+checks it. The framing, windowing and calibration are the runner's (each metric's own reference script, ported), not the
+manifest's. The noise stage refuses a metric pack (its role), and the metric runners a noise pack.
+
 ## Security (amended 2026-11-02)
 - The host hashes the very bytes it hands to ONNX Runtime (`commit_from_memory`), so nothing can be swapped between the check
   and the load. At run time it reads and hashes the model and the licence only; the conformance files are checked at fetch
@@ -179,7 +193,8 @@ With `r = 48000 / sample_rate`:
   model: "Security"). Check ORT's custom-op documentation before freezing this rule.
 - Reject an unknown spec major version.
 - The host reports `L` as above, and runs the pack through the harness (TODO 2's checks 1 and 2, in
-  `nf_stages::harness`):
+  `nf_stages::harness`; `check_stage` makes them one call, amended 2026-11-02: the profile, the offset at four block
+  phases, finite output through hostile input, and a parity hook):
   - `check_model`: the model's offset, driven hop by hop, equals `latency_samples - hop` (GCC-PHAT on speech to a tenth
     of a sample, and an impulse to the sample where the model passes one); `check_latency`: the noise stage's equals
     `L`; `check_profile`: the stage around it fits the host profile;

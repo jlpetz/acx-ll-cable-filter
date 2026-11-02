@@ -232,6 +232,42 @@ mod tests {
         assert!(stage.aec_stats().erle_db.is_finite(), "AEC3 converged enough to report");
     }
 
+    /// AEC3 through TODO 2's reusable check (`harness::check_stage`): the profile, its 430 at every block phase (impulses at
+    /// 0.5 on a silent reference, GCC-PHAT on speech), finite through the hostile blocks on both inputs and the mic coming
+    /// through after them, and bit-equal to sonora driven directly (the same config and dither seed) on 4 s of echo.
+    #[test]
+    fn aec3_passes_the_stage_check() {
+        use crate::harness::{ParityCase, StageCheck, Tolerance, check_stage};
+        let len = 4 * 48_000;
+        let far = speech_like(len, Voice::LOW, 7).samples;
+        let echo = scaled(&delayed(&convolve(&far, &room_impulse_response(4800, 0.15, 8))[..len], 1920), 0.5);
+        let mic = add(&add(&echo, &speech_like(len, Voice::HIGH.at(-30.0), 9).samples), &white_noise(len, 1e-3, 10));
+        let mut apm = build_apm();
+        let mut dither = Dither::new(DITHER_SEED);
+        let (mut scratch, mut out) = ([0.0f32; BLOCK], [0.0f32; BLOCK]);
+        let mut direct = Vec::with_capacity(len);
+        for (mi, ri) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0) {
+            let mut r = sanitized(ri);
+            dither.apply(&mut r, REFERENCE_DITHER);
+            apm.process_render_f32(&[&r[..]], &mut [&mut scratch[..]]).expect("render");
+            apm.process_capture_f32(&[&sanitized(mi)[..]], &mut [&mut out[..]]).expect("capture");
+            direct.extend_from_slice(&out);
+        }
+        let parity = ParityCase {
+            against: "sonora driven directly",
+            input: &mic,
+            aux: Some(&far),
+            expected: &direct,
+            shift: 0,
+            tolerance: Tolerance::Exact,
+        };
+        let make =
+            || -> Box<dyn Stage> { Box::new(Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).expect("stage")) };
+        let r = check_stage(&make, &StageCheck { impulse_amp: Some(0.5), parity: Some(parity) }).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((r.role, r.latency.declared, r.phases.len()), (StageRole::EchoCancel, AEC3_LATENCY, 4));
+        assert_eq!(r.parity.map(|p| (p.compared, p.first_mismatch)), Some((len, None)));
+    }
+
     #[test]
     fn it_fits_the_host_profile_as_the_echo_canceller() {
         let s = Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).expect("stage");

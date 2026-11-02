@@ -1,0 +1,39 @@
+{
+  "spec": "noise-filter.model-pack/0",
+  "id": "sigmos",
+  "version": "1.0.0",
+  "name": "SIGMOS v1 (P.804 dimensions, alpha)",
+  "authors": ["Nicolae-Catalin Ristea", "Babak Naderi", "Ando Saabas", "Ross Cutler", "Sebastian Braun", "Solomiya Branets"],
+  "homepage": "https://github.com/microsoft/SIG-Challenge/tree/main/ICASSP2024/sigmos",
+  "description": "No-reference speech quality metric: ITU-T P.804's COL, DISC, LOUD, NOISE, REVERB, SIG and OVRL predicted MOS from full-band 48 kHz audio. Upstream calls V1 an alpha; no published accuracy. A quality metric for noise-filter lab (TODO 14), never a noise model.",
+  "upstream": {"repo": "https://github.com/microsoft/SIG-Challenge", "commit": "bf4525153b6ed998f19d9e79ff1fd00f55dec42b", "script": "ICASSP2024/sigmos/sigmos.py", "paper": "https://arxiv.org/abs/2309.07385"},
+  "licenses": {
+    "code": "MIT",
+    "weights": "MIT (the repo's LICENSE)",
+    "attribution": ["SIGMOS, Copyright (c) Microsoft Corporation, MIT: https://github.com/microsoft/SIG-Challenge"]
+  },
+  "files": [
+    {
+      "path": "model-sigmos_1697718653_41d092e8-epo-200.onnx",
+      "role": "model",
+      "source": {"url": "https://media.githubusercontent.com/media/microsoft/SIG-Challenge/bf4525153b6ed998f19d9e79ff1fd00f55dec42b/ICASSP2024/sigmos/model-sigmos_1697718653_41d092e8-epo-200.onnx", "git_commit": "bf4525153b6ed998f19d9e79ff1fd00f55dec42b", "git_blob": "508d54d74690b3dcb2ae58797a9111ae412297bf", "lfs": true},
+      "size": 26264942,
+      "sha256": "f939dcc1945055a435565b4369e27dafd0f87df3cea4e2ff6eb81225e52cc53b"
+    },
+    {
+      "path": "LICENSE",
+      "role": "license",
+      "source": {"url": "https://raw.githubusercontent.com/microsoft/SIG-Challenge/bf4525153b6ed998f19d9e79ff1fd00f55dec42b/LICENSE", "git_commit": "bf4525153b6ed998f19d9e79ff1fd00f55dec42b", "git_blob": "9e841e7a26e4eb057b24511e7b92d42b257a80e5"},
+      "size": 1141,
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+    }
+  ],
+  "role": {"kind": "metric", "inputs": ["output"]},
+  "signal": {"sample_rate": 48000, "channels": 1},
+  "graph": {"kind": "metric", "model": "model-sigmos_1697718653_41d092e8-epo-200.onnx"},
+  "io": {
+    "input": {"name": "input", "layout": "B,C,T,F", "shape": [-1, 3, -1, 481], "dtype": "float32"},
+    "output": {"name": "output", "layout": "B,C", "shape": [-1, 7], "dtype": "float32"}
+  },
+  "metric": {"kind": "sigmos-v1"}
+}

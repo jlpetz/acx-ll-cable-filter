@@ -14,7 +14,10 @@ use nf_core::noise::{DEFAULT_DEPTH, Executor, ModelInfo, NoHooks, NoiseModel, Pi
 use nf_core::stage::{Activation, ProcessIo, Stage, StageError, StageRole, text};
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_ort::{NativeSpectral, OrtSpectralModel, Pack, SessionOptions};
-use nf_stages::harness::{check_latency, check_model, check_profile, gcc_offset, max_lag_for, peak_index, run_chain, scenes};
+use nf_stages::harness::{
+    ParityCase, StageCheck, Tolerance, check_latency, check_model, check_profile, check_stage, gcc_offset, max_lag_for, peak_index,
+    run_chain, run_stage, scenes,
+};
 use nf_stages::synth::Voice;
 use nf_stages::{AEC3_LATENCY, build_chain_with};
 
@@ -123,6 +126,33 @@ fn the_stage_passes_the_latency_and_profile_checks() {
         eprintln!("UL-UNAS stage (worker {thread}): latency {}, GCC-PHAT {:.3} at {:.1} dB", r.declared, r.gcc_offset, r.gcc_confidence_db);
         assert_eq!(r.declared, L);
         assert_eq!(check_profile(&make), Ok(StageRole::Noise));
+    }
+}
+
+/// UL-UNAS's stage through TODO 2's reusable check (`harness::check_stage`), inline and on a waited-for worker: the profile,
+/// its 2400 at every block phase by GCC-PHAT on speech (and by impulses with the high band passed through, where a click
+/// isn't the model's to suppress), finite through the hostile blocks and speech after them, and the parity hook: the stage on
+/// its worker bit for bit the stage inline (what TODO 6's pipeline promises offline), on 4 s of noisy speech.
+#[test]
+fn the_stage_passes_the_stage_check_inline_and_on_its_worker() {
+    let Some(p) = common::pack() else { return };
+    let x = scenes::noisy_speech(4 * SAMPLE_RATE as usize, Voice::HIGH, 10.0, 6).mix;
+    for (cfg, amp) in [(model_only(), None), (passing(), Some(0.5))] {
+        let inline = run_stage(&mut common::stage(&p, cfg.clone(), false), &x, None).out;
+        for thread in [false, true] {
+            let parity =
+                ParityCase { against: "the stage inline", input: &x, aux: None, expected: &inline, shift: 0, tolerance: Tolerance::Exact };
+            let make = || common::boxed(common::stage(&p, cfg.clone(), thread));
+            let r = check_stage(&make, &StageCheck { impulse_amp: amp, parity: Some(parity) })
+                .unwrap_or_else(|e| panic!("worker {thread}, impulses {amp:?}: {e}"));
+            eprintln!(
+                "UL-UNAS stage (worker {thread}, impulses {amp:?}): {} at phases {:?}, hostile peak {}",
+                r.latency.declared,
+                r.phases.iter().map(|q| format!("{}: {:.3}", q.0, q.1)).collect::<Vec<_>>(),
+                r.stress_peak
+            );
+            assert_eq!((r.role, r.latency.declared), (StageRole::Noise, L));
+        }
     }
 }
 

@@ -9,6 +9,8 @@
 //! - [`conformance`]: the conformance pair, framed as its reference was.
 //! - [`heap_probe`]: TODO 6's count of ONNX Runtime's heap calls, per thread (tests and `bench` only).
 //! - [`bench`]: the per-hop and per-block timing `noise-filter bench --model` prints and the ignored timing test runs.
+//! - [`metric`]: the quality metrics (DNSMOS P.835, SIGMOS) as packs of role `metric`, run offline by `noise-filter lab`
+//!   (TODO 14), and their 48-to-16 kHz resampler.
 //!
 //! [`noise_stage`] puts them together: the noise stage around a pack, its model on an inference worker (live) or inline
 //! (offline), `depth` blocks behind either way (`nf_core::noise::Pipelined`). The pack is loaded and hashed where the model
@@ -27,6 +29,7 @@ pub mod bench;
 pub mod conformance;
 pub mod env;
 pub mod heap_probe;
+pub mod metric;
 pub mod onnx_check;
 pub mod pack;
 pub mod session;

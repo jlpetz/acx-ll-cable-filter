@@ -65,6 +65,7 @@ mod cpu_check;
 mod exit;
 mod health;
 mod instance;
+mod lab;
 mod logger;
 mod mutex;
 mod quality;

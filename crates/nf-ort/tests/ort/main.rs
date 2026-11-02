@@ -15,6 +15,7 @@
 mod common;
 mod latency;
 mod memory;
+mod metric;
 mod pack;
 mod parity;
 mod quality;

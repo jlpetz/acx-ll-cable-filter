@@ -39,7 +39,7 @@ use crate::config::{self, resolve_device};
 use crate::exit::Failure;
 use crate::quality::QualityTest;
 use crate::quality::analysis::{self, AlignmentFailure, Analysis, Levels, MIN_REGION_S, Metrics, SpeechLevels, WINDOW_S};
-use crate::quality::echo_delay::{self, Calibration, EchoDelay, FarStart, MAX_RIG_OFFSET_MS, Marker, Plan};
+use crate::quality::echo_delay::{self, Calibration, EchoDelay, FarStart, MAX_RIG_OFFSET_MS, Marker, Plan, RigTrack};
 use crate::quality::signals::{self, Scene};
 use crate::{console, wav};
 
@@ -86,7 +86,8 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     if let (Some(echo), Some(chain)) = (take.echo.as_mut(), &chain) {
         echo.measure(chain, &scene);
     }
-    let result = analysis::analyse(&scene, &take.recorded.recording, take.scene_at);
+    let slip_from = take.echo.as_ref().and_then(|e| e.rig.as_ref()?.excluded_from());
+    let result = analysis::analyse_with(&scene, &take.recorded.recording, take.scene_at, slip_from);
     say!("{}", format_report(scene.test, &result, &take));
     if let Some(dir) = &args.save {
         let far = take.echo.as_ref().and_then(|e| Some(e.plan.far_as_played(scene.far.as_deref()?, e.far_start?.frames)));
@@ -207,6 +208,8 @@ pub struct EchoTake {
     pub far_start: Option<LateStart>,
     /// The echo's delay measured in the chain recording (filled in once the recorder has stopped), or why it wasn't.
     pub delay: Result<EchoDelay, String>,
+    /// Both devices' content against what they played, from the marker on (`echo_delay::track_rig`): a rig slip, if any.
+    pub rig: Option<RigTrack>,
 }
 
 impl EchoTake {
@@ -222,15 +225,20 @@ impl EchoTake {
                 Marker::NotYet { .. } => Err("the marker isn't in the chain recording".to_owned()),
             },
         };
+        self.rig = match (&marker, self.far_start) {
+            (Ok(cal), Some(start)) => Some(echo_delay::track_rig(chain, scene, &self.plan, cal, start.frames)),
+            _ => None,
+        };
+        let slip_from = self.rig.as_ref().and_then(RigTrack::excluded_from);
         self.delay = match (marker, self.far_start) {
             (_, None) => Err("the far voice didn't play".into()),
-            (Ok(cal), Some(start)) => echo_delay::measure(chain, scene, &self.plan, &cal, start.frames),
+            (Ok(cal), Some(start)) => echo_delay::measure(chain, scene, &self.plan, &cal, start.frames, slip_from),
             (Err(why), _) => Err(why),
         };
     }
 
-    /// The report's lines: the delay asked and measured, and the calibration.
-    fn lines(&self) -> [String; 2] {
+    /// The report's lines: the delay asked and measured, the calibration, and the rig's content against what it played.
+    fn lines(&self) -> Vec<String> {
         let ms = |v: f64| fixed(v, 1);
         let mut delay = format!("{:<26} asked {} ms, ", "echo delay", ms(self.plan.delay_ms));
         match &self.delay {
@@ -247,6 +255,10 @@ impl EchoTake {
                     ms(d.high_ms),
                     ms(d.lead_ms)
                 );
+                if !d.slipped.is_empty() {
+                    let each: Vec<String> = d.slipped.iter().map(|(at, v)| format!("{} ms at {:.0} s", ms(*v), at)).collect();
+                    let _ = write!(delay, "; after the rig slipped {}", each.join(", "));
+                }
             }
             Err(why) => {
                 let _ = write!(delay, "not measured: {why}");
@@ -276,13 +288,18 @@ impl EchoTake {
             }
             Err(why) => format!("{:<26} none ({why}): {played}, as for devices that add no delay", "calibration"),
         };
-        [delay, calibration]
+        let mut lines = vec![delay, calibration];
+        if let Some(r) = &self.rig {
+            lines.push(format!("{:<26} {} (against what each played)", "rig", echo_delay::rig_line(r)));
+        }
+        lines
     }
 
     /// What the report warns about: the measured delay's own warnings, and a calibration that didn't place the far voice
     /// where it asked.
     fn warnings(&self) -> Vec<String> {
-        let mut w = self.delay.as_ref().map(echo_delay::warnings).unwrap_or_default();
+        let mut w = self.rig.as_ref().map(echo_delay::slip_warnings).unwrap_or_default();
+        w.extend(self.delay.as_ref().map(echo_delay::warnings).unwrap_or_default());
         match (&self.calibration, self.far_start) {
             (Err(why), _) => w.push(format!(
                 "The echo delay wasn't calibrated ({why}), so the echo came where the devices put it: the measured delay is the \
@@ -407,6 +424,7 @@ fn play(
         }),
         far_start: recorded.late_starts.get(1).copied().flatten(),
         delay: Err("no chain recording".into()),
+        rig: None,
     });
     let scene_at = recorded.lead_frames + plan.map_or(0, |p| p.scene_at as usize);
     let conditions = conditions(&engine.status(), &after, engine.buffer_targets().output_ms);
@@ -894,9 +912,17 @@ fn metric_lines(m: &Metrics, engine: &EngineReadings) -> Vec<String> {
             lines.push(speech_row("speech in its cores", speech));
             lines
         }
-        Metrics::Echo { far_only, far_only_turns, converging, near_only, double_talk, both_talking } => {
+        Metrics::Echo { far_only, far_only_turns, slipped_turns, slipped_from, converging, near_only, double_talk, both_talking } => {
             let measure = if engine.noise_filter { "drop" } else { "ERLE" };
             let mut lines = vec![row("echo, far end alone", "input", &far_only.levels, measure, fall(&far_only.levels))];
+            if let Some(from) = slipped_from {
+                let each: Vec<String> = slipped_turns.iter().map(fall).collect();
+                lines.push(format!(
+                    "{:<26} {} dB, left out of the figure above (and double talk from then on): the rig slipped (see the warning)",
+                    format!("  from {:.0} s", *from as f64 / f64::from(SAMPLE_RATE)),
+                    if each.is_empty() { "--".to_owned() } else { each.join(", ") }
+                ));
+            }
             if !far_only_turns.is_empty() {
                 let mut drops: Vec<f32> = far_only_turns.iter().map(|t| -t.change_db()).collect();
                 let each: Vec<String> = far_only_turns.iter().map(fall).collect();
@@ -1189,6 +1215,8 @@ mod tests {
         let metrics = Metrics::Echo {
             far_only: EchoLevels { levels: levels(4.0, -24.5, -55.0), noise_dbfs: -84.1 },
             far_only_turns: vec![levels(1.3, -24.5, -52.0), levels(1.4, -24.5, -60.0), levels(1.3, -24.6, -54.6)],
+            slipped_turns: Vec::new(),
+            slipped_from: None,
             converging: levels(1.2, -24.4, -36.7),
             near_only: speech(3.2, -18.0, -18.3, -18.31, -50.0),
             double_talk: speech(1.4, -18.4, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
@@ -1237,10 +1265,12 @@ mod tests {
         assert!(report.contains("input -24.5 dBFS, output -55.0 dBFS: drop 30.5 dB over 4.0 s"), "{report}");
         assert!(report.contains("\n  note: The noise filter was on, so the echo's drop is the whole chain's"), "{report}");
         // The output silent where only the far end talks: a bound again
-        let Metrics::Echo { far_only_turns, converging, near_only, double_talk, both_talking, .. } = metrics else { panic!() };
+        let Metrics::Echo { far_only_turns, converging, near_only, double_talk, both_talking, .. } = metrics.clone() else { panic!() };
         let silent = Metrics::Echo {
             far_only: EchoLevels { levels: levels(4.0, -24.5, f32::NEG_INFINITY), noise_dbfs: -84.1 },
             far_only_turns,
+            slipped_turns: Vec::new(),
+            slipped_from: None,
             converging,
             near_only,
             double_talk,
@@ -1250,6 +1280,27 @@ mod tests {
             Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics: silent, delay_steps: Vec::new(), warnings: Vec::new() });
         let report = format_report(QualityTest::Echo, &echo, &take(&["A", "B"], aec));
         assert!(report.contains("output -inf dBFS: ERLE over 95.5 dB over 4.0 s"), "{report}");
+        // After a rig slip: the turns from its turn on, listed apart
+        let Metrics::Echo { far_only, far_only_turns, converging, near_only, double_talk, both_talking, .. } = metrics else { panic!() };
+        let slipped = Metrics::Echo {
+            far_only,
+            far_only_turns: far_only_turns[..1].to_vec(),
+            slipped_turns: vec![levels(1.3, -24.5, -27.0), levels(1.3, -24.5, -26.5)],
+            slipped_from: Some(18 * 48_000),
+            converging,
+            near_only,
+            double_talk,
+            both_talking,
+        };
+        let echo =
+            Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics: slipped, delay_steps: Vec::new(), warnings: Vec::new() });
+        let report = format_report(QualityTest::Echo, &echo, &take(&["A", "B"], aec));
+        assert!(
+            report
+                .contains("\n    from 18 s                2.5, 2.0 dB, left out of the figure above (and double talk from then on): the rig slipped (see the warning)\n"),
+            "{report}"
+        );
+        assert!(report.contains("\n    each far-only turn       27.5 dB: median 27.5, lowest 27.5;"), "{report}");
 
         let failed = Err(AlignmentFailure { alignment: Some(Alignment { correlation: 0.04, ..ALIGNMENT }), reason: "weak".into() });
         let report = format_report(QualityTest::Noise, &failed, &take(&["CABLE-A Input"], readings));
@@ -1306,6 +1357,7 @@ mod tests {
             high_ms: measured_ms + 0.2,
             turns: 6,
             turns_held: 6,
+            slipped: Vec::new(),
         }
     }
 
@@ -1322,6 +1374,7 @@ mod tests {
             calibration: Ok((calibration(-40.0), asked)),
             far_start: Some(LateStart { frames: asked.frames, set: Some(asked.frames) }),
             delay: Ok(delay(25.04, 11.0)),
+            rig: None,
         };
         let failed = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
         let report = |e: EchoTake| {
@@ -1384,6 +1437,64 @@ mod tests {
         let r = report(EchoTake { calibration: Ok((calibration(-300.0), plan.far_start(-300.0))), ..echo });
         assert!(r.contains("warning: On these devices an echo with no delay of its own reaches the mic -300.0 ms from its"), "{r}");
         assert!(r.contains("past the 250 ms either way a take makes up for"), "{r}");
+    }
+
+    /// A take whose far end slipped 70 ms at 24 s: the rig line says which side and when, the delay line lists the turns after
+    /// it apart, and the warning says the turns from its turn on are the rig's.
+    #[test]
+    fn the_report_says_when_the_rig_slipped() {
+        use crate::quality::echo_delay::{RigPoint, Side, Slip};
+        let plan = Plan::new(25.0);
+        let asked = plan.far_start(-40.0);
+        let point = |at: i64, offset: f64| RigPoint { at, offset, peak: 0.99 };
+        let rig = RigTrack {
+            mic: (0..100).map(|k| point(k * 24_000, 0.0)).collect(),
+            reference: (0..100).map(|k| point(k * 24_000, if k < 54 { 0.4 } else { 3_360.4 })).collect(),
+            slips: vec![Slip { side: Side::Reference, after: 24 * 48_000, at: 27 * 48_000, samples: 3_360.0, confirmed: true }],
+            lost: Vec::new(),
+        };
+        assert_eq!(rig.excluded_from(), Some(24 * 48_000));
+        let mut d = delay(25.04, 11.0);
+        d.slipped = vec![(27.0, -44.9), (36.0, -45.0)];
+        let echo = EchoTake {
+            plan: plan.clone(),
+            search_from: 0,
+            calibration: Ok((calibration(-40.0), asked)),
+            far_start: Some(LateStart { frames: asked.frames, set: Some(asked.frames) }),
+            delay: Ok(d),
+            rig: Some(rig),
+        };
+        let failed = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
+        let mut t = take(&["A", "B"], EngineReadings::default());
+        t.warnings.clear();
+        let r = format_report(QualityTest::Echo, &failed, &Take { echo: Some(echo), ..t });
+        assert!(
+            r.contains(
+                "24.9 to 25.2 ms); AEC3 sees it 11.0 ms after the reference it's given (the lead 14.0 ms); after the rig slipped -44.9 \
+                 ms at 27 s, -45.0 ms at 36 s\n"
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains(
+                "\n  rig                        the mic's 100 windows, within 0.0 ms, the reference's 100 windows, within 0.0 ms between \
+                 slips; the reference slipped +70.0 ms between 24.0 and 27.0 s (against what each played)\n"
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains(
+                "warning: The rig slipped: the far end's loopback (the far voice in the filter's reference) by +70.0 ms between 24.0 \
+                 and 27.0 s into the scene (the mic held), against what it played"
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains(
+                "so the far-only turns from 27 s on are left out of the echo figures, and double talk from then on: the rig's failure"
+            ),
+            "{r}"
+        );
     }
 
     #[test]

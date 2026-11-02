@@ -236,6 +236,37 @@ class Fetch(Base):
         with self.assertRaisesRegex(fm.FetchError, "model.onnx: SHA-256"):
             self.fetch(self.write(doc), served(doc), pin=True)
 
+    def test_an_lfs_file_is_checked_against_its_pointer_s_blob(self):
+        """A Git LFS file's blob in the tree is its pointer's: the pin is the pointer's blob, made from the download's
+        SHA-256 and size; the content's own blob id fails, and --pin records the pointer's."""
+        sha = hashlib.sha256(MODEL).hexdigest()
+        pointer = fm.lfs_pointer(sha, len(MODEL))
+        self.assertEqual(pointer, b"version https://git-lfs.github.com/spec/v1\noid sha256:" + sha.encode() + b"\nsize %d\n" % len(MODEL))
+        doc = manifest()
+        doc["files"][0]["source"].update(lfs=True, git_blob=fm.git_blob_id(pointer))
+        dest, _ = self.fetch(self.write(doc), served(doc))
+        self.assertEqual((dest / "model.onnx").read_bytes(), MODEL)
+        doc["files"][0]["source"]["git_blob"] = fm.git_blob_id(MODEL)
+        (dest / "model.onnx").unlink()
+        with self.assertRaisesRegex(fm.FetchError, "model.onnx: git blob"):
+            self.fetch(self.write(doc, "demo"), served(doc))
+        unpinned = manifest(pinned=False)
+        unpinned["files"][0]["source"]["lfs"] = True
+        path = self.write(unpinned)
+        (dest / "model.onnx").unlink(missing_ok=True)
+        self.fetch(path, served(unpinned), pin=True)
+        pinned = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(pinned["files"][0]["source"]["git_blob"], fm.git_blob_id(pointer))
+        # SIGMOS's pointer at SIG-Challenge bf45251 (26,264,942 B): its blob is the tree's, 508d54d...
+        sigmos = fm.lfs_pointer("f939dcc1945055a435565b4369e27dafd0f87df3cea4e2ff6eb81225e52cc53b", 26_264_942)
+        self.assertEqual((len(sigmos), fm.git_blob_id(sigmos)), (133, "508d54d74690b3dcb2ae58797a9111ae412297bf"))
+
+    def test_the_lfs_flag_is_a_bool(self):
+        doc = manifest()
+        doc["files"][0]["source"]["lfs"] = "yes"
+        with self.assertRaisesRegex(fm.FetchError, "source.lfs"):
+            fm.Pack(self.write(doc), self.cache, None).load()
+
     def test_main_picks_packs_by_id_and_refuses_bad_ids(self):
         doc = manifest()
         self.write(doc)

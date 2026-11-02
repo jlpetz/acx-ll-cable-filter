@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use nf_engine::{GateMode, HighBand, LatencyMode};
 
+use crate::lab::playlist::{self, DEFAULT_CLIP_S, MAX_CLIP_S, MIN_CLIP_S};
 use crate::quality::QualityTest;
 use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, EXCLUSIVE_MIC_ECHO_FLOOR_MS, MAX_ECHO_DELAY_MS};
 
@@ -24,6 +25,8 @@ pub enum Command {
     Quality(QualityArgs),
     Process(ProcessArgs),
     Bench(BenchArgs),
+    /// `lab`: TODO 14's offline batch, the Lab's phase 0.
+    Lab(LabArgs),
     /// `--sid` names the account to grant (the non-elevated side passes its own when it relaunches
     /// itself elevated, as the window's "Enable large pages" button does). `helper`: the hidden
     /// `--elevated-helper` flag that relaunch adds, so a helper that starts without elevation fails
@@ -168,6 +171,38 @@ pub struct BenchArgs {
     pub model: Option<String>,
 }
 
+/// A metric family `lab --metrics` can run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabMetric {
+    Dnsmos,
+    Sigmos,
+    /// `quality`'s level measures: noise in pauses, speech kept.
+    Levels,
+}
+
+/// `lab`'s options. `None` takes the default (see [`help_text`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabArgs {
+    /// The test-audio set's 48 kHz folder (`NF_TEST_AUDIO`, else the fetch tool's cache).
+    pub audio: Option<PathBuf>,
+    /// Where to write `scorecard.txt`, `clips.csv` and `lab.json`.
+    pub out: Option<PathBuf>,
+    /// The noise models to compare (`rnnoise`, pack ids), and the signal the others are compared with (a model or `noisy`).
+    pub models: Option<Vec<String>>,
+    pub baseline: Option<String>,
+    pub metrics: Option<Vec<LabMetric>>,
+    /// The SNRs, the segment length and the noise and speech filters.
+    pub playlist: playlist::Options,
+    pub config: Option<PathBuf>,
+    /// Applied to every model (the floor, the gate, the high band, the depth): not `--model`, `--aec` or `--ns`.
+    pub processing: Processing,
+    pub jobs: Option<usize>,
+}
+
+/// `lab --snr`'s range, and `--jobs`' most.
+pub const LAB_SNR_DB: (f32, f32) = (-10.0, 60.0);
+pub const MAX_LAB_JOBS: usize = 64;
+
 /// `run --seconds` at most: a day.
 pub const MAX_RUN_SECONDS: u32 = 86_400;
 /// `devices --check`'s default listening time and its range. The check keeps the chain recorder's per-block facts for the whole
@@ -233,6 +268,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "quality" => return parse_quality(&mut p).map(Command::Quality),
         "process" => return parse_process(&mut p).map(Command::Process),
         "bench" => return parse_bench(&mut p).map(Command::Bench),
+        "lab" => return parse_lab(&mut p).map(Command::Lab),
         "setup-large-pages" => return parse_setup(&mut p),
         other if other.starts_with('-') => return Err(usage(format!("unknown option '{other}'"))),
         other => return Err(usage(format!("unknown command '{other}'"))),
@@ -658,6 +694,105 @@ fn parse_bench(p: &mut Parser<'_>) -> Result<BenchArgs, UsageError> {
     Ok(b)
 }
 
+/// A comma-separated list: its items trimmed, none empty.
+fn list<'a>(flag: &str, v: &'a str) -> Result<Vec<&'a str>, UsageError> {
+    let items: Vec<&str> = v.split(',').map(str::trim).collect();
+    if items.iter().any(|i| i.is_empty()) {
+        return Err(usage(format!("{flag} takes a comma-separated list, not '{v}'")));
+    }
+    Ok(items)
+}
+
+fn parse_lab(p: &mut Parser<'_>) -> Result<LabArgs, UsageError> {
+    let mut a = LabArgs {
+        audio: None,
+        out: None,
+        models: None,
+        baseline: None,
+        metrics: None,
+        playlist: playlist::Options::default(),
+        config: None,
+        processing: Processing::default(),
+        jobs: None,
+    };
+    let path = |flag: &str, v: &str| text(flag, v).map(PathBuf::from);
+    while let Some(arg) = p.next() {
+        match arg {
+            Arg::Flag(flag, inline) => match flag {
+                "--audio" => a.audio = Some(path(flag, p.value(flag, inline)?)?),
+                "--out" => a.out = Some(path(flag, p.value(flag, inline)?)?),
+                "--config" => a.config = Some(path(flag, p.value(flag, inline)?)?),
+                "--models" => {
+                    let v = p.value(flag, inline)?;
+                    let mut models = Vec::new();
+                    for m in list(flag, v)? {
+                        let m = model_name(flag, m)?;
+                        if models.contains(&m) {
+                            return Err(usage(format!("--models names {m} twice")));
+                        }
+                        models.push(m);
+                    }
+                    a.models = Some(models);
+                }
+                "--baseline" => a.baseline = Some(text(flag, p.value(flag, inline)?)?),
+                "--metrics" => {
+                    let v = p.value(flag, inline)?;
+                    let mut metrics = Vec::new();
+                    for m in list(flag, v)? {
+                        metrics.push(match m.to_ascii_lowercase().as_str() {
+                            "dnsmos" => LabMetric::Dnsmos,
+                            "sigmos" => LabMetric::Sigmos,
+                            "levels" => LabMetric::Levels,
+                            other => return Err(usage(format!("--metrics takes dnsmos, sigmos and levels, not '{other}'"))),
+                        });
+                    }
+                    a.metrics = Some(metrics);
+                }
+                "--snr" => {
+                    let v = p.value(flag, inline)?;
+                    let (lo, hi) = LAB_SNR_DB;
+                    let what = "SNRs from -10 to 60 dB (e.g. --snr 0,10,20)";
+                    a.playlist.snrs_db = list(flag, v)?.iter().map(|x| number(flag, x, lo, hi, what)).collect::<Result<_, _>>()?;
+                }
+                "--clip-seconds" => {
+                    let v = p.value(flag, inline)?;
+                    a.playlist.clip_s = number(flag, v, MIN_CLIP_S, MAX_CLIP_S, "a clip length from 10 to 60 s")?;
+                }
+                "--noises" => a.playlist.noises = list(flag, p.value(flag, inline)?)?.into_iter().map(str::to_owned).collect(),
+                "--speech" => a.playlist.speech = list(flag, p.value(flag, inline)?)?.into_iter().map(str::to_owned).collect(),
+                "--jobs" => {
+                    let v = p.value(flag, inline)?;
+                    let n = v.trim().parse::<usize>().ok().filter(|n| (1..=MAX_LAB_JOBS).contains(n));
+                    a.jobs = Some(n.ok_or_else(|| usage(format!("--jobs takes a thread count from 1 to {MAX_LAB_JOBS}, not '{v}'")))?);
+                }
+                _ => {
+                    if !a.processing.take(p, flag, inline)? {
+                        return Err(p.unknown(flag));
+                    }
+                }
+            },
+            Arg::Positional(x) => return Err(usage(format!("'lab' takes no argument '{x}'"))),
+        }
+    }
+    let pr = &a.processing;
+    if pr.model.is_some() {
+        return Err(usage("'lab' compares the models --models names: drop --model"));
+    }
+    if pr.aec.is_some() {
+        return Err(usage("'lab' runs the noise models alone, with no echo reference: drop --aec or --no-aec"));
+    }
+    if pr.noise.is_some() {
+        return Err(usage("'lab' compares noise models, always on: drop --ns or --no-ns"));
+    }
+    if let (Some(b), Some(m)) = (&a.baseline, &a.models)
+        && b != "noisy"
+        && !m.contains(b)
+    {
+        return Err(usage(format!("--baseline {b} isn't one of --models ({}) or noisy", m.join(", "))));
+    }
+    Ok(a)
+}
+
 fn parse_setup(p: &mut Parser<'_>) -> Result<Command, UsageError> {
     let (mut sid, mut helper) = (None, false);
     while let Some(arg) = p.next() {
@@ -711,6 +846,12 @@ Usage:
   noise-filter bench [IN.wav] [--seconds N] [--aec] [--model NAME]
                                  Time RNNoise, AEC3 and the chain per block (no devices);
                                  --model times a model pack beside RNNoise (an onnx build)
+  noise-filter lab [--models LIST] [--baseline NAME] [--snr LIST] [--out DIR] [LAB]
+                                 Score noise models offline on the fetched test audio: each
+                                 speech segment in each noise at each SNR, through each model,
+                                 scored by DNSMOS P.835 and SIGMOS (an onnx build) and by the
+                                 level measures; prints a scorecard of means and paired
+                                 differences with 95% CIs
   noise-filter setup-large-pages [--sid SID]
                                  Grant the lock-pages privilege (asks for elevation)
   noise-filter --help | --version
@@ -793,6 +934,24 @@ QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records th
   --save DIR         Write the scene, the recording and the aligned recording there as WAVs,
                      and what the chain got and gave live (chain_*.wav, chain_blocks.csv)
 
+LAB (offline, no devices):
+  --models LIST      The noise models to compare, e.g. rnnoise,ulunas (default: rnnoise, and in
+                     an onnx build every model pack installed)
+  --baseline NAME    The one the others are compared with: a model, or noisy (the input)
+                     (default: the first model)
+  --metrics LIST     dnsmos, sigmos, levels (default: all this build has; DNSMOS and SIGMOS
+                     need --features onnx and python -I tools/fetch_models.py dnsmos sigmos)
+  --snr LIST         The noise under the speech, -10 to 60 dB (default {snrs})
+  --clip-seconds S   The speech takes are cut into clips this long, 10 to 60 s, 16 at most with
+                     DNSMOS (default {clip_s})
+  --noises LIST, --speech LIST
+                     Only these noises (keyboard, fan, aircon, dogs, cafe, cafe-demand, music)
+                     or speech takes (tsp_fa01, vctk_p225, ...)
+  --audio DIR        The test audio (default: tools/fetch_test_audio.py's cache, or NF_TEST_AUDIO)
+  --out DIR          Write scorecard.txt, clips.csv (each clip's scores) and lab.json there
+  --jobs N           Worker threads (default: the CPU's, up to 8)
+  --config FILE and PROCESSING (but --model, --aec and --ns) apply to every model
+
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no result (latency: no
 valid repetition; quality: the recording didn't line up with the scene; latency, quality,
 run --seconds or devices --check: cancelled), 4 the large-page helper started without
@@ -816,6 +975,8 @@ Log: %LOCALAPPDATA%\\noise-filter\\noise-filter.log",
         check_s = DEFAULT_CHECK_SECONDS,
         check_lo = MIN_CHECK_SECONDS,
         check_hi = MAX_CHECK_SECONDS,
+        snrs = playlist::DEFAULT_SNRS_DB.map(|d| format!("{d:.0}")).join(","),
+        clip_s = DEFAULT_CLIP_S,
     )
 }
 
@@ -854,7 +1015,7 @@ mod tests {
         assert_eq!(err(&["--version", "x"]), "'--version' takes no argument 'x'");
         let help = help_text();
         for command in [
-            "devices", "run", "latency", "--cable-only", "quality", "--far-speech", "--echo-delay", "process", "bench",
+            "devices", "run", "latency", "--cable-only", "quality", "--far-speech", "--echo-delay", "process", "bench", "lab",
             "setup-large-pages", "--version",
         ] {
             assert!(help.contains(command), "{command}");
@@ -1234,6 +1395,49 @@ mod tests {
         assert!(
             help_text().contains("--model NAME") && help_text().contains("--high-band MODE") && help_text().contains("--model-depth N")
         );
+    }
+
+    #[test]
+    fn lab_takes_models_a_baseline_metrics_and_the_playlist() {
+        let Ok(Command::Lab(a)) = p(&["lab"]) else { panic!() };
+        assert_eq!((a.models, a.baseline, a.metrics, a.out, a.jobs), (None, None, None, None, None));
+        assert_eq!(a.playlist, playlist::Options::default());
+        let Ok(Command::Lab(a)) = p(&[
+            "lab", "--models", "rnnoise, ulunas", "--baseline=noisy", "--metrics", "DNSMOS,levels", "--snr", "-5,0,7.5", "--clip-seconds",
+            "12", "--noises", "fan,cafe-demand", "--speech", "tsp_fa01", "--out", "lab-out", "--audio", "C:/audio", "--jobs", "3",
+            "--floor", "-30", "--high-band", "zero",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.models, Some(vec!["rnnoise".to_owned(), "ulunas".to_owned()]));
+        assert_eq!((a.baseline.as_deref(), a.metrics), (Some("noisy"), Some(vec![LabMetric::Dnsmos, LabMetric::Levels])));
+        assert_eq!(a.playlist.snrs_db, [-5.0, 0.0, 7.5]);
+        assert_eq!((a.playlist.clip_s, a.playlist.noises.len(), a.playlist.speech.len()), (12.0, 2, 1));
+        assert_eq!((a.out, a.audio, a.jobs), (Some("lab-out".into()), Some("C:/audio".into()), Some(3)));
+        assert_eq!((a.processing.floor_db, a.processing.high_band), (Some(-30.0), Some(HighBand::Zero)));
+        assert!(!p(&["lab"]).unwrap().needs_memory(), "offline, as process is");
+    }
+
+    #[test]
+    fn lab_refuses_what_it_cant_use() {
+        assert_eq!(err(&["lab", "--model", "ulunas"]), "'lab' compares the models --models names: drop --model");
+        assert!(err(&["lab", "--aec"]).ends_with("drop --aec or --no-aec"));
+        assert!(err(&["lab", "--no-ns"]).ends_with("drop --ns or --no-ns"));
+        assert_eq!(err(&["lab", "--models", "rnnoise,,ulunas"]), "--models takes a comma-separated list, not 'rnnoise,,ulunas'");
+        assert_eq!(err(&["lab", "--models", "rnnoise,rnnoise"]), "--models names rnnoise twice");
+        assert!(err(&["lab", "--models", "UL-UNAS"]).starts_with("--models takes a model's name"));
+        assert_eq!(
+            err(&["lab", "--models", "rnnoise", "--baseline", "ulunas"]),
+            "--baseline ulunas isn't one of --models (rnnoise) or noisy"
+        );
+        assert_eq!(err(&["lab", "--metrics", "pesq"]), "--metrics takes dnsmos, sigmos and levels, not 'pesq'");
+        assert!(err(&["lab", "--snr", "0,70"]).starts_with("--snr takes SNRs from -10 to 60 dB"));
+        assert!(err(&["lab", "--clip-seconds", "9"]).starts_with("--clip-seconds takes a clip length from 10 to 60 s"));
+        assert_eq!(err(&["lab", "--jobs", "0"]), "--jobs takes a thread count from 1 to 64, not '0'");
+        assert_eq!(err(&["lab", "x"]), "'lab' takes no argument 'x'");
+        assert_eq!(err(&["lab", "--probe", "a"]), "'lab' has no option '--probe'");
+        let help = help_text();
+        assert!(help.contains("noise-filter lab") && help.contains("--baseline NAME") && help.contains("(default 0,10,20)"), "{help}");
     }
 
     #[test]

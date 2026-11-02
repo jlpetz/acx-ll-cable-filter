@@ -2,7 +2,8 @@
 
 Status: designed 2026-10-26 (the owner wants it in the app, not as a companion). Metric licences
 and inputs were fact-checked the same day against the Microsoft DNS-, SIG- and AEC-Challenge repos
-and the metric papers.
+and the metric papers. Phase 0's batch, `noise-filter lab`, built 2026-11-02 (uncommitted when written), with DNSMOS P.835
+and SIGMOS as packs and the licences rechecked at their sources that day ("The batch" under Phases).
 
 ## Why in the app
 - **Scores come from the exact code that ships:** the same model packs, framing, AEC and gate. A
@@ -49,6 +50,15 @@ Notes:
   AECMOS-48k see the full band.
 - **Goodhart:** DNSMOS was trained on output from ~40 DNS Challenge suppressors. DNS-trained models
   may score well on it without sounding better.
+- **Rechecked 2026-11-02 at the sources** (the GitHub API, the repos' own files):
+  - DNS-Challenge at `591184a` (its newest commit, 2024-03-29): the README's Legal Notices license "the Microsoft
+    documentation and other content in this repository under the Creative Commons Attribution 4.0" (`LICENSE`) and "any
+    code" under MIT (`LICENSE-CODE`); nothing says which the ONNX files are, so the pack fetches and keeps both notices.
+    `DNSMOS/DNSMOS/sig_bak_ovr.onnx` is 1,157,965 B, as the catalogue had it; the reference is `DNSMOS/dnsmos_local.py`.
+  - SIG-Challenge at `bf45251` (2024-06-09): `LICENSE` is MIT (GitHub reads it so). The model is in Git LFS
+    (`ICASSP2024/sigmos/model-sigmos_1697718653_41d092e8-epo-200.onnx`, oid `f939dcc1...`, 26,264,942 B); `sigmos.py`
+    still calls V1 "an alpha version", and the Transparency FAQ adds no accuracy figure.
+  - Neither repo publishes reference outputs for its metric: the tests pin our runners' own scores instead.
 
 ## Statistics
 - **Only averages are reliable.** Per-clip agreement with listeners is low: DNSMOS P.835 PCC
@@ -164,6 +174,141 @@ Notes:
     and track the far and mic content against what was played (as `Downloads\nf-scratch\which_slipped.py` did) so a take
     that slipped is flagged as the rig's, from the second it happened. Likely what the unexplained 14 dB take of
     2026-11-01 (#10) was.
+    - **Built 2026-11-02** (`echo_delay::track_rig`; app.md's quality row): the measured delay is searched within 250 ms
+      (`MAX_RIG_OFFSET_MS`), so a slip shows at its size. Both devices' content is tracked against what each played: a
+      second of the probe's track (the scene's input) and of the far end's (the far voice from where it started), every half
+      second, found in the chain's mic and reference within 250 ms of the last window's place, or failing that within 2 s
+      (`RIG_REACQUIRE_MS`: a bigger slip; a correlation of 0.5 or more; windows where the device played nothing skipped),
+      and the place turned into the device's own position (the mic stream's index plus its unfilled skips; the reference
+      timeline's index at the block's rate), so the engine's discards, skips and read-position jumps don't count. Each side
+      runs on one clock, so its offset holds to the sample while the rig holds; a move of 1 ms or more that the next window
+      confirms is a slip (a window off both neighbours is an outlier). The report: a `rig` line (each side's windows and
+      spread, each slip), a warning naming the side, the size and when (between the start of the last window at the old
+      offset and the end of the first at the new, in that side's own content's time: the probe's input for the mic, the far
+      voice for the reference, which the far end plays from `far_start`), and the far-only turns from the one that holds it
+      on left out of the echo figure (listed apart: "from N s ... left out") and of the delay's median (their delays listed
+      apart), and double talk from then on left out too (AEC3 had a misaligned reference there).
+    - **Fixed after review (2026-11-02):** a slip past 250 ms used to be missed with no sign (every window after it failed
+      the search and was skipped, so the side "held"): now the 2 s look finds it at its size, and a side whose windows stop
+      being found even there, two or more to the end of the take, has lost its track (`Lost`: the `rig` line and the warning
+      say from when, and the turns from its last window found on are set apart as for a slip). The reference side's times
+      were the probe's, off by the far voice's advance (7 ms on `events-echo-2`, 120 on `d25-b-1`; up to 250): now the far
+      voice's own. A step in a side's last window, with no window after it, used to count as a slip: now it's named as
+      unconfirmed and sets nothing apart.
+    - **Tested** on fake chain recordings: a 70 ms far-end slip at 20 s found on the reference's side, +70.0 ms, between
+      windows 1.5 s apart that hold the far voice's 20.065 s, the mic held; its turns set apart, the ones after it measured
+      70 ms short; an 11 ms mic slip found as the mic's; 300 ms slips (the reference either way, the mic later) found at their
+      size; a 3 s slip as the reference's track lost from before 20 s; an engine jump of the reference (-144 samples, in its
+      facts) no slip; an unconfirmed last step set nothing apart.
+    - **On the take itself** (`events-echo-2`, rerun from its files by the ignored `a_saved_takes_rig` test): the reference
+      slipped +70.3 ms between 23.5 and 27.5 s (the far voice is silent in the 24-27 s near-only turn), the mic held over 112
+      windows to 0.0 ms, the reference's 84 windows held to 0.0 ms either side of the slip; the echo came 25.01 ms after its
+      tap in the three far-only turns before it (25 asked) and -45.28 ms in the four after (27-54 s), so those are left out.
+      Rerun after the review's fixes (the far voice's times, the 2 s look, lost tracks): the same, and the other 15
+      calibrated takes (`events-echo-1`, `events-echo-shared-1`, `excl-echo-d25`, `d25-*`, the eight `sweep-b-*`) held on both
+      sides, nothing lost or unconfirmed, their delays within 0.25 ms of the asked.
+  - **The batch, `noise-filter lab` (built 2026-11-02; app.md's command table has its options).** Named for this file's Lab
+    and its CLI sketch (`lab run playlist.toml ...`): phase 0 is that batch, and the later phases belong under the same name.
+    - **Metric packs** (ours): `packs/dnsmos` (`sig_bak_ovr.onnx`, both licence files) and `packs/sigmos` (the model, by
+      `media.githubusercontent.com`; the fetch tool learned `"lfs": true`, checking the LFS pointer's git blob, rebuilt from
+      the download's SHA-256 and size, against the commit's tree: `508d54d...`). Role `metric` (spec amendment "Metric
+      packs"): the noise stage refuses them and the metric runners refuse noise packs; the same file checks and external-data
+      refusal. Fetched with `python -I tools/fetch_models.py dnsmos sigmos` (27.4 MB).
+    - **The runners** (`nf_ort::metric`, offline, allocating freely; one ONNX Runtime thread a session, a session a worker):
+      DNSMOS P.835 as `dnsmos_local.py` runs it (the clip repeated to 9.01 s, 9.01 s windows a second apart, Python's float
+      arithmetic for their bounds, the non-personalised polynomials, the mean). That arithmetic has a quirk we keep: windows
+      7-23 (and some from 119) come out a sample short, and the script skips them, so a 45 s clip scores 19 of its 36
+      windows; under 17 s none is lost, so with DNSMOS the Lab refuses `--clip-seconds` over 16, and `clips.csv` gives each
+      clip's windows (`dnsmos_windows`). SIGMOS as `sigmos.py` frames it (960-point STFT, hop 480, the square
+      root of a periodic Hann, 480 zeros in front and up to 960 behind, |X|^0.3 with the phase kept, three planes), one run a
+      clip. The P.808 model (`model_v8.onnx`, a librosa mel spectrogram) isn't ported yet.
+    - **The resampler for DNSMOS** (`nf_ort::metric::resample`): the script's own, reproduced. `dnsmos_local.py` calls
+      `librosa.resample` with the rates positionally (before librosa 0.10), and DNS-Challenge 591184a's `requirements.txt`
+      pins librosa 0.8.1 (with numpy 1.22.4 and onnxruntime 1.13.1: late 2022), whose `resample` runs resampy's
+      `kaiser_best` and pads to `ceil(n / 3)`. librosa 0.8.1 takes `resampy >= 0.2.2`, and resampy 0.3.0 (2022-06-29)
+      regenerated `kaiser_best` (50 crossings, 8192 points each, roll-off 0.917, from 64, 512 and 0.948), so the pinned set
+      installs the new one: ours is resampy 0.3-0.4.3's table (its β, which resampy doesn't keep, solved from the table's
+      last entry: 12.984585247040012, rebuilding all 409 601 entries to 7e-16) read as `resample_f` reads it (index step
+      `int(8192 / 3)` = 2730, the right wing interpolated at 2730.67 + 2730k: 150 taps behind, 149 ahead), then librosa's
+      padding. The first version (an exact Kaiser sinc with 0.2.2's parameters, zero phase) was neither, and moved the
+      synthetic test scenes' DNSMOS by up to 0.026; 0.2.2's resampy against 0.4's moves them by up to 0.03 (BAK), its output
+      -52 dB off below 4 kHz, -46 dB to 7 kHz, as much as the signal in the transition band above.
+    - **Checked against numpy** (`tools/check_metric_features.py`, run by hand on a dump from the ignored
+      `dump_metric_features` test): SIGMOS's features are identical, value for value, to a numpy transcription of
+      `sigmos.py`'s, and DNSMOS's 16 kHz input to numpy ports of librosa 0.8.1's `resample` and resampy 0.4.3's
+      `resample`/`resample_f`, every float32 sample including librosa's padding (with resampy's own `kaiser_best.npz` tables,
+      fetched to a scratch folder and read with `allow_pickle=False`, or the rebuilt ones). The upstream scripts themselves are
+      never run: untrusted data. The metric tests pin the runners' scores
+      on fixed synthetic scenes (to 2e-3) and check their order: clean over 20 dB over 5 dB (DNSMOS BAK, SIGMOS NOISE), and on
+      UL-UNAS's real conformance clip 0174, enhanced and clean over noisy.
+    - **The playlist** (`lab::playlist`): the 10 speech takes cut into 15 s segments (a last part of 10 s or more kept: 17
+      segments, TSP 6 and VCTK 11) x the 7 noises (`keyboard`, `fan`, `aircon`, `dogs`, `cafe`, `cafe-demand`, `music`; a
+      long noise read from an offset that moves with the clip) x 0, 10 and 20 dB: 357 clips, each built by `quality`'s
+      noise-scene builder (-20 dBFS active speech, P.56-style activity), the same every run. Each clip through a fresh chain
+      per model, the model inline, its latency dropped; the clean speech (once a segment), the noisy input and each output
+      scored by DNSMOS, SIGMOS and `quality`'s level measures (`analysis::noise_metrics`, factored out of `analyse`).
+    - **Statistics** (`lab::stats`, ours): means over the clips; each signal's paired difference from the baseline with a
+      95% CI by Student's t, cluster-robust (CR1) by speaker (a speech take: a VCTK take's segments share a speaker and a
+      room) and noise file: two-way where a table pools noises (Cameron, Gelbach and Miller 2011: the two one-way variances
+      added, their cells' taken off, never under either one-way), by speaker within a noise; df the fewer clusters less 1
+      (6 overall, 9 per noise). With equal clusters it's exactly the t over cluster means; the point estimate stays the clips'
+      mean. "No difference" where it holds 0. The first version took t over the 357 clips as if independent, which a review
+      found too narrow by half or more (noise in pauses [-10.4, -7.5] dB over clips, [-17.1, -6.6] over speakers; speech kept
+      and DNSMOS SIG crossed 0 over the 7 noise files). In a simulation of the Lab's layout (speaker, noise and segment
+      effects as big as the clips' own scatter) the two-way interval held the true mean 94.7% of the time, the one over
+      clips 27%. Why t and not a bootstrap: the percentile bootstrap under-covers at the small end (18% too narrow at 10, and
+      7 to 10 clusters is where the Lab is) and adds a seed. The t quantile is the CDF's inverse by bisection (the incomplete
+      beta's continued fraction), to the tables' 9 digits.
+    - **The speech's own sound in the pauses** (quality's check, `speech_left_in_pauses_db`): VCTK's recordings carry their
+      room's noise and reverberation, so noise in pauses there partly measures the recording, which a model may keep as
+      speech, and every figure is pulled toward 0 dB (a review found it: the first run didn't check). On the fetched set,
+      against the added noise in the pauses: VCTK -35.8 to -21.8 dB at 0 dB SNR, -22.3 to -7.6 at 10, -11.2 to +12.2 at 20;
+      TSP -59.5 to -36.7, -51.2 to -14.1, -39.9 to +4.7 (the intermittent noises, dogs and music, quiet in some pauses, give
+      the high ends). Where it's within 25 dB (quality's warning), the clip's pause figures stay in `clips.csv` (with that
+      level) but out of the summaries, and the scorecard counts them: 179 of the 357 (every VCTK clip at 10 and 20 dB, 12 of
+      its 77 at 0 dB, 13 of TSP's 126), so the pause figures speak for TSP and for VCTK at 0 dB.
+    - **Outputs:** the scorecard (overall, then the headline metrics per noise type), `clips.csv` (a row a clip and signal),
+      `lab.json` (what ran, the takes' licences, every clip, the summaries overall, per noise and per SNR). A build without
+      `onnx` runs RNNoise and the level measures and says so. `noise-filter.exe` isn't run here: the run below is the ignored
+      `the_fetched_set_s_scorecard` test, the same function on the same set.
+    - **The run** (2026-11-02, after the review's fixes: the CIs clustered, the pause figures checked, the resampler
+      resampy's; the dev VM, release, onnx, 8 threads, 490 s; files in `Downloads\nf-lab\full-2026-11-02-b`): means over 357
+      clips, clean / noisy / RNNoise / UL-UNAS, and UL-UNAS less RNNoise with its 95% CI (two-way by 10 speakers and 7
+      noises, df 6):
+
+      | Metric | clean | noisy | RNNoise | UL-UNAS | UL-UNAS - RNNoise |
+      |---|---|---|---|---|---|
+      | DNSMOS SIG | 3.54 | 3.02 | 3.13 | 3.19 | no difference [-0.01, +0.13] |
+      | DNSMOS BAK | 4.04 | 2.40 | 3.45 | 4.00 | +0.55 [+0.28, +0.82] |
+      | DNSMOS OVRL | 3.26 | 2.26 | 2.67 | 2.93 | +0.26 [+0.12, +0.41] |
+      | SIGMOS COL | 4.20 | 3.36 | 3.17 | 3.70 | +0.53 [+0.40, +0.67] |
+      | SIGMOS DISC | 4.33 | 3.95 | 3.35 | 3.97 | +0.62 [+0.50, +0.74] |
+      | SIGMOS LOUD | 3.92 | 3.14 | 3.49 | 4.08 | +0.60 [+0.46, +0.73] |
+      | SIGMOS NOISE | 4.42 | 1.91 | 3.39 | 4.25 | +0.86 [+0.59, +1.13] |
+      | SIGMOS REVERB | 4.73 | 4.12 | 4.19 | 4.40 | +0.20 [+0.09, +0.32] |
+      | SIGMOS SIG | 4.03 | 3.04 | 2.87 | 3.56 | +0.68 [+0.57, +0.80] |
+      | SIGMOS OVRL | 3.64 | 2.19 | 2.44 | 3.12 | +0.68 [+0.54, +0.82] |
+      | noise in pauses, dB (178 clips) | | 0.00 | -19.71 | -35.60 | -15.89 [-26.28, -5.49] |
+      | 200 ms clear, dB (136 clips) | | 0.00 | -22.61 | -36.91 | -14.30 [-25.84, -2.75] |
+      | speech kept, dB | | 0.04 | -0.69 | -0.59 | no difference [-0.06, +0.26] |
+
+      - UL-UNAS over RNNoise on both OVRLs for every noise type (DNSMOS +0.15 cafe-demand to +0.60 music; SIGMOS +0.53 cafe
+        to +0.92 music; by speaker, df 9), and on every metric overall but DNSMOS SIG and the speech kept, which the
+        clustered CIs no longer separate. Noise in pauses: more cut on every noise but cafe-demand (no difference, [-9.4,
+        +0.0]), about 30 dB more on music and dogs, where RNNoise cuts only 7.4 and 6.4 dB. Speech kept: UL-UNAS keeps more on
+        music, aircon, fan and keyboard (+0.06 to +0.38 dB), no difference on the cafes and dogs.
+      - RNNoise against the noisy input: DNSMOS BAK and OVRL up, SIG no difference; SIGMOS NOISE, OVRL and LOUD up, but DISC
+        down 0.61 [0.23, 0.98], COL down 0.19 and SIG down 0.17: SIGMOS hears RNNoise's artefacts (discontinuity most).
+        Worth a listen before trusting it (uncalibrated).
+      - Against the first run (earlier that day: the CIs over clips, every clip's pause figures, the exact-sinc resampler):
+        the means are the same but for UL-UNAS's DNSMOS SIG and OVRL, 0.01 lower now (3.20 and 2.94 then: the resampler);
+        the intervals are about 3 to 7 times wider; DNSMOS SIG (+0.06 [+0.04, +0.08]) and the speech kept (+0.10 [+0.07, +0.14]) lose their verdicts; noise in
+        pauses, -8.97 [-10.41, -7.54] dB over every clip then, is -15.89 over those it can be read on, and the cafe
+        difference ("no difference" then) shows.
+    - **To do:** the P.808 runner (librosa's mel, its padding mode pinned by version); a `--save` of the clips' WAVs for
+      listening; model variants in one run (`ulunas:zero` for the high-band A/B); the live take's half (phase 1); more
+      speakers (and then perhaps a two-way cluster bootstrap); speech takes with a quieter floor, for the pause figures at 10
+      and 20 dB.
 - **Phase 1:** live capture that saves the raw mic take and loopback next to the processed output.
   - **Its small first part, the chain recorder (built 2026-11-01, for #10):** `Engine::record_chain` records what the chain
     got and gave live, block by block, from the run's first block when armed before the start (engine.md, "The chain

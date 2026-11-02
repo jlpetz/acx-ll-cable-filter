@@ -114,6 +114,15 @@ pub fn build(test: QualityTest, seconds: f32, snr_db: Option<f32>, echo_delay_ms
     }
 }
 
+/// A recording as the noise test's near speech before any noise is mixed in: looped or cut to `len`, at [`SPEECH_DBFS`] active
+/// level, with its activity (the detector and its hangover). The noise scene's `clean` is this (unless the mix had to be scaled
+/// down to keep it from clipping); `noise-filter lab` scores it as each clip's clean reference.
+pub fn near_speech(x: &[f32], len: usize) -> Result<(Vec<f32>, Vec<Range<usize>>), String> {
+    let mut t = Track::recorded(x, len, "--speech")?;
+    t.set_level(SPEECH_DBFS);
+    Ok((t.samples, t.activity))
+}
+
 fn noise_scene(len: usize, snr_db: f32, user: &UserAudio) -> Result<Scene, String> {
     let mut near = near_track(len, user)?;
     near.set_level(SPEECH_DBFS);
@@ -340,6 +349,13 @@ pub fn turn_at(i: usize) -> Turn {
         1 => Turn::DoubleTalk,
         _ => Turn::NearOnly,
     }
+}
+
+/// The start of the first far-only turn that holds scene sample `i` or comes after it (where a rig slip's turns begin).
+pub fn far_only_from(i: usize) -> usize {
+    let cycle = 3 * turn_len();
+    let start = i / cycle * cycle;
+    if i < start + turn_len() { start } else { start + cycle }
 }
 
 /// The echo test's turns as (near windows, far windows), adjacent ones merged (see [`turn_at`]).
@@ -634,6 +650,13 @@ mod tests {
         assert!(held.windows(2).all(|w| w[0].end < w[1].start) && held.len() < bare.len());
         // Clipped to the turns' windows
         assert_eq!(within_windows(&[0..10, 15..30], &[5..20, 25..40]), [5..10, 15..20, 25..30]);
+    }
+
+    /// A rig slip's turns begin at the far-only turn that holds it, or else the next one.
+    #[test]
+    fn the_far_only_turns_from_a_point_on() {
+        let at = |s: f64| far_only_from((s * FS as f64) as usize) / FS;
+        assert_eq!([at(0.0), at(2.9), at(3.0), at(10.0), at(12.5), at(26.5)], [0, 0, 9, 9, 18, 27]);
     }
 
     #[test]

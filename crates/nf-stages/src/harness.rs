@@ -14,6 +14,13 @@
 //! - The checks any stage, model or pack must pass, callable outside the tests (TODO 5's pack loader will run them on a
 //!   pack): [`check_latency`] and [`check_model`] (check 1) and [`check_profile`] (check 4's common part). Each returns
 //!   what it measured, or why it failed.
+//! - **[`check_stage`]: the one call a new stage or pack makes** (TODO 2's reusable check): [`check_profile`], then the
+//!   measured offset against the declared latency at four block phases ([`check_latency`]'s impulses when the stage passes
+//!   a click, and GCC-PHAT on speech started at each phase whether or not), finite output through hostile input (NaN, ±inf,
+//!   1e17, ±`f32::MAX`, subnormals, ±1e4 square waves, on every input) and speech coming through after it and a reset, and
+//!   the parity hook: a reference output the stage's must match, bit for bit or within a tolerance ([`ParityCase`]).
+//!   RNNoise's (against nnnoiseless driven directly), AEC3's (against sonora driven directly) and UL-UNAS's (its worker
+//!   against the same stage inline) tests call it.
 //!
 //! The tests call them on every built-in stage: `tests/conformance.rs` (check 1 and 4, plus our stages' own interface
 //! promises), the parity tests (check 2), `tests/timing.rs` and `noise-filter bench` (check 3).
@@ -327,6 +334,166 @@ pub fn check_profile(make: &dyn Fn() -> Box<dyn Stage>) -> Result<StageRole, Str
     Ok(role)
 }
 
+/// How closely a [`ParityCase`]'s output must match its reference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tolerance {
+    /// Bit for bit, over every sample compared.
+    Exact,
+    /// No sample further off than `max_abs`, and the error's RMS at most `rms_db` against the reference's.
+    Within { max_abs: f32, rms_db: f32 },
+}
+
+/// [`check_stage`]'s parity hook: `input` (whole blocks) through a fresh stage, `aux` on its second input when given, and
+/// its output read `shift` samples later (an output that lags its reference), against `expected`.
+#[derive(Clone, Copy, Debug)]
+pub struct ParityCase<'a> {
+    /// What the reference is (for the messages): "nnnoiseless driven directly".
+    pub against: &'a str,
+    pub input: &'a [f32],
+    pub aux: Option<&'a [f32]>,
+    pub expected: &'a [f32],
+    pub shift: usize,
+    pub tolerance: Tolerance,
+}
+
+/// What [`check_stage`] is given besides the stage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageCheck<'a> {
+    /// The impulse offsets' amplitude ([`check_latency`]); `None` for a stage that may suppress a click.
+    pub impulse_amp: Option<f32>,
+    pub parity: Option<ParityCase<'a>>,
+}
+
+/// What [`check_stage`] measured.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StageCheckReport {
+    pub role: StageRole,
+    pub latency: LatencyReport,
+    /// GCC-PHAT's offset and confidence with the speech started at each of [`scenes::IMPULSE_PHASES`]' block phases.
+    pub phases: Vec<(usize, f64, f32)>,
+    /// The largest |output sample| through the hostile blocks (every one finite).
+    pub stress_peak: f32,
+    pub parity: Option<Parity>,
+}
+
+/// [`check_stage`]'s phase scenes: 4 s of the low voice over pink noise at 30 dB, delayed by the phase.
+fn phase_scene(phase: usize) -> Vec<f32> {
+    let mut x = vec![0.0f32; phase];
+    x.extend(scenes::noisy_speech(4 * SAMPLE_RATE as usize, Voice::LOW, 30.0, 2).mix);
+    x.resize(x.len().div_ceil(BLOCK) * BLOCK, 0.0);
+    x
+}
+
+/// The hostile blocks [`check_stage`] feeds every input: what a broken driver or a bug upstream could hand a stage.
+pub fn hostile_block(k: usize) -> Block {
+    std::array::from_fn(|i| match k % 9 {
+        0 => {
+            if (i / 24) % 2 == 0 {
+                1e4
+            } else {
+                -1e4
+            }
+        }
+        1 => f32::NAN,
+        2 => {
+            if i % 7 == 0 {
+                f32::INFINITY
+            } else {
+                1e17
+            }
+        }
+        3 => {
+            if i % 2 == 0 {
+                f32::MAX
+            } else {
+                -f32::MAX
+            }
+        }
+        4 => f32::NEG_INFINITY,
+        5 => 1e-40 * if i % 2 == 0 { 1.0 } else { -1.0 },
+        6 => {
+            if i % 3 == 0 {
+                f32::NAN
+            } else {
+                0.5
+            }
+        }
+        7 => 0.0,
+        _ => (i as f32 * 0.05).sin(),
+    })
+}
+
+/// TODO 2's reusable check for a new stage or pack (see the module notes): `make` gives a fresh stage each call (the check
+/// activates it). Returns what it measured, or the first thing that failed.
+pub fn check_stage(make: &dyn Fn() -> Box<dyn Stage>, check: &StageCheck<'_>) -> Result<StageCheckReport, String> {
+    let role = check_profile(make)?;
+    let latency = check_latency(make, check.impulse_amp)?;
+    let fresh = || -> Result<Box<dyn Stage>, String> {
+        let mut s = make();
+        s.activate(&Activation::HOST).map_err(|e| e.0)?;
+        Ok(s)
+    };
+    let mut stage = fresh()?;
+    let name = stage.descriptor().id.to_string();
+    let declared = stage.latency();
+    let aux = stage.audio_ports().input_count() > 1;
+    // The offset at every block phase, by GCC-PHAT on speech (a stage that suppresses clicks still shows its framing here)
+    let mut phases = Vec::new();
+    for phase in scenes::IMPULSE_PHASES {
+        let x = phase_scene(phase);
+        let silent = vec![0.0f32; x.len()];
+        let y = run_stage(&mut *fresh()?, &x, aux.then_some(&silent[..])).out;
+        let (d, conf) = gcc_matches(&format!("{name} at block phase {phase}"), &x, &y, declared, max_lag_for(declared))?;
+        phases.push((phase, d, conf));
+    }
+    // Finite output through hostile input on every input (the second gets the same blocks, a block later in the cycle)
+    let mut peak = 0.0f32;
+    let mut y = [0.0f32; BLOCK];
+    for k in 0..90 {
+        let (x, r) = (hostile_block(k), hostile_block(k + 4));
+        if aux {
+            stage.process(ProcessIo::new(&[&x, &r], &mut y));
+        } else {
+            stage.process(ProcessIo::new(&[&x], &mut y));
+        }
+        if let Some(i) = y.iter().position(|v| !v.is_finite()) {
+            return Err(format!("{name}: hostile block {k} (kind {}) gave {} at sample {i}", k % 9, y[i]));
+        }
+        peak = y.iter().fold(peak, |m, v| m.max(v.abs()));
+    }
+    // ... and speech comes through after it and a reset
+    stage.reset();
+    let x = scenes::noisy_speech(2 * SAMPLE_RATE as usize, Voice::LOW, 20.0, 3).mix;
+    let silent = vec![0.0f32; x.len()];
+    let after = run_stage(&mut *stage, &x, aux.then_some(&silent[..])).out;
+    let energy = |v: &[f32]| v.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>();
+    if !after.iter().all(|v| v.is_finite()) || energy(&after) < 0.01 * energy(&x) {
+        return Err(format!("{name}: after the hostile blocks and a reset, speech no longer comes through"));
+    }
+    let parity = match &check.parity {
+        Some(c) => {
+            let out = run_stage(&mut *fresh()?, c.input, c.aux).out;
+            let p = parity(&out, c.expected, c.shift);
+            let want = c.expected.len().min(out.len().saturating_sub(c.shift));
+            let ok = p.compared == want
+                && p.compared > 0
+                && match c.tolerance {
+                    Tolerance::Exact => p.first_mismatch.is_none(),
+                    Tolerance::Within { max_abs, rms_db } => p.max_abs <= max_abs && p.rms_err_db <= rms_db,
+                };
+            if !ok {
+                return Err(format!(
+                    "{name} against {}: {} samples compared, max |diff| {}, RMS error {:.1} dB, first mismatch {:?} ({:?} asked)",
+                    c.against, p.compared, p.max_abs, p.rms_err_db, p.first_mismatch, c.tolerance
+                ));
+            }
+            Some(p)
+        }
+        None => None,
+    };
+    Ok(StageCheckReport { role, latency, phases, stress_peak: peak, parity })
+}
+
 /// How an output matches a reference output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Parity {
@@ -545,6 +712,66 @@ mod tests {
         for lie in [-1, 1, 256] {
             assert!(check_model(&delay_model(lie), Some(0.25)).unwrap_err().contains("hop phase"), "lie {lie}");
             assert!(check_model(&delay_model(lie), None).unwrap_err().contains("GCC-PHAT"), "lie {lie}");
+        }
+    }
+
+    /// The one check on an honest stage: its profile, its offset at every block phase, finite through the hostile blocks, and
+    /// its parity hook; a liar about its latency fails at the offsets, a reference that differs fails the parity, and a stage
+    /// that lets a NaN through fails the hostile blocks.
+    #[test]
+    fn the_stage_check_passes_the_truth_and_catches_each_failure() {
+        let x = scenes::noisy_speech(2 * SAMPLE_RATE as usize, Voice::LOW, 20.0, 9).mix;
+        let delayed: Vec<f32> = std::iter::repeat_n(0.0, 992).chain(x.iter().copied()).take(x.len()).collect();
+        let exact =
+            ParityCase { against: "the input delayed", input: &x, aux: None, expected: &x, shift: 992, tolerance: Tolerance::Exact };
+        let r = check_stage(&delay_stage(0), &StageCheck { impulse_amp: Some(0.5), parity: Some(exact) }).expect("an honest stage");
+        assert_eq!((r.role, r.latency.declared), (StageRole::Noise, 992));
+        assert_eq!(r.phases.iter().map(|p| p.0).collect::<Vec<_>>(), scenes::IMPULSE_PHASES);
+        assert!(r.phases.iter().all(|p| (p.1 - 992.0).abs() < GCC_TOLERANCE), "{:?}", r.phases);
+        assert!(r.stress_peak.is_finite() && r.parity.unwrap().first_mismatch.is_none(), "{r:?}");
+        // The reference delayed by hand, read with no shift: the same parity
+        let unshifted = ParityCase { shift: 0, expected: &delayed, ..exact };
+        let ok = check_stage(&delay_stage(0), &StageCheck { impulse_amp: None, parity: Some(unshifted) });
+        assert!(ok.is_ok(), "{ok:?}");
+        // The undelayed reference read with no shift: a parity failure, said with its numbers
+        let wrong = ParityCase { shift: 0, ..exact };
+        let e = check_stage(&delay_stage(0), &StageCheck { impulse_amp: None, parity: Some(wrong) }).unwrap_err();
+        assert!(e.contains("against the input delayed") && e.contains("first mismatch Some("), "{e}");
+        let loose = ParityCase { tolerance: Tolerance::Within { max_abs: 10.0, rms_db: 10.0 }, ..wrong };
+        assert!(check_stage(&delay_stage(0), &StageCheck { impulse_amp: None, parity: Some(loose) }).is_ok());
+        for lie in [-1, 480] {
+            assert!(check_stage(&delay_stage(lie), &StageCheck::default()).unwrap_err().contains("GCC-PHAT"), "lie {lie}");
+        }
+        let e = check_stage(&|| -> Box<dyn Stage> { Box::new(Leaky(delay_stage(0)())) }, &StageCheck::default()).unwrap_err();
+        assert!(e.contains("hostile block 1 (kind 1) gave NaN"), "{e}");
+    }
+
+    /// Lets a NaN in its input through to its output, once it has seen one (as an unsanitised stage would).
+    struct Leaky(Box<dyn Stage>);
+
+    impl Stage for Leaky {
+        fn descriptor(&self) -> &StageDescriptor {
+            self.0.descriptor()
+        }
+        fn audio_ports(&self) -> &AudioPorts {
+            self.0.audio_ports()
+        }
+        fn activate(&mut self, a: &Activation) -> Result<(), StageError> {
+            self.0.activate(a)
+        }
+        fn latency(&self) -> u32 {
+            self.0.latency()
+        }
+        fn process(&mut self, io: ProcessIo<'_>) {
+            let nan = io.main().iter().any(|v| v.is_nan());
+            let ProcessIo { inputs, output } = io;
+            self.0.process(ProcessIo::new(inputs, &mut *output));
+            if nan {
+                output[0] = f32::NAN;
+            }
+        }
+        fn reset(&mut self) {
+            self.0.reset();
         }
     }
 

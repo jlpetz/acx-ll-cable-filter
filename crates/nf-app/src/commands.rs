@@ -4,6 +4,7 @@
 mod bench;
 mod check;
 mod devices;
+mod lab;
 mod latency;
 mod process;
 mod quality;
@@ -31,6 +32,7 @@ pub fn run_cli(command: &Command) -> Result<(), Failure> {
         Command::Quality(args) => quality::quality(args),
         Command::Process(args) => process::process(args),
         Command::Bench(args) => bench::bench(args),
+        Command::Lab(args) => lab::lab(args),
         Command::SetupLargePages { sid, helper } => setup::setup_large_pages(sid.as_deref(), *helper),
         Command::Gui => Err(Failure::usage("the window isn't a CLI command")),
     }

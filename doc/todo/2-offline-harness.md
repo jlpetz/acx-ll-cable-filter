@@ -71,6 +71,17 @@ fixtures are synthetic and built in memory (`nf_stages::synth`); WAVs go only to
     - `check_profile(make)`: `check_host_profile`, activation (twice, the latency unmoved, at most 4096), each
       param's range, clamping and NaN refusal, the state round trip, and an idle reset changing nothing.
     Their own tests feed them stages and models that misreport by -1, +1 and a hop: both measurements catch each.
+  - **`check_stage(make, &StageCheck { impulse_amp, parity })`: the one call a new stage or pack makes** (built
+    2026-11-02): `check_profile`, then `check_latency` (the impulses at block phases 0, 17, 301 and 479 when the stage
+    passes a click), then GCC-PHAT on 4 s of speech started at each of those block phases (within 0.1 sample at > 25 dB:
+    the phase check for a stage that suppresses clicks), then 90 hostile blocks on every input (±1e4 square waves, NaN,
+    ±inf, 1e17, ±`f32::MAX`, subnormals, NaN among samples, silence, a sine) with every output sample finite, then a
+    reset and 2 s of noisy speech that must come through (at least 1% of its energy), then the parity hook: a
+    `ParityCase { against, input, aux, expected, shift, tolerance }` run on a fresh stage and compared by `parity`,
+    `Tolerance::Exact` (bit for bit) or `Within { max_abs, rms_db }`. It returns a `StageCheckReport` (the role, the
+    latency report, the four phase offsets, the hostile blocks' peak, the parity), or the first failure, naming it. Its own
+    test passes the pure-delay stage and catches a latency lie (-1, a block), a parity reference that differs, and a stage
+    that lets a NaN through.
 - **Check 1, latency conformance** (`tests/conformance.rs`, through `check_latency` and `check_model`):
   - the impulse offset equals `latency()` exactly at all four phases: RNNoise 480 (a 1e-6 impulse, floor off),
     AEC3 430 (0.5, silent reference);
@@ -81,6 +92,13 @@ fixtures are synthetic and built in memory (`nf_stages::synth`); WAVs go only to
   - the re-blocker, with a pure-delay model at hops 160, 240, 256, 480, 512, 768, 960 and 1024, with and without
     a frame of lookahead, through a chain: the latency follows #3's formula, the output is the input delayed by it
     sample for sample, and a 0 dB floor gives exactly the delayed dry signal.
+- **The one check on every stage** (`check_stage`, 2026-11-02): RNNoise (`tests/conformance.rs`): 480 at every phase
+  (impulses at 1e-6; GCC-PHAT 479.983-479.996 at 36.5-36.8 dB), finite through the hostile blocks (peak 1.0, its
+  clamp), bit-equal to nnnoiseless driven directly over 288 000 samples with the loud blocks; AEC3 (`src/aec3.rs`, which
+  sees its dither seed): 430 at every phase, finite on both inputs, bit-equal to sonora driven directly over 4 s of echo
+  with its reference; UL-UNAS (nf-ort's `tests/ort/latency.rs`), inline and on a waited-for worker, the floor off and
+  then the high band passed (impulses at 0.5): 2400.000 at every phase, finite (peak 1.0), the worker bit for bit the
+  stage inline.
 - **Check 2, parity:**
   - the noise stage around RNNoise (floor off, gate off) is bit-equal to nnnoiseless driven directly (×32768 in,
     ÷32768 out, clamped): 288 000 samples, loud clipped blocks included;
@@ -126,6 +144,7 @@ fixtures are synthetic and built in memory (`nf_stages::synth`); WAVs go only to
 ## Next
 1. Recorded mic + loopback pairs from the owner's desktop with speakers (order step 3), run as `test_audio.rs` runs the
    ICASSP pair.
-2. Each new model as it lands (#5): `check_model`, `check_latency` and `check_profile`, and its conformance pair through
-   `parity`; UL-UNAS's `0174.wav` (shifted by 256 at 16 kHz) in an ignored test.
+2. Each new model as it lands (#5): `check_stage` (with `check_model` on the model alone), and its conformance pair through
+   `parity`; UL-UNAS's `0174.wav` (shifted by 256 at 16 kHz) in an ignored test. Proposal (ours): the pack loader runs
+   `check_stage` once per pack and caches the result by the model's SHA-256.
 3. The timing rows on the owner's desktops (`noise-filter bench`).

@@ -24,6 +24,10 @@
 //! The hashes come from the cached manifest, which arrives with the model; pinning the repo manifest's model hash in the
 //! host would make it a second anchor (not done in v0: packs are evaluation only, fetched by a developer).
 //!
+//! **Two kinds.** The checks every pack takes (`check_files`: the spec, the id, the paths, the files' sizes and hashes, one
+//! model) are shared; then a noise model's (`check_noise`, through [`Pack::load`]) or a quality metric's
+//! (`crate::metric::check_metric`, role `metric`), so neither kind loads as the other.
+//!
 //! SHA-256 is Windows CNG's (`BCryptHash` with the SHA-256 pseudo-handle): no hashing crate.
 
 use std::path::{Path, PathBuf};
@@ -83,6 +87,16 @@ pub struct Manifest {
     pub latency: Latency,
     #[serde(default)]
     pub conformance: Vec<Conformance>,
+    /// A quality metric's pack (role `metric`): which metric it is, for its runner to check (`crate::metric`).
+    #[serde(default)]
+    pub metric: Option<MetricSpec>,
+}
+
+/// A metric pack's `metric` section.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MetricSpec {
+    /// The metric its runner computes: `dnsmos-p835` or `sigmos-v1`.
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -299,15 +313,7 @@ impl Pack {
 
     /// [`Pack::installed`], verifying `which` files.
     pub fn installed_with(id: &str, which: Verify) -> Result<Pack, PackError> {
-        if !is_pack_id(id) {
-            return Err(PackError(format!("'{id}' isn't a model id ([a-z0-9][a-z0-9-]{{0,63}})")));
-        }
-        let root = models_dir().ok_or_else(|| PackError("neither NF_MODELS nor LOCALAPPDATA is set".into()))?;
-        let dir = root.join(id);
-        if !dir.join("manifest.json").is_file() {
-            return Err(PackError(format!("the pack isn't installed in {}: python -I tools/fetch_models.py {id}", dir.display())));
-        }
-        Self::load_with(&dir, which)
+        Self::load_with(&installed_dir(id)?, which)
     }
 
     /// Loads and checks the pack in `dir` for the runtime (see the module notes).
@@ -317,10 +323,16 @@ impl Pack {
 
     /// Loads and checks the pack in `dir`, reading and hashing `which` of its files.
     pub fn load_with(dir: &Path, which: Verify) -> Result<Pack, PackError> {
+        Self::load_kind(dir, which, check_noise)
+    }
+
+    /// Loads the pack in `dir`: its manifest through the checks every pack takes and `kind`'s (a noise model's, or a quality
+    /// metric's: `crate::metric`), then `which` of its files read and hashed.
+    pub(crate) fn load_kind(dir: &Path, which: Verify, kind: fn(&Manifest) -> Result<(), String>) -> Result<Pack, PackError> {
         let raw = read_capped(&dir.join("manifest.json"), MAX_MANIFEST)?;
         let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| PackError(format!("{}: manifest.json: {e}", dir.display())))?;
         let folder = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        check(&manifest, folder).map_err(|e| PackError(format!("pack {}: {e}", dir.display())))?;
+        check_files(&manifest, folder).and_then(|()| kind(&manifest)).map_err(|e| PackError(format!("pack {}: {e}", dir.display())))?;
         let mut model_bytes = None;
         for f in manifest.files.iter().filter(|f| which == Verify::All || f.role != "conformance") {
             let path = safe_parts(&f.path)?.iter().fold(dir.to_path_buf(), |p, part| p.join(part));
@@ -372,6 +384,19 @@ impl Pack {
     }
 }
 
+/// `models_dir()/<id>`, if it holds a manifest; else how to fetch it.
+pub(crate) fn installed_dir(id: &str) -> Result<PathBuf, PackError> {
+    if !is_pack_id(id) {
+        return Err(PackError(format!("'{id}' isn't a model id ([a-z0-9][a-z0-9-]{{0,63}})")));
+    }
+    let root = models_dir().ok_or_else(|| PackError("neither NF_MODELS nor LOCALAPPDATA is set".into()))?;
+    let dir = root.join(id);
+    if !dir.join("manifest.json").is_file() {
+        return Err(PackError(format!("the pack isn't installed in {}: python -I tools/fetch_models.py {id}", dir.display())));
+    }
+    Ok(dir)
+}
+
 /// Reads `path` if it is a regular file (not a link) of at most `cap` bytes.
 fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, PackError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| PackError(format!("{}: {e}", path.display())))?;
@@ -393,8 +418,15 @@ fn is_hex(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The manifest's checks (module notes). `folder` is the pack folder's name.
+/// A noise model pack's checks (module notes): every pack's, then the noise stage's. `folder` is the pack folder's name.
 pub fn check(m: &Manifest, folder: &str) -> Result<(), String> {
+    check_files(m, folder)?;
+    check_noise(m)
+}
+
+/// The checks every pack takes, whatever its kind: the spec, the id and its folder, the files' paths, roles, sizes and
+/// hashes, and the one model file.
+pub(crate) fn check_files(m: &Manifest, folder: &str) -> Result<(), String> {
     match m.spec.strip_prefix(SPEC_PREFIX) {
         Some("0") => {}
         Some(major) => return Err(format!("spec major version {major} is unknown (this host reads {SPEC})")),
@@ -425,6 +457,12 @@ pub fn check(m: &Manifest, folder: &str) -> Result<(), String> {
     if models != [m.graph.model.as_str()] {
         return Err(format!("v0 takes exactly one model file, the one graph.model names ({:?}); the files list {models:?}", m.graph.model));
     }
+    Ok(())
+}
+
+/// What the noise stage can run: a denoise or dereverb pack on the mic, spectral, one channel at a divisor of 48 kHz, its
+/// STFT, I/O and state as the host frames them. (A quality metric's pack, role `metric`, fails here: it's no noise model.)
+fn check_noise(m: &Manifest) -> Result<(), String> {
     if !["denoise", "dereverb"].contains(&m.role.kind.as_str()) || m.role.inputs != ["mic"] {
         return Err(format!(
             "role {:?} with inputs {:?}: the noise stage takes denoise or dereverb packs on the mic only",

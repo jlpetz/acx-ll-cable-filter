@@ -8,6 +8,8 @@
 //!   engine calls a stage;
 //! - **check 2, parity:** the noise stage around RNNoise is bit-equal to nnnoiseless driven directly (AEC3's parity with
 //!   sonora is a unit test in `src/aec3.rs`, which can see the stage's config and dither seed);
+//! - **the one check** (`harness::check_stage`, TODO 2's reusable check): RNNoise passes it whole, nnnoiseless driven
+//!   directly as its parity hook (AEC3's call is in `src/aec3.rs`, UL-UNAS's in nf-ort's `tests/ort/latency.rs`);
 //! - **check 4, the host profile and the interface:** each stage passes `check_profile` (the profile, activation, the
 //!   params' clamping, the state round trip, an idle reset); and ours refuse other formats, have their param defaults,
 //!   tolerate unknown ids in a state, and have their own extensions.
@@ -23,7 +25,9 @@ use nf_core::BLOCK;
 use nf_core::config::{GateConfig, GateMode, ProcessingConfig};
 use nf_core::noise::{DelayModel, NoiseStage, PARAMS, param};
 use nf_core::stage::{Activation, ParamError, Stage, StageRole, check_host_profile, state};
-use nf_stages::harness::{self, chain_for, check_latency, check_model, check_profile, parity, scenes};
+use nf_stages::harness::{
+    self, ParityCase, StageCheck, Tolerance, chain_for, check_latency, check_model, check_profile, check_stage, parity, scenes,
+};
 use nf_stages::synth::{Voice, white_noise};
 use nf_stages::{AEC3_LATENCY, RNNOISE_INFO, RNNOISE_LATENCY, RnnoiseModel, build_chain};
 use nnnoiseless::DenoiseState;
@@ -126,19 +130,20 @@ fn the_reblocker_s_latency_holds_through_the_chain_at_every_hop() {
 
 // ---- Check 2: parity --------------------------------------------------------------------------------------------------
 
-#[test]
-fn the_rnnoise_stage_is_nnnoiseless_driven_directly() {
-    // Floor off, gate off: the stage's output is nnnoiseless's on the input ×32768, ÷32768 and clamped, bit for bit. Loud
-    // blocks (×4 full scale) take the clamp too.
-    let len = 6 * SR;
-    let mut x = scenes::noisy_speech(len, Voice::HIGH, 10.0, 4).mix;
+/// 6 s of the high voice in noise at 10 dB, with loud blocks (×4 full scale) 2 s in, which take the stage's clamp.
+fn rnnoise_parity_scene() -> Vec<f32> {
+    let mut x = scenes::noisy_speech(6 * SR, Voice::HIGH, 10.0, 4).mix;
     for (i, v) in x[2 * SR..2 * SR + 4 * BLOCK].iter_mut().enumerate() {
         *v = if (i / 60) % 2 == 0 { 4.0 } else { -4.0 };
     }
-    let staged = run_stage(&mut rnnoise(model_only()), &x, None).out;
+    x
+}
+
+/// nnnoiseless driven directly on `x`: ×32768 in, ÷32768 and clamped out, block by block.
+fn nnnoiseless_direct(x: &[f32]) -> Vec<f32> {
     let mut state = DenoiseState::new();
     let (mut i16_in, mut i16_out) = ([0.0f32; BLOCK], [0.0f32; BLOCK]);
-    let mut direct = Vec::with_capacity(len);
+    let mut direct = Vec::with_capacity(x.len());
     for b in x.as_chunks::<BLOCK>().0 {
         for (d, &v) in i16_in.iter_mut().zip(b) {
             *d = v * 32768.0;
@@ -146,10 +151,49 @@ fn the_rnnoise_stage_is_nnnoiseless_driven_directly() {
         state.process_frame(&mut i16_out, &i16_in);
         direct.extend(i16_out.iter().map(|v| (v * (1.0 / 32768.0)).clamp(-1.0, 1.0)));
     }
+    direct
+}
+
+#[test]
+fn the_rnnoise_stage_is_nnnoiseless_driven_directly() {
+    // Floor off, gate off: the stage's output is nnnoiseless's on the input ×32768, ÷32768 and clamped, bit for bit. Loud
+    // blocks (×4 full scale) take the clamp too.
+    let len = 6 * SR;
+    let x = rnnoise_parity_scene();
+    let staged = run_stage(&mut rnnoise(model_only()), &x, None).out;
+    let direct = nnnoiseless_direct(&x);
     let p = parity(&staged, &direct, 0);
     eprintln!("RNNoise stage vs nnnoiseless: {} samples, max |diff| {}, first mismatch {:?}", p.compared, p.max_abs, p.first_mismatch);
     assert_eq!((p.first_mismatch, p.compared), (None, len));
     assert!(staged.iter().any(|v| v.abs() == 1.0), "the loud blocks reached the clamp");
+}
+
+// ---- The one check (TODO 2's reusable check) ------------------------------------------------------------------------
+
+/// RNNoise through `check_stage`: the profile, its 480 at every block phase (impulses at 1e-6 and GCC-PHAT on speech),
+/// finite through the hostile blocks and speech after them, and bit-equal to nnnoiseless driven directly.
+#[test]
+fn rnnoise_passes_the_stage_check() {
+    let x = rnnoise_parity_scene();
+    let direct = nnnoiseless_direct(&x);
+    let parity = ParityCase {
+        against: "nnnoiseless driven directly",
+        input: &x,
+        aux: None,
+        expected: &direct,
+        shift: 0,
+        tolerance: Tolerance::Exact,
+    };
+    let make = || boxed(rnnoise(model_only()));
+    let r = check_stage(&make, &StageCheck { impulse_amp: Some(1e-6), parity: Some(parity) }).unwrap_or_else(|e| panic!("{e}"));
+    eprintln!(
+        "RNNoise, the stage check: {} at phases {:?}; hostile blocks' peak {}; parity {} samples exact",
+        r.latency.declared,
+        r.phases.iter().map(|p| format!("{}: {:.3} at {:.1} dB", p.0, p.1, p.2)).collect::<Vec<_>>(),
+        r.stress_peak,
+        r.parity.map_or(0, |p| p.compared)
+    );
+    assert_eq!((r.role, r.latency.declared, r.phases.len()), (StageRole::Noise, RNNOISE_LATENCY, 4));
 }
 
 // ---- Check 4: the host profile and the interface ---------------------------------------------------------------------

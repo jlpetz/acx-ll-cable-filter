@@ -14,6 +14,13 @@ Downloads are untrusted data: nothing downloaded is executed, imported or parsed
 pinned size (a cap on the download too), SHA-256 and git blob id; names are checked before they become paths, and sources
 must be https. --pin records the size, SHA-256 and git blob id of files that have none yet, in the repo's manifest.
 
+A file stored with Git LFS (`"lfs": true` in its source, fetched from media.githubusercontent.com) has its LFS pointer as its
+blob in the commit's tree, so its git blob id is checked against the pointer that the download's SHA-256 and size make (a
+pointer's oid is its content's SHA-256): the pin still ties the bytes to the commit.
+
+Packs come in two kinds (doc/spec/model-pack-v0.md): noise models (role denoise or dereverb, run by the noise stage) and
+quality metrics (role metric: DNSMOS, SIGMOS, run offline by `noise-filter lab`). This script fetches both alike.
+
 The host (nf-ort) checks the sizes and hashes again when it loads a pack, and hashes the very bytes it hands to ONNX Runtime.
 """
 from __future__ import annotations
@@ -57,6 +64,11 @@ FetchError, Http, safe_parts, inside, sha256_file, write_atomic, dump_json = (
 def git_blob_id(data):
     """git's object id for a file's bytes: SHA-1 over "blob <size>\\0" and the bytes."""
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def lfs_pointer(sha256, size):
+    """The Git LFS pointer file (spec v1) that git stores in the tree for content of this SHA-256 and size."""
+    return b"version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n" % (sha256.encode("ascii"), size)
 
 
 def _hex(value, n):
@@ -107,6 +119,8 @@ def validate(doc, folder_name=None, pin=False):
             for k, n in (("git_blob", 40), ("git_commit", 40)):
                 if src.get(k) is not None and not _hex(src[k], n):
                     raise FetchError(f"{path}: source.{k} {src[k]!r} isn't {n} lower-case hex digits")
+            if not isinstance(src.get("lfs", False), bool):
+                raise FetchError(f"{path}: source.lfs {src['lfs']!r} must be true or false")
         missing = [k for k, v in (("size", size), ("sha256", f.get("sha256"))) if v is None]
         if isinstance(src, dict) and src.get("git_blob") is None:
             missing.append("git_blob")
@@ -181,7 +195,8 @@ class Pack:
                 part = path.with_name(path.name + ".part")
                 try:
                     part, n, sha, _ = self.http.download(src["url"], path, f.get("size") or MAX_FILE)
-                    blob = git_blob_id(part.read_bytes())  # within the size cap: the download refused more
+                    # An LFS file's blob is its pointer's; else the bytes' own (within the size cap: the download refused more)
+                    blob = git_blob_id(lfs_pointer(sha, n) if src.get("lfs") else part.read_bytes())
                     self.check(f, n, sha, blob)
                     os.replace(part, path)
                 finally:
