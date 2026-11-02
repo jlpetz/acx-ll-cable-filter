@@ -985,12 +985,12 @@ mod tests {
             ),
             "{c}"
         );
-        // At the fixed target (a run's first two minutes, or back there after an underrun): said neutrally, as a snapshot.
+        // At the fixed target (a run's first four minutes, or back there after an underrun): said neutrally, as a snapshot.
         let start = OutputTarget { ms: 14.0, adaptive: true, fixed_ms: 14.0 };
         let c = conditions(None, None, &s("A", false, false, false), &s("B", false, false, false), LatencyMode::VirtualLoop, true, start);
         assert!(
             c.contains(
-                "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 120 s of running, and \
+                "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 240 s of running, and \
                  goes back up to it after an underrun)"
             ),
             "{c}"

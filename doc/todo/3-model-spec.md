@@ -137,8 +137,9 @@ These are our decisions, within the owner's #17 decision (the floor and gate ins
   - `prepare()`: on the processing thread, at activate; it may allocate;
   - `reset()` and `process_hop(input, output) -> VAD or NaN`: real-time. The input is finite and within ±1e4
     (`nf_core::dsp::INPUT_LIMIT`, +80 dBFS): it can exceed ±1 (a hot mic), so a model must stay finite up to that
-    bound. `reset` doesn't allocate, with one known exception: a model whose spare state is spent may rebuild in
-    place (RNNoise's second real reset before the next `prepare`, ten allocations from the engine's pool).
+    bound. `reset` doesn't allocate but in one known case: a model whose fresh state allocates keeps spares built off
+    the audio thread (RNNoise: two, replaced by its spare maker within 100 ms, 2026-11-02; TODO 4), and rebuilds in place
+    only when a reset finds them all spent (a third real reset within 100 ms of two others).
 - **What the stage does around the model:**
   - it sanitises the input: NaN and ±inf to 0, the rest clamped to ±1e4 (a finite sample of about 1e17 overflowed
     RNNoise's ×32768 to inf and aborted inside easyfft, a hazard as old as v0);

@@ -86,7 +86,7 @@ minimise for now; the tray comes later (TODO #15, #16).
        in another app. With echo cancelling on, if echo gets through or your voice crackles, try
        turning this off." (its other two costs, the longer echo floor and the one-period buffer,
        as what to try.)
-     - "Adaptive output buffer": "Trims the output buffer to what your PC needs after two minutes
+     - "Adaptive output buffer": "Trims the output buffer to what your PC needs after four minutes
        of running (about 7 ms less on VB-CABLE). A rare hiccup can then cost a short glitch, three
        a run at most. Turn off for a recording that must have none."
      - under them: "A device that refuses exclusive mode runs in shared mode, and a note at the top
@@ -113,6 +113,10 @@ minimise for now; the tray comes later (TODO #15, #16).
     read nor backed up (locked, or on a share or drive that isn't there yet) is left alone, and
     the session doesn't save (a warning says so; restart once it's readable). A missing folder is
     a first run only if AppData itself is there.
+  - A `"version"` (`SETTINGS_VERSION`, 1 from the automatic model depth on; a file without one is 0)
+    tells a value whose meaning changed: a file from before 1 with `processing.model_depth` 2 (the
+    default the window saved, which it never sets) loads as automatic (`settings::upgrade_engine`,
+    which the CLI's `--config` uses too).
   - Save on every change, debounced to 500 ms, through a background save. Never block the UI
     thread on disk if Reactor makes that awkward; small synchronous writes are acceptable.
 - **Applying:** every control change calls `engine.apply(&config)` (cheap). Device and I/O changes

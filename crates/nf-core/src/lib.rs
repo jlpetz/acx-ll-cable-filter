@@ -6,10 +6,11 @@
 //! Real-time rule (CLAUDE.md): anything called per block from the audio thread must not allocate, lock, log or make a
 //! system call, and is O(1) per block: [`chain::Chain::process`]; a stage's `process` and `reset`, its extension getters
 //! and values, `param_value` and `set_param` ([`stage`]); a [`noise::NoiseModel`]'s `process_hop` and `reset`; the `dsp`
-//! types' `process` and `reset`. Construction, `activate` and state save and load may allocate. One exception, known and
-//! bounded: a model's `reset` once its spare state is spent (RNNoise's second real reset before the next `activate`
-//! rebuilds its state in place, ten allocations, which the engine's real-time pool serves; [`noise::NoiseModel::reset`]).
-//! And CLAUDE.md's one planned exception: a model inside [`noise::Pipelined`] runs on its own inference worker thread, where
+//! types' `process` and `reset`. Construction, `activate` and state save and load may allocate. A model that keeps spare
+//! states for its `reset` (RNNoise) replaces them off the audio thread. One exception, known and bounded: a reset that finds
+//! every spare spent rebuilds the state in place (RNNoise: a third real reset within 100 ms of two others, ten allocations,
+//! which the engine's real-time pool serves; counted; [`noise::NoiseModel::reset`]). And CLAUDE.md's one planned
+//! exception: a model inside [`noise::Pipelined`] runs on its own inference worker thread, where
 //! per-run allocations are allowed and measured (ONNX Runtime's, TODO 6); the audio thread's side of it allocates nothing
 //! and makes one non-blocking system call a block, the worker's wake-up.
 //!

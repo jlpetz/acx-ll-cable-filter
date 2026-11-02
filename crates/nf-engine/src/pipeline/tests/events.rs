@@ -118,8 +118,10 @@ struct Case {
     /// Each wake is late by a uniform 0..jitter ms.
     jitter_ms: f64,
     event: Event,
-    /// The adaptive output target (out_target.rs) instead of the fixed one.
+    /// The adaptive output target (out_target.rs) instead of the fixed one; with the old single-stage lowering (where a
+    /// case starts once the target has come down: with the trial it takes a window longer to get there).
     adaptive: bool,
+    single_stage: bool,
     /// The event happens at this time (s), and again every `repeat_s` (a `LateWake` only); the steady latency is the mean
     /// over the 10 s before it. The run lasts `run_s`.
     event_s: f64,
@@ -158,7 +160,7 @@ fn run(c: Case) -> Outcome {
     let cfg = PipelineConfig { out_period: c.out_period, out_margin: 96, ref_period: None, max_packet: 4800 };
     let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new());
     if c.adaptive {
-        p = p.with_adaptive_target();
+        p = if c.single_stage { p.with_single_stage_target() } else { p.with_adaptive_target() };
     }
     let t0 = 1e10;
     let mut sink = VSink::new(c.out_period, c.ppm, c.phase, t0);
@@ -267,6 +269,7 @@ fn case(event: Event, ppm: f64, phase: f64) -> Case {
         jitter_ms: 1.0,
         event,
         adaptive: false,
+        single_stage: false,
         event_s: EVENT_S,
         repeat_s: None,
         run_s: RUN_S,
@@ -374,7 +377,8 @@ fn the_steady_latency_varies_by_less_than_a_period_with_the_phase() {
 }
 
 /// The adaptive output target (out_target.rs) in these scenes, with the event at 200 s, after the target has come down (it
-/// walks down from 120 s), against the fixed target in the same scenes:
+/// walks down from 120 s, in the old single stage: what follows once it is down is the same in both, and the trial takes a
+/// window longer to get there), against the fixed target in the same scenes:
 /// - up to the event it runs clean, as the fixed target does, and at a lower latency wherever it came down (by 7-9 ms with
 ///   this delivery's 1 ms of jitter; the 1024-frame device and the 8 ms jitter keep it near the fixed target);
 /// - at the event it underruns at most once more than the fixed target. That's the trade: a wake 10-15 ms late, which the
@@ -403,7 +407,7 @@ fn the_adaptive_target_after_it_has_come_down() {
     cases.push(later(Case { out_period: 1024, ..case(Event::None, 0.0, 0.5) }));
     let mut extra = Vec::new();
     for c in cases {
-        let (fixed, adaptive) = (run(c), run(Case { adaptive: true, ..c }));
+        let (fixed, adaptive) = (run(c), run(Case { adaptive: true, single_stage: true, ..c }));
         let tag = format!("{c:?}: adaptive {adaptive:?} against fixed {fixed:?}");
         assert_clean_start(&c, &fixed);
         assert_clean_start(&c, &adaptive);
@@ -427,20 +431,26 @@ fn the_adaptive_target_after_it_has_come_down() {
 }
 
 /// A wake 15 ms late every 150 s, which the fixed target's spare block covers each time: the fixed target never
-/// underruns. The adaptive one underruns at the first after it has come down, and the strike's need holds it at the fixed
-/// target through the next for 10 minutes, then (the second strike) 20; the third keeps it fixed for the run. Over 50
-/// minutes that's 3 underruns, and none after the third. Without the strikes' memory (the need forgotten with the
-/// two-minute window) it underran at every other hiccup: 7 times in 1000 s.
+/// underruns. Nor does the adaptive one: each hiccup lands in a trial's window (out_target.rs) and fails it, so the target
+/// stays fixed. The old single stage, lowered on each window between hiccups, underran at the first after it had come down,
+/// and the strike's need held it at the fixed target through the next for 10 minutes, then (the second strike) 20; the
+/// third kept it fixed for the run: over 50 minutes 3 underruns, and none after the third. Without the strikes' memory (the
+/// need forgotten with the two-minute window) it underran at every other hiccup: 7 times in 1000 s.
 #[test]
 fn rare_hiccups_cost_the_adaptive_target_at_most_three_underruns() {
     for ppm in [0.0, 300.0] {
         let c = Case { event_s: 150.0, repeat_s: Some(150.0), run_s: 3000.0, ..case(Event::LateWake(15.0), ppm, 0.37) };
-        let (fixed, adaptive) = (run(c), run(Case { adaptive: true, ..c }));
+        let (fixed, trials, single) = (run(c), run(Case { adaptive: true, ..c }), run(Case { adaptive: true, single_stage: true, ..c }));
         assert_eq!((fixed.underruns_before, fixed.underruns_after, fixed.dry_after), (0, 0, 0), "{ppm} ppm: {fixed:?}");
-        assert_eq!(adaptive.underruns_before, 0, "{ppm} ppm: {adaptive:?}");
-        assert!(adaptive.underruns_after >= 1 && adaptive.underruns_after <= 3, "{ppm} ppm: {adaptive:?}");
-        assert_eq!(u64::from(adaptive.strikes), adaptive.underruns_after, "{ppm} ppm: {adaptive:?}");
-        assert!(adaptive.strikes < 3 || adaptive.target_end == fixed.target_end, "{ppm} ppm: fixed after the third: {adaptive:?}");
+        assert_eq!(
+            (trials.underruns_before, trials.underruns_after, trials.dry_after, trials.strikes, trials.target_end),
+            (0, 0, 0, 0, fixed.target_end),
+            "{ppm} ppm: no trial passes: {trials:?}"
+        );
+        assert_eq!(single.underruns_before, 0, "{ppm} ppm: {single:?}");
+        assert!(single.underruns_after >= 1 && single.underruns_after <= 3, "{ppm} ppm: {single:?}");
+        assert_eq!(u64::from(single.strikes), single.underruns_after, "{ppm} ppm: {single:?}");
+        assert!(single.strikes < 3 || single.target_end == fixed.target_end, "{ppm} ppm: fixed after the third: {single:?}");
     }
 }
 
@@ -618,4 +628,117 @@ fn adaptive_sweep() {
         let (f, a) = (run(c), run(Case { adaptive: true, ..c }));
         eprintln!("every 150 s, {ppm} ppm: fixed {f:?}\n    adaptive {a:?}");
     }
+}
+
+/// The wakes' block counts over `seconds` of mic packets of `packet` frames, packet `j` ready `late(j)` ms after its last
+/// sample, the thread waking at each ready packet (those ready together come in one wake), counted as the audio loop counts
+/// them (`Telemetry::count_wake_blocks`).
+fn wake_blocks(packet: usize, late: fn(u64) -> f64, seconds: f64) -> nf_core::telemetry::WakeBlocks {
+    let cfg = PipelineConfig { out_period: 480, out_margin: 96, ref_period: None, max_packet: 4800 };
+    let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new());
+    let t0 = 1e10;
+    let mut sink = VSink::new(480, 0.0, 0.37, t0);
+    p.prefill(&mut sink).unwrap();
+    let tel = Telemetry::new();
+    let mut mic = FakeCapture::default();
+    let mut ticks = FakeTicks(0);
+    let pkt_hns = packet as f64 * 1e7 / 48_000.0;
+    let ready = |j: u64| t0 + (j + 1) as f64 * pkt_hns + late(j) * 1e4;
+    let mut j = 0u64;
+    loop {
+        let now = ready(j);
+        if now > t0 + seconds * 1e7 {
+            break;
+        }
+        sink.advance_to(now);
+        while ready(j) <= now {
+            mic.push(j * packet as u64, Some((t0 + j as f64 * pkt_hns) as u64), vec![0.1; packet]);
+            j += 1;
+        }
+        p.drain_mic(&mut mic, now).unwrap();
+        let mut blocks = 0;
+        while p.process_block(&mut CopyChain, &mut sink, &mut ticks, &tel, false).unwrap() {
+            blocks += 1;
+            if p.second_due() {
+                p.publish_second(&tel, &CopyChain, 0, 0, 0);
+            }
+        }
+        tel.count_wake_blocks(blocks);
+    }
+    tel.snapshot().wake_blocks
+}
+
+/// The automatic model depth (TODO 5) from fake delivery, as the engine chooses it at a start (`audio::choose_model_depth`)
+/// from what the run before measured (`control::measured_delivery`), keyed by how the mic opened (`audio::MicOpening`):
+/// steady 10 ms packets (a block a wake, a little late at random) and the exclusive mic's 3.33 ms packets (a block every
+/// third) choose depth 1; the cables' bursts (every other packet a wake late, so pairs), a pair every ten packets, a 20 ms
+/// device period (two blocks a wake) and an exclusive period of 512 frames (a device whose minimum is over a block: a pair
+/// every 15 wakes or so) choose 2. Unmeasured, the exclusive mic at a period of a block or less is 1 and any other mic 2; a
+/// measurement of another endpoint, or of the same one opened another way (exclusive or shared, another period, another
+/// option), says nothing; too short a run, or an endpoint without an id, leaves nothing to remember; a depth that's set is
+/// kept; and RNNoise has none.
+#[test]
+fn the_wakes_choose_the_model_depth() {
+    use nf_core::config::MicDelivery::{self, Bursts, OneAtATime, Unknown};
+
+    use crate::audio::{MicOpening, choose_model_depth};
+    use crate::control::measured_delivery;
+    fn jittered(j: u64) -> f64 {
+        0.3 + (j.wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0
+    }
+    fn pairs(j: u64) -> f64 {
+        if j.is_multiple_of(2) { 10.5 } else { 0.5 }
+    }
+    fn one_pair_in_ten(j: u64) -> f64 {
+        if j.is_multiple_of(10) { 10.5 } else { 0.5 }
+    }
+    let pack = ProcessingConfig { noise_model: "ulunas".into(), ..ProcessingConfig::default() };
+    assert!(pack.model_depth_auto(), "automatic by default");
+    let shared = MicOpening { id: Some("mic".into()), exclusive: false, period_frames: 480, low_latency: false, raw: true };
+    let exclusive = |period_frames| MicOpening { exclusive: true, period_frames, ..shared.clone() };
+    let auto = |depth, d: MicDelivery| Some(crate::api::ModelDepth { depth, auto: Some(d) });
+    type Late = fn(u64) -> f64;
+    let cases: [(&str, usize, Late, MicOpening, MicDelivery, u32); 6] = [
+        ("steady", 480, jittered, shared.clone(), OneAtATime, 1),
+        ("the exclusive mic's packets", 160, jittered, exclusive(160), OneAtATime, 1),
+        ("the cables' bursts", 480, pairs, shared.clone(), Bursts, 2),
+        ("a pair every ten packets", 480, one_pair_in_ten, shared.clone(), Bursts, 2),
+        ("a 20 ms period", 960, jittered, MicOpening { period_frames: 960, ..shared.clone() }, Bursts, 2),
+        ("an exclusive period of 512 frames", 512, jittered, exclusive(512), Bursts, 2),
+    ];
+    for (what, packet, late, mic, delivery, depth) in cases {
+        let wakes = wake_blocks(packet, late, 30.0);
+        assert_eq!(wakes.delivery(), delivery, "{what}: {wakes:?}");
+        let remembered = measured_delivery(mic.clone(), &wakes);
+        assert_eq!(remembered, Some((mic.clone(), delivery)), "{what}");
+        assert_eq!(choose_model_depth(&pack, &mic, remembered.as_ref()), auto(depth, delivery), "{what}: {wakes:?}");
+        // Unmeasured: a block at a time only for the exclusive mic at a period of a block or less.
+        let unmeasured = if mic.exclusive && mic.period_frames <= 480 { auto(1, OneAtATime) } else { auto(2, Unknown) };
+        assert_eq!(choose_model_depth(&pack, &mic, None), unmeasured, "{what}");
+        // Another endpoint, or this one opened another way, isn't what was measured.
+        let others = [
+            MicOpening { id: Some("another mic".into()), ..mic.clone() },
+            MicOpening { id: None, ..mic.clone() },
+            MicOpening { exclusive: !mic.exclusive, ..mic.clone() },
+            MicOpening { period_frames: mic.period_frames / 2, ..mic.clone() },
+            MicOpening { low_latency: !mic.low_latency, ..mic.clone() },
+            MicOpening { raw: !mic.raw, ..mic.clone() },
+        ];
+        for other in others {
+            assert_eq!(
+                choose_model_depth(&pack, &other, remembered.as_ref()),
+                choose_model_depth(&pack, &other, None),
+                "{what}: {other:?}"
+            );
+        }
+        // A depth that's set is used, said as set.
+        let set = ProcessingConfig { model_depth: 3, ..pack.clone() };
+        assert_eq!(choose_model_depth(&set, &mic, remembered.as_ref()), Some(crate::api::ModelDepth { depth: 3, auto: None }));
+        assert_eq!(choose_model_depth(&ProcessingConfig::default(), &mic, remembered.as_ref()), None, "RNNoise");
+        assert_eq!(measured_delivery(MicOpening { id: None, ..mic }, &wakes), None, "{what}: no id to know it by");
+    }
+    // Five seconds is too few wakes to say: nothing is remembered.
+    let short = wake_blocks(480, pairs, 5.0);
+    assert_eq!((short.delivery(), measured_delivery(shared.clone(), &short)), (Unknown, None));
+    assert_eq!(choose_model_depth(&pack, &shared, None), auto(2, Unknown), "a shared mic not measured yet: the safe depth");
 }

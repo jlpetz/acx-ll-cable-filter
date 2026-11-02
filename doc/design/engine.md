@@ -70,12 +70,18 @@ Once, when the thread starts:
    order: inside the scope the leak would take the locked pool.
 
 For each run:
-- Resolve the devices (cheap, so a run waiting for a device fails before building anything), then
-  build and activate the chain *inside the scope* with `nf_stages::build_chain` (AEC3 when AEC is on,
-  then the noise stage around RNNoise; `Chain::activate` checks each stage against the host profile,
-  activates it at 48 kHz in 480-frame blocks on this thread, and caches its latency). The offline tools
-  use the same constructor, so the live chain and a rerun can't drift apart.
-- Open the mic, output, loopback and keep-alive streams.
+- Resolve the devices (cheap, so a run waiting for a device fails before building anything).
+- Open the mic, output, loopback and keep-alive streams (opened, not started).
+- Build and activate the chain *inside the scope* with `models::build_chain` (AEC3 when AEC is on,
+  then the noise stage around RNNoise or a model pack, a pack at the depth `choose_model_depth` picks from
+  how the mic opened: "The inference worker" below; `Chain::activate` checks each stage against the host
+  profile, activates it at 48 kHz in 480-frame blocks on this thread, and caches its latency). The offline
+  tools use the same constructor, so the live chain and a rerun can't drift apart. RNNoise's `activate`
+  starts its spare maker, a thread of the model's own at normal priority (no MMCSS: it does no audio),
+  which keeps two pristine model states for its resets, so a reset on this thread doesn't allocate (TODO 4;
+  nf-stages `rnnoise.rs`); the one known exception, a third real reset within 100 ms of two others, finds
+  none, rebuilds the state in place (ten pool allocations) and is counted (`RnnoiseModel::rebuilds`).
+  Dropping the chain stops and joins it, and what it held is freed by the dropper.
 - If `start()` has given up meanwhile (a driver slower than the start timeout), stop here: a newer
   run may already have the devices. The same check comes again before the streams start.
 - Prefill the output to its target with zeros. Warm up with 3 silent blocks through the chain.
@@ -178,6 +184,25 @@ the start with how to fetch it (`python -I tools/fetch_models.py ID`); a pack th
 (`ProcessingConfig.model_depth`, `--model-depth`), is a restart (`control::restart_needed`); the high-band policy
 (`ProcessingConfig.high_band`) is live, like the floor and gate.
 
+**The depth is automatic by default** (`model_depth` 0, `AUTO_MODEL_DEPTH`; TODO 5, ours, from the live A/B: depth 2 costs
+10 ms, and depth 1 ran clean with the exclusive mic). `open_session` opens the streams first and then builds the chain, at the
+depth `audio::choose_model_depth` picks: 1 when the mic delivers a block a wake, 2 when it bursts or hasn't been measured.
+How it delivers: as an earlier run in this process measured it, when it opened the same way (`audio::MicOpening`: the
+endpoint, exclusive or shared, the period, IAudioClient3's small period, RAW); unmeasured, a block a wake for the exclusive
+mic at a period of a block or less (its 3.33 ms packets make a block at every third; a device whose exclusive minimum is
+over a block, 512 frames say, brings two blocks in some wakes), and not known for any other. The measure is the run's own
+wake counts (`Telemetry::wake_blocks`, `WakeBlocks::delivery`): from 1,000 wakes on, a block at a time when a worker one
+block behind would have missed at most one block in 500 (one every 5 s at most), else bursts. The control side keeps the
+last run's (the mic as it opened, and its delivery: `Inner::mic_delivery`), exclusive or shared, taken as each run ends
+(`stop_locked`, before a restart's reset of the counters). So an exclusive mic that measured bursts (a long period, or a
+thread often held up) gets 2 at its next start, and a change of how the mic opens (an I/O setting) starts unmeasured. The
+depth is decided only at a start, never mid-stream: it is the noise stage's latency, so a change would move the output by
+a block (a click), and a restart is a gap of its own, so the engine doesn't restart for it. A mic first measured in a run
+gets its depth at the next start (any restart: a model change, a settings or device change). `--model-depth N` (or a config's 1-4) forces it; `--model-depth auto` puts it back. The status says which and why
+(`EngineStatus::model_depth`, `ModelDepth::text`: "depth 1 (auto: the mic delivers a block at a time)"; `run`'s Engine
+line), and `quality --save` writes the depth the start chose into `chain_config.json`, so the rerun matches. Offline
+(`process`, `bench`) nothing delivers, and auto is 2, as before.
+
 A pack's model runs on its own thread, `nf-inference`, because ONNX Runtime allocates from the C runtime's heap on every run
 (about 3,700 allocations: `doc/todo/6-inference-memory.md`): CLAUDE.md's one exception to the real-time rule.
 - **Set-up, on the worker:** `models::EngineHooks::enter` (MMCSS "Pro Audio" at `MmcssPriority::Worker`: normal priority,
@@ -189,7 +214,7 @@ A pack's model runs on its own thread, `nf-inference`, because ONNX Runtime allo
   state allocates in Rust comes from the locked pool and is counted: nothing, measured) and "ready". `open_session` waits
   up to 3 s for it (`READY_TIMEOUT`, under the 5 s start timeout; about 120 ms on the dev VM), looking every 100 ms at the
   run's command, so a stop or a start timeout ends the wait; a slow build fails the start with the model named.
-- **Per block, on the audio thread** (`Pipelined::process_hop`, inside the noise stage), `D` = the depth (2 by default):
+- **Per block, on the audio thread** (`Pipelined::process_hop`, inside the noise stage), `D` = the depth (automatic: 1 or 2):
   take the result of the call `D` back (older ones ahead of it count as `late`, a later one at the front means it never
   came); push this block's job (a full ring is a `gap`, and the next job that gets in resets the model); `Thread::unpark`
   the worker (no allocation, no blocking: the host profile's one allowed system call); output that result, or the
@@ -336,15 +361,28 @@ later than the others finds that much less queued. With `io.adaptive_output` (on
   the device position now, or the padding without a clock) is under its 1 s mean; each second's largest, kept for 120 s.
   The need is the largest over that window: a high percentile would let the rarest bursts through, and each costs an
   underrun. After a correction the mean starts again from the plain mean of 300 blocks, which aren't counted.
-- **Lowered slowly:** once 120 s have passed since the last move was decided, the goal is the floor (one period + the
-  margin: what the device's period requires) + the need + 1 ms, when that's at least 1 ms lower. The target walks down to
-  it a tenth of the way each second (at most 0.5 ms a second, at least a sample: 9 ms takes 53 s, all but the last
-  0.25 ms in the first 41), through `DriftController::set_target`, and the loop slips the fill after it, so nothing
-  clicks. A walk, not a step: set in one step, the PI loop ran at its 1500 ppm limit, wound its integral up as the fill
-  neared the target and carried it past, 1.4 ms under the new target for 10 s (under the floor, in exclusive mode),
-  just when the target is least proven; a steady walk overshoots when it stops (0.8 ms at 0.25 ms/s). The walk's slowing
-  end lets the loop's integral wind down with it: in the simulations the queue's 1 s means stay above where the walk ends
-  (within 0.1 ms; they run up to 1 ms ahead of or behind the moving target meanwhile).
+- **Lowered slowly, after a trial:** once 120 s have passed since the last move was decided, the target can go to the
+  floor (one period + the margin: what the device's period requires) + the need + 1 ms, when that's at least 1 ms lower.
+  Until proven (the run's start, and after a strike), a window that allows it starts a **trial** instead: the target
+  holds where it is (the fixed target) for a second window (`AdaptiveTarget::on_trial`, published as
+  `output_target_on_trial`). If that one passes without an underrun and allows a lowering too, the target is proven and
+  comes down on its need; if not, the trial has failed and the next window that allows a lowering starts another.
+  Proven, each lowering goes at once. Why (ours, 2026-11-02): the first window has seen the least of the delivery. The
+  soak on the cables walked from 14 to 9.9 ms in 9 s on its first window's need, heading for 6.8, and ran dry there with
+  the queue at 10.6 ms, so on a block 8 ms or more later than the rest (about 10 in the simulations: a missed wake; TODO
+  13's detail, "Soak"); its end point then ran 17 minutes clean. A first stop short of the fixed target doesn't cover
+  that: in the soak's conditions one halfway (10.1-10.4 ms) or at a period + a block (12 ms) ran short with a block 10 ms
+  late while it held (a block more than a block late, with the fill under a period, is a deficit), where the fixed target
+  rode out blocks up to 13.5 ms late. Held at the fixed target, the trial rides out what the fixed target does, and a
+  hiccup in it fails the trial instead of costing a strike. The end point is the same, a window later;
+  the price is the fixed target's latency for minutes 2 to 4. The target walks down a tenth of the way each second (at
+  most 0.5 ms a second, at least a sample: 9 ms takes 53 s, all but the last 0.25 ms in the first 41), through
+  `DriftController::set_target`, and the loop slips the fill after it, so nothing clicks. A walk, not a step: set in one
+  step, the PI loop ran at its 1500 ppm limit, wound its integral up as the fill neared the target and carried it past,
+  1.4 ms under the new target for 10 s (under the floor, in exclusive mode), just when the target is least proven; a
+  steady walk overshoots when it stops (0.8 ms at 0.25 ms/s). The walk's slowing end lets the loop's integral wind down
+  with it: in the simulations the queue's 1 s means stay above where the walk ends (within 0.1 ms; they run up to 1 ms
+  ahead of or behind the moving target meanwhile).
 - **Raised at once:** an underrun (the device or the exclusive ring ran dry, or a deficit) puts it back to the fixed
   target, and the deficit's zeros fill the device to it at that block. Under the fixed target that's a **strike**: the
   fixed target might have covered it. Its need (its dip, and at least how far under the fixed target it ran) holds the
@@ -355,20 +393,36 @@ later than the others finds that much less queued. With `io.adaptive_output` (on
 - **The trade:** under the fixed target, a rare hiccup that its spare block would have covered (a missed wake, 10-15 ms
   late) runs the device dry. The strikes bound it: at most three underruns a run more than the fixed target's. Without
   them the need was forgotten with the window, and hiccups rarer than it came back each time (a wake 15 ms late every
-  150 s underran 7 times in 1000 s where the fixed target never did).
+  150 s underran 7 times in 1000 s where the fixed target never did; with the trials it never lets the target down, as
+  each lands in a trial's window).
 - The deficit and drop thresholds are on the target, so they follow it; `output_target_ms` is published each second,
   and `run`'s status line, the window's budget and fill lines and the reports' conditions show it.
-- In the first 120 s of a run it is the fixed target, and then it walks for up to a minute. `latency` and `quality`
-  measure at once by default (at the fixed start, which they say before measuring), so a lab run doesn't wait three
-  minutes; `--settle` waits for it to settle (to move and then hold still for 3 s; up to 188 s) before they measure. Their
+- In the first 240 s of a run it is the fixed target (the window and the trial), then it walks down (up to 53 s:
+  `ADAPTIVE_OUTPUT_SETTLE_S`, 293 s, when nothing strikes). `latency` and `quality` measure at once by default (at the
+  fixed start, which they say before measuring), so a lab run doesn't wait five minutes; `--settle` waits for it to settle
+  (to move and then hold still for 3 s, not on trial; up to 308 s) before they measure. Their
   conditions give the target as a snapshot at the test's end (`output_target_text`): "6.8 ms at the end (adaptive, down
   from 14.0 ms)", or, at the fixed one, the neutral "14.0 ms at the end (adaptive, at the fixed target: it comes down only
-  after 120 s of running, and goes back up to it after an underrun)", since a run's first two minutes, a strike, a
+  after 240 s of running, and goes back up to it after an underrun)", since a run's first four minutes, a strike, a
   delivery that needs the whole target and a `--settle` that timed out all read the same there.
+
+The first lowering in the simulations (`pipeline/tests/exclusive.rs`, `the_first_lowering_waits_for_a_second_window`,
+the soak's conditions: both exclusive, packets up to 1.8 ms late): both end at about 6.8 ms, within the jitter their
+windows saw, the trial a window later. A block 11 ms late at 129 s (the old single stage 9 s into its walk, at 9.7 ms, as
+the soak's was at 9.9) runs the single stage dry; the trial, at 14 ms then, rides it out and fails on it, another trial
+passes once it has left the window, and the target ends where it would have; a block 13 ms late in the middle of the
+trial is ridden out too. Swept by hand (2026-11-02): the trial covers a block up to 13.5 ms late at 129, 150, 180 and
+230 s (14 ran it dry at two of them); the single stage 9 s into its walk up to 10.5; a first stop halfway (10.1 ms) or at
+a period + a block (12 ms), each tried before the trial, ran short at 10. `budget.rs`'s
+`an_underrun_raises_the_adaptive_target_at_once` is the same on a 5 ms shared device: a wake 13 ms late at 200 s runs the
+single stage's lowered target dry, and the trial, at the fixed target then, rides it out and ends at the same target. The
+traces' shared-mic delivery (`timeline.rs`, the ignored `traces_and_the_adaptive_target`) settles at 16.4-19.9 ms with the
+trial and 16.7-20.0 with the single stage, neither underrunning.
 
 In the event simulations, with the events at 200 s, after it has come down (`pipeline/tests/events.rs`,
 `the_adaptive_target_after_it_has_come_down`, and `budget.rs`'s scenes; `events.rs`'s ignored `adaptive_sweep` prints
-them): steady delivery with 1 ms of wake jitter brings a 10 ms device's 22 ms down to about 13.5-14 and the latency by
+them; these use the old single stage, `Pipeline::with_single_stage_target`, which gets down a window sooner than the
+trial: what follows once it is down is the same): steady delivery with 1 ms of wake jitter brings a 10 ms device's 22 ms down to about 13.5-14 and the latency by
 8 ms (37.7 to 29.0 ms in `budget.rs`), the cables' bursts to about 18 (3.4 ms off), and one wake in five missed keeps it
 at 21-22, all with no underrun at any phase. At the event: a wake 15 ms late, which the fixed target covers, runs it dry
 once in half the phases and drifts tried (and one wake 10 ms late, at the worst phase and 300 ppm), and the strike puts it back to the fixed

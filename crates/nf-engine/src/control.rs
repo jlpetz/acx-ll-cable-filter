@@ -99,6 +99,8 @@ pub(crate) struct StatusInfo {
     pub(crate) lost_reference_id: Option<String>,
     /// What the user can do about `message` (the window's button).
     pub(crate) remedy: Option<Remedy>,
+    /// The run's model pack depth, and how it was chosen (`Opened::model_depth`).
+    pub(crate) model_depth: Option<crate::api::ModelDepth>,
 }
 
 impl StatusInfo {
@@ -213,6 +215,10 @@ pub(crate) struct Inner {
     pub(crate) test_running: AtomicBool,
     /// A chain recorder is armed (one at a time).
     pub(crate) recording: AtomicBool,
+    /// The last mic a run measured, as it opened (its endpoint, mode, period and options), and how it delivered
+    /// (`remember_mic_delivery`): what the next start's automatic model depth goes by when it opens the same mic the same
+    /// way (TODO 5). In memory for the process.
+    pub(crate) mic_delivery: Mutex<Option<(crate::audio::MicOpening, nf_core::config::MicDelivery)>>,
 }
 
 impl Inner {
@@ -231,6 +237,7 @@ impl Inner {
             ctl: Mutex::new(None),
             test_running: AtomicBool::new(false),
             recording: AtomicBool::new(false),
+            mic_delivery: Mutex::new(None),
         })
     }
 
@@ -680,7 +687,7 @@ fn clear_targets(t: &Telemetry) {
     t.output_target_ms.store(0.0);
     t.reference_target_ms.store(0.0);
     t.reference_stamped.store(false, Relaxed);
-    for f in [&t.mic_exclusive, &t.output_exclusive, &t.output_adaptive] {
+    for f in [&t.mic_exclusive, &t.output_exclusive, &t.output_adaptive, &t.output_target_on_trial] {
         f.store(false, Relaxed);
     }
 }
@@ -737,6 +744,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         shared: shared.clone(),
         tap: end,
         recorder: rec_end,
+        mic_delivery: lock(&inner.mic_delivery).clone(),
         ready: ready_tx,
         done: done_tx,
     };
@@ -908,12 +916,16 @@ fn status_from(o: Opened) -> StatusInfo {
         reference_lost: false,
         lost_reference_id: None,
         remedy: None,
+        model_depth: o.model_depth,
     }
 }
 
 /// Stops the live run, if any: sets its stop flag and joins it (≤ 1 s). The thread stops and
 /// releases its own streams, in reverse order, and reverts MMCSS.
 fn stop_locked(inner: &Inner, run: &mut RunState) {
+    if run.audio.is_some() {
+        remember_mic_delivery(inner);
+    }
     if let Some(h) = run.audio.take() {
         h.shared.command.store(CMD_STOP, Relaxed);
         let shared = h.shared.clone();
@@ -928,6 +940,30 @@ fn stop_locked(inner: &Inner, run: &mut RunState) {
     recorder::run_stopped(inner);
     lock(&inner.desired).running = None;
     clear_targets(&inner.telemetry);
+}
+
+/// Before a run's status and counters go (at its stop, or a restart's): how its mic delivered, as it opened, for the next
+/// start's automatic model depth (TODO 5; `audio::choose_model_depth`), once its wakes say (`WakeBlocks::delivery`: 10 s or
+/// more). Exclusive or shared: an exclusive mic whose period is over a block, or whose thread is often held up, can bring
+/// two blocks in a wake too. The counters are the run's own (reset at each start), as its last once-a-second publication
+/// had them.
+fn remember_mic_delivery(inner: &Inner) {
+    let opening = {
+        let st = lock(&inner.status);
+        st.mic.as_ref().map(|info| crate::audio::MicOpening::of(st.mic_id.as_deref(), info))
+    };
+    if let Some(entry) = opening.and_then(|o| measured_delivery(o, &inner.telemetry.snapshot().wake_blocks)) {
+        *lock(&inner.mic_delivery) = Some(entry);
+    }
+}
+
+/// What a run's wakes say of its mic, to remember: the mic as it opened, and its delivery, once the wakes say (and the
+/// endpoint has an id to know it by again). Pure, for tests.
+pub(crate) fn measured_delivery(
+    mic: crate::audio::MicOpening, wakes: &nf_core::telemetry::WakeBlocks,
+) -> Option<(crate::audio::MicOpening, nf_core::config::MicDelivery)> {
+    let delivery = wakes.delivery();
+    (mic.id.is_some() && delivery != nf_core::config::MicDelivery::Unknown).then_some((mic, delivery))
 }
 
 /// Waits up to STOP_TIMEOUT for the run to end and release its streams; `false` if it didn't.
@@ -993,6 +1029,7 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
         notes: st.notes,
         retrying: inner.armed(),
         remedy: st.remedy,
+        model_depth: st.model_depth,
     }
 }
 
@@ -1313,6 +1350,7 @@ mod tests {
                 crate::errors::Warning::KeepAliveUnavailable(-1),
             ],
             targets: BufferTargets { output_ms: 22.0, reference_ms: 0.0 },
+            model_depth: None,
         };
         let s = status_from(o);
         assert_eq!(s.warnings.len(), 2, "one entry per warning: {:?}", s.warnings);

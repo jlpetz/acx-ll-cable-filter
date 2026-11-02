@@ -75,6 +75,8 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
         None
     };
     super::run::start_engine(&engine, &cfg)?;
+    // The depth a model pack ran at (automatic by default: chosen at the start), so that chain_config.json reruns as it ran.
+    let ran = ran_config(&cfg, engine.status().model_depth);
     let route = Route { probe, capture, far, text: route };
     let take = play(&engine, &cfg, args.settle, &scene, plan.as_ref(), recorder.as_ref(), route);
     // Before the engine stops, so the recording ends with the take rather than with the run.
@@ -93,7 +95,7 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
         let names = save(dir, &scene, far.as_deref(), &take.recorded.recording, result.as_ref().ok().map(|a| a.aligned.as_slice()))?;
         say!("Wrote {} to {}.", names.join(", "), dir.display());
         if let Some(chain) = &chain {
-            let names = save_chain(dir, &cfg, chain)?;
+            let names = save_chain(dir, &ran, chain)?;
             say!("{}", chain_line(&names, chain));
         }
     }
@@ -104,6 +106,16 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
             f.reason
         ))),
     }
+}
+
+/// The config as the run ran it: a model pack's automatic depth replaced by the one the start chose (`EngineStatus::model_depth`),
+/// which an offline rerun (`process --config`) must use to match; with RNNoise, or a depth that was set, `cfg` as it is.
+fn ran_config(cfg: &EngineConfig, depth: Option<nf_engine::ModelDepth>) -> EngineConfig {
+    let mut ran = cfg.clone();
+    if let Some(d) = depth {
+        ran.processing.model_depth = d.depth;
+    }
+    ran
 }
 
 /// `run`'s options as the quality test starts the engine with them: the echo test takes its reference from --far, with AEC on
@@ -1142,7 +1154,7 @@ mod tests {
         // A take that didn't --settle (or went back after an underrun): at the fixed target, and it says what that means.
         let start = conditions(&status, &TelemetrySnapshot { output_target_ms: 14.0, ..t }, 14.0);
         assert!(start.ends_with(
-            "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 120 s of running, and goes \
+            "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 240 s of running, and goes \
              back up to it after an underrun)"
         ));
         let none = conditions(&EngineStatus::default(), &TelemetrySnapshot { output_target_ms: 22.0, ..Default::default() }, 22.0);
@@ -1675,6 +1687,14 @@ mod tests {
         let back = crate::config::load(&dir.join("chain_config.json")).unwrap();
         assert_eq!(back, cfg, "process --config reads it");
         let _ = std::fs::remove_dir_all(dir);
+        // A model pack's automatic depth is saved as the depth the start chose, so the rerun matches; RNNoise's is left as is.
+        let pack = EngineConfig {
+            processing: nf_engine::ProcessingConfig { noise_model: "ulunas".into(), ..Default::default() },
+            ..Default::default()
+        };
+        let chose = nf_engine::ModelDepth { depth: 1, auto: Some(nf_engine::MicDelivery::OneAtATime) };
+        assert_eq!(ran_config(&pack, Some(chose)).processing.model_depth, 1);
+        assert_eq!(ran_config(&cfg, None), cfg);
     }
 
     #[test]

@@ -162,6 +162,47 @@ the onnx release build (88d1caa). WAVs in the VM's `Downloads\nf-quality\ab-*` f
 - **Latency:** the app path (readout + chain) 34.4 ms with RNNoise, 74.6 ms with UL-UNAS at depth 2 (the chain 50 ms), 64.5
   ms at depth 1 (the chain 40 ms). Depth 1 ran clean here (no dropouts, the same noise cut) because the exclusive mic
   delivers a block at a time; with the shared mic's bursts it would miss (the fix pass's table). Proposal: pick the depth
-  from the mic's delivery (1 when steady), not a fixed 2.
+  from the mic's delivery (1 when steady), not a fixed 2. Built, below.
 - So UL-UNAS cuts 8-19 dB more noise in pauses for the same speech level, at 30-40 ms more latency. Latency is the owner's
   first criterion: RNNoise stays the default; UL-UNAS (if the patent question allows) as a stronger mode.
+
+## The automatic depth (built 2026-11-02, ours)
+`--model-depth auto` is the default (`ProcessingConfig::model_depth` 0, `AUTO_MODEL_DEPTH`; engine.md, "The inference
+worker"); `--model-depth N` (1-4) still forces it.
+- **The rule:** at each start the engine opens the streams, then builds the chain at depth 1 when the mic delivers a block
+  a wake, else 2. How it delivers: as an earlier run in this process measured it, when it opened the same way
+  (`audio::MicOpening`: the endpoint, exclusive or shared, the period, IAudioClient3's small period, RAW); unmeasured, a
+  block a wake for the exclusive mic at a period of a block or less (its 3.33 ms packets make a block at every third, so a
+  wake brings one at most but after a stall), and not known for any other mic. Measured from the run's own wake counts
+  (`Telemetry::wake_blocks`, `WakeBlocks::delivery`): from 1,000 wakes, a block at a time when a worker one block behind
+  would have missed at most one block in 500 (one every 5 s at most); else bursts. The engine keeps the last run's (the mic
+  as it opened, and its delivery), exclusive or shared, as each run ends. Bursts, or no measurement (a shared mic's first
+  start, an exclusive period over a block, a mic opened another way since, or offline): 2, the safe depth.
+- **After review (2026-11-02):** the first version gave any exclusive mic depth 1 and kept only shared mics' measurements,
+  by endpoint id alone. An exclusive period over a block (`exclusive_period` falls back to the device's minimum when no
+  divisor of the block fits: 512 frames brought a pair every 15 wakes or so in the simulation) would then have played an
+  unfiltered block every 160 ms with nothing to correct it, and an I/O change that reopened the mic another way (RAW, the
+  small period) reused the old measurement.
+- **When it changes:** only at a start (a restart counts: a model, settings or device change). Never mid-stream: the depth
+  is the noise stage's latency, so a change moves the output by a block, a click, and the chain's delay lines are sized at
+  its activate. Considered and left (ours): switching depth inside `Pipelined` during silence (it would also move the
+  chain's other paths and the readout), and the engine restarting itself once a shared mic measures steady (a restart is a
+  gap of its own). So a shared mic first measured in a run gets depth 1 from the next start: in the window, a model change
+  after running RNNoise on that mic is such a start.
+- **Said:** `EngineStatus::model_depth` ("depth 1 (auto: the mic delivers a block at a time)", or "depth 3 (set)"), on
+  `run`'s Engine line. `quality --save` writes the depth the start chose into `chain_config.json`, so `process --config`
+  reruns at it (offline, auto is 2).
+- **Tests** (fake delivery, `pipeline/tests/events.rs`, `the_wakes_choose_the_model_depth`): steady 10 ms packets and the
+  exclusive mic's 3.33 ms ones choose 1; the cables' pairs, a pair every ten packets, a 20 ms period and an exclusive
+  period of 512 frames choose 2; unmeasured, the exclusive mic at 160 frames is 1 and the rest 2; a measurement of another
+  endpoint, of one without an id, or of the same one opened another way (exclusive or shared, period, small period, RAW)
+  says nothing; 5 s of wakes measure nothing; a set depth is kept; RNNoise has none. Thresholds: `telemetry.rs`, `the_wakes_say_how_the_mic_delivers`; the rule: `config.rs`,
+  `the_automatic_depth_follows_the_mic_s_delivery`.
+- **A settings file** saved with `model_depth: 2` (the window saved the whole processing config since 88d1caa, when 2 was
+  the default, and nothing in the window sets the depth) loads as automatic: the file now carries a `"version"` (1), and
+  one without it has its 2 taken for the old default (`nf_gui` `settings::upgrade_engine`, which the CLI's `--config`
+  applies to the window's file too). A depth in a file of version 1, 2 included, is kept; a bare engine config
+  (`chain_config.json`) keeps its depth, the one the run used.
+- **Not done:** a note when a depth-1 run's worker misses pass the steady threshold (the next start would measure bursts
+  and pick 2 anyway); the measurement is in memory only, so a shared mic gets its depth 1 from its second start in a
+  process.

@@ -42,7 +42,7 @@ Port 0 of each direction is the main port (`CLAP_AUDIO_PORT_IS_MAIN`); there is 
 | descriptor, audio ports | any | constant |
 | `activate` | **the thread that will process** (deviation: CLAP says main thread) | may allocate; may be called again, which implies a deactivate; must not change our stages' latency |
 | `process` | audio | no allocation, locks, system calls or logging; O(1) per block. One non-blocking system call is allowed: a noise stage may wake its inference worker (`Thread::unpark`: an atomic swap, and `WakeByAddressSingle` only if the worker is parked) |
-| `reset` | audio | no locks or system calls; a no-op when nothing was processed since the last one. No allocation, with one known exception: RNNoise's second real reset before the next `activate` rebuilds its state in place (ten allocations, from the engine's real-time pool) |
+| `reset` | audio | no locks or system calls; a no-op when nothing was processed since the last one. No allocation but one known exception: RNNoise swaps in a pristine state its spare maker built off the audio thread (two kept, replaced within 100 ms), and only a third real reset within 100 ms of two others rebuilds in place (ten allocations from the engine's real-time pool, counted) |
 | latency | any | valid after `activate`, fixed until the next; the host caches it |
 | params: list, value | whoever holds the stage | constant list; reading a value is real-time safe |
 | params: set | whoever holds the stage: while active, the processing thread between blocks (where CLAP's in-events sit) | never during `process`; no allocation or locks; takes effect at the next block |

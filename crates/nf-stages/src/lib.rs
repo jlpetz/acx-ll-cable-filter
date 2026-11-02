@@ -25,7 +25,7 @@ mod rnnoise;
 pub mod synth;
 
 pub use aec3::{AEC3_DESCRIPTOR, AEC3_LATENCY, Aec3Stage};
-pub use rnnoise::{RNNOISE_INFO, RNNOISE_LATENCY, RnnoiseModel, rnnoise_stage};
+pub use rnnoise::{MAKER_POLL, RNNOISE_INFO, RNNOISE_LATENCY, RnnoiseModel, SPARES, rnnoise_stage};
 
 /// Builds this thread's easyfft state (FFT planners and scratch, which easyfft leaks per thread by
 /// design) so it lands on the system heap rather than the locked pool. Call it on the audio thread

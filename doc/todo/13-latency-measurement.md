@@ -283,7 +283,7 @@ same day:
   the likely holder). Stop the window's filter before a lab run on its devices, and before `latency --cable-only` on a
   cable the window holds.
 - `latency` and `quality` measure what the product does by default, at once: the adaptive target is then at its fixed
-  start (14 ms with the exclusive output), which they say before measuring; `--settle` waits for it (up to 188 s), as they
+  start (14 ms with the exclusive output), which they say before measuring; `--settle` waits for it (up to 308 s), as they
   did with `--adaptive-output` before. Their conditions give the target at the test's end, neutrally ("at the fixed
   target", or "down from" it), as a strike or a timed-out `--settle` reads the same as a run's first two minutes. The
   18.1 ms row above is the settled one; an unsettled run should read about the "both exclusive" row's 24.8.
@@ -309,9 +309,10 @@ and "The output target"). What each should take off the cables' readout of 64 ms
   settled); the exclusive render side is the device's two buffers (1.5 periods: 3 ms at 2 ms) plus what VB-CABLE holds past
   its clock; with the exclusive mic, mic delivery reads about 3.6 ms and the wait about 6.7 (a block's first sample comes
   with its 3.33 ms packet and waits for the other two).
-- The adaptive target takes two minutes to move and then walks down (a tenth of the way a second, at most 0.5 ms: a
-  step drove the queue 1.4 ms under the new target for 10 s, under the floor in exclusive mode), so `latency --settle`
-  and `quality --settle` wait for it to settle (up to 188 s) before they measure; in a shorter run it is the fixed one.
+- The adaptive target takes four minutes to move (a window, and a second, its trial, to confirm it) and then walks down
+  (a tenth of the way a second, at most 0.5 ms: a step drove the queue 1.4 ms under the new target for 10 s, under the
+  floor in exclusive mode), so `latency --settle` and `quality --settle` wait for it to settle (up to 308 s) before they
+  measure; in a shorter run it is the fixed one.
   Its floor is a whole period + the margin (12 ms shared, 4 ms exclusive), the design's reasoning rather than the
   simulation's half period, plus 1 ms of headroom over the largest dip in two minutes; it never goes over the fixed
   target.
@@ -347,12 +348,54 @@ build (bf5534e). The log is `Downloads\nf-scratch\soak-1.txt` (outside the repo)
 - **One output underrun, at about 122 s:** the adaptive target's first walk down (14 to 9.9 ms in 9 s, heading for about
   6.8) went under what the cable needed. The strike put it back to 14 ms; it walked down again from 233 s, held at 10.9
   from 270 s, and came down to 6.8 by 751 s, with no underrun in the 17 minutes after. As designed (at most three strikes),
-  but a slower first walk, or one that stops at the measured need plus more than 1 ms, would avoid it.
+  but a slower first walk, or one that stops at the measured need plus more than 1 ms, would avoid it. Built: the trial
+  below (first as two stages). What ran the cable dry isn't known (the run kept no chain recording): the queue was at 10.6 ms against
+  the 9.9 target, so a block about 8 ms or more late, or a late answer to the exclusive output's event; the render side
+  read 2 ms (a period) higher for the rest of the run after it, which a stale period not counted in the device stream's
+  index would do. A soak with the chain recorder armed would say.
 - **The reference** (cable B's loopback, carrying only the keep-alive's silence): 171 short takes after the first 5 s, in
   three bursts (about 66 by 19 min, 113 by 23.5 min, 175 by 26 min) and 2 jumps (one before 19 min, one at 26 min). Each
   jump makes AEC3 reconverge for 5-10 s. Cable B's loopback hiccupping, as in #10's traces; real speakers to compare.
 - **Unexplained:** the output drift reading climbed from about 0 to +98 ppm over the last 30 s of the run, with the latency
   unchanged. Check in the next soak whether it's real (VB-CABLE changing rate) or the reading.
+
+## The first lowering after a trial (built 2026-11-02, ours)
+`out_target.rs` ("Two windows before the first lowering"; engine.md, "The output target"). Until proven (the run's start,
+and after a strike), a window that would lower the target starts a trial instead: the target holds where it is (the
+fixed target) for a second window, and comes down only if that one passes without an underrun and allows it too, on its
+own need; a trial whose window doesn't allow it has failed, and the next window that allows one starts another. Proven,
+each lowering goes at once. The end point is the same, a window later: in the soak's case 14 ms to 240 s, 6.8 by about
+290 s instead of 165. `latency --settle` and `quality --settle` wait past the trial (it's published,
+`output_target_on_trial`), up to 308 s instead of 188.
+- **First built as two stages** (the same day, replaced after review): the first lowering stopped halfway and held there
+  for the second window. The verifier's sweep and ours showed it no safer than the soak needed: the soak ran dry with its
+  queue at 10.6 ms, on a block 8 ms or more late (about 10 in the simulations, a missed wake), and held halfway
+  (10.1-10.4 ms), or at a period + a block (12 ms, tried next), the target ran short with a block 10 ms late (a block more
+  than a block late, with the fill under a period, is a deficit: zeros), where the fixed target rode out 13.5. A first
+  lowering under 2 ms also went at once and counted as proven, so the next, however big, skipped the halfway stop.
+- **Simulated** (`pipeline/tests/exclusive.rs`, `the_first_lowering_waits_for_a_second_window`; the soak's conditions,
+  both exclusive, 160-frame packets up to 1.8 ms late): the trial and the old single stage end at 6.8 ms within the jitter
+  their windows saw, nothing underrunning. A block 11 ms late at 129 s (the single stage 9 s into its walk, at 9.7 ms, as
+  the soak's was at 9.9) runs the single stage dry, a strike back to 14 ms for ten minutes; the trial, at 14 ms, rides it
+  out and fails on it, another trial passes once it has left the window, and the target ends within 0.3 ms of the same
+  point. A block 13 ms late at 180 s, mid-trial, is ridden out too. On a 5 ms shared device (`budget.rs`,
+  `an_underrun_raises_the_adaptive_target_at_once`) a wake 13 ms late at 200 s runs the single stage's lowered target dry
+  and not the trial; it ends at the single stage's end point. A wake 15 ms late every 150 s (`events.rs`,
+  `rare_hiccups_cost_the_adaptive_target_at_most_three_underruns`) fails every trial: no underrun in 50 minutes, where the
+  single stage struck three times.
+- **What the trial covers** (swept by hand, the same conditions, a block late by X on top of its jitter): at 129, 150, 180
+  and 230 s up to 13.5 ms (14 ran it dry at 150 and 230); the single stage 9 s into its walk up to 10.5 (11 ran it dry).
+  A hiccup rarer than the two windows, coming after them, is the strikes' business as before; one larger than the fixed
+  target covers runs it dry either way.
+- **The traces** in `%LOCALAPPDATA%\noise-filter\traces` (the cables' shared mic and loopback, 20-30 s each), the mic's
+  delivery looped to 330 s on a shared 10 ms device (`timeline.rs`, ignored `traces_and_the_adaptive_target`, which
+  prints): needs of 3.4-6.9 ms; the single stage settles at 16.7-20.0 ms by 180 s, the trial at 16.4-19.9 by 300 s, and
+  neither underruns. They hold no hiccup the first window misses, so they show the end point kept, not the underrun
+  avoided; the exclusive mic's delivery (the soak's case) is the simulation's above.
+- **For the live check:** a 30-minute soak on the cables, the defaults. Expect the target at 14 ms to 240 s, then 6.8 by
+  about 290 s, and no underrun in the first four minutes. With the chain recorder armed (`quality --save`, or a recorder
+  in a longer run) an underrun would show what ran dry. The cost to check against: 7 ms more latency for minutes 2 to 4
+  than the single stage had.
 
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI

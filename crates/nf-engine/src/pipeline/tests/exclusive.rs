@@ -106,6 +106,8 @@ struct XSim {
     /// A loopback (10 ms stamped packets, 20 ms ahead of the mic) for the echo reference.
     reference: bool,
     adaptive: bool,
+    /// The adaptive target's old single-stage lowering (out_target.rs), for comparison.
+    single_stage: bool,
     seconds: f64,
 }
 
@@ -119,6 +121,7 @@ const BASE: XSim = XSim {
     stall: None,
     reference: false,
     adaptive: false,
+    single_stage: false,
     seconds: 40.0,
 };
 
@@ -166,7 +169,7 @@ fn run(s: XSim) -> XOut {
     let cfg = PipelineConfig { out_period: s.period, out_margin: 96, ref_period: s.reference.then_some(480), max_packet: 4800 };
     let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(cfg.out_target() as f32), SlipResampler::new(), SlipResampler::new());
     if s.adaptive {
-        p = p.with_adaptive_target();
+        p = if s.single_stage { p.with_single_stage_target() } else { p.with_adaptive_target() };
     }
     let mut sink = EventRender::new(XDev::new(s.period, s.ppm), RING_FRAMES);
     p.prefill(&mut sink).unwrap();
@@ -396,20 +399,22 @@ fn the_exclusive_mic_s_small_packets_assemble_blocks_with_their_stamps() {
 }
 
 /// Exclusive on both sides, 160-frame mic packets and a 2 ms output: 10.3 ms to the write, 14 ms queued, 3 ms after it.
-/// With the adaptive target on and steady delivery, after the two-minute window the target walks down to the floor (a
-/// period + the margin, 4 ms) + the wake jitter seen + 1 ms, the queue follows it without going under it (a target set in
-/// one step drove the queue 1.4 ms under it for 10 s, under the floor), and still nothing underruns.
+/// With the adaptive target on and steady delivery, the two-minute window starts a trial (held at 14 ms for a second
+/// window), and then the target walks down to the floor (a period + the margin, 4 ms) + the wake jitter seen + 1 ms; the
+/// queue follows the walk without going under where it ends (a target set in one step drove the queue 1.4 ms under it for
+/// 10 s, under the floor), and still nothing underruns.
 #[test]
 fn exclusive_on_both_sides_and_the_adaptive_target() {
     let both = XSim { packet: 160, late: |_| 0.3, ..BASE };
     let (b, readout) = means(&run(both).rows, SETTLED_S);
     assert!((readout - 27.3).abs() < 0.6, "{readout}: {b:?}");
     for ppm in [0.0, 300.0] {
-        let o = run(XSim { adaptive: true, ppm, seconds: 240.0, ..both });
+        let o = run(XSim { adaptive: true, ppm, seconds: 330.0, ..both });
         let target_ms = o.p.out_target() as f32 / 48.0;
         assert!(target_ms > 4.9 && target_ms < 6.5, "{ppm} ppm: {target_ms}");
         assert!(near(o.tel.output_target_ms.load(), target_ms, 1e-3), "published");
-        let (late, late_readout) = means(&o.rows, 200.0);
+        assert!(!o.tel.output_target_on_trial.load(Relaxed), "{ppm} ppm: proven by the end");
+        let (late, late_readout) = means(&o.rows, 310.0);
         assert!(near(late.queue_ms, target_ms, 0.3), "{ppm} ppm: {late:?}");
         if ppm != 0.0 {
             assert!((late_readout - (readout - f64::from(14.0 - target_ms))).abs() < 0.8, "{late_readout} against {readout}");
@@ -417,7 +422,7 @@ fn exclusive_on_both_sides_and_the_adaptive_target() {
         // From the lowering on, the queue's 1 s means follow the walk, within 1.5 ms (behind it as it starts, ahead of it
         // as it slows: the loop's lag), and never go under where it ends.
         let (mut lowest, mut behind, mut ahead) = (f32::MAX, f32::MIN, f32::MIN);
-        for second in 120..240 {
+        for second in 120..330 {
             let rows: Vec<Row> = o.rows.iter().filter(|r| r.t_s >= second as f64 && r.t_s < (second + 1) as f64).copied().collect();
             let (m, _) = means(&rows, 0.0);
             let target_then = o.targets.iter().rev().find(|(t, _)| *t <= second as f64 + 1.0).map_or(0.0, |x| x.1 as f32 / 48.0);
@@ -428,9 +433,78 @@ fn exclusive_on_both_sides_and_the_adaptive_target() {
         assert!(lowest > target_ms - 0.15, "{ppm} ppm: the queue's lowest 1 s mean {lowest} against {target_ms}");
         let under = o.targets.iter().map(|x| x.1).collect::<Vec<_>>();
         assert!(under.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 24), "{ppm} ppm: a walk down");
+        let at = |t: f64| o.targets.iter().rev().find(|(s, _)| *s <= t).map_or(0, |x| x.1);
+        assert_eq!(at(239.0), 672, "{ppm} ppm: held at the fixed target for the trial");
         let (inserted, late_events, _) = o.sink.counts();
         assert_eq!((o.p.counters.render_underruns, inserted - o.start_silence, late_events), (0, 0, 0), "{:?}", o.p.counters);
     }
+}
+
+/// The exclusive mic's packets as the soak saw them (TODO 13's detail, "Soak": both exclusive, a need of about 1.8 ms, the
+/// target heading from 14 to 6.8 ms): each packet up to 1.8 ms late, by a hash of its number.
+fn soak_like(j: u64) -> f64 {
+    0.3 + 1.8 * (j.wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0
+}
+
+/// The soak's packets, and a block 11 ms later than that at 129 s (its last packet held back): a hiccup the first window
+/// didn't see, 9 s into the single stage's walk, as the soak's underrun was.
+fn soak_hiccup(j: u64) -> f64 {
+    if j == 129 * 300 + 2 { 11.0 + soak_like(j) } else { soak_like(j) }
+}
+
+/// The soak's packets, and a block 13 ms later at 180 s, in the middle of the trial's window.
+fn soak_late_hiccup(j: u64) -> f64 {
+    if j == 180 * 300 + 2 { 13.0 + soak_like(j) } else { soak_like(j) }
+}
+
+/// The first lowering (out_target.rs, "Two windows before the first lowering"), in the soak's conditions: both exclusive
+/// (160-frame mic packets, a 2 ms output), the packets up to 1.8 ms late. The old single stage walked from 14 ms to about
+/// 6.8 after the first window, and the soak ran dry on that walk (at 9.9 ms, about 122 s, 9 s into it). Now the first
+/// window starts a trial: the target holds at 14 ms for a second window, and comes down only if that one allows it too.
+/// - Without a hiccup both end at the same target (within the jitter their windows saw), the trial a window later, and
+///   nothing underruns.
+/// - With a hiccup the first window didn't see (a block 11 ms late at 129 s: the single stage at 9.7 ms then, as the
+///   soak's was), the single stage runs the device dry (a strike: back to 14 ms, held for 10 minutes); the trial rides it
+///   out at the fixed target, fails on it (its window needs the fixed target), and once the hiccup has left the window
+///   another trial passes, and the target comes down to the same end point as without it.
+/// - A block 13 ms late in the middle of the trial (180 s) is ridden out too.
+/// - What it covers, swept by hand (2026-11-02): the trial (at 14 ms) a block up to 13.5 ms late at 129, 150, 180 and 230 s
+///   (14 ran it dry at 150 and 230); the single stage 9 s into its walk (9.7 ms) up to 10.5 (11 ran it dry); a first stop
+///   halfway down (10.1 ms) or at a period + a block (12 ms) ran it dry at 10 (a block more than a block late with the
+///   device's fill under a period is a deficit). A hiccup rarer than the two windows, coming after them, is still the
+///   strikes' business, as before.
+#[test]
+fn the_first_lowering_waits_for_a_second_window() {
+    let soak = XSim { packet: 160, late: soak_like, adaptive: true, seconds: 300.0, ..BASE };
+    let (two, one) = (run(soak), run(XSim { single_stage: true, seconds: 200.0, ..soak }));
+    let ms = |o: &XOut| o.p.out_target() as f32 / 48.0;
+    let at = |o: &XOut, t: f64| o.targets.iter().rev().find(|(s, _)| *s <= t).map_or(0, |x| x.1);
+    let end = one.p.out_target();
+    assert!(ms(&one) > 6.0 && ms(&one) < 7.6, "the soak's end point, about 6.8 ms: {}", ms(&one));
+    assert!(two.p.out_target().abs_diff(end) <= 12, "with a trial, the same end: {} against {end}", two.p.out_target());
+    assert_eq!((at(&two, 239.0), at(&one, 239.0) < 400), (672, true), "held at 14 ms for the trial, where the single stage is down");
+    assert_eq!((one.p.counters.render_underruns, two.p.counters.render_underruns), (0, 0));
+    // A block 11 ms late at 129 s.
+    let hiccup = XSim { late: soak_hiccup, ..soak };
+    let (two, one) = (run(XSim { seconds: 450.0, ..hiccup }), run(XSim { single_stage: true, seconds: 135.0, ..hiccup }));
+    let one_then = at(&one, 128.9);
+    assert!(one_then > end + 96 && one_then < 480, "9 s into the single stage's walk: {one_then}");
+    assert_eq!(one.p.counters.render_underruns, 1, "it ran dry: {:?}", one.p.counters);
+    assert_eq!((one.p.out_target(), one.p.adaptive.as_ref().map(|a| a.strikes())), (672, Some(1)), "a strike, back to 14 ms");
+    let (inserted, late_events, _) = two.sink.counts();
+    assert_eq!((two.p.counters.render_underruns, inserted - two.start_silence, late_events), (0, 0, 0), "{:?}", two.p.counters);
+    assert_eq!(at(&two, 300.0), 672, "the trial failed on the hiccup, and the next held too");
+    assert!(
+        two.p.out_target().abs_diff(end) <= 24,
+        "then the same end point (within its windows' jitter): {} against {end}",
+        two.p.out_target()
+    );
+    assert_eq!(two.p.adaptive.as_ref().map(|a| a.strikes()), Some(0));
+    // A block 13 ms late at 180 s, in the trial.
+    let two = run(XSim { late: soak_late_hiccup, seconds: 250.0, ..soak });
+    let (inserted, late_events, _) = two.sink.counts();
+    assert_eq!((two.p.counters.render_underruns, inserted - two.start_silence, late_events), (0, 0, 0), "{:?}", two.p.counters);
+    assert_eq!(two.p.out_target(), 672, "held at the fixed target");
 }
 
 /// The exclusive output, the adaptive target, the mic and the reference over 2000 wakes: nothing allocates.

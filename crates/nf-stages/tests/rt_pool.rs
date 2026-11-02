@@ -62,7 +62,8 @@ fn start_on_a_fresh_thread(warm: bool, start: impl FnOnce() + Send + 'static) ->
 }
 
 /// Builds, activates, runs `input` through and drops the noise stage. The gate is on, so all of
-/// NoisePost runs.
+/// NoisePost runs. Two resets on the way swap in RNNoise's spare states, and its spare maker (a
+/// thread outside the scope) frees the used ones, from the pool, and builds new ones on the heap.
 fn noise_stage_start(controls: &Arc<ChainControls>, input: &Arc<Vec<f32>>) -> impl FnOnce() + Send + 'static {
     let (controls, input) = (controls.clone(), input.clone());
     move || {
@@ -70,7 +71,11 @@ fn noise_stage_start(controls: &Arc<ChainControls>, input: &Arc<Vec<f32>>) -> im
             Ok(mut stage) => {
                 let ok = stage.activate(&Activation::HOST).is_ok();
                 let mut y = [0.0f32; BLOCK];
-                for x in input.as_chunks::<BLOCK>().0 {
+                for (b, x) in input.as_chunks::<BLOCK>().0.iter().enumerate() {
+                    if b == 30 || b == 60 {
+                        stage.reset();
+                        std::thread::sleep(nf_stages::MAKER_POLL + std::time::Duration::from_millis(50));
+                    }
                     stage.process(ProcessIo::new(&[x], &mut y));
                 }
                 std::hint::black_box(&y);

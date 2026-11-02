@@ -5,7 +5,8 @@
 //!   had. An unreadable file that can't be moved aside either (locked, or on a share that isn't
 //!   there yet) turns saving off for the session instead ([`Loaded::read_only`]).
 //! - Missing fields take their defaults (`#[serde(default)]` here and throughout `EngineConfig`) and
-//!   unknown ones are ignored, so files written by older and newer versions keep loading.
+//!   unknown ones are ignored, so files written by older and newer versions keep loading. A value
+//!   whose meaning changed is brought up to date on load by the file's `version` ([`upgrade_engine`]).
 //! - Every value is clamped to its control's range on load ([`Settings::sanitize`]): a hand-edited
 //!   file can't put a slider out of range.
 //! - Saved by a background thread [`SAVE_DEBOUNCE`] after the last change (a slider drag is dozens
@@ -138,7 +139,7 @@ impl IoSwitch {
                  or your voice crackles, try turning this off."
             }
             Self::AdaptiveOutput => {
-                "Trims the output buffer to what your PC needs after two minutes of running (about 7 ms less on VB-CABLE). A \
+                "Trims the output buffer to what your PC needs after four minutes of running (about 7 ms less on VB-CABLE). A \
                  rare hiccup can then cost a short glitch, three a run at most. Turn off for a recording that must have none."
             }
             // The mic's shared-mode options: the exclusive mic has its own small period and no Windows effects.
@@ -152,15 +153,39 @@ impl IoSwitch {
 pub(crate) const EXCLUSIVE_FALLBACK: &str =
     "A device that refuses exclusive mode runs in shared mode, and a note at the top says why and how to fix it.";
 
+/// The settings file's version, saved with it: 1 from the automatic model depth on (a file without one is 0).
+pub const SETTINGS_VERSION: u32 = 1;
+/// The model depth every window saved before the automatic depth (88d1caa on): the default then, which nothing in the
+/// window sets.
+const OLD_DEFAULT_MODEL_DEPTH: u32 = 2;
+
+/// Brings an engine config saved in a settings file of `version` up to this version's meaning (the CLI's `--config` reads
+/// the window's file too). Before 1, a model depth of 2 was the default the window saved, not a choice: it becomes
+/// automatic (`nf_engine::AUTO_MODEL_DEPTH`). A depth a later file sets, 2 included, is kept.
+pub fn upgrade_engine(version: u32, engine: &mut EngineConfig) {
+    if version < 1 && engine.processing.model_depth == OLD_DEFAULT_MODEL_DEPTH {
+        engine.processing.model_depth = nf_engine::AUTO_MODEL_DEPTH;
+    }
+}
+
 /// Everything the settings file holds.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
+    /// [`SETTINGS_VERSION`] when written by this version; a file without it is 0 (its own default, not the struct's).
+    #[serde(default)]
+    pub version: u32,
     /// What the engine runs with. Its `processing.meters_enabled` and
     /// `processing.latency_readout_enabled` are the "Show meters" and "Live readout" toggles: the
     /// engine skips that work when they're off, so they live in its config rather than here twice.
     pub engine: EngineConfig,
     pub ui: UiSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { version: SETTINGS_VERSION, engine: EngineConfig::default(), ui: UiSettings::default() }
+    }
 }
 
 /// The latency test's loop (gui.md section 6). The engine's [`LatencyMode`] isn't serde, so the
@@ -269,6 +294,8 @@ fn clamp_side(value: f64, min: f64, default: f64) -> f64 {
 pub(crate) fn parse(bytes: &[u8]) -> Result<Settings, serde_json::Error> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let mut settings: Settings = serde_json::from_slice(bytes)?;
+    upgrade_engine(settings.version, &mut settings.engine);
+    settings.version = settings.version.max(SETTINGS_VERSION);
     settings.sanitize();
     Ok(settings)
 }
@@ -661,6 +688,22 @@ mod tests {
         let s = parse(newer).unwrap();
         assert_eq!(s.ui.test_repetitions, 3);
         assert_eq!(s.engine, EngineConfig::default());
+        assert_eq!(s.version, 7, "kept, so a save doesn't make it older");
+    }
+
+    /// The automatic model depth (TODO 5): a file from before it (no version) holds the depth the window saved by default,
+    /// 2, which becomes automatic; any other depth there, and any depth in a file of this version, 2 included, is kept. The
+    /// window saves the version.
+    #[test]
+    fn an_older_file_s_saved_depth_becomes_automatic() {
+        let depth = |json: &str| parse(json.as_bytes()).unwrap().engine.processing.model_depth;
+        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 2}}}"#), nf_engine::AUTO_MODEL_DEPTH);
+        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 1}}}"#), 1);
+        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 3}}}"#), 3);
+        assert_eq!(depth(r#"{"version": 1, "engine": {"processing": {"model_depth": 2}}}"#), 2);
+        assert_eq!(depth("{}"), nf_engine::AUTO_MODEL_DEPTH);
+        let saved: serde_json::Value = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(saved["version"], SETTINGS_VERSION, "{saved}");
     }
 
     #[test]

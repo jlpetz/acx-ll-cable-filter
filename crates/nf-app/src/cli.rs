@@ -59,7 +59,8 @@ pub struct Processing {
     pub model: Option<String>,
     /// `--high-band model|zero|pass`: what a band-limited model puts above its band.
     pub high_band: Option<HighBand>,
-    /// `--model-depth N`: how many blocks behind the audio thread a model pack's inference worker runs (1-4).
+    /// `--model-depth auto|N`: how many blocks behind the audio thread a model pack's inference worker runs (1-4), or
+    /// automatic (`nf_engine::AUTO_MODEL_DEPTH`, the default: chosen at each start from how the mic delivers).
     pub model_depth: Option<u32>,
 }
 
@@ -177,8 +178,9 @@ pub const MIN_CHECK_SECONDS: u32 = 5;
 pub const MAX_CHECK_SECONDS: u32 = 120;
 /// The latency test's default repetitions (the engine's `LatencyTestRequest` default).
 pub const DEFAULT_REPETITIONS: u32 = 5;
-/// The longest `--settle` waits for the adaptive output target: its window, its longest walk down, and 15 s.
-pub const ADAPTIVE_WAIT_S: u64 = nf_engine::ADAPTIVE_OUTPUT_WINDOW_S + nf_engine::ADAPTIVE_OUTPUT_WALK_S + 15;
+/// The longest `--settle` waits for the adaptive output target: its two windows and the walks (`ADAPTIVE_OUTPUT_SETTLE_S`),
+/// and 15 s.
+pub const ADAPTIVE_WAIT_S: u64 = nf_engine::ADAPTIVE_OUTPUT_SETTLE_S + 15;
 /// `quality`'s default scene length, and its range. The echo scene is one FFT convolution over its whole length, as `bench`'s
 /// is, hence the same cap.
 pub const DEFAULT_QUALITY_SECONDS: f32 = 30.0;
@@ -356,9 +358,15 @@ impl Processing {
             "--model-depth" => {
                 let v = p.value(flag, inline)?;
                 let max = nf_engine::MAX_MODEL_DEPTH;
-                let n = v.trim().parse::<u32>().ok().filter(|n| (1..=max).contains(n));
+                let n = if v.trim().eq_ignore_ascii_case("auto") {
+                    Some(nf_engine::AUTO_MODEL_DEPTH)
+                } else {
+                    v.trim().parse::<u32>().ok().filter(|n| (1..=max).contains(n))
+                };
                 self.model_depth =
-                    Some(n.ok_or_else(|| usage(format!("--model-depth takes a whole number of blocks from 1 to {max}, not '{v}'")))?);
+                    Some(n.ok_or_else(|| {
+                        usage(format!("--model-depth takes auto or a whole number of blocks from 1 to {max}, not '{v}'"))
+                    })?);
             }
             "--high-band" => {
                 let v = p.value(flag, inline)?.trim().to_ascii_lowercase();
@@ -746,8 +754,9 @@ other side, which stays shared whatever these say.
                      the mic {echo_floor} ms or more after the speakers' sound is mixed (14 shared)
   --no-adaptive-output
                      Keep the output's buffer target fixed at a period + a block + the margin.
-                     Adaptive, it walks down after two minutes to a period + the margin + the
-                     lateness measured (about 7 ms less on VB-CABLE). An underrun puts it back
+                     Adaptive, it comes down after four minutes (two to measure the delivery,
+                     two more to confirm it), to a period + the margin + the lateness measured
+                     (about 7 ms less on VB-CABLE). An underrun puts it back
                      to the fixed one and holds it there for 10 minutes, 20 after a second;
                      after a third it stays fixed. So a rare hiccup the fixed target would
                      ride out can cost a glitch, up to three in a run: turn it off for a
@@ -755,9 +764,9 @@ other side, which stays shared whatever these say.
   A device that refuses exclusive mode runs in shared mode, with a note saying why, what it
   costs and how to fix it.
   --settle           (latency, quality) Wait for the adaptive output target to come down
-                     before measuring: it can after two minutes of running, then walks for up
-                     to a minute ({settle_s} s at most). Without it they measure at once, at its
-                     fixed start, and the report's conditions say so
+                     before measuring: after four minutes of running ({settle_s} s at most).
+                     Without it they measure at once, at its fixed start, and the report's
+                     conditions say so
 
 PROCESSING (run, latency, quality, process):
   --aec, --no-aec    Echo cancellation on or off (default off; on in quality's echo test)
@@ -771,10 +780,13 @@ PROCESSING (run, latency, quality, process):
                      and runs on a worker thread: 50 ms of stream latency against RNNoise's 10
   --high-band MODE   Above a 16 kHz model's band: model (its own top-band gain, the default),
                      zero (band-limited to 8 kHz) or pass (the input, untouched)
-  --model-depth N    How many 10 ms blocks behind a model pack's worker runs, 1 to 4 (default
-                     2). Each adds 10 ms; a wake that brings more blocks at once than this (a
-                     20 ms device period, a cable's burst) plays the unfiltered mic for each
-                     one over
+  --model-depth auto|N
+                     How many 10 ms blocks behind a model pack's worker runs, 1 to 4. Each
+                     adds 10 ms; a wake that brings more blocks at once than this (a 20 ms
+                     device period, a cable's burst) plays the unfiltered mic for each one
+                     over. auto (the default) picks it at each start: 1 with the exclusive
+                     mic, which delivers a block at a time, or a shared mic an earlier run
+                     measured steady; else 2. The Engine line at the start says which
 
 QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records the output):
   --test noise|echo  Speech in noise (the default), or speech with a far voice's echo
@@ -1218,6 +1230,8 @@ mod tests {
             assert_eq!((processing.model.as_deref(), processing.high_band), (Some("ulunas"), Some(HighBand::Zero)), "{cmd:?}");
             assert_eq!(processing.model_depth, Some(3), "{cmd:?}");
         }
+        let Ok(Command::Run(r)) = p(&["run", "--model-depth", "Auto"]) else { panic!() };
+        assert_eq!(r.engine.processing.model_depth, Some(nf_engine::AUTO_MODEL_DEPTH), "auto, back over a config's depth");
         let Ok(Command::Run(r)) = p(&["run", "--model=rnnoise"]) else { panic!() };
         assert_eq!(r.engine.processing.model.as_deref(), Some("rnnoise"));
         for bad in ["../ulunas", "C:/x", "UL-UNAS", "a b"] {
@@ -1228,11 +1242,13 @@ mod tests {
         for bad in ["0", "5", "two", "-1", "1.5"] {
             assert_eq!(
                 err(&["run", "--model-depth", bad]),
-                format!("--model-depth takes a whole number of blocks from 1 to 4, not '{bad}'")
+                format!("--model-depth takes auto or a whole number of blocks from 1 to 4, not '{bad}'")
             );
         }
         assert!(
-            help_text().contains("--model NAME") && help_text().contains("--high-band MODE") && help_text().contains("--model-depth N")
+            help_text().contains("--model NAME")
+                && help_text().contains("--high-band MODE")
+                && help_text().contains("--model-depth auto|N")
         );
     }
 

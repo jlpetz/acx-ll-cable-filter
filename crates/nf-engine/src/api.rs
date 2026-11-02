@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use nf_core::config::{
-    DEFAULT_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EngineConfig, GateConfig, GateMode, HighBand, IoConfig, MAX_MODEL_DEPTH,
-    ProcessingConfig, is_model_id,
+    AUTO_MODEL_DEPTH, BURSTY_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EngineConfig, GateConfig, GateMode, HighBand, IoConfig,
+    MAX_MODEL_DEPTH, MicDelivery, ProcessingConfig, STEADY_MODEL_DEPTH, is_model_id,
 };
 pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{
@@ -101,6 +101,28 @@ pub struct EngineStatus {
     pub retrying: bool,
     /// What the user can do about the error in `message`, when the app can take them there.
     pub remedy: Option<Remedy>,
+    /// The depth a model pack's inference worker runs at in this run, and how it was chosen (`None`: RNNoise, or stopped).
+    pub model_depth: Option<ModelDepth>,
+}
+
+/// The depth a run's model pack runs at (`ProcessingConfig::model_depth`; TODO 5, 6), chosen at the start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelDepth {
+    pub depth: u32,
+    /// Picked automatically (the default), from how the mic delivers: as its last run in this process, opened the same way,
+    /// measured it (`TelemetrySnapshot::wake_blocks`), else a block at a time for the exclusive mic at a period of a block or
+    /// less. `None`: the config set it.
+    pub auto: Option<MicDelivery>,
+}
+
+impl ModelDepth {
+    /// "depth 1 (auto: the mic delivers a block at a time)", or "depth 3 (set)".
+    pub fn text(&self) -> String {
+        match self.auto {
+            Some(d) => format!("depth {} (auto: {})", self.depth, d.text()),
+            None => format!("depth {} (set)", self.depth),
+        }
+    }
 }
 
 /// A fix for a failure that the app can take the user to (the window offers it as a button).
@@ -142,16 +164,23 @@ pub struct BufferTargets {
 /// With `IoConfig::adaptive_output`, how long a run measures the delivery at the fixed output target before the target can
 /// come down, in seconds (engine.md, "The output target").
 pub const ADAPTIVE_OUTPUT_WINDOW_S: u64 = crate::out_target::WINDOW_S as u64;
+/// The earliest the adaptive output target first comes down, in seconds: a window, and a second that confirms it (its
+/// trial: out_target.rs).
+pub const ADAPTIVE_OUTPUT_FIRST_S: u64 = 2 * ADAPTIVE_OUTPUT_WINDOW_S;
 /// The longest the adaptive output target's walk down takes once it has started, in seconds (it moves a tenth of the way a
 /// second, so the queue follows without overshooting).
 pub const ADAPTIVE_OUTPUT_WALK_S: u64 = crate::out_target::RAMP_MAX_S as u64;
+/// The longest a run's adaptive output target takes to settle when nothing runs it short, in seconds: the first window starts
+/// a trial, which holds it for a second (`TelemetrySnapshot::output_target_on_trial`), and then it walks down (engine.md,
+/// "The output target").
+pub const ADAPTIVE_OUTPUT_SETTLE_S: u64 = crate::out_target::SETTLE_MAX_S as u64;
 
 /// The output target as the reports' conditions name it, from the target at the test's end
 /// (`TelemetrySnapshot::output_target_ms`), whether it adapts, and the fixed one it starts at (`BufferTargets::output_ms`):
 /// "output target 22.0 ms (fixed)"; adaptive, either "6.8 ms at the end (adaptive, down from 14.0 ms)" or "14.0 ms at the end
-/// (adaptive, at the fixed target: it comes down only after 120 s of running, and goes back up to it after an underrun)". A
+/// (adaptive, at the fixed target: it comes down only after 240 s of running, and goes back up to it after an underrun)". A
 /// snapshot, so "at the end": a long test may have run part of its time at another target. The second is the neutral
-/// reading of a target at the fixed one, which a run's first two minutes are (`latency` and `quality` measure at once
+/// reading of a target at the fixed one, which a run's first four minutes are (`latency` and `quality` measure at once
 /// unless `--settle` waits), but so is a run that went back after an underrun (out_target.rs's strikes), whose delivery
 /// needs the whole target, or whose `--settle` timed out. Empty without a target (stopped).
 pub fn output_target_text(target_ms: f32, adaptive: bool, fixed_ms: f32) -> String {
@@ -165,7 +194,7 @@ pub fn output_target_text(target_ms: f32, adaptive: bool, fixed_ms: f32) -> Stri
         format!("down from {fixed_ms:.1} ms")
     } else {
         format!(
-            "at the fixed target: it comes down only after {ADAPTIVE_OUTPUT_WINDOW_S} s of running, and goes back up to it after \
+            "at the fixed target: it comes down only after {ADAPTIVE_OUTPUT_FIRST_S} s of running, and goes back up to it after \
              an underrun"
         )
     };
