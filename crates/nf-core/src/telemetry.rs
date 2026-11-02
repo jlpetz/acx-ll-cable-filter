@@ -407,6 +407,54 @@ pub struct Telemetry {
     pub output_exclusive: AtomicBool,
     /// The output's target adapts to the delivery (`IoConfig::adaptive_output`): `output_target_ms` moves.
     pub output_adaptive: AtomicBool,
+    /// The noise model runs on an inference worker (a model pack, TODO 6): the `inference_*` counters below are its
+    /// (`nf_core::noise::InferenceStats`), published once a second.
+    pub inference_active: AtomicBool,
+    pub inference_runs: AtomicU64,
+    /// Blocks whose result came too late: the substitute (the delayed input, gain-matched) played instead.
+    pub inference_misses: AtomicU64,
+    pub inference_late: AtomicU64,
+    pub inference_gaps: AtomicU64,
+    pub inference_errors: AtomicU64,
+    /// One inference's time on the worker, in µs, over its last 100 runs, and the most since the start.
+    pub inference_run_us_p50: AtomicF32,
+    pub inference_run_us_p99: AtomicF32,
+    pub inference_run_us_max: AtomicF32,
+    /// The worker's Rust allocations since it was ready (from the locked pool), and those that fell back to the heap.
+    pub inference_worker_allocs: AtomicU64,
+    pub inference_worker_fallbacks: AtomicU64,
+    /// The audio thread's wakes that processed 1, 2, 3, and 4 or more blocks (TODO 6, 13): what a model pack's inference
+    /// worker, `depth` blocks behind, has to keep up with. A wake of `k` blocks costs it `max(0, k - depth)` misses
+    /// ([`WakeBlocks::misses_at`]).
+    pub wake_blocks: [AtomicU64; 4],
+}
+
+/// How many wakes processed 1, 2, 3, and 4 or more blocks ([`Telemetry::wake_blocks`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WakeBlocks(pub [u64; 4]);
+
+impl WakeBlocks {
+    /// The misses a model pack's worker `depth` blocks behind would have had at these wakes if it caught up between them
+    /// (a wake of 4 or more counted as 4: a lower bound).
+    pub fn misses_at(&self, depth: u32) -> u64 {
+        self.0.iter().enumerate().map(|(i, &n)| n * (i as u64 + 1).saturating_sub(u64::from(depth))).sum()
+    }
+
+    /// Wakes that processed more than one block.
+    pub fn bursts(&self) -> u64 {
+        self.0[1..].iter().sum()
+    }
+
+    /// From `earlier` to these (each count's growth).
+    pub fn since(&self, earlier: &WakeBlocks) -> WakeBlocks {
+        WakeBlocks(std::array::from_fn(|i| self.0[i].saturating_sub(earlier.0[i])))
+    }
+
+    pub fn add(&mut self, other: &WakeBlocks) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a += b;
+        }
+    }
 }
 
 /// A plain copy of [`Telemetry`] for the UI.
@@ -465,6 +513,18 @@ pub struct TelemetrySnapshot {
     pub mic_exclusive: bool,
     pub output_exclusive: bool,
     pub output_adaptive: bool,
+    pub inference_active: bool,
+    pub inference_runs: u64,
+    pub inference_misses: u64,
+    pub inference_late: u64,
+    pub inference_gaps: u64,
+    pub inference_errors: u64,
+    pub inference_run_us_p50: f32,
+    pub inference_run_us_p99: f32,
+    pub inference_run_us_max: f32,
+    pub inference_worker_allocs: u64,
+    pub inference_worker_fallbacks: u64,
+    pub wake_blocks: WakeBlocks,
 }
 
 impl Telemetry {
@@ -495,6 +555,31 @@ impl Telemetry {
     /// after this has every counter as of that publication.
     pub fn publishes(&self) -> u64 {
         self.publishes.load(Acquire)
+    }
+
+    /// Copies an inference worker's stats in (once a second, before [`Telemetry::published`]), or marks none.
+    pub fn publish_inference(&self, stats: Option<&crate::noise::InferenceStats>) {
+        self.inference_active.store(stats.is_some(), Relaxed);
+        let Some(s) = stats else { return };
+        let s = s.snapshot();
+        self.inference_runs.store(s.runs, Relaxed);
+        self.inference_misses.store(s.misses, Relaxed);
+        self.inference_late.store(s.late, Relaxed);
+        self.inference_gaps.store(s.gaps, Relaxed);
+        self.inference_errors.store(s.errors, Relaxed);
+        self.inference_run_us_p50.store(s.run_us_p50);
+        self.inference_run_us_p99.store(s.run_us_p99);
+        self.inference_run_us_max.store(s.run_us_max);
+        self.inference_worker_allocs.store(s.worker_pool_allocs, Relaxed);
+        self.inference_worker_fallbacks.store(s.worker_fallbacks, Relaxed);
+    }
+
+    /// Counts a wake that processed `blocks` blocks (none: nothing). The audio thread, once a wake. Real-time.
+    #[inline]
+    pub fn count_wake_blocks(&self, blocks: usize) {
+        if blocks > 0 {
+            self.wake_blocks[blocks.min(4) - 1].fetch_add(1, Relaxed);
+        }
     }
 
     /// Marks a publication done: after every counter of it is stored (the audio thread, once a second).
@@ -557,6 +642,18 @@ impl Telemetry {
             mic_exclusive: self.mic_exclusive.load(Relaxed),
             output_exclusive: self.output_exclusive.load(Relaxed),
             output_adaptive: self.output_adaptive.load(Relaxed),
+            inference_active: self.inference_active.load(Relaxed),
+            inference_runs: self.inference_runs.load(Relaxed),
+            inference_misses: self.inference_misses.load(Relaxed),
+            inference_late: self.inference_late.load(Relaxed),
+            inference_gaps: self.inference_gaps.load(Relaxed),
+            inference_errors: self.inference_errors.load(Relaxed),
+            inference_run_us_p50: self.inference_run_us_p50.load(),
+            inference_run_us_p99: self.inference_run_us_p99.load(),
+            inference_run_us_max: self.inference_run_us_max.load(),
+            inference_worker_allocs: self.inference_worker_allocs.load(Relaxed),
+            inference_worker_fallbacks: self.inference_worker_fallbacks.load(Relaxed),
+            wake_blocks: WakeBlocks(std::array::from_fn(|i| self.wake_blocks[i].load(Relaxed))),
         }
     }
 }
@@ -567,6 +664,22 @@ mod tests {
 
     fn budget(mic_ms: f32, wait_ms: f32, chain_ms: f32, queue_ms: f32, render_ms: f32) -> LatencyBudget {
         LatencyBudget { mic_ms, wait_ms, chain_ms, queue_ms, render_ms }
+    }
+
+    /// The wakes' block counts, and the misses a worker at each depth would have had at them (TODO 6).
+    #[test]
+    fn wake_blocks_count_the_bursts_and_what_a_depth_would_miss() {
+        let tel = Telemetry::new();
+        for k in [1usize, 1, 2, 0, 3, 6, 2] {
+            tel.count_wake_blocks(k);
+        }
+        let w = tel.snapshot().wake_blocks;
+        assert_eq!(w, WakeBlocks([2, 2, 1, 1]));
+        assert_eq!((w.bursts(), w.misses_at(1), w.misses_at(2), w.misses_at(3), w.misses_at(4)), (4, 2 + 2 + 3, 1 + 2, 1, 0));
+        let mut sum = w.since(&WakeBlocks([1, 0, 0, 0]));
+        assert_eq!(sum, WakeBlocks([1, 2, 1, 1]));
+        sum.add(&WakeBlocks([1, 1, 1, 1]));
+        assert_eq!(sum, WakeBlocks([2, 3, 2, 2]));
     }
 
     /// The readout is the four parts on the sample's way; the chain's offset comes on top of it.

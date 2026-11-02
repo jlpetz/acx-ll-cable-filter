@@ -5,10 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
+pub use nf_core::config::{
+    DEFAULT_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EngineConfig, GateConfig, GateMode, HighBand, IoConfig, MAX_MODEL_DEPTH,
+    ProcessingConfig, is_model_id,
+};
 pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{
-    BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot,
+    BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, WakeBlocks,
 };
 
 /// Endpoint direction.
@@ -707,7 +710,7 @@ impl ChainRecorder {
 
 /// Runs the engine's start-up warm-up on `chain`: three silent blocks, dithered as the engine dithers, through the chain on
 /// the calling thread. The engine does this before every run's first block (after the stages' first-block set-up), so a
-/// chain built and activated as the engine builds it (`nf_stages::build_chain` with the run's processing settings), warmed
+/// chain built and activated as the engine builds it (`models::build_chain` with the run's processing settings), warmed
 /// up with this and fed a [`ChainRecording`]'s `mic` and `reference` reproduces its `output`.
 pub fn warm_up_chain(chain: &mut nf_core::chain::Chain) {
     crate::audio::warm_up(chain)

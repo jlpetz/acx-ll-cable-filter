@@ -9,4 +9,9 @@ publish.workspace = true
 
 [dependencies]
 realfft.workspace = true
+# The inference worker's two rings (noise/pipeline.rs). Pure Rust, no allocation after construction.
+rtrb.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,13 +1,15 @@
 # noise-filter: a low-latency mic noise filter and echo canceller for Windows 11.
 # Crates: nf-core (pure DSP and the stage interface, no Windows deps), nf-mem (locked and large-page
-# memory, the real-time allocator), nf-stages (RNNoise, AEC3), nf-engine (WASAPI, threads, clocks,
-# latency), nf-gui (the Reactor window), nf-app (the exe: window by default, CLI subcommands).
+# memory, the real-time allocator), nf-stages (RNNoise, AEC3), nf-ort (ONNX model packs through ONNX
+# Runtime: the only crate that links it, TODO 5), nf-engine (WASAPI, threads, clocks, latency), nf-gui
+# (the Reactor window), nf-app (the exe: window by default, CLI subcommands).
 [workspace]
 resolver = "3"
 members = [
     "crates/nf-core",
     "crates/nf-mem",
     "crates/nf-stages",
+    "crates/nf-ort",
     "crates/nf-engine",
     "crates/nf-gui",
     "crates/nf-app",
@@ -18,13 +20,15 @@ default-members = ["crates/nf-app"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.91"
+# 1.92: ort 2.0.0-rc.15's minimum.
+rust-version = "1.92"
 publish = false
 
 [workspace.dependencies]
 nf-core = { path = "crates/nf-core" }
 nf-mem = { path = "crates/nf-mem" }
 nf-stages = { path = "crates/nf-stages" }
+nf-ort = { path = "crates/nf-ort" }
 nf-engine = { path = "crates/nf-engine" }
 nf-gui = { path = "crates/nf-gui" }
 # Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
@@ -32,6 +36,10 @@ nnnoiseless = { version = "=0.5.2", default-features = false }
 sonora = "=0.2.0"
 wasapi = "=0.26.0"
 windows-reactor = "=0.100.0"
+# ONNX Runtime 1.31.0 (TODO 1, 5). Only nf-ort links it, and nf-engine and nf-app only with their `onnx` feature. No
+# ndarray, tracing or copy-dylibs: ort-sys links pyke's static build (which on Windows always includes DirectML, delay-loaded
+# by nf-ort's build.rs) and checks the archive's SHA-256 against its own table.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-31"] }
 windows = "0.62.2"
 rtrb = "=0.4.1"
 rlsf = "=0.2.3"

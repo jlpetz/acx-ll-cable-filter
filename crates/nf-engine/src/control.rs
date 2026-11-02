@@ -501,9 +501,15 @@ pub(crate) fn reference_gone(ev: &DevEvent, v: &RunView<'_>) -> bool {
 }
 
 /// Whether applying `new` over the running config needs the streams rebuilt: devices or I/O
-/// changed, or AEC turned on without its stage and reference (engine.md "Device rules").
+/// changed, AEC turned on without its stage and reference (engine.md "Device rules"), or another noise model, or another
+/// depth for a model pack's worker (its stage is built at the start: TODO 5, 6).
 pub(crate) fn restart_needed(running: &EngineConfig, aec_built: bool, new: &EngineConfig) -> bool {
-    running.devices != new.devices || running.io != new.io || (new.processing.aec_enabled && !aec_built)
+    let (r, n) = (&running.processing, &new.processing);
+    running.devices != new.devices
+        || running.io != new.io
+        || (n.aec_enabled && !aec_built)
+        || r.noise_model != n.noise_model
+        || (n.noise_model != nf_core::config::DEFAULT_NOISE_MODEL && r.model_depth != n.model_depth)
 }
 
 /// The devices, the I/O or the AEC switch differ: what decides which streams a start opens.
@@ -647,14 +653,20 @@ fn reset_telemetry(t: &Telemetry) {
     for c in [
         &t.output_slips, &t.reference_slips, &t.capture_glitches, &t.render_underruns, &t.reference_gaps, &t.stalls,
         &t.output_coarse_drops, &t.reference_coarse_drops, &t.tap_overflows, &t.output_deficits, &t.output_zero_frames,
-        &t.output_dropped_frames, &t.output_reanchors, &t.output_silence_frames, &t.publishes,
+        &t.output_dropped_frames, &t.output_reanchors, &t.output_silence_frames, &t.publishes, &t.inference_runs, &t.inference_misses,
+        &t.inference_late, &t.inference_gaps, &t.inference_errors, &t.inference_worker_allocs, &t.inference_worker_fallbacks,
+        &t.wake_blocks[0], &t.wake_blocks[1], &t.wake_blocks[2], &t.wake_blocks[3],
     ] {
         c.store(0, Relaxed);
     }
     t.output_slip_net.store(0, Relaxed);
-    for f in [&t.block_us_p50, &t.block_us_p99, &t.block_us_max, &t.aec_us_p99, &t.noise_us_p99, &t.aec_delay_ms, &t.aec_erle_db] {
+    for f in [
+        &t.block_us_p50, &t.block_us_p99, &t.block_us_max, &t.aec_us_p99, &t.noise_us_p99, &t.aec_delay_ms, &t.aec_erle_db,
+        &t.inference_run_us_p50, &t.inference_run_us_p99, &t.inference_run_us_max,
+    ] {
         f.store(0.0);
     }
+    t.inference_active.store(false, Relaxed);
     t.rt_heap_allocations.store(0, Relaxed);
     t.rt_pool_allocations_per_s.store(0, Relaxed);
     t.mic_period_ms.store(0.0);
@@ -1172,6 +1184,19 @@ mod tests {
         let mut aec_off = aec.clone();
         aec_off.processing.aec_enabled = false;
         assert!(!restart_needed(&aec, true, &aec_off), "turning AEC off is a bypass");
+        let mut model = base.clone();
+        model.processing.noise_model = "ulunas".into();
+        assert!(restart_needed(&base, false, &model), "another noise model is another stage");
+        assert!(!io_changed(&base, &model), "but not other streams");
+        let mut hb = base.clone();
+        hb.processing.high_band = nf_core::config::HighBand::Zero;
+        assert!(!restart_needed(&base, false, &hb), "the high band is live");
+        let mut deeper = model.clone();
+        deeper.processing.model_depth = 3;
+        assert!(restart_needed(&model, false, &deeper), "a pack's worker at another depth is another stage");
+        let mut rnnoise_deeper = base.clone();
+        rnnoise_deeper.processing.model_depth = 3;
+        assert!(!restart_needed(&base, false, &rnnoise_deeper), "RNNoise has no worker");
     }
 
     fn view<'a>(c: &'a EngineConfig, running: bool, waiting: bool) -> RunView<'a> {

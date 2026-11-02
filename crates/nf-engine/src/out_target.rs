@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(a.target(), FLOOR + HEADROOM);
         assert_eq!(a.underrun(5000.0 - 100.0, true), Some(FIXED));
         assert_eq!(a.strikes(), MAX_STRIKES);
-        assert_eq!(blocks(&mut a, 3 * STRIKE_HOLD_S, |_| 0.0), [], "fixed for the run");
+        assert_eq!(blocks(&mut a, 3 * STRIKE_HOLD_S, |_| 0.0), Vec::<usize>::new(), "fixed for the run");
         // A block later than a whole block, at the fixed target: no strike; it stays there, and a window passes before it
         // can come down, then only as far as the dip allows (here not at all) until the dip leaves the window.
         let mut b = AdaptiveTarget::new(FLOOR, FIXED);
@@ -369,14 +369,14 @@ mod tests {
         assert_eq!(b.underrun(5000.0 - 700.0, true), None, "at the fixed target already");
         assert_eq!(b.underrun(f64::NAN, true), None);
         assert_eq!((b.target(), b.strikes()), (FIXED, 0));
-        assert_eq!(blocks(&mut b, WINDOW_S, |_| 0.0), [], "the dip holds it");
+        assert_eq!(blocks(&mut b, WINDOW_S, |_| 0.0), Vec::<usize>::new(), "the dip holds it");
         blocks(&mut b, WINDOW_S + RAMP_MAX_S, |_| 0.0);
         assert_eq!(b.target(), FLOOR + HEADROOM, "and then it's gone");
         // An underrun at the fixed target just before the window ends puts the lowering off for another window.
         let mut c = AdaptiveTarget::new(FLOOR, FIXED);
         blocks(&mut c, WINDOW_S - 1, |_| 0.0);
         assert_eq!(c.underrun(5000.0 - 100.0, true), None);
-        assert_eq!(blocks(&mut c, 2, |_| 0.0), [], "no walk");
+        assert_eq!(blocks(&mut c, 2, |_| 0.0), Vec::<usize>::new(), "no walk");
         assert_eq!((c.goal(), c.strikes()), (FIXED, 0));
     }
 

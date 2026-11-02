@@ -78,7 +78,8 @@ Rules:
   960 points; sonora has its own 128-point FFT). The only FFT in our code is the latency test's
   offline analysis (realfft), and realfft and rustfft are already linked through nnnoiseless, so it
   adds nothing.
-- When the first spectral model pack lands, put the STFT behind a small nf-core trait, and benchmark
+- When the first spectral model pack lands, put the STFT behind a small nf-core trait (built 2026-11-02 without the trait:
+  "Built" below), and benchmark
   realfft against PhastFT 0.4.1 (MIT/Apache, pure safe Rust, runtime SIMD via fearless_simd, has
   r2c, split re/im layout) at that model's sizes.
   - PhastFT is power-of-two only (non-power-of-two is listed as planned), so it can't do 960
@@ -169,9 +170,65 @@ These are our decisions, within the owner's #17 decision (the floor and gate ins
   edge; and the rules (the manifest wins, `metadata_props` as a fallback for keys it leaves out, checksums first, no
   custom ops or outside paths, an unknown major version refused, the pack through #2's checks). No parser yet.
 
+## Built (2026-11-02, with TODO 5's first pack)
+Our decisions, from the design step for TODO 5, 3 and 6 (`doc/todo/5-candidate-models.md`).
+- **The host STFT** is `nf_core::dsp::stft`: concrete `Stft` and `Istft` types over realfft (no trait: one FFT library),
+  periodic Hann, causal framing (zeros before the first sample), an analysis ring of N, a frame every H, the inverse ×1/N
+  with bins 0 and N/2 made real, WOLA per sample (`out[n] = acc[n] / Σ w²[n + jH]`), stream offset N - H. Tested: identity
+  reconstruction at 512/256, 1536/768, 960/480 and 1024/256; the envelope within [0.5, 1]; no allocation.
+- **The high-band policy** is `nf_core::dsp::high_band`, live from `ChainControls.noise.high_band` (`ProcessingConfig.high_band`,
+  `--high-band model|zero|pass`): `model` carries the model's own gain over 62.5-93.75% of its band (UL-UNAS: bins 160-240,
+  5-7.5 kHz) to everything above, clamped to [0, 1], the last frame's when that band holds nothing; `zero` band-limits;
+  `pass` passes the input.
+- **The bin-mapped framing** is `nf_ort::OrtSpectralModel` (hop 768, `latency_samples` 1536, offset 768); the native one
+  `nf_ort::NativeSpectral` (offline). The spec's amendments are in `doc/spec/model-pack-v0.md` (still a draft).
+- **The manifest parser** is `nf_ort::pack`, with the conformance runner in `nf_ort::conformance` (torch's framing: center,
+  reflect, the full envelope, trimmed).
+
+## P3: bin-mapped against native (measured 2026-11-02, `nf-ort/tests/ort/parity.rs`)
+`noisy_0174` upsampled ×3 by FFT zero-padding, with 2048 samples of -100 dBFS noise on each side (at 16 kHz, so
+band-limited). Two lessons from the first runs:
+- **The first causal frame isn't band-limited:** half zeros and half signal is a hard edge mid-window, whose energy above
+  8 kHz aliases at 16 kHz. With the signal starting at sample 0, the mapping's error over the file was -83 dB below 4 kHz;
+  padded, it is -138 dB. Live, that frame is the start-up region either way.
+- **Digital silence sets the model apart:** UL-UNAS's features are `log10(max(|X|, 1e-12))`, so exact zeros at 16 kHz against
+  the 48 kHz interpolation's ringing (around 1e-9) differ by decades, and the recurrent state diverged (-25 dB at the output,
+  with the input matching). Padding with -100 dBFS noise removed it. Live input is dithered (±1e-9), so this is a test effect.
+
+The model's input and output frames, error energy over native's per band:
+
+| Band (model bins) | input, as designed | output, as designed | input, bin 256 real (default) | output, bin 256 real (default) | input, folded | output, folded |
+|---|---|---|---|---|---|---|
+| 0-4 kHz (0-127) | -137.8 dB | -38.9 dB | -137.8 | -46.4 | -137.8 | -57.5 |
+| 4-7 kHz (128-223) | -109.4 | -52.2 | -109.4 | -58.4 | -109.4 | -76.6 |
+| 7-7.75 kHz (224-247) | -89.8 | -45.8 | -89.8 | -52.5 | -89.8 | -74.8 |
+| 7.75-8 kHz (248-255) | -27.4 | -34.9 | -27.4 | -34.8 | -89.9 | -78.1 |
+| 8 kHz (256) | -4.4 | +1.3 | -81.0 | -25.1 | -81.0 | -63.1 |
+
+- **As designed** (bins 0-256 ÷ 3) the input matches the design step's figures (-153/-113/-91 dB there, on its own framing;
+  top 8 bins -17.5 dB, bin 256 -4 dB). But the top bins' mismatch reaches the whole output through the model's
+  cross-frequency layers: -39 dB below 4 kHz, and bin 256's output is unrelated.
+- **Why the top bins differ:** decimation's identity gives, for each frame, `X16[k] = (X48[k] + X48[k + 512] + X48[k + 1024]) /
+  3`. For a band-limited input the middle term is near 24 kHz (nothing) and the last is `conj X48[512 - k]`: the window's spread
+  just above 8 kHz, folded back. So at bin 256, `X16[256] = 2·Re(X48[256]) / 3`, not `X48[256] / 3`.
+- **Bin 256 real, the default since the review** (ours): the model only ever saw a real Nyquist bin (the native STFT's, for
+  an even `n_fft`), but the design fed it a complex host bin 256 (`mix[256].im` never 0). It now gets the fold's own term,
+  `2·Re(X48[256]) / 3`, the decimated DFT's bin, and nothing else changes: the input matches there (-81.0 dB) and the
+  model's output follows, -46.4 dB below 4 kHz instead of -38.9. The host's bin 256 out comes from the high-band policy
+  with the bins above it (the model's real Nyquist output can't give the host bin's phase; `Zero` so leaves the output
+  under 8 kHz).
+- **The fold** (`Spectral::set_fold(8)`: bins 248-255 take `(X[k] + conj X[512 - k]) / 3` too) makes the input match at every
+  bin and the output to -57 dB or better. For full-band input it folds the host's 8-8.25 kHz into 7.75-8 kHz, as a 16 kHz
+  signal's own aliasing would. **Off by default** (ours): whether it sounds better is TODO 14's A/B, beside the high-band
+  policy.
+- Pinned (about 4 dB inside the figures): with the default mapping, input bands 0-2 under -130, -105 and -85 dB and bin 256
+  under -75; output bands 0-4 under -42, -54, -48, -30 and -20; folded, input under -75 everywhere and output under -53
+  (0-4 kHz), -70 (4-8 kHz) and -58 (bin 256).
+
 ## Next
-1. The manifest parser and the first pack with #5: an `OrtSpectralModel` or `OrtWaveformModel` adapter of
-   `NoiseModel`, owning the host STFT (the nf-core trait above), the ORT session, preallocated tensors, state
-   pairs and the rate handling (bin mapping 1536/768, ×1/3, the high-band policy).
-2. Before freezing the spec, check the ONNX external-data spec and ORT's custom-op documentation.
-3. #6: a worker hand-off inside `NoiseStage` for ORT's per-run allocations, at 480 more latency.
+1. TODO 14's A/B: the high-band policy and the fold, by ear and the Lab's scores, on the owner's mic.
+2. Before freezing the spec: ORT's custom-op documentation (v0 registers no op library, so a custom domain fails the
+   session). External data is refused by the host's own walk of the model (`nf_ort::onnx_check`, every place onnx.proto
+   holds a tensor), not by construction: ONNX Runtime 1.31 resolves a model-from-memory's relative external-data path
+   against the current folder (the verifier's check, 2026-11-02).
+3. Waveform packs (FastEnhancer wav2wav): the resampler path is `doc/todo/5-candidate-models.md`'s "left for later".

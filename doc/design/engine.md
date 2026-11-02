@@ -30,6 +30,7 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
 - `out_target`: the adaptive output target (below, "The output target").
 - `reference`: the reference's timeline (below, "The reference").
 - `audio`: the audio thread (below).
+- `models`: the noise model by the config's name, and the one chain constructor (below, "The inference worker").
 - `control`: `Inner` (telemetry, status, the command channel, the audio-thread handle),
   `start/stop/apply/status`, and status messages worded for the user. The control thread owns:
   - a device-change listener (`DeviceEventCallbacks`) that restarts on removal, a followed default's
@@ -166,6 +167,59 @@ Never allocate, lock, log or make blocking calls inside the loop:
 **Stop:** set the flag and wait for the run to end (≤ 1 s); the run stops and releases its streams
 in reverse order and the thread goes back to waiting. MMCSS and COM stay with the thread until the
 engine is dropped.
+
+## The inference worker (`models.rs`, `nf_core::noise::Pipelined`; TODO 5, 6)
+`ProcessingConfig.noise_model` names the noise model: `"rnnoise"` (built in, the default) or a model pack's id, which needs a
+build with the `onnx` feature (nf-ort, ONNX Runtime 1.31). `models::build_chain(controls, &processing, with_aec, thread)` is
+the one constructor: the audio thread builds its chain with `ModelThread::Worker` inside its real-time scope (`open_session`),
+and `process`, `quality`'s reruns (through `process --warm-up`) and `bench` with `ModelThread::Inline`. A missing pack fails
+the start with how to fetch it (`python -I tools/fetch_models.py ID`); a pack that fails its checks fails the start too
+(`StartFailure::Stage`); there's no silent fallback to RNNoise. Changing the model, or a pack's depth
+(`ProcessingConfig.model_depth`, `--model-depth`), is a restart (`control::restart_needed`); the high-band policy
+(`ProcessingConfig.high_band`) is live, like the floor and gate.
+
+A pack's model runs on its own thread, `nf-inference`, because ONNX Runtime allocates from the C runtime's heap on every run
+(about 3,700 allocations: `doc/todo/6-inference-memory.md`): CLAUDE.md's one exception to the real-time rule.
+- **Set-up, on the worker:** `models::EngineHooks::enter` (MMCSS "Pro Audio" at `MmcssPriority::Worker`: normal priority,
+  under the audio thread's Critical; refused, it falls back to HIGHEST, under the audio thread's own TIME_CRITICAL
+  fallback, and the start carries a warning, `Warning::InferenceMmcss`); the pack loaded, checked and hashed (the model and
+  the licence only; on the worker, so not on the audio thread or in its pool) and its session built from the verified
+  bytes; `prepare` (32 frames of noise and 32 of silence, then everything zeroed, so the arena, the memory pattern and MLAS's
+  per-thread buffers exist on the thread that runs); then `EngineHooks::steady` (`nf_mem::RtScope`, so whatever its steady
+  state allocates in Rust comes from the locked pool and is counted: nothing, measured) and "ready". `open_session` waits
+  up to 3 s for it (`READY_TIMEOUT`, under the 5 s start timeout; about 120 ms on the dev VM), looking every 100 ms at the
+  run's command, so a stop or a start timeout ends the wait; a slow build fails the start with the model named.
+- **Per block, on the audio thread** (`Pipelined::process_hop`, inside the noise stage), `D` = the depth (2 by default):
+  take the result of the call `D` back (older ones ahead of it count as `late`, a later one at the front means it never
+  came); push this block's job (a full ring is a `gap`, and the next job that gets in resets the model); `Thread::unpark`
+  the worker (no allocation, no blocking: the host profile's one allowed system call); output that result, or the
+  substitute (the clean input delayed by the same offset, 2400 samples for UL-UNAS, × its gain-matched `g`) and count a
+  `miss`. Both rings are rtrb, 32 blocks each way (more than the mic FIFO's 20, so a stall's backlog never gaps), moved by
+  value. Measured: 4.2 µs p50, 5.1 µs p99 a block, no allocation and no C heap call.
+- **The deadline is the call `D` later, not a block's time.** This loop processes every complete block of a wake back to
+  back, so a wake of `k` blocks (a 20 ms device period, VB-CABLE's bursts, a late wake, a stall's backlog) gives the worker
+  microseconds for the jobs pushed earlier in it: with the worker caught up before the wake, it costs `max(0, k - D)`
+  misses. Depth 2 absorbs two-block wakes (common on the cables: TODO 8's detail), at 10 ms more latency than depth 1
+  (UL-UNAS: 60 ms live against 50); measured on the dev VM, wakes of 2 lose 49% of their blocks at depth 1 and none at 2,
+  wakes of 3 lose 66% and 33% (`doc/todo/6-inference-memory.md`, "The pipeline's depth", with the expected rate per device
+  mode). The loop counts each wake's blocks (`Telemetry::wake_blocks`: wakes of 1, 2, 3 and 4+), so a soak says what each
+  depth would miss.
+- **The start-up rule:** after any reset of the model (a stage reset, a gap, a failed run) the first `D` + ⌈1440/480⌉ = 5
+  calls play the substitute (silence after a stage reset: `g` = 0), counting no miss. That is the stage's start-up region,
+  which the chain doesn't play at a toggle-on: a stage whose latency is over a block stays on the slot's delay line (the same
+  latency) for its start-up blocks and then crossfades in (`chain.rs`, `Mode::Starting`), so a switch-on has no silence and
+  no dip. A toggle-on (reset, prime, process in one block) never counts a miss, and the inline executor follows the same
+  rule: offline equals live bit for bit whenever the worker misses no deadline.
+- **Telemetry:** `InferenceStats` (runs, misses, late, gaps, errors, the run time's p50/p99/max over the last 100, the worker's
+  pool allocations and fallbacks, a refused MMCSS) is copied into `Telemetry` once a second (`publish_inference`, before
+  the second is marked published); `run`'s status line shows `model misses N run P µs bursts B` when a worker exists, and
+  a soak's summary has a `wakes` line.
+- **Stopping:** the session drops with the chain: stop flag, unpark, join; the session is dropped on the worker.
+- **Linking:** pyke's static ONNX Runtime always includes DirectML: `DirectML.dll`, `d3d12.dll` and `dxgi.dll` are
+  delay-loaded (build.rs), and nothing registers that provider. Its C++ static initialisers run before `main`, ahead of the
+  CPU gate, and it needs AVX2; hence the feature, off by default. Under it the hard working-set minimum is 128 MiB (64
+  without).
+- **The chain recorder** doesn't log the substitute's blocks yet, so a run with misses doesn't rerun exactly.
 
 ## Exclusive mode (`exclusive.rs`, `stream.rs`; TODO 13)
 Each side on its own, both **on by default** (the owner, 2026-11-02: "by default apply the lowest processing default ...
@@ -605,7 +659,8 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   drain thread holds while it appends: `ChainRecorder::copy_from(n)` copies the blocks from the nth on while it runs (the
   quality echo test's calibration reads its marker so, every 20 ms). Neither thread is the audio thread, which only pushes into
   the ring.
-- **Rerunning it offline:** the engine builds its chain with `nf_stages::build_chain` and warms it up with three dithered
+- **Rerunning it offline:** the engine builds its chain with `models::build_chain` (the noise model of the run's config; a
+  pack's inline offline, as many blocks behind as on its worker) and warms it up with three dithered
   silent blocks (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recorded mic and
   reference are dithered already. So a chain built with the run's processing settings, warmed up and fed the recording block by
   block reproduces its output sample for sample (`the_live_chain_reruns_offline_sample_for_sample`, AEC3 and RNNoise behind
@@ -632,6 +687,11 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   `the_cables_bursts_move_the_output_path_by_its_slips_alone`). The 9-13 ms steps the dev VM's quality takes saw (TODO 9)
   were silence inserted between the filter's output and the test's capture: the cable's, unless the next take's capture gaps
   show the test's recorder filled a position jump (TODO 8's detail, "The output path's 9-13 ms steps").
+- The inference worker (`nf_core::noise::Pipelined`, nf-core's unit tests): the latency formula, inline equal to a waited-for
+  worker bit for bit through resets, a model that sleeps 15 ms every 100th hop on an unwaited worker (misses counted, the output
+  finite and aligned between them, recovery), old-epoch results dropped, a full ring's gap and resync, a failed run's restart,
+  and no allocation on the calling thread (`nf-core/tests/rt_no_alloc.rs`, a stalling worker included). With the pack fetched,
+  nf-ort's tests run it end to end (`crates/nf-ort/tests/ort/`).
 - Exclusive mode the same way: `EventRender` over a `PeriodDevice` (the WASAPI one is `ExclusiveRenderDevice`), the
   period and format choices, the retries and the fall-back as pure functions; `pipeline/tests/exclusive.rs` drives a
   2 ms device on its own clock against steady and bursty mic delivery, a thread stalled mid-run and before its first

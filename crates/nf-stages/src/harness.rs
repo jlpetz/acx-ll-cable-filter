@@ -6,8 +6,11 @@
 //! - [`run_stage`]: direct per-block calls on a stage, with what its extensions published after each block.
 //! - Offsets: [`impulse_offset`] (an impulse's peak, to the sample), [`gcc_offset`] (GCC-PHAT on a broadband signal, to a
 //!   fraction of one) and [`model_offset`] (a [`NoiseModel`] driven hop by hop).
-//! - [`parity`]: an output against a reference output (a model pack's conformance pair later, TODO 3).
+//! - [`parity`]: an output against a reference output (nf-ort's parity checks; a pack's PCM16 conformance pair is
+//!   `nf_ort::conformance::compare_pcm16`).
 //! - [`scenes`]: the test scenes, over [`crate::synth`].
+//! - [`audio`]: the fetched test-audio set (TODO 14) and the quality measures the ignored tests print (the pause cut, below
+//!   and above 8 kHz, and the speech kept), shared by nf-stages' and nf-ort's tests.
 //! - The checks any stage, model or pack must pass, callable outside the tests (TODO 5's pack loader will run them on a
 //!   pack): [`check_latency`] and [`check_model`] (check 1) and [`check_profile`] (check 4's common part). Each returns
 //!   what it measured, or why it failed.
@@ -26,6 +29,8 @@ use nf_core::stage::{Activation, AecStats, ParamFlags, ProcessIo, Stage, StageEr
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 
 use crate::synth::{Voice, white_noise};
+
+pub mod audio;
 
 /// Runs `mic` and `reference` (silence past either's end) through `chain` in blocks, and returns as many samples as `mic`:
 /// the chain's output from sample `skip` on, flushed with silence so the tail comes out too. `skip` = the chain's latency
@@ -334,8 +339,8 @@ pub struct Parity {
     pub first_mismatch: Option<usize>,
 }
 
-/// `out[n + shift]` against `reference[n]`, over as much as both have (`shift`: e.g. UL-UNAS's `center=True` offline
-/// reference is 256 samples ahead at 16 kHz).
+/// `out[n + shift]` against `reference[n]`, over as much as both have (`shift`: an output that lags its reference by that
+/// many samples).
 pub fn parity(out: &[f32], reference: &[f32], shift: usize) -> Parity {
     let out = out.get(shift..).unwrap_or(&[]);
     let n = out.len().min(reference.len());

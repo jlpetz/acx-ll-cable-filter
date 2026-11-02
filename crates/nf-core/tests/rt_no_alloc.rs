@@ -265,3 +265,160 @@ fn the_reblocker_does_not_allocate() {
         assert_eq!(n, 0, "hop {hop}");
     }
 }
+
+/// The host STFT and its inverse, and the high-band policy, at the bin-mapped 48 kHz size (TODO 3).
+#[test]
+fn the_stft_and_the_high_band_policy_do_not_allocate() {
+    use nf_core::config::HighBand;
+    use nf_core::dsp::high_band::{MODEL_BAND, band_gain, fill};
+    use nf_core::dsp::stft::{Complex32, Istft, Stft, hann};
+    let w = hann(1536, true);
+    let (mut stft, mut istft) = (Stft::new(&w, 768), Istft::new(&w, 768));
+    let x: Vec<f32> = (0..768).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let mut y = vec![0.0f32; 768];
+    let mix = vec![0.5f32; 514];
+    let mut hi = vec![Complex32::new(0.0, 0.0); 512];
+    let n = allocations_in(|| {
+        for k in 0..50 {
+            let spec = stft.push(&x);
+            let g = band_gain(&mix, &mix, MODEL_BAND).unwrap_or(0.0);
+            fill(HighBand::ALL[k % 3], g, &spec[257..], &mut hi);
+            let s = istft.spectrum_mut();
+            s.copy_from_slice(stft.spectrum());
+            s[257..].copy_from_slice(&hi);
+            istft.synthesize(&mut y);
+            if k == 25 {
+                stft.reset();
+                istft.reset();
+            }
+        }
+    });
+    assert_eq!(n, 0);
+    std::hint::black_box(&y);
+}
+
+/// The pipelined model's audio side (TODO 6): no allocation on the calling thread, inline or with a worker, at each depth,
+/// through resets, a stalled worker (gaps and misses) and recovery. The worker's own allocations are its thread's, not
+/// counted here.
+#[test]
+fn the_pipelined_models_audio_side_does_not_allocate() {
+    use nf_core::noise::{DEFAULT_DEPTH, Executor, MAX_DEPTH, NoHooks, NoiseModel, Pipelined, RING};
+    for depth in 1..=MAX_DEPTH {
+        for exec in [0, 1, 2] {
+            let make = Box::new(|| Ok(Box::new(DelayModel::new(768, 1536)) as Box<dyn NoiseModel>));
+            let e = match exec {
+                0 => Executor::Inline,
+                w => Executor::Thread { hooks: Arc::new(NoHooks), wait_for_results: w == 2 },
+            };
+            let mut p = Pipelined::spawn(make, e, depth).expect("spawn");
+            p.prepare().expect("prepare");
+            let mut out = [0.0f32; BLOCK];
+            let stats = p.stats();
+            let n = allocations_in(|| {
+                for blk in 0..200 {
+                    let x = tone(blk);
+                    std::hint::black_box(p.process_hop(&x, &mut out));
+                    if blk % 60 == 59 {
+                        p.reset();
+                    }
+                    let _ = stats.snapshot();
+                }
+            });
+            assert_eq!(n, 0, "depth {depth}, executor {exec}: allocations on the audio side");
+        }
+    }
+    // A worker that falls behind for longer than the ring holds: gaps, misses, late results, all without allocating on
+    // this side.
+    let make = Box::new(|| {
+        struct Stall(DelayModel, u32);
+        impl NoiseModel for Stall {
+            fn info(&self) -> &nf_core::noise::ModelInfo {
+                self.0.info()
+            }
+            fn prepare(&mut self) -> Result<(), StageError> {
+                Ok(())
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+            fn process_hop(&mut self, i: &[f32], o: &mut [f32]) -> f32 {
+                self.1 += 1;
+                if self.1 % 40 == 0 {
+                    // Longer than the ring: a block every 2 ms fills its 32 slots in 64 ms.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                self.0.process_hop(i, o)
+            }
+        }
+        Ok(Box::new(Stall(DelayModel::new(480, 960), 0)) as Box<dyn NoiseModel>)
+    });
+    assert_eq!(RING, 32);
+    let exec = Executor::Thread { hooks: Arc::new(NoHooks), wait_for_results: false };
+    let mut p = Pipelined::spawn(make, exec, DEFAULT_DEPTH).expect("spawn");
+    let mut out = [0.0f32; BLOCK];
+    let n = allocations_in(|| {
+        for blk in 0..200 {
+            p.process_hop(&tone(blk), &mut out);
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(2) {
+                std::hint::spin_loop();
+            }
+        }
+    });
+    let s = p.stats().snapshot();
+    assert_eq!(n, 0, "a stalling worker: {s:?}");
+    assert!(s.misses > 0 && s.gaps > 0, "it did fall behind: {s:?}");
+}
+
+/// The worker's own counters (TODO 6): read 0 Rust allocations in its steady state. The baseline is taken after "ready",
+/// whose model info (a pack's owned id and name) is cloned before it, so those two don't count against the jobs.
+#[test]
+fn the_worker_s_steady_state_counts_no_allocation() {
+    use std::any::Any;
+
+    use nf_core::noise::{DEFAULT_DEPTH, Executor, ModelInfo, NoiseModel, Pipelined, WorkerCounters, WorkerGuard, WorkerHooks};
+
+    /// The worker's counters are this binary's per-thread allocation count, read on the worker.
+    struct Counted;
+    impl WorkerHooks for Counted {
+        fn enter(&self) -> WorkerGuard {
+            WorkerGuard::none()
+        }
+        fn steady(&self) -> Box<dyn Any> {
+            Box::new(())
+        }
+        fn counters(&self) -> WorkerCounters {
+            WorkerCounters { pool_allocs: ALLOCATIONS.with(Cell::get) as u64, ..WorkerCounters::default() }
+        }
+    }
+    /// A delay model with owned text, as a pack's info is.
+    struct Owned(DelayModel, ModelInfo);
+    impl NoiseModel for Owned {
+        fn info(&self) -> &ModelInfo {
+            &self.1
+        }
+        fn prepare(&mut self) -> Result<(), StageError> {
+            Ok(())
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn process_hop(&mut self, i: &[f32], o: &mut [f32]) -> f32 {
+            self.0.process_hop(i, o)
+        }
+    }
+    let make = Box::new(|| {
+        let d = DelayModel::new(768, 1536);
+        let info = ModelInfo { id: Text::Owned("a-pack".into()), name: Text::Owned("A pack".into()), ..d.info().clone() };
+        Ok(Box::new(Owned(d, info)) as Box<dyn NoiseModel>)
+    });
+    let exec = Executor::Thread { hooks: Arc::new(Counted), wait_for_results: true };
+    let mut p = Pipelined::spawn(make, exec, DEFAULT_DEPTH).expect("spawn");
+    let mut out = [0.0f32; BLOCK];
+    for blk in 0..300 {
+        p.process_hop(&tone(blk), &mut out);
+    }
+    let s = p.stats().snapshot();
+    assert!(s.jobs >= 298, "{s:?}");
+    assert_eq!((s.worker_pool_allocs, s.worker_fallbacks), (0, 0), "{s:?}");
+}

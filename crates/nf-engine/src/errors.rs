@@ -107,6 +107,9 @@ pub(crate) enum StartFailure {
 pub(crate) enum Warning {
     /// MMCSS registration failed with this Win32 error; the thread runs at a raised normal priority.
     Mmcss(u32),
+    /// The noise model's inference worker (a model pack's, TODO 6) couldn't register with MMCSS (this Win32 error); it runs
+    /// at a raised normal priority under the audio thread's.
+    InferenceMmcss(u32),
     /// The echo reference couldn't be opened; AEC runs on silence.
     ReferenceUnavailable(StartFailure),
     /// The keep-alive stream couldn't be opened; the reference has gaps during silence.
@@ -310,6 +313,9 @@ pub(crate) fn describe_warning(w: &Warning) -> String {
         Warning::Mmcss(code) => format!(
             "The audio thread couldn't join the Windows \"Pro Audio\" scheduling class (error {code}); dropouts are more likely under load."
         ),
+        Warning::InferenceMmcss(code) => format!(
+            "The noise model's inference thread couldn't join the Windows \"Pro Audio\" scheduling class (error {code}); it runs at a raised normal priority, so under load the model is more likely to miss blocks (they play the unfiltered microphone)."
+        ),
         Warning::ReferenceUnavailable(f) => {
             format!("Echo cancellation has no reference signal: {}", describe_start_failure(f))
         }
@@ -510,6 +516,8 @@ mod tests {
         let f = describe_fault(Fault::Stream { role: StreamRole::Mic, hr: hr::AUDCLNT_E_DEVICE_INVALIDATED });
         assert!(f.ends_with("restarts when it's back."), "{f}");
         assert!(describe_warning(&Warning::Mmcss(1552)).contains("Pro Audio"));
+        let w = describe_warning(&Warning::InferenceMmcss(1552));
+        assert!(w.contains("inference thread") && w.contains("error 1552") && w.contains("miss blocks"), "{w}");
         let w = describe_warning(&Warning::ReferenceUnavailable(StartFailure::NotFound(StreamRole::Reference)));
         assert!(w.starts_with("Echo cancellation has no reference signal: No speakers"), "{w}");
         let w = describe_warning(&Warning::MicSharesOutputDevice("VB-Audio Virtual Cable".into()));
@@ -575,9 +583,10 @@ mod tests {
             "another app is using it, and exclusive mode needs it to itself"
         );
         // Every other start-up condition stays a warning.
-        for w in
-            [Warning::Mmcss(1), Warning::KeepAliveUnavailable(0), Warning::OutputIsSpeakers { name: "x".into(), exclusive_withheld: true }]
-        {
+        for w in [Warning::Mmcss(1), Warning::InferenceMmcss(1), Warning::KeepAliveUnavailable(0), Warning::OutputIsSpeakers {
+            name: "x".into(),
+            exclusive_withheld: true,
+        }] {
             assert!(!w.is_note(), "{w:?}");
         }
     }

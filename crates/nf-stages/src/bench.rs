@@ -158,21 +158,44 @@ impl BlockTimes {
 
 /// Times `f(block)` for blocks `WARM_UP..blocks`, each alone, after running the first `WARM_UP`
 /// untimed. `count`, if given, is read after the warm-up and at the end.
-pub fn time_blocks(name: &'static str, blocks: usize, count: Option<AllocCounter>, mut f: impl FnMut(usize)) -> BlockTimes {
+pub fn time_blocks(name: &'static str, blocks: usize, count: Option<AllocCounter>, f: impl FnMut(usize)) -> BlockTimes {
+    time_blocks_counted(name, blocks, count, None, None, f).0
+}
+
+/// [`time_blocks`] with a second counter, `extra` (e.g. a heap probe's count of C runtime calls), read the same way, and
+/// optionally paced: with `period`, block `b` starts no earlier than `b × period` after the first (a wait that isn't timed),
+/// so a consumer on another thread sees that pace (nf-ort's inference worker). Returns the row and `extra`'s growth.
+pub fn time_blocks_counted(
+    name: &'static str, blocks: usize, count: Option<AllocCounter>, extra: Option<AllocCounter>, period: Option<std::time::Duration>,
+    mut f: impl FnMut(usize),
+) -> (BlockTimes, Option<u64>) {
+    let start = Instant::now();
+    let pace = |b: usize| {
+        if let Some(p) = period {
+            let due = p * b as u32;
+            while start.elapsed() < due {
+                std::hint::spin_loop();
+            }
+        }
+    };
     let warm = WARM_UP.min(blocks);
     for b in 0..warm {
+        pace(b);
         f(b);
     }
     let mut us = Vec::with_capacity(blocks - warm);
     let before = count.map(|c| c());
+    let extra_before = extra.map(|c| c());
     for b in warm..blocks {
+        pace(b);
         let t = Instant::now();
         f(b);
         us.push(t.elapsed().as_secs_f64() * 1e6);
     }
     let allocations = count.zip(before).map(|(c, before)| c().wrapping_sub(before));
+    let extra = extra.zip(extra_before).map(|(c, before)| c().wrapping_sub(before));
     us.sort_by(f64::total_cmp);
-    BlockTimes { name, us, allocations }
+    (BlockTimes { name, us, allocations }, extra)
 }
 
 fn controls(cfg: ProcessingConfig) -> Arc<ChainControls> {

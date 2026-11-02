@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use crate::atomic::AtomicF32;
-use crate::config::{GateConfig, GateMode, ProcessingConfig};
+use crate::config::{GateConfig, GateMode, HighBand, ProcessingConfig};
 
 /// Gate settings, readable per block as [`GateParams`]. The fields are the crate's, so the noise stage's params can read
 /// and write them one by one.
@@ -88,6 +88,15 @@ pub struct NoiseControls {
     /// Maximum attenuation in dB (negative); see [`crate::dsp::mix::FloorMix`].
     pub floor_db: AtomicF32,
     pub gate: GateControls,
+    /// [`HighBand::to_u8`]: what a band-limited model puts above its band, read by the model every hop.
+    pub high_band: AtomicU8,
+}
+
+impl NoiseControls {
+    #[inline]
+    pub fn high_band(&self) -> HighBand {
+        HighBand::from_u8(self.high_band.load(Relaxed))
+    }
 }
 
 /// The echo canceller's controls.
@@ -111,7 +120,12 @@ impl ChainControls {
     pub fn new(cfg: &ProcessingConfig) -> Self {
         let c = Self {
             aec: AecControls { enabled: AtomicBool::new(false) },
-            noise: NoiseControls { enabled: AtomicBool::new(false), floor_db: AtomicF32::new(0.0), gate: GateControls::new(&cfg.gate) },
+            noise: NoiseControls {
+                enabled: AtomicBool::new(false),
+                floor_db: AtomicF32::new(0.0),
+                gate: GateControls::new(&cfg.gate),
+                high_band: AtomicU8::new(0),
+            },
             meters_enabled: AtomicBool::new(true),
             passthrough: AtomicBool::new(false),
         };
@@ -128,6 +142,7 @@ impl ChainControls {
             passthrough: self.passthrough.load(Relaxed),
             floor_db: self.noise.floor_db.load(),
             gate: self.noise.gate.load(),
+            high_band: self.noise.high_band(),
         }
     }
 
@@ -137,6 +152,7 @@ impl ChainControls {
         self.noise.enabled.store(cfg.noise_enabled, Relaxed);
         self.noise.floor_db.store(cfg.floor_db.min(0.0));
         self.noise.gate.apply(&cfg.gate);
+        self.noise.high_band.store(cfg.high_band.to_u8(), Relaxed);
         self.meters_enabled.store(cfg.meters_enabled, Relaxed);
     }
 }
@@ -150,6 +166,7 @@ pub struct ChainParams {
     pub passthrough: bool,
     pub floor_db: f32,
     pub gate: GateParams,
+    pub high_band: HighBand,
 }
 
 impl ChainParams {
@@ -157,7 +174,8 @@ impl ChainParams {
     pub fn same(&self, other: &Self) -> bool {
         let f = |a: f32, b: f32| a.to_bits() == b.to_bits();
         let (g, h) = (&self.gate, &other.gate);
-        (self.aec_enabled, self.noise_enabled, self.passthrough) == (other.aec_enabled, other.noise_enabled, other.passthrough)
+        (self.aec_enabled, self.noise_enabled, self.passthrough, self.high_band)
+            == (other.aec_enabled, other.noise_enabled, other.passthrough, other.high_band)
             && f(self.floor_db, other.floor_db)
             && (g.mode, g.use_vad) == (h.mode, h.use_vad)
             && f(g.threshold_db, h.threshold_db)
@@ -189,5 +207,8 @@ mod tests {
         assert!(nan.same(&c.load()) && nan != c.load());
         c.meters_enabled.store(false, Relaxed);
         assert!(nan.same(&c.load()), "the meters don't change the output");
+        c.apply(&ProcessingConfig { high_band: HighBand::Pass, ..ProcessingConfig::default() });
+        assert_eq!((c.noise.high_band(), c.load().high_band), (HighBand::Pass, HighBand::Pass));
+        assert!(!a.same(&c.load()));
     }
 }

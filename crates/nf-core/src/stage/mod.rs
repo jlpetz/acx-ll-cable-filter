@@ -13,7 +13,8 @@
 //!   host calls it on the thread that will process (the engine's audio thread, inside its real-time scope), and may call
 //!   it again; calling it again implies a deactivate. Our stages refuse any format but [`Activation::HOST`].
 //! - **`process`**: CLAP's `process`. Real-time: no allocation, locks, system calls or logging, O(1) per block; always
-//!   [`BLOCK`] frames, mono.
+//!   [`BLOCK`] frames, mono. One system call is allowed: a noise stage whose model runs on an inference worker wakes it
+//!   (`Thread::unpark`, which doesn't block; [`crate::noise::Pipelined`]).
 //! - **`reset`**: CLAP's `reset` (audio thread). No locks or system calls, and no allocation but one known exception (a
 //!   noise model's spent spare state, [`crate::noise::NoiseModel::reset`]); a reset with nothing processed since the last
 //!   one is a no-op. Deviation: CLAP's clears all processing state, but AEC3's flushes the audio it holds and keeps its

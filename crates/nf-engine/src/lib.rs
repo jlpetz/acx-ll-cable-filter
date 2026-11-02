@@ -36,6 +36,7 @@ mod handover;
 mod latency_test;
 #[cfg(all(test, feature = "live-probe"))]
 mod live_probe;
+pub mod models;
 mod out_target;
 mod pipeline;
 mod play_record;

@@ -10,3 +10,10 @@ target/
 *.ogg
 *.opus
 *.m4a
+# No model weights in the repo either (TODO 5): packs/<id>/manifest.json is the record, tools/fetch_models.py fetches the
+# files into %LOCALAPPDATA%\noise-filter\models
+*.onnx
+*.ort
+*.tar
+# Python's bytecode, should a tool be run without -I's dont_write_bytecode
+__pycache__/

@@ -7,8 +7,8 @@ use std::marker::PhantomData;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
     AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_NORMAL, AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
-    AvSetMmThreadPriority, GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_NORMAL,
-    THREAD_PRIORITY_TIME_CRITICAL,
+    AvSetMmThreadPriority, GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_HIGHEST,
+    THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::core::w;
 
@@ -33,21 +33,35 @@ impl Drop for Com {
     }
 }
 
-/// Which priority the thread asks for inside MMCSS.
+/// Which priority the thread asks for inside MMCSS, and the raised normal priority it falls back to without it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MmcssPriority {
-    /// The audio thread: the one thread whose deadline matters most.
+    /// The audio thread: the one thread whose deadline matters most. Falls back to TIME_CRITICAL.
     Critical,
-    /// Helpers (the latency test).
+    /// Helpers (the latency test). Falls back to TIME_CRITICAL.
     Normal,
+    /// A model pack's inference worker (TODO 6): MMCSS's normal priority, as a helper's, but it falls back to HIGHEST,
+    /// below the audio thread's own fallback, so its millisecond runs can't hold the audio thread up on a shared core when
+    /// MMCSS is unavailable.
+    Worker,
+}
+
+impl MmcssPriority {
+    fn fallback(self) -> THREAD_PRIORITY {
+        match self {
+            MmcssPriority::Critical | MmcssPriority::Normal => THREAD_PRIORITY_TIME_CRITICAL,
+            MmcssPriority::Worker => THREAD_PRIORITY_HIGHEST,
+        }
+    }
 }
 
 /// The calling thread's MMCSS "Pro Audio" registration, reverted on drop. When registration fails,
-/// the thread runs at TIME_CRITICAL instead, and the drop puts its previous priority back (RT-2: the
-/// latency test drops the guard before its long analysis, which must not run at priority 15).
+/// the thread runs at its [`MmcssPriority`]'s fallback instead (TIME_CRITICAL, or HIGHEST for the
+/// inference worker), and the drop puts its previous priority back (RT-2: the latency test drops
+/// the guard before its long analysis, which must not run at priority 15).
 pub(crate) struct Mmcss {
     handle: Option<HANDLE>,
-    /// The Win32 error when registration failed (the thread then runs at TIME_CRITICAL).
+    /// The Win32 error when registration failed (the thread then runs at its fallback priority).
     pub(crate) error: Option<u32>,
     /// The fallback's priority to restore on drop.
     restore: Option<THREAD_PRIORITY>,
@@ -65,7 +79,7 @@ impl Mmcss {
             Ok(handle) => {
                 let p: AVRT_PRIORITY = match priority {
                     MmcssPriority::Critical => AVRT_PRIORITY_CRITICAL,
-                    MmcssPriority::Normal => AVRT_PRIORITY_NORMAL,
+                    MmcssPriority::Normal | MmcssPriority::Worker => AVRT_PRIORITY_NORMAL,
                 };
                 // SAFETY: `handle` was just returned for this thread.
                 let _ = unsafe { AvSetMmThreadPriority(handle, p) };
@@ -74,7 +88,7 @@ impl Mmcss {
             Err(e) => {
                 // Keep the code; the control thread words it.
                 let code = e.code().0 as u32 & 0xFFFF;
-                Self { handle: None, error: Some(code), restore: raise_to_time_critical(), _not_send: PhantomData }
+                Self { handle: None, error: Some(code), restore: raise_to(priority.fallback()), _not_send: PhantomData }
             }
         }
     }
@@ -84,9 +98,10 @@ impl Mmcss {
     }
 }
 
-/// The fallback when MMCSS refuses: TIME_CRITICAL. Returns the priority to restore (NORMAL if the
-/// current one can't be read), or `None` when the raise itself failed.
-fn raise_to_time_critical() -> Option<THREAD_PRIORITY> {
+/// The fallback when MMCSS refuses: `to` (TIME_CRITICAL, or HIGHEST for the worker). Returns the
+/// priority to restore (NORMAL if the current one can't be read), or `None` when the raise itself
+/// failed.
+fn raise_to(to: THREAD_PRIORITY) -> Option<THREAD_PRIORITY> {
     // SAFETY: GetCurrentThread returns a pseudo-handle that needs no closing; both calls only act on
     // the calling thread.
     unsafe {
@@ -96,7 +111,7 @@ fn raise_to_time_critical() -> Option<THREAD_PRIORITY> {
             p if p == i32::MAX => THREAD_PRIORITY_NORMAL,
             p => THREAD_PRIORITY(p),
         };
-        SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL).ok().map(|()| prev)
+        SetThreadPriority(thread, to).ok().map(|()| prev)
     }
 }
 
@@ -123,20 +138,28 @@ mod tests {
         unsafe { GetThreadPriority(GetCurrentThread()) }
     }
 
-    /// RT-2: the fallback (no MMCSS) raises the thread to TIME_CRITICAL, and dropping the guard
-    /// puts the previous priority back. Runs on its own short-lived thread.
+    /// RT-2: the fallback (no MMCSS) raises the thread to TIME_CRITICAL (the inference worker's to
+    /// HIGHEST, below it), and dropping the guard puts the previous priority back. Runs on its own
+    /// short-lived thread.
     #[test]
     fn the_fallback_priority_is_restored_on_drop() {
-        std::thread::spawn(|| {
-            let before = priority();
-            let guard = Mmcss { handle: None, error: Some(1552), restore: raise_to_time_critical(), _not_send: PhantomData };
-            assert_eq!(priority(), THREAD_PRIORITY_TIME_CRITICAL.0);
-            assert!(!guard.registered());
-            drop(guard);
-            assert_eq!(priority(), before);
-        })
-        .join()
-        .unwrap();
+        for (p, raised) in [
+            (MmcssPriority::Critical, THREAD_PRIORITY_TIME_CRITICAL),
+            (MmcssPriority::Normal, THREAD_PRIORITY_TIME_CRITICAL),
+            (MmcssPriority::Worker, THREAD_PRIORITY_HIGHEST),
+        ] {
+            std::thread::spawn(move || {
+                let before = priority();
+                let guard = Mmcss { handle: None, error: Some(1552), restore: raise_to(p.fallback()), _not_send: PhantomData };
+                assert_eq!(priority(), raised.0, "{p:?}");
+                assert!(!guard.registered());
+                drop(guard);
+                assert_eq!(priority(), before);
+            })
+            .join()
+            .unwrap();
+        }
+        const { assert!(THREAD_PRIORITY_HIGHEST.0 < THREAD_PRIORITY_TIME_CRITICAL.0, "the worker's fallback is under the audio thread's") };
     }
 
     /// Whichever way registration goes, the guard leaves the thread at its old priority.
@@ -145,6 +168,7 @@ mod tests {
         std::thread::spawn(|| {
             let before = priority();
             drop(Mmcss::enter(MmcssPriority::Normal));
+            drop(Mmcss::enter(MmcssPriority::Worker));
             assert_eq!(priority(), before);
         })
         .join()

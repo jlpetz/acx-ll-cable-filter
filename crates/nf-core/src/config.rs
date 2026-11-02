@@ -32,8 +32,19 @@ pub struct DeviceSelection {
 pub struct ProcessingConfig {
     /// Echo cancellation ("using speakers"). Off by default: headphones need none (TODO #10).
     pub aec_enabled: bool,
-    /// The noise filter (RNNoise in v0).
+    /// The noise filter.
     pub noise_enabled: bool,
+    /// The noise filter's model: `"rnnoise"` (built in, the default) or a model pack's id (TODO 5: `"ulunas"`, for
+    /// evaluation, in a build with the `onnx` feature), which follows the pack id rule ([`is_model_id`]). Changing it
+    /// rebuilds the chain: an engine restart.
+    pub noise_model: String,
+    /// What a band-limited model's output does above its band (a 16 kHz model's 8 kHz): applied live.
+    pub high_band: HighBand,
+    /// How many blocks behind the audio thread a model pack's inference worker runs (1 to [`MAX_MODEL_DEPTH`]; TODO 6,
+    /// `noise::Pipelined`). Each block adds 10 ms of latency; a wake that processes more blocks than this back to back (a
+    /// 20 ms device period, a cable's burst, a late wake) costs a block of the unfiltered mic for each one over. RNNoise
+    /// ignores it. Changing it, with a pack in use, is an engine restart.
+    pub model_depth: u32,
     /// Maximum attenuation the noise stage may apply, in dB (negative). -60 is effectively unlimited.
     pub floor_db: f32,
     pub gate: GateConfig,
@@ -48,10 +59,70 @@ impl Default for ProcessingConfig {
         Self {
             aec_enabled: false,
             noise_enabled: true,
+            noise_model: DEFAULT_NOISE_MODEL.to_owned(),
+            high_band: HighBand::default(),
+            model_depth: DEFAULT_MODEL_DEPTH,
             floor_db: -60.0,
             gate: GateConfig::default(),
             meters_enabled: true,
             latency_readout_enabled: true,
+        }
+    }
+}
+
+/// The built-in default noise model.
+pub const DEFAULT_NOISE_MODEL: &str = "rnnoise";
+/// [`ProcessingConfig::model_depth`]'s default and its limit (`noise::DEFAULT_DEPTH`, `noise::MAX_DEPTH`).
+pub const DEFAULT_MODEL_DEPTH: u32 = crate::noise::DEFAULT_DEPTH;
+pub const MAX_MODEL_DEPTH: u32 = crate::noise::MAX_DEPTH;
+
+/// A model id: a model pack's id rule (`[a-z0-9][a-z0-9-]{0,63}`, `doc/spec/model-pack-v0.md`), which `"rnnoise"` follows too.
+/// A pack's folder is named by it, so it can't hold a path.
+pub fn is_model_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    let ok = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (1..=64).contains(&b.len()) && b.first().is_some_and(ok) && b.iter().all(|c| ok(c) || *c == b'-')
+}
+
+/// What the noise stage puts above a band-limited model's band (`doc/todo/3-model-spec.md`, "Rate handling"; the A/B is
+/// TODO 14's). A full-band model (RNNoise) ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HighBand {
+    /// The model's own gain over its top band (5-7.5 kHz for a 16 kHz model), applied to everything above: full band out.
+    #[default]
+    Model,
+    /// Nothing above the band: the output is band-limited, as a resampler path's would be (without the resampler).
+    Zero,
+    /// The input above the band, untouched (a diagnostic).
+    Pass,
+}
+
+impl HighBand {
+    pub const ALL: [HighBand; 3] = [HighBand::Model, HighBand::Zero, HighBand::Pass];
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            HighBand::Model => 0,
+            HighBand::Zero => 1,
+            HighBand::Pass => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => HighBand::Zero,
+            2 => HighBand::Pass,
+            _ => HighBand::Model,
+        }
+    }
+
+    /// Its name on the command line and in the config: `model`, `zero` or `pass`.
+    pub fn name(self) -> &'static str {
+        match self {
+            HighBand::Model => "model",
+            HighBand::Zero => "zero",
+            HighBand::Pass => "pass",
         }
     }
 }
@@ -179,5 +250,23 @@ mod tests {
         assert!(io.low_latency_periods && io.raw_mic && io.keep_alive_reference);
         assert_eq!(io.output_margin_ms, 2.0);
         assert_eq!(EngineConfig::default().io, io);
+    }
+
+    #[test]
+    fn rnnoise_is_the_default_model_and_ids_follow_the_pack_rule() {
+        let p = ProcessingConfig::default();
+        assert_eq!((p.noise_model.as_str(), p.high_band, p.model_depth), ("rnnoise", HighBand::Model, 2));
+        let old: ProcessingConfig = serde_json::from_str(r#"{"noise_model": "ulunas"}"#).unwrap();
+        assert_eq!(old.model_depth, DEFAULT_MODEL_DEPTH, "an older settings file gets the default depth");
+        for good in ["rnnoise", "ulunas", "a", "fast-enhancer-48k", &"x".repeat(64)] {
+            assert!(is_model_id(good), "{good}");
+        }
+        for bad in ["", "-x", "UL", "a b", "a/b", "..", "a.b", &"x".repeat(65), "\u{fc}"] {
+            assert!(!is_model_id(bad), "{bad}");
+        }
+        for h in HighBand::ALL {
+            assert_eq!(HighBand::from_u8(h.to_u8()), h);
+        }
+        assert_eq!(HighBand::ALL.map(HighBand::name), ["model", "zero", "pass"]);
     }
 }

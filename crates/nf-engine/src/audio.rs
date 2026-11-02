@@ -18,6 +18,7 @@ use nf_core::config::EngineConfig;
 use nf_core::controls::ChainControls;
 use nf_core::dsp::drift::DriftController;
 use nf_core::dsp::slip::SlipResampler;
+use nf_core::noise::InferenceStats;
 use nf_core::rt::Dither;
 use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, SAMPLE_RATE};
@@ -204,6 +205,8 @@ struct Session {
     lb: Option<CaptureStream>,
     ka: Option<KeepAlive>,
     chain: Chain,
+    /// The noise model's inference worker's stats, when a model pack runs on one (TODO 6).
+    inference: Option<Arc<InferenceStats>>,
 }
 
 impl Drop for Session {
@@ -239,7 +242,7 @@ fn run(r: Run<'_>) {
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
     }
-    let (mut session, ids) = match open_session(&config, &controls, &mut warnings) {
+    let (mut session, ids) = match open_session(&config, &controls, &shared, &mut warnings) {
         Ok(s) => s,
         Err(f) => {
             let _ = ready.send(Err(f));
@@ -345,7 +348,9 @@ struct Ids {
 /// opens every stream. The reference and keep-alive are optional: failing them is a warning.
 /// Devices come first: resolving is cheap, so a start that can't run (a retry waiting for a device)
 /// fails before building the stages.
-fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: &mut Vec<Warning>) -> Result<(Session, Ids), StartFailure> {
+fn open_session(
+    config: &EngineConfig, controls: &Arc<ChainControls>, run_shared: &Arc<AudioShared>, warnings: &mut Vec<Warning>,
+) -> Result<(Session, Ids), StartFailure> {
     let aec_wanted = config.processing.aec_enabled;
     let en = DeviceEnumerator::new().map_err(|e| StartFailure::Enumerator(hr_of(&e)))?;
     let out_id = config.devices.output.as_deref().ok_or(StartFailure::NotFound(StreamRole::Output))?;
@@ -381,8 +386,17 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
     }
 
     // Built and activated here, inside the thread's real-time scope, by the one constructor the offline tools use too, so a
-    // chain recording reruns offline exactly (engine.md, "The chain recorder").
-    let chain = nf_stages::build_chain(controls.clone(), aec_wanted).map_err(|e| StartFailure::Stage(e.0))?;
+    // chain recording reruns offline exactly (engine.md, "The chain recorder"). A model pack loads and starts on its
+    // inference worker meanwhile (TODO 6), this thread waiting for it at most 3 s and giving up when the start is stopped (a
+    // start timeout or a stop: the command leaves CMD_RUN); a pack that fails to load fails the start.
+    let stopped = run_shared.clone();
+    let give_up: crate::models::GiveUp = Arc::new(move || stopped.command.load(Relaxed) != CMD_RUN);
+    let thread = crate::models::ModelThread::Worker { give_up: Some(give_up) };
+    let crate::models::BuiltChain { chain, inference } =
+        crate::models::build_chain(controls.clone(), &config.processing, aec_wanted, thread).map_err(|e| StartFailure::Stage(e.0))?;
+    if let Some(code) = inference.as_ref().and_then(|s| s.snapshot().worker_sched_refused) {
+        warnings.push(Warning::InferenceMmcss(code));
+    }
 
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
     // Exclusive mode where asked (the default; engine.md, "Exclusive mode"): a device that refuses it runs shared, with a
@@ -413,7 +427,7 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
         }
     }
     let ids = Ids { mic: mic_dev.get_id().ok(), output: ids_out, reference: ref_id, output_default: out_default };
-    Ok((Session { mic, out, lb, ka, chain }, ids))
+    Ok((Session { mic, out, lb, ka, chain, inference }, ids))
 }
 
 /// The interface friendly name two endpoints share ("VB-Audio Virtual Cable" for both sides of a
@@ -647,12 +661,17 @@ fn audio_loop(
         handover::service(&mut pipe.tap, ends.tap, shared.tap_stop.load(Relaxed), &mut returning);
         handover::service(&mut pipe.recorder, ends.recorder, false, &mut returning_recorder);
 
-        // 3. Every complete block; 4. once a second, the slow statistics.
+        // 3. Every complete block; 4. once a second, the slow statistics. The blocks a wake processed are counted (TODO 6:
+        //    a model pack's worker misses one for each block past its depth that a wake brings back to back).
         let readout = shared.readout.load(Relaxed);
+        let mut blocks = 0usize;
         loop {
             match pipe.process_block(&mut s.chain, &mut s.out, &mut ticks, tel, readout) {
                 Ok(true) => {
+                    blocks += 1;
                     if pipe.second_due() {
+                        // Before publish_second, whose last step marks the second published.
+                        tel.publish_inference(s.inference.as_deref());
                         pipe.publish_second(
                             tel,
                             &s.chain,
@@ -672,6 +691,7 @@ fn audio_loop(
                 Err(hr) => return output_fault(hr),
             }
         }
+        tel.count_wake_blocks(blocks);
     }
 }
 

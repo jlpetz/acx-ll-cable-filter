@@ -3,15 +3,18 @@
 //! `gain-adjustment-metering/0` and the model's VAD its `speech-probability/0` (the owner's TODO 17 decision: the floor and
 //! gate inside the noise stage, an extension publishing speech probability).
 //!
-//! Models plug in through [`NoiseModel`], the internal model trait (not in the public spec): RNNoise now
-//! (`nf_stages::RnnoiseModel`), ONNX adapters later (TODO 5: `OrtSpectralModel`, `OrtWaveformModel`, each owning its STFT,
-//! session, tensors, state pairs and rate handling).
+//! Models plug in through [`NoiseModel`], the internal model trait (not in the public spec): RNNoise
+//! (`nf_stages::RnnoiseModel`), and model packs through ONNX Runtime (TODO 5: `nf_ort::OrtSpectralModel`, which owns its
+//! STFT, session, tensors, state pairs and rate handling). Two adaptors layer around a model: [`Reblocked`] runs a model
+//! of any hop in 480-sample hops, and [`Pipelined`] runs one on an inference worker thread, `depth` blocks behind (TODO 6,
+//! the one exception to the real-time rule: the worker may allocate per run, measured; the audio thread doesn't).
 //!
 //! **Latency.** A model reports `latency_samples` (algorithmic: window + lookahead × hop, at 48 kHz) and its `hop`; its
 //! stream offset is `latency_samples - hop`. A hop other than 480 is re-blocked ([`Reblocker`]), which adds `hop -
-//! gcd(hop, 480)`. So the stage's latency is `L = (latency_samples - hop) + (hop - gcd(hop, 480))`, plus 480 later if
-//! the model runs on a worker (TODO 6): RNNoise 480 + 0 = 480; a hop of 512 (FastEnhancer-48k, offset 512) 992; UL-UNAS
-//! bin-mapped (hop 768, latency 1536) 768 + 672 = 1440. `NoisePost`'s dry delay is `L`, so the floor lines up at any hop.
+//! gcd(hop, 480)`. So the stage's latency is `L = (latency_samples - hop) + (hop - gcd(hop, 480))`, plus `depth` × 480 if
+//! the model runs on a worker (TODO 6, [`Pipelined`]): RNNoise 480 + 0 = 480; a hop of 512 (FastEnhancer-48k, offset 512)
+//! 992; UL-UNAS bin-mapped (hop 768, latency 1536) 768 + 672 = 1440, and 2400 on its worker at the default depth of 2.
+//! `NoisePost`'s dry delay is `L`, so the floor lines up at any hop.
 //!
 //! **Per block:** sanitise the input into `clean` (NaN and ±inf to 0, the rest clamped to ±[`crate::dsp::INPUT_LIMIT`],
 //! so no model sees a sample it could overflow); the model, straight into the output for hop 480 (RNNoise: bit for bit
@@ -38,6 +41,15 @@ use crate::stage::{
     Stage, StageDescriptor, StageError, StageReport, Text, VENDOR, features, text,
 };
 use crate::{BLOCK, Block};
+
+mod pipeline;
+mod reblocked;
+
+pub use pipeline::{
+    DEFAULT_DEPTH, Executor, InferenceSnapshot, InferenceStats, MAX_DEPTH, MakeModel, NoHooks, Pipelined, READY_TIMEOUT, RING,
+    WorkerCounters, WorkerGuard, WorkerHooks,
+};
+pub use reblocked::Reblocked;
 
 /// What a model is, at the 48 kHz host rate. Its text is [`Text`]: literals for a built-in model, owned for a model pack
 /// (its manifest's `id` and `name`).
@@ -84,8 +96,37 @@ pub trait NoiseModel: Send {
     /// Denoises one hop: `input` and `output` are each `hop` samples, at full scale ±1. The input is finite and within
     /// ±[`crate::dsp::INPUT_LIMIT`] (the stage zeros NaN and ±inf and clamps the rest). A hot mic can exceed ±1, so a model
     /// must stay finite up to that limit; the stage clamps the output to ±1. Returns the speech probability for the window
-    /// this output came from, or NaN. Real-time.
+    /// this output came from, or NaN. Real-time, unless the model runs inside [`Pipelined`] on its inference worker, where it
+    /// may allocate per call (TODO 6: measured, and off the audio thread).
     fn process_hop(&mut self, input: &[f32], output: &mut [f32]) -> f32;
+
+    /// What the hops since the last call did beyond their output: the inferences they ran, the time those took, and whether
+    /// one failed (its output is then to be discarded: [`Pipelined`] substitutes for it and resets the model). Read after
+    /// each hop or block, on the thread that ran it. Real-time. A model with nothing to report keeps the default.
+    fn take_report(&mut self) -> HopReport {
+        HopReport::default()
+    }
+}
+
+/// What a model's hops did ([`NoiseModel::take_report`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HopReport {
+    /// Inferences run (a model pack's session runs).
+    pub runs: u32,
+    /// Their total time, in µs.
+    pub run_us: f32,
+    /// One of them failed (an error, or a non-finite output): the output is the model's fallback, not its estimate.
+    pub failed: bool,
+}
+
+impl HopReport {
+    /// Adds `other`'s runs, time and failure to this one.
+    #[inline]
+    pub fn add(&mut self, other: HopReport) {
+        self.runs += other.runs;
+        self.run_us += other.run_us;
+        self.failed |= other.failed;
+    }
 }
 
 /// The noise stage's param ids, stable from now on (state blobs hold them).

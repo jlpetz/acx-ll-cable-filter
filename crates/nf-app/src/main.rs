@@ -87,8 +87,12 @@ static GLOBAL: nf_mem::RtAllocator = nf_mem::RtAllocator::new();
 /// The locked pool: AEC3's construction (about 300 KB) and its per-block allocations, RNNoise, the
 /// audio thread's buffers, with room to spare (app.md).
 const POOL_BYTES: usize = 32 << 20;
-/// Added to the hard working-set minimum, so code, stacks and heaps stay resident.
+/// Added to the hard working-set minimum, so code, stacks and heaps stay resident. With the `onnx` feature, ONNX Runtime's code
+/// and heap (about 20-40 MB) are in it too (TODO 5, 6).
+#[cfg(not(feature = "onnx"))]
 const WORKING_SET_BYTES: usize = 64 << 20;
+#[cfg(feature = "onnx")]
+const WORKING_SET_BYTES: usize = 128 << 20;
 
 fn main() -> ExitCode {
     // Before anything else: everything after this may run x86-64-v3 code

@@ -2,7 +2,8 @@
 //! - [`rnnoise_stage`]: nf-core's noise stage (`NoiseStage`: the floor mix and the gate after the model, as params) around
 //!   [`RnnoiseModel`], RNNoise through nnnoiseless.
 //! - [`Aec3Stage`]: WebRTC AEC3 through sonora, at 48 kHz (`Rate48kHz`), with the reference dithered, on a non-main input.
-//! - [`build_chain`]: the v0 chain, built and activated: what the engine runs and the offline tools rerun.
+//! - [`build_chain`]: the v0 chain, built and activated: what the engine runs and the offline tools rerun;
+//!   [`build_chain_with`] the same around another noise stage (a model pack's, nf-ort, through nf-engine's `models.rs`).
 //! - [`harness`]: TODO 2's offline harness: run a stage or the chain block by block as the engine does, measure stream
 //!   offsets and parity, and the test scenes.
 //! - [`synth`]: deterministic test signals for the harness (`tests/`).
@@ -43,8 +44,15 @@ pub fn warm_up_fft_thread() {
 /// easyfft's per-thread FFT state there, so `Chain::process` then doesn't allocate on that thread
 /// (sonora's own per-block allocations aside, see [`Aec3Stage`]).
 pub fn build_chain(controls: Arc<ChainControls>, with_aec: bool) -> Result<Chain, StageError> {
-    let aec: Option<Box<dyn Stage>> = if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None };
     let noise: Box<dyn Stage> = Box::new(rnnoise_stage(controls.clone())?);
+    build_chain_with(controls, with_aec, noise)
+}
+
+/// [`build_chain`] around `noise` (built on `controls`) in the noise slot: AEC3 first if `with_aec`, then the chain is
+/// activated on the calling thread. nf-engine's `models::build_chain` is the one caller that picks the noise stage by the
+/// config's model.
+pub fn build_chain_with(controls: Arc<ChainControls>, with_aec: bool, noise: Box<dyn Stage>) -> Result<Chain, StageError> {
+    let aec: Option<Box<dyn Stage>> = if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None };
     let mut chain = Chain::new(controls, aec, Some(noise));
     chain.activate()?;
     Ok(chain)

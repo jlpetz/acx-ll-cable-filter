@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use nf_engine::{GateMode, LatencyMode};
+use nf_engine::{GateMode, HighBand, LatencyMode};
 
 use crate::quality::QualityTest;
 use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, EXCLUSIVE_MIC_ECHO_FLOOR_MS, MAX_ECHO_DELAY_MS};
@@ -55,6 +55,12 @@ pub struct Processing {
     pub floor_db: Option<f32>,
     pub gate: Option<GateMode>,
     pub threshold_db: Option<f32>,
+    /// `--model NAME`: the noise model, `rnnoise` or a model pack's id (checked for its syntax here, resolved at the start).
+    pub model: Option<String>,
+    /// `--high-band model|zero|pass`: what a band-limited model puts above its band.
+    pub high_band: Option<HighBand>,
+    /// `--model-depth N`: how many blocks behind the audio thread a model pack's inference worker runs (1-4).
+    pub model_depth: Option<u32>,
 }
 
 /// The streams' options (`IoConfig`'s latency options), shared by `run`, `latency` and `quality`. `None` keeps the config's
@@ -158,6 +164,8 @@ pub struct BenchArgs {
     pub seconds: f32,
     /// Time the whole chain with AEC3 in it.
     pub aec: bool,
+    /// `--model NAME`: time a model pack (a build with `--features onnx`) beside RNNoise.
+    pub model: Option<String>,
 }
 
 /// `run --seconds` at most: a day.
@@ -309,6 +317,17 @@ fn text(flag: &str, v: &str) -> Result<String, UsageError> {
     if v.is_empty() { Err(usage(format!("{flag} needs a value"))) } else { Ok(v.to_owned()) }
 }
 
+/// A noise model's name: `rnnoise` or a model pack's id, by the pack id rule (its syntax only; whether it's installed, and
+/// whether this build runs packs, is the start's to say).
+fn model_name(flag: &str, v: &str) -> Result<String, UsageError> {
+    let v = text(flag, v)?;
+    if nf_engine::is_model_id(&v) {
+        Ok(v)
+    } else {
+        Err(usage(format!("{flag} takes a model's name: rnnoise, or a model pack's id (lower-case letters, digits and '-'), not '{v}'")))
+    }
+}
+
 impl Processing {
     /// Takes one processing option. `Ok(false)`: not one of them.
     fn take<'a>(&mut self, p: &mut Parser<'a>, flag: &str, inline: Option<&'a str>) -> Result<bool, UsageError> {
@@ -332,6 +351,23 @@ impl Processing {
             "--threshold" => {
                 let v = p.value(flag, inline)?;
                 self.threshold_db = Some(number(flag, v, -120.0, 0.0, "a level from 0 to -120 dBFS (e.g. --threshold -45)")?);
+            }
+            "--model" => self.model = Some(model_name(flag, p.value(flag, inline)?)?),
+            "--model-depth" => {
+                let v = p.value(flag, inline)?;
+                let max = nf_engine::MAX_MODEL_DEPTH;
+                let n = v.trim().parse::<u32>().ok().filter(|n| (1..=max).contains(n));
+                self.model_depth =
+                    Some(n.ok_or_else(|| usage(format!("--model-depth takes a whole number of blocks from 1 to {max}, not '{v}'")))?);
+            }
+            "--high-band" => {
+                let v = p.value(flag, inline)?.trim().to_ascii_lowercase();
+                self.high_band = Some(
+                    HighBand::ALL
+                        .into_iter()
+                        .find(|h| h.name() == v)
+                        .ok_or_else(|| usage(format!("--high-band takes model, zero or pass, not '{v}'")))?,
+                );
             }
             _ => return Ok(false),
         }
@@ -603,7 +639,7 @@ fn parse_process(p: &mut Parser<'_>) -> Result<ProcessArgs, UsageError> {
 }
 
 fn parse_bench(p: &mut Parser<'_>) -> Result<BenchArgs, UsageError> {
-    let mut b = BenchArgs { input: None, seconds: DEFAULT_BENCH_SECONDS, aec: false };
+    let mut b = BenchArgs { input: None, seconds: DEFAULT_BENCH_SECONDS, aec: false, model: None };
     while let Some(arg) = p.next() {
         match arg {
             Arg::Flag(flag, inline) => match flag {
@@ -612,6 +648,7 @@ fn parse_bench(p: &mut Parser<'_>) -> Result<BenchArgs, UsageError> {
                     b.seconds = number(flag, v, 2.0, MAX_BENCH_SECONDS, "a length from 2 to 300 s (1 s of it is warm-up)")?;
                 }
                 "--aec" => b.aec = switch(flag, inline)?,
+                "--model" => b.model = Some(model_name(flag, p.value(flag, inline)?)?),
                 _ => return Err(p.unknown(flag)),
             },
             Arg::Positional(a) if b.input.is_none() => b.input = Some(PathBuf::from(a)),
@@ -671,8 +708,9 @@ Usage:
                                  Filter a 48 kHz WAV offline; writes 48 kHz mono float.
                                  --warm-up starts the chain as the engine does, so quality
                                  --save's chain_mic.wav and chain_ref.wav rerun exactly
-  noise-filter bench [IN.wav] [--seconds N] [--aec]
-                                 Time RNNoise, AEC3 and the chain per block (no devices)
+  noise-filter bench [IN.wav] [--seconds N] [--aec] [--model NAME]
+                                 Time RNNoise, AEC3 and the chain per block (no devices);
+                                 --model times a model pack beside RNNoise (an onnx build)
   noise-filter setup-large-pages [--sid SID]
                                  Grant the lock-pages privilege (asks for elevation)
   noise-filter --help | --version
@@ -727,6 +765,16 @@ PROCESSING (run, latency, quality, process):
   --floor DB         The most the noise filter may attenuate, 0 to -120 dB (default -60)
   --gate MODE        off, static or auto (default off)
   --threshold DB     The static gate's threshold in dBFS (implies --gate static)
+  --model NAME       The noise model: rnnoise (the default), or an installed model pack's id,
+                     such as ulunas (for evaluation: a build with --features onnx, and the pack
+                     fetched with python -I tools/fetch_models.py ulunas). UL-UNAS is 16 kHz
+                     and runs on a worker thread: 50 ms of stream latency against RNNoise's 10
+  --high-band MODE   Above a 16 kHz model's band: model (its own top-band gain, the default),
+                     zero (band-limited to 8 kHz) or pass (the input, untouched)
+  --model-depth N    How many 10 ms blocks behind a model pack's worker runs, 1 to 4 (default
+                     2). Each adds 10 ms; a wake that brings more blocks at once than this (a
+                     20 ms device period, a cable's burst) plays the unfiltered mic for each
+                     one over
 
 QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records the output):
   --test noise|echo  Speech in noise (the default), or speech with a far voice's echo
@@ -843,6 +891,9 @@ mod tests {
                         floor_db: Some(-20.0),
                         gate: Some(GateMode::Auto),
                         threshold_db: Some(-45.5),
+                        model: None,
+                        high_band: None,
+                        model_depth: None,
                     },
                     io: IoOptions::default(),
                 },
@@ -1126,18 +1177,63 @@ mod tests {
 
     #[test]
     fn bench_takes_an_optional_file_seconds_and_aec() {
-        assert_eq!(p(&["bench"]), Ok(Command::Bench(BenchArgs { input: None, seconds: DEFAULT_BENCH_SECONDS, aec: false })));
+        assert_eq!(p(&["bench"]), Ok(Command::Bench(BenchArgs { input: None, seconds: DEFAULT_BENCH_SECONDS, aec: false, model: None })));
         assert_eq!(
             p(&["bench", "voice.wav", "--seconds", "10", "--aec"]),
-            Ok(Command::Bench(BenchArgs { input: Some("voice.wav".into()), seconds: 10.0, aec: true }))
+            Ok(Command::Bench(BenchArgs { input: Some("voice.wav".into()), seconds: 10.0, aec: true, model: None }))
         );
+        let Ok(Command::Bench(b)) = p(&["bench", "--model", "ulunas"]) else { panic!() };
+        assert_eq!(b.model.as_deref(), Some("ulunas"));
+        assert!(err(&["bench", "--model", "UL.UNAS"]).starts_with("--model takes a model's name"));
         assert!(err(&["bench", "--seconds", "1"]).starts_with("--seconds takes a length from 2"));
         // An hour needed 8-10 GB for the synthetic signals (app-privilege F7): 300 s is the most
-        assert_eq!(p(&["bench", "--seconds", "300"]), Ok(Command::Bench(BenchArgs { input: None, seconds: 300.0, aec: false })));
+        assert_eq!(
+            p(&["bench", "--seconds", "300"]),
+            Ok(Command::Bench(BenchArgs { input: None, seconds: 300.0, aec: false, model: None }))
+        );
         assert_eq!(err(&["bench", "--seconds", "301"]), "--seconds takes a length from 2 to 300 s (1 s of it is warm-up), not '301'");
         assert!(err(&["bench", "--seconds=3600"]).starts_with("--seconds takes a length from 2 to 300 s"));
         assert!(err(&["bench", "a.wav", "b.wav"]).contains("'b.wav' is a second"));
         assert_eq!(err(&["bench", "--no-ns"]), "'bench' has no option '--no-ns'");
+    }
+
+    /// `--model` and `--high-band` for every command that takes the processing options (TODO 5): the syntax is checked here,
+    /// the model's presence at the start, so they parse in any build.
+    #[test]
+    fn the_noise_model_and_its_high_band_are_processing_options() {
+        let commands: [&[&str]; 4] =
+            [&["run"], &["latency", "--probe", "a", "--capture", "b"], &["quality", "--probe", "a", "--capture", "b"], &[
+                "process", "i.wav", "o.wav",
+            ]];
+        for cmd in commands {
+            let mut a: Vec<&str> = cmd.to_vec();
+            a.extend(["--model", "ulunas", "--high-band", "Zero", "--model-depth", "3"]);
+            let processing = match p(&a) {
+                Ok(Command::Run(r)) => r.engine.processing,
+                Ok(Command::Latency(l)) => l.engine.processing,
+                Ok(Command::Quality(q)) => q.engine.processing,
+                Ok(Command::Process(x)) => x.processing,
+                other => panic!("{cmd:?}: {other:?}"),
+            };
+            assert_eq!((processing.model.as_deref(), processing.high_band), (Some("ulunas"), Some(HighBand::Zero)), "{cmd:?}");
+            assert_eq!(processing.model_depth, Some(3), "{cmd:?}");
+        }
+        let Ok(Command::Run(r)) = p(&["run", "--model=rnnoise"]) else { panic!() };
+        assert_eq!(r.engine.processing.model.as_deref(), Some("rnnoise"));
+        for bad in ["../ulunas", "C:/x", "UL-UNAS", "a b"] {
+            assert!(err(&["run", "--model", bad]).starts_with("--model takes a model's name"), "{bad}");
+        }
+        assert_eq!(err(&["run", "--high-band", "loud"]), "--high-band takes model, zero or pass, not 'loud'");
+        assert_eq!(err(&["run", "--model"]), "--model needs a value");
+        for bad in ["0", "5", "two", "-1", "1.5"] {
+            assert_eq!(
+                err(&["run", "--model-depth", bad]),
+                format!("--model-depth takes a whole number of blocks from 1 to 4, not '{bad}'")
+            );
+        }
+        assert!(
+            help_text().contains("--model NAME") && help_text().contains("--high-band MODE") && help_text().contains("--model-depth N")
+        );
     }
 
     #[test]

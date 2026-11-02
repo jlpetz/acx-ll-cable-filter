@@ -9,6 +9,9 @@
 //! types' `process` and `reset`. Construction, `activate` and state save and load may allocate. One exception, known and
 //! bounded: a model's `reset` once its spare state is spent (RNNoise's second real reset before the next `activate`
 //! rebuilds its state in place, ten allocations, which the engine's real-time pool serves; [`noise::NoiseModel::reset`]).
+//! And CLAUDE.md's one planned exception: a model inside [`noise::Pipelined`] runs on its own inference worker thread, where
+//! per-run allocations are allowed and measured (ONNX Runtime's, TODO 6); the audio thread's side of it allocates nothing
+//! and makes one non-blocking system call a block, the worker's wake-up.
 //!
 //! The stage interface is CLAP-shaped (TODO 17, [`stage`]); the noise stage runs a model behind it ([`noise`]).
 

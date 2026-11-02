@@ -47,6 +47,15 @@ impl Processing {
         if let Some(v) = self.gate {
             p.gate.mode = v;
         }
+        if let Some(v) = &self.model {
+            p.noise_model = v.clone();
+        }
+        if let Some(v) = self.high_band {
+            p.high_band = v;
+        }
+        if let Some(v) = self.model_depth {
+            p.model_depth = v;
+        }
     }
 }
 
@@ -185,12 +194,18 @@ mod tests {
         let mut p = ProcessingConfig::default();
         Processing::default().apply(&mut p);
         assert_eq!(p, ProcessingConfig::default());
-        Processing { aec: Some(true), noise: Some(false), floor_db: Some(-20.0), gate: None, threshold_db: Some(-45.0) }.apply(&mut p);
+        Processing { aec: Some(true), noise: Some(false), floor_db: Some(-20.0), threshold_db: Some(-45.0), ..Default::default() }
+            .apply(&mut p);
         assert!(p.aec_enabled && !p.noise_enabled);
         assert_eq!((p.floor_db, p.gate.mode, p.gate.threshold_db), (-20.0, GateMode::Static, -45.0));
         // An explicit --gate wins over --threshold's implied static gate
         Processing { gate: Some(GateMode::Auto), threshold_db: Some(-40.0), ..Default::default() }.apply(&mut p);
         assert_eq!((p.gate.mode, p.gate.threshold_db), (GateMode::Auto, -40.0));
+        assert_eq!((p.noise_model.as_str(), p.high_band), ("rnnoise", nf_engine::HighBand::Model), "kept unless given");
+        Processing { model: Some("ulunas".into()), high_band: Some(nf_engine::HighBand::Pass), ..Default::default() }.apply(&mut p);
+        assert_eq!((p.noise_model.as_str(), p.high_band, p.model_depth), ("ulunas", nf_engine::HighBand::Pass, 2));
+        Processing { model_depth: Some(1), ..Default::default() }.apply(&mut p);
+        assert_eq!(p.model_depth, 1);
     }
 
     /// The latency options go over the config's: given ones win, the rest keep the file's, or the defaults (all on: the

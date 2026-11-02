@@ -1,0 +1,31 @@
+[package]
+name = "nf-ort"
+description = "noise-filter's ONNX model packs: the manifest, ONNX Runtime sessions and the spectral model adapter (TODO 3, 5, 6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+nf-core.workspace = true
+# The harness, the reference chain and the test signals (shared with the pack's checks).
+nf-stages.workspace = true
+ort.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+log.workspace = true
+realfft.workspace = true
+# SHA-256 through CNG (BCryptHash: no hashing crate), and the heap probe's import-table patch and counters (heap_probe.rs).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }

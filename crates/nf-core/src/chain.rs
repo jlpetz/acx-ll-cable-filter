@@ -11,8 +11,12 @@
 //!   for that one block (1 kHz and up, noise and speech: under 0.5 dB).
 //! - A stage that didn't run last block is reset, then primed with last block's input before its
 //!   output is used, so its first block is processed audio rather than a fade-in from silence
-//!   (review DSP-1). One block covers a latency up to [`BLOCK`] (RNNoise 480, AEC3 430); a longer
-//!   one starts with `latency - BLOCK` samples from its reset state.
+//!   (review DSP-1). One block covers a latency up to [`BLOCK`] (RNNoise 480, AEC3 430). A longer
+//!   one (a model pack on its inference worker: 2400) is still in its start-up region after the
+//!   prime, so the slot stays on its delay line, which has the same latency, for the stage's
+//!   `ceil(latency / BLOCK) - 1` further start-up blocks while the stage runs (the switch-on block
+//!   among them), and then crossfades into it as from passthrough (`Mode::Starting`): no dip and
+//!   no silence at a switch-on.
 //! - Switching on from off raises the latency from 0 to the stage's: a dip splice (the old path out
 //!   over 2.5 ms, then the new in over 2.5 ms). Overlapping the two misaligned copies would comb
 //!   (review DSP-6).
@@ -78,6 +82,9 @@ enum Mode {
     /// Switched off and crossfaded into the delay line, which still delays by the stage latency;
     /// the count is blocks since the switch.
     Draining(u32),
+    /// Switched on and restarted, the stage running but still in its start-up region: the output is the delay line (the
+    /// same latency) for this many more blocks, then a crossfade into the stage.
+    Starting(u32),
 }
 
 /// What the controls ask a slot for.
@@ -160,6 +167,12 @@ impl Slot {
     /// The latency this slot adds now, given whether its stage is enabled.
     fn latency(&self, enabled: bool) -> u32 {
         if enabled || matches!(self.mode, Mode::Draining(_)) { self.latency } else { 0 }
+    }
+
+    /// The blocks, from the one it is switched on in, whose output a restarted stage gives from its start-up region: that
+    /// region is `latency` samples from its reset, and the prime (last block's input) takes the first block of it.
+    fn start_blocks(&self) -> u32 {
+        (self.latency as usize).div_ceil(BLOCK).saturating_sub(1) as u32
     }
 }
 
@@ -356,16 +369,50 @@ fn run_slot(slot: &mut Slot, want: Want, test_starts: bool, input: &Block, refer
             slot.delay.process(input, scratch);
             restart(slot, out);
             slot.stage.process(ProcessIo::new(ins, out));
-            crossfade_into(scratch, out);
-            Mode::On
+            match slot.start_blocks() {
+                0 => {
+                    crossfade_into(scratch, out);
+                    Mode::On
+                }
+                // Still starting up: the delay path, already playing, carries on.
+                n => {
+                    *out = *scratch;
+                    Mode::Starting(n - 1)
+                }
+            }
         }
-        // From no latency to the stage's: dip splice.
+        // From no latency to the stage's: dip splice (into the delay path while the stage starts up).
         (Mode::Off, Want::On) => {
             slot.delay.process(input, scratch);
             restart(slot, out);
             slot.stage.process(ProcessIo::new(ins, out));
+            let n = slot.start_blocks();
+            if n > 0 {
+                *out = *scratch;
+            }
             dip_splice_into(input, out);
-            Mode::On
+            if n == 0 { Mode::On } else { Mode::Starting(n - 1) }
+        }
+        // The stage's start-up, on the delay path (the same latency), then a crossfade into the stage.
+        (Mode::Starting(n), Want::On) => {
+            slot.delay.process(input, scratch);
+            slot.stage.process(ProcessIo::new(ins, out));
+            if n == 0 {
+                crossfade_into(scratch, out);
+                Mode::On
+            } else {
+                *out = *scratch;
+                Mode::Starting(n - 1)
+            }
+        }
+        // Already on the delay path: nothing to fade.
+        (Mode::Starting(_), Want::Passthrough) => {
+            slot.delay.process(input, out);
+            Mode::Passthrough
+        }
+        (Mode::Starting(_), Want::Off) => {
+            slot.delay.process(input, out);
+            Mode::Draining(0)
         }
         (Mode::Off, Want::Passthrough) => {
             slot.delay.process(input, out);
@@ -620,7 +667,8 @@ mod tests {
         let controls = Arc::new(ChainControls::new(cfg));
         let resets = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let stage = Scaled { line: DelayLine::new(1024, lat as usize), lat, gain, resets: resets.clone(), calls: calls.clone() };
+        let stage =
+            Scaled { line: DelayLine::new(MAX_STAGE_LATENCY, lat as usize), lat, gain, resets: resets.clone(), calls: calls.clone() };
         let mut chain = Chain::new(controls.clone(), None, Some(Box::new(stage)));
         chain.activate().unwrap();
         Rig { chain, controls, resets, calls }
@@ -772,11 +820,13 @@ mod tests {
     #[test]
     fn a_stage_switched_on_is_primed_with_the_previous_block() {
         // Review DSP-1: a reset stage's first output was a fade from silence (RNNoise's 480 samples
-        // of latency are a whole block). Primed, its first block is already the delayed signal.
-        for lat in [480u32, 430] {
+        // of latency are a whole block). Primed, its first block is already the delayed signal. A
+        // longer latency (a model pack on its worker: 1920 at depth 1, 2400 at 2) plays the delay
+        // line through the stage's start-up instead, then crossfades: the same delayed signal.
+        for lat in [480u32, 430, 1000, 1920, 2400] {
             let cfg = ProcessingConfig { noise_enabled: false, ..ProcessingConfig::default() };
             let mut r = rig(lat, 1.0, &cfg);
-            let x = sine(8 * BLOCK);
+            let x = sine(16 * BLOCK);
             let mut y = vec![0.0f32; x.len()];
             for (b, (xi, yo)) in x.as_chunks::<BLOCK>().0.iter().zip(y.as_chunks_mut::<BLOCK>().0).enumerate() {
                 r.controls.noise.enabled.store(b >= 4, Relaxed);
@@ -784,7 +834,7 @@ mod tests {
             }
             let l = lat as usize;
             // After the splice's fade-in, the switch block is exactly the input `lat` samples earlier.
-            for n in 4 * BLOCK + 2 * SPLICE_FADE..y.len() {
+            for n in (4 * BLOCK + 2 * SPLICE_FADE).max(l)..y.len() {
                 assert_eq!(y[n], x[n - l], "latency {lat}, sample {n}");
             }
         }
@@ -879,7 +929,9 @@ mod tests {
             (305, true, false, Kind::Crossfade),  // out of passthrough
         ];
         let blocks = 320;
-        for lat in [480u32, 430] {
+        for lat in [480u32, 430, 1920, 2400] {
+            // A switch-on crossfades from the delay line once the stage's start-up has passed: up to this many blocks on.
+            let start = (lat as usize).div_ceil(BLOCK);
             for (name, x) in [("sine", sine(blocks * BLOCK)), ("noise", noise(blocks * BLOCK))] {
                 let cfg = ProcessingConfig { noise_enabled: false, ..ProcessingConfig::default() };
                 let mut r = rig(lat, 1.0, &cfg);
@@ -900,7 +952,7 @@ mod tests {
                     .map(|s| (x[s..s + BLOCK].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / BLOCK as f64).sqrt());
                 let quietest = floor_rms.fold(f64::INFINITY, f64::min) as f32;
                 for &(b, _, _, kind) in schedule {
-                    let around = (b - 1) * BLOCK..(b + 2) * BLOCK;
+                    let around = (b - 1) * BLOCK..(b + start + 1) * BLOCK;
                     let step = max_step(&y, around.clone());
                     let dip = worst_window_db(&y, around.start - BLOCK..around.end, quietest);
                     let what = format!("{name}, latency {lat}, block {b} ({kind:?})");
@@ -928,6 +980,8 @@ mod tests {
                     if schedule.iter().any(|e| e.0 == b || e.0 + 1 == b) {
                         continue;
                     }
+                    // A long stage's start-up blocks and its crossfade are on the delay path or between identical
+                    // paths: exact too, so nothing else is skipped.
                     let l = latency[b - 1];
                     for n in b * BLOCK..(b + 1) * BLOCK {
                         assert_eq!(y[n], x[n - l], "{name}, latency {lat}: sample {n} at offset {l}");
@@ -935,6 +989,42 @@ mod tests {
                 }
                 assert_eq!(latency[229], lat as usize, "{name}: still draining before the timeout");
                 assert_eq!(latency[230], 0, "{name}: drained at the timeout");
+            }
+        }
+    }
+
+    /// A model pack's layout (a 768-hop model re-blocked, two blocks behind on the inline executor: a stage latency of 2400)
+    /// switched off and on again, from draining and from off: the blocks after the switch-on hold the signal (the verifier's
+    /// case was three silent blocks after the crossfade, then the model's output starting hard), and it is the stage's.
+    #[test]
+    fn a_long_model_stage_switches_on_without_silence() {
+        use crate::noise::{DEFAULT_DEPTH, DelayModel, Executor, NoiseModel, NoiseStage, Pipelined};
+        for (off_blocks, from) in [(3usize, "draining"), (200, "off")] {
+            let cfg = ProcessingConfig { floor_db: -100.0, ..ProcessingConfig::default() };
+            let controls = Arc::new(ChainControls::new(&cfg));
+            let make = Box::new(|| Ok(Box::new(DelayModel::new(768, 1536)) as Box<dyn NoiseModel>));
+            let stage =
+                NoiseStage::new(controls.clone(), Box::new(Pipelined::spawn(make, Executor::Inline, DEFAULT_DEPTH).unwrap())).unwrap();
+            let mut chain = Chain::new(controls.clone(), None, Some(Box::new(stage)));
+            chain.activate().unwrap();
+            assert_eq!(chain.latency(), 2400);
+            let x = sine((40 + off_blocks + 40) * BLOCK);
+            let mut y = vec![0.0f32; x.len()];
+            for (b, (xi, yo)) in x.as_chunks::<BLOCK>().0.iter().zip(y.as_chunks_mut::<BLOCK>().0).enumerate() {
+                controls.noise.enabled.store(!(40..40 + off_blocks).contains(&b), Relaxed);
+                chain.process(xi, &[0.0; BLOCK], yo);
+            }
+            let on = 40 + off_blocks;
+            let rms = |v: &[f32]| (v.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / v.len() as f64).sqrt();
+            let delayed = |b: usize| &x[b * BLOCK - 2400..(b + 1) * BLOCK - 2400];
+            // The switch-on block: a crossfade from draining (none), a dip splice from off (its 5 ms V).
+            let ratio = rms(&y[on * BLOCK..(on + 1) * BLOCK]) / rms(delayed(on));
+            let floor = if from == "off" { 0.6 } else { 0.999 };
+            assert!(ratio >= floor, "{from}: the switch-on block at {ratio} of the delayed input's RMS");
+            // Then the delay line through the stage's start-up, the crossfade into the stage and the stage's own output (the
+            // input 2400 samples late): the same signal, exactly.
+            for n in (on + 1) * BLOCK..y.len() {
+                assert_eq!(y[n], x[n - 2400], "{from}: sample {n}");
             }
         }
     }

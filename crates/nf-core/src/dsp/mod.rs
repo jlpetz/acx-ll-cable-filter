@@ -5,11 +5,13 @@ pub mod delay;
 pub mod drift;
 pub mod fade;
 pub mod gate;
+pub mod high_band;
 pub mod meter;
 pub mod mix;
 pub mod noise_post;
 pub mod reblock;
 pub mod slip;
+pub mod stft;
 
 use crate::Block;
 

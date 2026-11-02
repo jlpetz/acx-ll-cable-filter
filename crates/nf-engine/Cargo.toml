@@ -10,11 +10,16 @@ publish.workspace = true
 # The live probe (src/live_probe.rs): an ignored test that opens real audio devices to trace a device's delivery. Only
 # built with this feature, so that no plain `cargo test` can open a device.
 live-probe = []
+# Model packs through ONNX Runtime (nf-ort, TODO 5): `noise_model` may then name a pack. Off by default: pyke's ONNX Runtime
+# links DirectML (delay-loaded, build.rs), runs C++ static initialisers before `main`, needs AVX2 and adds about 20 MB. The
+# owner builds the evaluation variant with `--features onnx` (on nf-app, which passes it here).
+onnx = ["dep:nf-ort"]
 
 [dependencies]
 nf-core.workspace = true
 nf-mem.workspace = true
 nf-stages.workspace = true
+nf-ort = { workspace = true, optional = true }
 wasapi.workspace = true
 rtrb.workspace = true
 log.workspace = true

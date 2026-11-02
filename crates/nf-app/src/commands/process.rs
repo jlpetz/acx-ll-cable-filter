@@ -1,4 +1,5 @@
-//! `process IN.wav OUT.wav`: the same `Chain` and stages as the engine (`nf_stages::build_chain`), offline, run
+//! `process IN.wav OUT.wav`: the same `Chain` and stages as the engine (`nf_engine::models::build_chain`, with `--model`'s
+//! noise model inline: as many blocks behind as on the engine's inference worker), offline, run
 //! block by block by TODO 2's harness (`nf_stages::harness::run_chain`). The input (and the
 //! `--ref` reference) must be 48 kHz; more channels are averaged to mono. The output is 48 kHz mono
 //! float, as long as the input. By default it is the stream the live app would send, so it lags the
@@ -87,8 +88,9 @@ pub fn process_files(args: &ProcessArgs) -> Result<Processed, Failure> {
 
     let start = Instant::now();
     let controls = Arc::new(ChainControls::new(&cfg));
-    let mut chain = nf_stages::build_chain(controls, cfg.aec_enabled)
-        .map_err(|e| Failure::error(format!("Couldn't set up the processing chain: {e}")))?;
+    let mut chain = nf_engine::models::build_chain(controls, &cfg, cfg.aec_enabled, nf_engine::models::ModelThread::Inline)
+        .map_err(|e| Failure::error(format!("Couldn't set up the processing chain: {e}")))?
+        .chain;
     if args.warm_up {
         nf_engine::warm_up_chain(&mut chain);
     }
@@ -145,6 +147,37 @@ mod tests {
         let done = process_files(&args(&dir, Processing { noise: Some(false), ..Default::default() })).unwrap();
         assert_eq!((done.frames, done.latency), (x.len(), 0));
         assert_eq!(read(&dir.join("out.wav")), x);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `--model ulunas` (TODO 5), offline: the model inline, the default two blocks behind as on the engine's worker, so the
+    /// stream lags by 2400 samples (1920 with `--model-depth 1`). Skips without the pack; a build without the `onnx` feature
+    /// refuses it with a message.
+    #[test]
+    fn a_model_pack_runs_offline_at_its_latency() {
+        let dir = crate::test_dir("process-model");
+        let x = noisy_speech();
+        wav::write_mono_f32(&dir.join("in.wav"), &x).unwrap();
+        let a = args(&dir, Processing { model: Some("ulunas".into()), ..Default::default() });
+        if !cfg!(feature = "onnx") {
+            let e = process_files(&a).unwrap_err();
+            assert!(e.message.contains("needs a build with --features onnx"), "{}", e.message);
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        match process_files(&a) {
+            Err(e) if e.message.contains("isn't installed") => eprintln!("skipped: {}", e.message),
+            r => {
+                let done = r.unwrap();
+                assert_eq!((done.frames, done.latency), (x.len(), 2400));
+                let raw = read(&dir.join("out.wav"));
+                assert!(raw.iter().all(|v| v.is_finite()));
+                let (lag, conf) = gcc_phat(&x, &raw, 5000, 0.75).unwrap();
+                assert!((lag - 2400.0).abs() < 0.5, "lag {lag} at {conf} dB");
+                let one = args(&dir, Processing { model: Some("ulunas".into()), model_depth: Some(1), ..Default::default() });
+                assert_eq!(process_files(&one).unwrap().latency, 1920, "--model-depth 1");
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -3,6 +3,12 @@
 //! and the whole chain (with AEC3 under `--aec`). It is `nf_stages::bench`, the code `tests/timing.rs`
 //! runs (TODO 2's check 3), timed inside an `RtScope` as the audio thread runs, so each row also counts
 //! the allocations made after the warm-up (`nf_mem::thread_scope_allocs`). No devices.
+//!
+//! `--model ID` (a build with the `onnx` feature) times a model pack instead, beside RNNoise (`nf_ort::bench`): the ONNX
+//! Runtime run and the model per hop, the stage per block with its model inline, and the audio thread's side per block with
+//! the model on its worker (entered as the engine enters it, MMCSS and the real-time scope), with the heap probe installed
+//! so each row also counts the C runtime's heap calls, and the worker's. Then the worker fed as bursty wakes deliver, at real
+//! time: wakes of 1, 2 and 3 blocks at depth 1 and at the config's default, 2 (`nf_ort::bench::bursts`, 3 s each; TODO 6).
 
 use nf_stages::bench::{self, AllocCounter, BlockTimes, Signals};
 
@@ -11,6 +17,9 @@ use crate::exit::Failure;
 use crate::wav;
 
 pub fn bench(args: &BenchArgs) -> Result<(), Failure> {
+    if let Some(id) = args.model.as_deref().filter(|m| *m != nf_engine::DEFAULT_NOISE_MODEL) {
+        return bench_model(args, id);
+    }
     let source = match &args.input {
         Some(path) => format!("{} as the near end", path.display()),
         None => "a synthetic voice over pink noise".to_owned(),
@@ -49,6 +58,70 @@ pub fn measure(args: &BenchArgs) -> Result<Vec<BlockTimes>, Failure> {
     ])
 }
 
+#[cfg(not(feature = "onnx"))]
+fn bench_model(_args: &BenchArgs, id: &str) -> Result<(), Failure> {
+    Err(Failure::usage(format!("noise model '{id}' needs a build with --features onnx (this one has RNNoise only)")))
+}
+
+#[cfg(feature = "onnx")]
+fn bench_model(args: &BenchArgs, id: &str) -> Result<(), Failure> {
+    use std::sync::Arc;
+    let pack = nf_ort::Pack::installed(id).map_err(|e| Failure::error(e.0))?;
+    let probe = nf_ort::heap_probe::install().map_err(Failure::error)?;
+    let signals = match &args.input {
+        Some(path) => Signals::with_near(&wav::read_mono_48k(path)?.samples, args.seconds),
+        None => Signals::synthetic(args.seconds),
+    };
+    say!(
+        "Timing {} ({}) over {} s, after a 1 s warm-up; {}. Memory: {}. Heap probe: {}.",
+        pack.manifest.name,
+        nf_ort::env::build_info(),
+        args.seconds,
+        "the worker row paced at 4x real time",
+        memory(),
+        if probe.sees_the_crt() { "on" } else { "blind (no C runtime imports to hook)" }
+    );
+    let hooks = Arc::new(nf_ort::bench::ProbeHooks(Arc::new(nf_engine::models::EngineHooks::default())));
+    nf_stages::warm_up_fft_thread();
+    let report = {
+        let _scope = nf_mem::RtScope::enter();
+        nf_ort::bench::measure(&pack, &signals, Some(nf_mem::thread_scope_allocs), hooks).map_err(Failure::error)?
+    };
+    for row in &report.rows {
+        say!("{}", row.line());
+    }
+    let w = report.worker;
+    say!(
+        "worker: {} runs, {} misses, {} late, {} gaps, {} errors; run p50 {:.0} µs, p99 {:.0}, max {:.0}; its Rust allocations {} \
+         (fallbacks {}); its C heap calls {} ({:.1} a run)",
+        w.runs,
+        w.misses,
+        w.late,
+        w.gaps,
+        w.errors,
+        w.run_us_p50,
+        w.run_us_p99,
+        w.run_us_max,
+        w.worker_pool_allocs,
+        w.worker_fallbacks,
+        w.worker_crt_heap_calls.map_or("--".into(), |c| c.to_string()),
+        w.worker_crt_heap_calls.unwrap_or(0) as f64 / w.runs.max(1) as f64,
+    );
+    say!(
+        "allocs: Rust allocations after the warm-up on this thread; C heap calls: the C runtime's (ONNX Runtime's), on this \
+         thread. The audio side of the worker row makes neither: ONNX Runtime's per-run heap calls are the worker's (TODO 6)."
+    );
+    say!("The worker fed as bursty wakes deliver, at real time (a wake of k blocks costs about k - depth misses):");
+    for depth in [1, nf_engine::DEFAULT_MODEL_DEPTH] {
+        for burst in [1, 2, 3] {
+            let worker = Arc::new(nf_engine::models::EngineHooks::default());
+            let row = nf_ort::bench::bursts(&pack, &signals.noisy, worker, depth, burst, 300).map_err(Failure::error)?;
+            say!("  {}", row.line());
+        }
+    }
+    Ok(())
+}
+
 fn memory() -> String {
     nf_mem::pool_status().map_or_else(|| "system heap (no locked pool)".to_owned(), |s| s.describe())
 }
@@ -66,7 +139,7 @@ mod tests {
         let near: Vec<f32> = (0..24_000).map(|i| ((i as f32) * 0.03).sin() * 0.1).collect();
         wav::write_mono_f32(&path, &near).unwrap();
         for (input, aec) in [(None, false), (Some(path.clone()), true)] {
-            let rows = measure(&BenchArgs { input, seconds: 2.0, aec }).unwrap();
+            let rows = measure(&BenchArgs { input, seconds: 2.0, aec, model: None }).unwrap();
             let names: Vec<_> = rows.iter().map(|r| r.name).collect();
             let chain = if aec { "chain: meters + AEC3 + RNNoise" } else { "chain: meters + RNNoise" };
             let noise = ["RNNoise (noisy speech)", "RNNoise model alone", "floor + gate (NoisePost, auto gate)"];
@@ -91,7 +164,9 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_an_error() {
-        let e = measure(&BenchArgs { input: Some("no-such-file.wav".into()), seconds: 2.0, aec: false }).unwrap_err();
+        let e = measure(&BenchArgs { input: Some("no-such-file.wav".into()), seconds: 2.0, aec: false, model: None }).unwrap_err();
         assert_eq!(e.exit, crate::exit::Exit::Error);
+        let e = bench(&BenchArgs { input: None, seconds: 2.0, aec: false, model: Some("no-such-pack".into()) }).unwrap_err();
+        assert!(e.message.contains("no-such-pack"), "{}", e.message);
     }
 }

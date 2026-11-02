@@ -20,12 +20,21 @@ path = "src/main.rs"
 name = "noise-filter-cli"
 path = "src/launcher.rs"
 
+[features]
+# Model packs through ONNX Runtime (TODO 5): `--model ulunas` and the like, for evaluation. Off by default, so the default exe
+# stays as it was: pyke's ONNX Runtime links DirectML (delay-loaded, build.rs), runs C++ static initialisers before `main`
+# (ahead of the CPU gate, which check_cpu_gate_asm.py can't see into), needs AVX2 and adds about 20 MB. The owner builds the
+# evaluation variant with `cargo build --release --features onnx`.
+onnx = ["nf-engine/onnx", "dep:nf-ort"]
+
 [dependencies]
 nf-core.workspace = true
 nf-mem.workspace = true
 nf-stages.workspace = true
 nf-engine.workspace = true
 nf-gui.workspace = true
+# `bench --model`: the pack's rows and the heap probe (the `onnx` feature only).
+nf-ort = { workspace = true, optional = true }
 hound.workspace = true
 log.workspace = true
 # `--config FILE`: the window's settings.json, or a bare EngineConfig.

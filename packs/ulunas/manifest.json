@@ -1,0 +1,110 @@
+{
+  "spec": "noise-filter.model-pack/0",
+  "id": "ulunas",
+  "version": "0.1.0",
+  "name": "UL-UNAS (DNS3 checkpoint, streaming ONNX)",
+  "authors": ["Xiaobin Rong", "Leyan Yang", "Dahan Wang", "Yuxiang Hu", "Changbao Zhu", "Kai Chen", "Jing Lu"],
+  "homepage": "https://github.com/Xiaobin-Rong/ul-unas",
+  "description": "16 kHz spectral denoiser, 512/256 STFT, 32 ms algorithmic, no lookahead. Evaluation only (TODO 5).",
+  "upstream": {"repo": "https://github.com/Xiaobin-Rong/ul-unas", "commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "paper": "https://doi.org/10.1109/TASLPRO.2026.3661271"},
+  "licenses": {
+    "code": "MIT",
+    "weights": "MIT",
+    "data": ["DNS Challenge 3 (ICASSP 2021) training data: mixed licences, unverified (TODO 7)"],
+    "attribution": ["UL-UNAS, Copyright (c) 2026 Xiaobin Rong, MIT", "Streaming ONNX export by Kailai Shen (ul-unas PR #11)"],
+    "patents": ["CN119673187 (China): probably covers UL-UNAS, unconfirmed (TODO 7); shipping waits on the owner (TODO 5)"]
+  },
+  "files": [
+    {
+      "path": "ulunas_stream_simple.onnx",
+      "role": "model",
+      "size": 788967,
+      "sha256": "f2e804d54d6a88f4f82f44d86c9f1cf646db2509bfca935cfbfc5fcd8cbfac3b",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/ulunas_onnx/onnx_models/ulunas_stream_simple.onnx", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "70146cd787c593f6134ed947dc2e9373fd44f37d"}
+    },
+    {
+      "path": "LICENSE",
+      "role": "license",
+      "size": 1069,
+      "sha256": "94daad6ad643a2f79d4a111015c3415fe20c6f630b908e884edf466923724184",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/LICENSE", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "b347147eec832c3eb8ca23d8b80d4e543f6c0dfd"}
+    },
+    {
+      "path": "conformance/noisy_0174.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "7ca4fd68a473a880b53eb6404f274e6bf125b268fc88b1d4348caaec19a91add",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/noisy/0174.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "785906f608d43039ee5c9053ea35034f03b58e9b"}
+    },
+    {
+      "path": "conformance/enhanced_0174.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "e760f287ee55e2b370bbf5277b36e552e00965b64420c2a8734789881732d44a",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/enhanced/0174.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "8c182a61a4b9da1b0b7bfb96310738295eb6f85d"}
+    },
+    {
+      "path": "conformance/clean_0174.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "33d413c96dc8db89b5f9c4a2f63e0fcbdfc5f5069527648b3e664340a3a31107",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/clean/0174.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "d78ce1c0dd126808fa3338de147dbfa94f973330"}
+    },
+    {
+      "path": "conformance/noisy_0119.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "a9b292f6749caf8e819cc79ade8e40f9d2514b295220ce15e59dcc69dfeb8b58",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/noisy/0119.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "f84ee58176b3bfa6f4890ee3c212f20f52a0e36c"}
+    },
+    {
+      "path": "conformance/enhanced_0119.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "442c740e9477fcda9cf617043a47165edab19504fc848a2a66cb7f897c527cca",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/enhanced/0119.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "17bc0d0984f4c184852a5d637edc5be63d55d0b1"}
+    },
+    {
+      "path": "conformance/clean_0119.wav",
+      "role": "conformance",
+      "size": 320044,
+      "sha256": "936a2486349fe1b57afb93c02de09cdce9e1e2bc4f4114b56bdb56928fd94723",
+      "source": {"url": "https://raw.githubusercontent.com/Xiaobin-Rong/ul-unas/00f7c700da43d38347f30a6ccebd86fcbc798e07/audio/clean/0119.wav", "git_commit": "00f7c700da43d38347f30a6ccebd86fcbc798e07", "git_blob": "730879933b2cbd9ec15ba596b47a8ec77f892fce"}
+    }
+  ],
+  "role": {"kind": "denoise", "inputs": ["mic"]},
+  "signal": {"sample_rate": 16000, "channels": 1, "input_scale": 1.0, "band": 8000},
+  "graph": {
+    "kind": "spectral",
+    "model": "ulunas_stream_simple.onnx",
+    "stft": {"n_fft": 512, "hop_length": 256, "window_length": 512, "window_type": "hann", "periodic": true, "normalized": false, "normalization": "wola", "center": true, "pad_mode": "reflect"}
+  },
+  "io": {
+    "input": {"name": "mix", "layout": "B,F,T,RI", "shape": [1, 257, 1, 2], "dtype": "float32"},
+    "output": {
+      "name": "enh",
+      "layout": "B,F,T,RI",
+      "shape": [1, 257, 1, 2],
+      "dtype": "float32",
+      "kind": "masked_spectrum",
+      "mask": "real"
+    }
+  },
+  "state": [
+    {"in": "conv_cache", "out": "conv_cache_out", "shape": [1, 5358], "dtype": "float32", "init": "zeros"},
+    {"in": "tfa_cache", "out": "tfa_cache_out", "shape": [1, 402], "dtype": "float32", "init": "zeros"},
+    {"in": "inter_cache", "out": "inter_cache_out", "shape": [1, 1056], "dtype": "float32", "init": "zeros"}
+  ],
+  "latency": {"lookahead_frames": 0},
+  "runtime": {
+    "min_opset": 11,
+    "fft_ops": false,
+    "providers": ["cpu"],
+    "engines": ["onnxruntime>=1.17"],
+    "known_bad": ["tract: mis-carries the GRU state (tract #2629)"]
+  },
+  "conformance": [
+    {"input": "conformance/noisy_0174.wav", "output": "conformance/enhanced_0174.wav", "reference": "offline", "pcm": "pcm16", "align_samples": 0, "skip_samples": 0, "max_abs": 0.0002, "rms_db": -60.0},
+    {"input": "conformance/noisy_0119.wav", "output": "conformance/enhanced_0119.wav", "reference": "offline", "pcm": "pcm16", "align_samples": 0, "skip_samples": 0, "max_abs": 0.0002, "rms_db": -60.0}
+  ]
+}

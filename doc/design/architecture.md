@@ -7,9 +7,10 @@ included. It is built to take more noise models later without touching the engin
 ## Crates
 | Crate | What | Windows deps |
 |---|---|---|
-| `nf-core` | Constants, the CLAP-shaped stage interface, the chain, the noise stage and its model trait, controls (atomics), config and telemetry types, DSP (meter, gate, floor mix, delay, slip resampler, drift controller, fades), and latency analysis (sweep, deconvolution, arrival detection, rolling stats). Pure Rust, unit-tested. | none |
+| `nf-core` | Constants, the CLAP-shaped stage interface, the chain, the noise stage and its model trait (with `Reblocked` and `Pipelined`, the inference worker), controls (atomics), config and telemetry types, DSP (meter, gate, floor mix, delay, slip resampler, drift controller, fades, the host STFT, the high-band policy), and latency analysis (sweep, deconvolution, arrival detection, rolling stats). Pure Rust, unit-tested. | none |
 | `nf-mem` | The locked memory pool (large pages by default, 4 KB + `VirtualLock` fallback), the lock-pages privilege (enable, elevated grant to a given SID), the working-set minimum, and `RtAllocator`, the global-allocator router. | yes |
 | `nf-stages` | `RnnoiseModel` (nnnoiseless) in nf-core's noise stage (`rnnoise_stage`), `Aec3Stage` (sonora), `build_chain`, and TODO 2's offline harness (`harness`, `synth`, `bench`) with its tests. | none |
+| `nf-ort` | Model packs through ONNX Runtime (TODO 5, evaluation only): the manifest and its checks, the session with preallocated I/O, `OrtSpectralModel` on the bin-mapped 48 kHz STFT, the conformance runner, the heap probe and the pack's bench. The only crate that links ONNX Runtime; nf-engine and nf-app take it with their `onnx` feature, off by default. | yes (CNG, the probe) |
 | `nf-engine` | WASAPI devices and streams, the MMCSS audio thread, drift control, telemetry, the latency readout, the latency test runner, and the control thread. Public API in `api.rs`. | yes |
 | `nf-gui` | The Reactor settings window and settings persistence. | via Reactor |
 | `nf-app` | `noise-filter.exe`: the window by default; CLI subcommands `run`, `devices`, `latency`, `quality`, `process`, `bench`, `setup-large-pages`. Installs `RtAllocator` as `#[global_allocator]`. | yes |
@@ -36,13 +37,16 @@ included. It is built to take more noise models later without touching the engin
 - Stage CPU use is small. On the dev VM at x86-64-v3 (relative numbers only), per block: RNNoise
   about 36 µs, AEC3 about 50 µs and the whole chain about 85 µs (doc/dev/build-report.md §11). At
   x86-64-v2 they were 40, 54 and 97 µs, with sonora's `mul_add` patched to plain arithmetic (AEC3
-  took 91 µs before the patch). The i9-14900K figure for AEC3 in the research is 45 µs. Inference
-  stays on the audio thread. A heavy future model may run on a worker inside the noise stage, at
-  one more block of latency (TODO 6 decides the thread service).
+  took 91 µs before the patch). The i9-14900K figure for AEC3 in the research is 45 µs. RNNoise's
+  inference stays on the audio thread. A model pack (ONNX Runtime, which allocates every run) runs
+  on an inference worker inside the noise stage, `depth` blocks behind (2 by default: two-block
+  wakes are common, and the engine processes a wake's blocks back to back), about 1 ms a run for
+  UL-UNAS (TODO 6; engine.md, "The inference worker").
 - **Toggles** (nf-core `chain.rs` has the details):
   - Turning a stage on resets it and primes it with the last block's input, so its first block is
-    processed audio. Latency 0 to the stage's goes in with a dip splice (5 ms), not a crossfade of
-    two misaligned copies, which would comb.
+    processed audio. A stage whose latency is over a block (a model pack on its worker) plays its
+    delay line through the rest of its start-up and then crossfades in. Latency 0 to the stage's
+    goes in with a dip splice (5 ms), not a crossfade of two misaligned copies, which would comb.
   - Turning a stage off crossfades into a delay line of its latency and stops running it at once,
     so CPU is saved. The latency drops later, with a dip splice, at the first quiet block (or
     after 1.5 s, or when a latency test starts).

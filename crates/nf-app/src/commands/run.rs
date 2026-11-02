@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use nf_engine::{
     BudgetTotals, EngineConfig, EngineState, EngineStatus, LatencyBudget, OutputEvents, REFERENCE_TARGET_HIGH_MS, StreamInfo,
-    TelemetrySnapshot,
+    TelemetrySnapshot, WakeBlocks,
 };
 
 use super::{budget_text, db, fixed, list_devices};
@@ -119,6 +119,9 @@ pub struct Counts {
     pub reference_jumps: u64,
     pub reference_slips: u64,
     pub output: OutputEvents,
+    /// The wakes that processed 1, 2, 3 and 4 or more blocks (TODO 6, 13), and a model pack's worker's misses.
+    pub wakes: WakeBlocks,
+    pub model_misses: u64,
 }
 
 impl Counts {
@@ -130,6 +133,8 @@ impl Counts {
             reference_jumps: t.reference_coarse_drops,
             reference_slips: t.reference_slips,
             output: OutputEvents::of(t),
+            wakes: t.wake_blocks,
+            model_misses: t.inference_misses,
         }
     }
 
@@ -146,6 +151,8 @@ impl Counts {
             reference_jumps: a.reference_jumps.saturating_sub(b.reference_jumps),
             reference_slips: a.reference_slips.saturating_sub(b.reference_slips),
             output: OutputEvents::between(before, after),
+            wakes: a.wakes.since(&b.wakes),
+            model_misses: a.model_misses.saturating_sub(b.model_misses),
         }
     }
 
@@ -155,6 +162,8 @@ impl Counts {
         self.reference_gaps += d.reference_gaps;
         self.reference_jumps += d.reference_jumps;
         self.reference_slips += d.reference_slips;
+        self.wakes.add(&d.wakes);
+        self.model_misses += d.model_misses;
         let (o, e) = (&mut self.output, &d.output);
         o.underruns += e.underruns;
         o.deficits += e.deficits;
@@ -223,6 +232,8 @@ pub struct Summary {
     /// The streams' devices, from the status.
     pub mic: String,
     pub output: String,
+    /// A model pack's inference worker ran (at the end).
+    pub model: bool,
 }
 
 impl Tally {
@@ -327,6 +338,7 @@ impl Tally {
             rt_heap: self.rt_heap,
             mic: device(status.mic.as_ref()),
             output: device(status.output.as_ref()),
+            model: end.inference_active,
         }
     }
 }
@@ -479,6 +491,22 @@ impl Summary {
             "
   {:<15}clipped in {} of {} s; real-time heap allocations {}",
             "input", self.clipped_s, self.seen_s, self.rt_heap
+        );
+        let w = &c.wakes;
+        let model = if self.model { format!("; the model missed {}", c.model_misses) } else { String::new() };
+        let _ = write!(
+            s,
+            "
+  {:<15}{} with 1 block, {} with 2, {} with 3, {} with 4 or more; a model pack's worker would miss about {} blocks at \
+             --model-depth 1, {} at 2, {} at 3{model}",
+            "wakes",
+            w.0[0],
+            w.0[1],
+            w.0[2],
+            w.0[3],
+            w.misses_at(1),
+            w.misses_at(2),
+            w.misses_at(3)
         );
         let p = self.problems();
         let result = if p.is_empty() {
@@ -659,7 +687,9 @@ pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS (the input
      it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not cover); \
      dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse corrections, \
      output/reference (whole blocks dropped to catch up; on the reference, jumps of its timeline); 'excl', then the streams \
-     in WASAPI exclusive mode (out, mic); real-time heap allocations (pool allocations per second). Ctrl+C stops.";
+     in WASAPI exclusive mode (out, mic); with a model pack (--model), its inference worker's misses (blocks it was late \
+     for, which played the delayed input instead), its run time's p99 and the wakes that brought more than one block (each \
+     block past --model-depth in one is a miss); real-time heap allocations (pool allocations per second). Ctrl+C stops.";
 
 /// One line of live telemetry. `retrying`: stopped by a fault, with the engine set to restart by
 /// itself (`EngineStatus::retrying`). `clipped`: the input clipped since the last line (the clip latch, taken: TODO 12).
@@ -710,6 +740,17 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool, clipped: bool) -> Stri
     if t.output_coarse_drops > 0 || t.reference_coarse_drops > 0 {
         rare.push_str(&format!(" coarse {}/{}", t.output_coarse_drops, t.reference_coarse_drops));
     }
+    // A model pack's inference worker (TODO 6): its misses (blocks it was too late for) and its run time.
+    let model = if t.inference_active {
+        format!(
+            "  model misses {} run {} µs bursts {}",
+            t.inference_misses,
+            fixed(f64::from(t.inference_run_us_p99), 0),
+            t.wake_blocks.bursts()
+        )
+    } else {
+        String::new()
+    };
     let mut reference = String::new();
     if t.reference_target_ms > 0.0 {
         reference = format!("  ref {}/{} ms", fixed(f64::from(t.reference_fill_ms), 1), fixed(f64::from(t.reference_target_ms), 1));
@@ -722,7 +763,7 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool, clipped: bool) -> Stri
     }
     format!(
         "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}{target}  cpu {} µs  drift {}/{} ppm{reference}  \
-         drops {}/{}/{}{rare}{modes}  rt {} ({}/s)",
+         drops {}/{}/{}{rare}{modes}{model}  rt {} ({}/s)",
         db(t.input.peak_dbfs),
         db(t.input.rms_dbfs),
         db(t.output.peak_dbfs),
@@ -914,6 +955,17 @@ mod tests {
         assert!(status_line(&t, false, false).contains("drops 1/0/0 coarse 0/4  rt 0"), "{}", status_line(&t, false, false));
         let t = TelemetrySnapshot { stalls: 1, output_coarse_drops: 3, reference_coarse_drops: 5, ..quiet };
         assert!(status_line(&t, false, false).contains("drops 1/0/0 stalls 1 coarse 3/5  rt 0"), "{}", status_line(&t, false, false));
+        // A model pack on its inference worker (TODO 5, 6): its misses and run time, before the allocations.
+        let wakes = nf_engine::WakeBlocks([500, 7, 2, 1]);
+        let t =
+            TelemetrySnapshot { inference_active: true, inference_misses: 3, inference_run_us_p99: 1104.4, wake_blocks: wakes, ..quiet };
+        assert!(
+            status_line(&t, false, false).contains("drops 1/0/0  model misses 3 run 1104 µs bursts 10  rt 0"),
+            "{}",
+            status_line(&t, false, false)
+        );
+        assert!(!status_line(&quiet, false, false).contains("model"), "RNNoise has no worker");
+        assert!(LEGEND.contains("its inference worker's misses") && !LEGEND.contains("  "), "{LEGEND}");
         assert!(LEGEND.contains("stalls") && LEGEND.contains("coarse"));
     }
 

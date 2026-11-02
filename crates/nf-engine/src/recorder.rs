@@ -76,6 +76,7 @@ impl ChainItem {
                     range_db: 0.0,
                     use_vad: false,
                 },
+                high_band: nf_core::config::HighBand::Model,
             },
             budget: None,
             output: OutputFacts {
