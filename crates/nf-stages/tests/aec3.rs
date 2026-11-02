@@ -6,29 +6,13 @@ mod common;
 use common::*;
 use nf_core::config::ProcessingConfig;
 use nf_core::latency::analysis::gcc_phat;
-use nf_core::stage::{ProcessIo, Stage, StageRole};
-use nf_core::{BLOCK, SAMPLE_RATE, db_to_lin};
+use nf_core::stage::{Activation, AecTelemetry, MONO_WITH_REFERENCE, ProcessIo, Stage, StageRole, check_host_profile};
+use nf_core::{BLOCK, SAMPLE_RATE};
+use nf_stages::harness::scenes::echo_room as room;
 use nf_stages::synth::*;
 use nf_stages::{AEC3_LATENCY, Aec3Stage};
 
 const LAT: usize = AEC3_LATENCY as usize;
-/// The echo path's bulk delay: 40 ms.
-const ECHO_DELAY: usize = 1920;
-
-/// A far-end talker, the echo it makes at the mic (synthetic room, 40 ms, ×0.5), and a -70 dBFS
-/// mic noise floor.
-struct Room {
-    far: Speech,
-    echo: Vec<f32>,
-    mic_noise: Vec<f32>,
-}
-
-fn room(len: usize, rt60_s: f32, seed: u64) -> Room {
-    let far = speech_like(len, Voice::LOW, seed);
-    let rir = room_impulse_response(9600, rt60_s, seed + 50);
-    let echo = scaled(&delayed(&convolve(&far.samples, &rir)[..len], ECHO_DELAY), 0.5);
-    Room { far, echo, mic_noise: white_noise(len, db_to_lin(-70.0), seed + 9) }
-}
 
 #[test]
 fn stream_offset_is_aec3_latency() {
@@ -61,7 +45,7 @@ fn echo_is_cancelled_by_15_db_after_3_s() {
         dump(&format!("aec-rt{rt60}-out"), &run.out);
         let span = 3 * SR..len - LAT;
         let erle = db(rms(&mic[span.clone()]) / rms(&y[span]));
-        let s = run.stats.last().copied().expect("stats");
+        let s = run.aec.last().copied().expect("stats");
         eprintln!("RT60 {rt60}: ERLE after 3 s {erle:.1} dB; AEC3 reports ERLE {:.1} dB, delay {} ms", s.erle_db, s.echo_delay_ms);
         assert!(erle >= 15.0, "RT60 {rt60}: ERLE {erle:.1} dB");
         // AEC3's own figures: its linear filter's ERLE (the tail past its 52 ms filter limits it),
@@ -150,7 +134,7 @@ fn reset_keeps_the_converged_echo_path() {
     let mic = add(&r.echo, &r.mic_noise);
     let mut s = aec3();
     run_stage(&mut s, &mic[..6 * SR], Some(&r.far.samples[..6 * SR]));
-    let converged = s.stats();
+    let converged = s.aec_stats();
     s.reset();
     // Right after the reset the echo is still cancelled, and AEC3's own ERLE and delay estimate
     // carry on where they were (a fresh AEC3 starts from 0 dB and takes seconds).
@@ -159,10 +143,10 @@ fn reset_keeps_the_converged_echo_path() {
     let first = 0..SR - LAT;
     let erle = db(rms(&mic[tail.start..tail.start + first.end]) / rms(&run.out[LAT..first.end + LAT]));
     assert!(erle >= 15.0, "ERLE in the first second after reset {erle:.1} dB");
-    let at_1s = run.stats[SR / BLOCK];
+    let at_1s = run.aec[SR / BLOCK];
     assert!(at_1s.erle_db >= converged.erle_db - 3.0, "reported ERLE {:.1} -> {:.1} dB", converged.erle_db, at_1s.erle_db);
     assert_eq!(at_1s.echo_delay_ms, converged.echo_delay_ms);
-    let fresh = run_stage(&mut aec3(), &mic[tail.clone()], Some(&r.far.samples[tail])).stats[SR / BLOCK];
+    let fresh = run_stage(&mut aec3(), &mic[tail.clone()], Some(&r.far.samples[tail])).aec[SR / BLOCK];
     assert!(fresh.erle_db < converged.erle_db - 6.0, "a fresh AEC3 for comparison: {:.1} dB", fresh.erle_db);
 }
 
@@ -187,20 +171,21 @@ fn bad_input_is_sanitised() {
     let mut s = aec3();
     let mut y = [0.0f32; BLOCK];
     for x in white_noise(20 * BLOCK, 0.1, 1).as_chunks::<BLOCK>().0 {
-        s.process(ProcessIo { input: x, reference: None, output: &mut y });
+        s.process(ProcessIo::new(&[x], &mut y));
         assert!(y.iter().all(|v| v.is_finite()));
     }
 }
 
 #[test]
-fn info_and_format() {
+fn descriptor_ports_and_format() {
     let mut s = Aec3Stage::new(controls(ProcessingConfig::default())).expect("build");
-    let info = s.info();
-    assert_eq!((info.id, info.role, info.needs_reference, info.needs_worker), ("aec3", StageRole::EchoCancel, true, false));
-    assert!(s.activate(44_100, BLOCK).is_err());
-    assert!(s.activate(SAMPLE_RATE, 256).is_err());
-    assert!(s.activate(SAMPLE_RATE, BLOCK).is_ok());
-    let fresh = s.stats();
+    assert_eq!(s.descriptor().id, "noise-filter.echo-cancel");
+    assert_eq!(check_host_profile(&s), Ok(StageRole::EchoCancel));
+    assert_eq!(*s.audio_ports(), MONO_WITH_REFERENCE, "the mic, then the speaker reference on a non-main port");
+    assert!(s.activate(&Activation { sample_rate: 44_100, ..Activation::HOST }).is_err());
+    assert!(s.activate(&Activation { sample_rate: SAMPLE_RATE, min_frames: 256, max_frames: 256 }).is_err());
+    assert!(s.activate(&Activation::HOST).is_ok());
+    let fresh = s.aec_stats();
     assert!(fresh.erle_db.is_nan() && fresh.echo_delay_ms.is_nan(), "nothing measured yet: {fresh:?}");
 }
 

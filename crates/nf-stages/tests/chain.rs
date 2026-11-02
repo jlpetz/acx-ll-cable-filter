@@ -36,6 +36,28 @@ fn reported_latency_follows_the_enabled_stages() {
 }
 
 #[test]
+fn huge_finite_mic_samples_come_out_finite() {
+    // The engine only zeros non-finite capture samples, so a garbage float buffer can hold 1e17 or f32::MAX. RNNoise's
+    // ×32768 overflowed those to inf, and the NaN it became aborted inside easyfft; the noise stage now clamps its input
+    // first. With and without AEC3, the noise filter switched off and on again (its reset and priming see them too).
+    for with_aec in [false, true] {
+        let c = controls(both_on());
+        let mut chain = build_chain(c.clone(), with_aec).expect("chain");
+        let mut mic = speech_like(3 * SR, Voice::HIGH, 3).samples;
+        for (k, i) in (BLOCK..mic.len()).step_by(997).enumerate() {
+            mic[i] = [1e17, f32::MAX, -f32::MAX, 3e38][k % 4];
+        }
+        let far = white_noise(mic.len(), 0.05, 2);
+        let mut y = run_chain(&mut chain, &mic[..SR], &far[..SR]);
+        c.noise.enabled.store(false, Relaxed);
+        y.extend(run_chain(&mut chain, &mic[SR..2 * SR], &far[SR..2 * SR]));
+        c.noise.enabled.store(true, Relaxed);
+        y.extend(run_chain(&mut chain, &mic[2 * SR..], &far[2 * SR..]));
+        assert!(y.iter().all(|v| v.is_finite()), "with_aec {with_aec}");
+    }
+}
+
+#[test]
 fn passthrough_delays_an_impulse_by_the_reported_latency() {
     for (with_aec, cfg) in [(true, both_on()), (false, ProcessingConfig::default())] {
         let c = controls(cfg);
@@ -89,8 +111,7 @@ fn both_stages_together_cancel_echo_and_noise() {
     let span = 3 * SR..len - lat;
     let cut = db(rms(&mic[span.clone()]) / rms(&y[span.start + lat..span.end + lat]));
     assert!(cut >= 20.0, "echo plus noise down by only {cut:.1} dB");
-    let (aec, noise_stats) = chain.stage_stats();
-    let aec = aec.expect("AEC stats");
+    let aec = chain.aec_stats().expect("AEC stats");
     assert!(aec.erle_db > 6.0 && (32.0..=44.0).contains(&aec.echo_delay_ms), "{aec:?}");
-    assert!(noise_stats.is_some_and(|s| s.erle_db.is_nan()), "RNNoise has no slow stats");
+    assert_eq!(build_chain(controls(both_on()), false).expect("chain").aec_stats(), None, "no AEC slot, no AEC stats");
 }

@@ -17,6 +17,8 @@ fn per_block_costs() {
     let sig = Signals::synthetic(SECONDS);
     let rows = [
         bench::rnnoise(&sig, None).expect("RNNoise"),
+        bench::rnnoise_model(&sig, None).expect("RNNoise model"),
+        bench::noise_post(&sig, None),
         bench::aec3(&sig, None).expect("AEC3"),
         bench::aec3_silent_reference(&sig, None).expect("AEC3"),
         bench::sonora_undithered(&sig, None),

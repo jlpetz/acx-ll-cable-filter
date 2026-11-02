@@ -3,9 +3,14 @@
 //! The app's internal format is fixed: [`SAMPLE_RATE`] (48 kHz), mono, `f32` in ±1, processed in
 //! [`BLOCK`]-frame (10 ms) blocks. Devices are converted to it at the edge (`nf-engine`).
 //!
-//! Real-time rule (CLAUDE.md): anything called per block from the audio thread
-//! ([`stage::Stage::process`], [`chain::Chain::process`], the `dsp` types' `process`) must not
-//! allocate, lock, log or make a system call. Construction may allocate.
+//! Real-time rule (CLAUDE.md): anything called per block from the audio thread must not allocate, lock, log or make a
+//! system call, and is O(1) per block: [`chain::Chain::process`]; a stage's `process` and `reset`, its extension getters
+//! and values, `param_value` and `set_param` ([`stage`]); a [`noise::NoiseModel`]'s `process_hop` and `reset`; the `dsp`
+//! types' `process` and `reset`. Construction, `activate` and state save and load may allocate. One exception, known and
+//! bounded: a model's `reset` once its spare state is spent (RNNoise's second real reset before the next `activate`
+//! rebuilds its state in place, ten allocations, which the engine's real-time pool serves; [`noise::NoiseModel::reset`]).
+//!
+//! The stage interface is CLAP-shaped (TODO 17, [`stage`]); the noise stage runs a model behind it ([`noise`]).
 
 pub mod atomic;
 pub mod chain;
@@ -13,6 +18,7 @@ pub mod config;
 pub mod controls;
 pub mod dsp;
 pub mod latency;
+pub mod noise;
 pub mod rt;
 pub mod stage;
 pub mod telemetry;

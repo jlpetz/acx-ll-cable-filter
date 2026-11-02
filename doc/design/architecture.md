@@ -7,9 +7,9 @@ included. It is built to take more noise models later without touching the engin
 ## Crates
 | Crate | What | Windows deps |
 |---|---|---|
-| `nf-core` | Constants, the stage interface, the chain, controls (atomics), config and telemetry types, DSP (meter, gate, floor mix, delay, slip resampler, drift controller, fades), and latency analysis (sweep, deconvolution, arrival detection, rolling stats). Pure Rust, unit-tested. | none |
+| `nf-core` | Constants, the CLAP-shaped stage interface, the chain, the noise stage and its model trait, controls (atomics), config and telemetry types, DSP (meter, gate, floor mix, delay, slip resampler, drift controller, fades), and latency analysis (sweep, deconvolution, arrival detection, rolling stats). Pure Rust, unit-tested. | none |
 | `nf-mem` | The locked memory pool (large pages by default, 4 KB + `VirtualLock` fallback), the lock-pages privilege (enable, elevated grant to a given SID), the working-set minimum, and `RtAllocator`, the global-allocator router. | yes |
-| `nf-stages` | `RnnoiseStage` (nnnoiseless, with `NoisePost`: floor mix + gate) and `Aec3Stage` (sonora). Offline harness tests. | none |
+| `nf-stages` | `RnnoiseModel` (nnnoiseless) in nf-core's noise stage (`rnnoise_stage`), `Aec3Stage` (sonora), `build_chain`, and TODO 2's offline harness (`harness`, `synth`, `bench`) with its tests. | none |
 | `nf-engine` | WASAPI devices and streams, the MMCSS audio thread, drift control, telemetry, the latency readout, the latency test runner, and the control thread. Public API in `api.rs`. | yes |
 | `nf-gui` | The Reactor settings window and settings persistence. | via Reactor |
 | `nf-app` | `noise-filter.exe`: the window by default; CLI subcommands `run`, `devices`, `latency`, `quality`, `process`, `bench`, `setup-large-pages`. Installs `RtAllocator` as `#[global_allocator]`. | yes |
@@ -26,7 +26,7 @@ included. It is built to take more noise models later without touching the engin
   2. `Chain::process`:
      - input meter (raw mic);
      - AEC stage (if enabled; mic plus reference);
-     - noise stage (if enabled; RNNoise, then floor mix and gate inside it);
+     - noise stage (if enabled; the model (RNNoise), then floor mix and gate inside it);
      - output meter;
   3. slip the output to the cable's clock and write it to the cable's render buffer;
   4. per-block timing, latency readout and telemetry atomics.
@@ -37,8 +37,8 @@ included. It is built to take more noise models later without touching the engin
   about 36 µs, AEC3 about 50 µs and the whole chain about 85 µs (doc/dev/build-report.md §11). At
   x86-64-v2 they were 40, 54 and 97 µs, with sonora's `mul_add` patched to plain arithmetic (AEC3
   took 91 µs before the patch). The i9-14900K figure for AEC3 in the research is 45 µs. Inference
-  stays on the audio thread; a worker thread is reserved for heavy future models
-  (`StageInfo::needs_worker`).
+  stays on the audio thread. A heavy future model may run on a worker inside the noise stage, at
+  one more block of latency (TODO 6 decides the thread service).
 - **Toggles** (nf-core `chain.rs` has the details):
   - Turning a stage on resets it and primes it with the last block's input, so its first block is
     processed audio. Latency 0 to the stage's goes in with a dip splice (5 ms), not a crossfade of
@@ -49,16 +49,42 @@ included. It is built to take more noise models later without touching the engin
   - Measurement *passthrough* replaces each enabled stage with a delay line of its latency, so the
     measured delay equals the live configuration's delay; the switch is a crossfade.
 
-## Stage interface (CLAP-shaped; whether it is exported as CLAP is TODO #17's open proposal)
-- `info()` gives id, name, role, whether a second input port (the speaker reference) is needed, and
-  whether a worker is needed.
-- `activate(sample_rate, block)` may allocate. `process(io)` is real-time: no allocation, locks,
-  syscalls or logging.
-- `latency()` follows CLAP semantics: the samples by which output lags input in the stream (the
-  stream offset, *not* the algorithmic latency, which is the offset plus one hop). RNNoise is 480.
-  AEC3 is 430 (8.96 ms), measured with an impulse (`nf_stages::AEC3_LATENCY`), so the chain with both
-  is 910 (18.96 ms).
-- Controls are atomics shared through `Arc`, read once per block (as CLAP params would be).
+## Stage interface (CLAP-shaped, TODO 17: the owner, 2026-11-02)
+Every stage, ours included, follows CLAP's model through the Rust trait `nf_core::stage::Stage`, in-process
+with no FFI. `doc/spec/host-profile-v0.md` is the published side; `.clap` export and an fx-host for
+third-party plugins come later.
+- **Descriptor** (`descriptor()`): id, name, vendor, version, description and feature tags. The role comes
+  from a tag: `noise-filter:echo-cancel`, `noise-filter:denoise`, or neither (an effect). The namespace
+  `noise-filter` is provisional (one macro, `nf_core::namespaced!`).
+- **Ports** (`audio_ports()`): a main mono input and output at index 0. The echo canceller takes the
+  speaker reference on a non-main input (CLAP's sidechain); the chain gives the reference to any stage
+  with a second input, the same block in every slot (not delayed by upstream slots, so the engine's lead is
+  the AEC slot's alone). Descriptor, port and param text is `Cow<'static, str>`: literals for our stages,
+  owned for what is only known at run time (a model pack, later a third-party plugin).
+- **`activate(&Activation)`**: always `Activation::HOST` (48 kHz, 480-frame blocks). It may allocate, and
+  runs on the audio thread inside its real-time scope (a deviation from CLAP's main thread, for easyfft).
+  `Chain::activate` first checks each stage against the host profile and its slot (`check_host_profile`).
+- **`process(ProcessIo { inputs, output })`** and **`reset()`** are real-time: no allocation, locks,
+  syscalls or logging. A reset with nothing processed since the last one is a no-op. One known exception:
+  RNNoise's second real reset before the next activate rebuilds its state in place (ten allocations from the
+  engine's real-time pool).
+- **`latency()`** follows CLAP semantics: the samples by which output lags input in the stream (the
+  stream offset, *not* the algorithmic latency, which is the offset plus one hop). The chain caches it at
+  activate. RNNoise is 480. AEC3 is 430 (8.96 ms), measured with an impulse (`nf_stages::AEC3_LATENCY`),
+  so the chain with both is 910 (18.96 ms).
+- **Params** (`params()`, `param_value`, `set_param`): the noise stage's floor and gate, ids 1-9, over the
+  same atomics `ChainControls` holds (`ChainControls::apply` still writes them whole, from any thread).
+  `set_param` takes `&mut self`: whoever holds the stage calls it, on the processing thread between blocks
+  while it is active (CLAP's in-events); no other thread reaches a stage. **State** (`save_state`,
+  `load_state`): the params in a small binary blob. Bypass (on, off, passthrough) is the host's, not a param.
+- **Extensions** are typed getters returning `Option<&dyn Ext>`: `gain_adjustment()`
+  (`clap.gain-adjustment-metering/0`), `speech_probability()` and `aec_telemetry()` (ours). The chain's
+  per-block `ChainReport::noise` and `Chain::aec_stats` read them.
+- **The noise stage** (`nf_core::noise::NoiseStage`) is one stage for every noise model: it sanitises the
+  input (NaN and ±inf to 0, the rest clamped to ±1e4 so no model overflows), runs a `NoiseModel`
+  (RNNoise now, ONNX adapters in TODO 5), clamps, then the floor mix and the gate (`NoisePost`). A model
+  with a hop other than 480 is re-blocked, at `hop - gcd(hop, 480)` more latency
+  (`doc/spec/model-pack-v0.md`).
 
 ## Clocks
 - **The mic is the master clock.** The reference (loopback) and output (cable) each have their own

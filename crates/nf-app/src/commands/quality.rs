@@ -1425,9 +1425,9 @@ mod tests {
 
         use nf_core::controls::ChainControls;
         use nf_engine::ProcessingConfig;
+        use nf_stages::harness::run_chain;
         use nf_stages::synth::{Voice, delayed, speech_like};
 
-        use super::super::process::run_chain;
         use crate::quality::analysis::{MAX_PATH_DELAY_S, MIN_CORRELATION, analyse};
 
         const FS: usize = 48_000;

@@ -1,8 +1,8 @@
 """Tests for tools/hot_loop_spills.py: which functions it selects (only audio-thread code), and
 which asm it reads by default. Run from any directory:
     python tools/test_hot_loop_spills.py
-The symbols are real v0 ones, copied from the bin's asm of 2026-10-26, except the two generics
-instantiated with a closure, which are built by hand.
+The symbols are real v0 ones, copied from the bin's asm of 2026-10-26 (the stage interface's of
+2026-11-02), except the two generics instantiated with a closure, which are built by hand.
 """
 import io
 import os
@@ -20,8 +20,9 @@ import hot_loop_spills as h  # noqa: E402
 
 # On the audio thread
 METER = "_RNvMs_NtNtCs8pgegnlmNbx_7nf_core3dsp5meterNtB4_5Meter7measure"
-RNNOISE_PROCESS = ("_RNvXs_NtCsajscNIkuRER_9nf_stages7rnnoiseNtB4_12RnnoiseStage"
-                   "NtNtCs8pgegnlmNbx_7nf_core5stage5Stage7process")
+NOISE_STAGE_PROCESS = "_RNvXs0_NtCshJVJJNpKG7l_7nf_core5noiseNtB5_10NoiseStageNtNtB7_5stage5Stage7process"
+RNNOISE_PROCESS_HOP = ("_RNvXs0_NtCskiPHVW4EiF1_9nf_stages7rnnoiseNtB5_12RnnoiseModel"
+                       "NtNtCshJVJJNpKG7l_7nf_core5noise10NoiseModel11process_hop")
 DITHER = "_RNvMNtCs8pgegnlmNbx_7nf_core2rtNtB2_6Dither5apply"
 AUDIO_THREAD = ("_RINvNtNtCs4OTV8YV3LlN_3std3sys9backtrace28___rust_begin_short_backtrace"
                 "NCNvNtCsnYpoMpMsaZ_9nf_engine5audio5spawn0uEB1d_")
@@ -41,18 +42,25 @@ LISTENER_SHIM = ("_RNSNvYNCNvNtCsnYpoMpMsaZ_9nf_engine7control17register_listene
 GUI_SAVER_THREAD = ("_RINvNtNtCs4OTV8YV3LlN_3std3sys9backtrace28___rust_begin_short_backtrace"
                     "NCNvMs4_NtCs5cpTG4XF0eX_6nf_gui8settingsNtB1f_5Saver5spawn0uEB1h_")
 RUN_SLOT_GUI = "_RINvNtCs8pgegnlmNbx_7nf_core5chain8run_slotNCNvNtCs5cpTG4XF0eX_6nf_gui4live4tick0E"
-RNNOISE_ACTIVATE = ("_RNvXs_NtCsajscNIkuRER_9nf_stages7rnnoiseNtB4_12RnnoiseStage"
-                    "NtNtCs8pgegnlmNbx_7nf_core5stage5Stage8activate")
+RNNOISE_PREPARE = ("_RNvXs0_NtCskiPHVW4EiF1_9nf_stages7rnnoiseNtB5_12RnnoiseModel"
+                   "NtNtCshJVJJNpKG7l_7nf_core5noise10NoiseModel7prepare")
+HARNESS_RUN_CHAIN = "_RNvNtCskiPHVW4EiF1_9nf_stages7harness9run_chain"
+BUILD_CHAIN = "_RNvCskiPHVW4EiF1_9nf_stages11build_chain"
+PROFILE_CHECK_CLOSURE = "_RNCNvNtCshJVJJNpKG7l_7nf_core5stage18check_host_profile0B5_"
+PROFILE_CHECK_FIND = ("_RINvXs2J_NtNtCsc2SWBamaTzL_4core5slice4iterINtB7_4IterNtNtNtCshJVJJNpKG7l_7nf_core5stage5ports"
+                      "13AudioPortInfoENtNtNtNtBb_4iter6traits8iterator8Iterator4findNCNvBU_18check_host_profiles0_0EBW_")
 
 
 class Selection(unittest.TestCase):
     def test_audio_thread_code_is_selected(self):
-        for sym in (METER, RNNOISE_PROCESS, DITHER, AUDIO_THREAD, RUN_SLOT_AUDIO):
+        for sym in (METER, NOISE_STAGE_PROCESS, RNNOISE_PROCESS_HOP, DITHER, AUDIO_THREAD, RUN_SLOT_AUDIO):
             self.assertTrue(h.is_hot(sym, h.HOT), h.describe(sym).name)
+        self.assertEqual(h.describe(NOISE_STAGE_PROCESS).name, "<nf_core::noise::NoiseStage as nf_core::stage::Stage>::process")
 
     def test_off_thread_modules_are_left_out(self):
         for sym in (SPEECH_LIKE, WITH_ECHO, START_LOCKED, LOWER_FIRST, BUILD_REPORT, LATENCY_THREAD,
-                    CONTROL_THREAD, LISTENER_SHIM, GUI_SAVER_THREAD, RNNOISE_ACTIVATE):
+                    CONTROL_THREAD, LISTENER_SHIM, GUI_SAVER_THREAD, RNNOISE_PREPARE, HARNESS_RUN_CHAIN, BUILD_CHAIN,
+                    PROFILE_CHECK_CLOSURE, PROFILE_CHECK_FIND):
             self.assertFalse(h.is_hot(sym, h.HOT), h.describe(sym).name)
 
     def test_a_hot_generic_instantiated_with_a_cold_closure_is_cold(self):

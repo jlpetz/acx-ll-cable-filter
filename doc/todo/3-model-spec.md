@@ -1,7 +1,8 @@
 # 3. Model interface and the published model-pack spec
 
 Status: design, fact-checked 2026-10-26 (plugin formats, ONNX metadata conventions, 16 vs 48 kHz).
-Publishing the spec is the owner's tentative wish (#1).
+Publishing the spec is the owner's tentative wish (#1). Built 2026-11-02: the noise stage's internal model
+trait, its re-blocker, and spec v0 as a draft, `doc/spec/model-pack-v0.md` (see "Built" below).
 
 ## Why our own spec for models
 - No standard describes streaming speech-enhancement models.
@@ -16,8 +17,8 @@ Publishing the spec is the owner's tentative wish (#1).
 - Post-processing effects (a voice changer) are CLAP stages (#17), not model packs.
 
 ## Two layers
-Effects are CLAP plugins (owner, 2026-10-26). Making the AEC and noise filter CLAP-shaped stages too
-is our proposal, awaiting the owner (#17). This file covers the models *inside* the noise stage.
+Effects are CLAP plugins (owner, 2026-10-26), and the AEC and the noise filter are CLAP-shaped stages too
+(owner, 2026-11-02, #17). This file covers the models *inside* the noise stage.
 1. **Built-in models (Rust):** models that need custom DSP — RNNoise/`nnnoiseless`, DeepFilterNet3
    (three graphs plus ERB features and deep filtering in host code) — and later the hand-written
    ports (#6).
@@ -124,3 +125,53 @@ Rules:
 - **Tiers:** native 48 kHz models (RNNoise now; FastEnhancer-48k or DFN3 if the weights clear, #7)
   for quality, 16 kHz plus the high-band policy otherwise. CPU doesn't separate the tiers (both cost
   a few % of a core); latency and licences do.
+
+## Built (2026-11-02)
+These are our decisions, within the owner's #17 decision (the floor and gate inside the noise stage).
+- **The noise stage** (`nf_core::noise::NoiseStage`, the CLAP-shaped `noise-filter.denoise`) runs any model
+  through the internal trait `NoiseModel`:
+  - `info() -> &ModelInfo { id, name, hop, latency_samples, has_vad }`, at 48 kHz; `latency_samples` is
+    algorithmic (window + lookahead × hop), so the stream offset is `latency_samples - hop`. `id` and `name` are
+    `Cow<'static, str>`, so a pack's manifest can fill them at run time;
+  - `prepare()`: on the processing thread, at activate; it may allocate;
+  - `reset()` and `process_hop(input, output) -> VAD or NaN`: real-time. The input is finite and within ±1e4
+    (`nf_core::dsp::INPUT_LIMIT`, +80 dBFS): it can exceed ±1 (a hot mic), so a model must stay finite up to that
+    bound. `reset` doesn't allocate, with one known exception: a model whose spare state is spent may rebuild in
+    place (RNNoise's second real reset before the next `prepare`, ten allocations from the engine's pool).
+- **What the stage does around the model:**
+  - it sanitises the input: NaN and ±inf to 0, the rest clamped to ±1e4 (a finite sample of about 1e17 overflowed
+    RNNoise's ×32768 to inf and aborted inside easyfft, a hazard as old as v0);
+  - it zeros non-finite output and clamps to ±1;
+  - it runs the floor mix and the gate (`NoisePost`, its dry path delayed by the stage's whole latency);
+  - it owns the params and the extensions;
+  - it resets the model only when something was processed since the last reset.
+- **RNNoise** is `nf_stages::RnnoiseModel`: hop 480, `latency_samples` 960, a VAD; ×32768 in, ÷32768 out; its spare
+  state and easyfft warm-up are in `prepare`. `nf_stages::rnnoise_stage` is the v0 noise stage. Its output is bit
+  for bit what the old `RnnoiseStage` gave (the refactor guard, #2).
+- **The re-blocker** (`nf_core::dsp::reblock`) lets a model keep its own hop:
+  - the output is primed with `hop - gcd(hop, 480)` zeros, the least that never runs dry, so that is the added
+    delay; nothing for hops that divide 480 or are multiples of it;
+  - fixed buffers, at most ⌈480/hop⌉ hops a block, no allocation;
+  - so `L = (latency_samples - hop) + (hop - gcd(hop, 480))`: RNNoise 480; FastEnhancer-48k (hop 512) 992;
+    UL-UNAS bin-mapped (hop 768, latency 1536) 1440. That is 10 ms extra at hop 512 and 14 ms at 768: input
+    for #5 and #7's 10 ms-hop retrain;
+  - the VAD is the last hop's, carried over a block with no hop. Its alignment for a hop other than 480 is
+    approximate; no real model exercises it until #5;
+  - a model needing more than `MAX_STAGE_LATENCY` (4096) is refused.
+- **Checked** (#2): the latency formula at hops 160 to 1024 with and without lookahead, to the sample, through
+  the chain; no allocation at any hop; the RNNoise model's offset hop by hop is 480 (`harness::check_model`, which
+  TODO 5's loader can run on a pack).
+- **Spec v0** is `doc/spec/model-pack-v0.md`, a draft: the manifest fields above, made concrete; the derived 48 kHz
+  values (`hop`, `latency_samples`, `has_vad`) that fill `ModelInfo`, for spectral and waveform packs (a waveform
+  pack's `latency.samples` is algorithmic, its hop is `out_samples`, an adapter's resampler adds its delay, and the
+  rate must divide 48 kHz); a `"ref"` input for `aec` packs only (the noise stage's models see only the mic); the
+  STFT's `normalized`, `normalization` (`wola` | `ola`), `center` and `pad_mode`; `band` as the trained band's upper
+  edge; and the rules (the manifest wins, `metadata_props` as a fallback for keys it leaves out, checksums first, no
+  custom ops or outside paths, an unknown major version refused, the pack through #2's checks). No parser yet.
+
+## Next
+1. The manifest parser and the first pack with #5: an `OrtSpectralModel` or `OrtWaveformModel` adapter of
+   `NoiseModel`, owning the host STFT (the nf-core trait above), the ORT session, preallocated tensors, state
+   pairs and the rate handling (bin mapping 1536/768, ×1/3, the high-band policy).
+2. Before freezing the spec, check the ONNX external-data spec and ORT's custom-op documentation.
+3. #6: a worker hand-off inside `NoiseStage` for ORT's per-run allocations, at 480 more latency.

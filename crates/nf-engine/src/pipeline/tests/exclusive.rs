@@ -140,8 +140,8 @@ impl BlockProcessor for Spy {
         *out = *mic;
         ChainReport::default()
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (None, None)
+    fn aec_stats(&self) -> Option<AecStats> {
+        None
     }
 }
 

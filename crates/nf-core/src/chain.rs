@@ -21,6 +21,22 @@
 //!   and the undelayed signal are below -50 dBFS, or after 1.5 s; or at the block where measurement
 //!   passthrough comes on, so a stage switched off just before a latency test can't drop its
 //!   latency at a quiet probe gap in the middle of it. [`Chain::latency`] counts a draining stage.
+//!
+//! The stages are CLAP-shaped (`stage`, TODO 17), and the chain is their host:
+//! - [`Chain::activate`] checks each stage against the host profile ([`check_host_profile`]), refuses one in the wrong
+//!   slot, activates it at [`Activation::HOST`], and caches its latency (fixed until the next activate) and its input
+//!   count.
+//! - **Ports:** the chain gets the mic and the speaker reference (already on the mic's clock: the timeline, the slip
+//!   resampler and the dither have run). Each slot's main input is the previous slot's output (the AEC slot's, the mic);
+//!   a stage with a second input port gets the reference on it, the v0 host's only sidechain source. That reference is the
+//!   same block in every slot, not delayed by the slots upstream: the engine's lead (12-18 ms) is set up for the AEC slot,
+//!   whose main input is the mic. A later slot's main input lags the mic by the upstream latency (430 samples with AEC3
+//!   on, 0 with it off, changing as it drains), so its sidechain leads by that much more. No v0 stage takes one there;
+//!   whichever stage first does decides whether the chain delays it.
+//! - **Report:** after the slots run, when the noise filter runs live (on, not in passthrough), [`ChainReport::noise`] is
+//!   read from the noise stage's extensions (`speech-probability/0`, `gain-adjustment-metering/0`; NaN where it has
+//!   none). Every branch that runs it live processes this block last, after any reset and priming.
+//! - Bypass is the host's: `enabled` and `passthrough` are slot state, not stage params.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -29,8 +45,8 @@ use crate::controls::ChainControls;
 use crate::dsp::delay::DelayLine;
 use crate::dsp::fade::{crossfade_into, dip_splice_into};
 use crate::dsp::meter::{Meter, MeterReading, mean_square};
-use crate::stage::{ProcessIo, Stage, StageError, StageReport, StageStats};
-use crate::{BLOCK, Block, SAMPLE_RATE};
+use crate::stage::{Activation, AecStats, ProcessIo, Stage, StageError, StageReport, StageRole, check_host_profile};
+use crate::{BLOCK, Block};
 
 /// Largest stage latency the passthrough delay lines can stand in for.
 pub const MAX_STAGE_LATENCY: usize = 4096;
@@ -94,8 +110,13 @@ impl Want {
 /// A stage plus its bypass state.
 struct Slot {
     stage: Box<dyn Stage>,
-    /// `stage.info().needs_reference`, read once (the info is constant).
-    needs_ref: bool,
+    /// The role this slot takes.
+    role: StageRole,
+    /// Input blocks `process` gets: 1, or 2 with the reference on the second (ports are constant; cached again at
+    /// activate).
+    inputs: usize,
+    /// `stage.latency()`, cached at activate.
+    latency: u32,
     /// Stand-in for the stage in passthrough and while draining: a delay of the stage's latency.
     delay: DelayLine,
     mode: Mode,
@@ -105,11 +126,12 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(stage: Box<dyn Stage>) -> Self {
-        let needs_ref = stage.info().needs_reference;
+    fn new(stage: Box<dyn Stage>, role: StageRole) -> Self {
         Self {
+            inputs: stage.audio_ports().input_count().clamp(1, 2),
             stage,
-            needs_ref,
+            role,
+            latency: 0,
             delay: DelayLine::new(MAX_STAGE_LATENCY, 0),
             mode: Mode::Off,
             prev_in: Box::new([0.0; BLOCK]),
@@ -117,9 +139,27 @@ impl Slot {
         }
     }
 
+    /// Checks the stage against the host profile and this slot, activates it and caches what the chain reads of it.
+    fn activate(&mut self) -> Result<(), StageError> {
+        let role = check_host_profile(&*self.stage)?;
+        let id = self.stage.descriptor().id.clone();
+        if role != self.role {
+            return Err(StageError(format!("stage {id} is a {role:?} stage, not one for the {:?} slot", self.role)));
+        }
+        self.stage.activate(&Activation::HOST)?;
+        let lat = self.stage.latency();
+        if lat as usize > MAX_STAGE_LATENCY {
+            return Err(StageError(format!("stage {id} latency {lat} exceeds the passthrough limit {MAX_STAGE_LATENCY}")));
+        }
+        self.latency = lat;
+        self.inputs = self.stage.audio_ports().input_count().clamp(1, 2);
+        self.delay.set_delay(lat as usize);
+        Ok(())
+    }
+
     /// The latency this slot adds now, given whether its stage is enabled.
     fn latency(&self, enabled: bool) -> u32 {
-        if enabled || matches!(self.mode, Mode::Draining(_)) { self.stage.latency() } else { 0 }
+        if enabled || matches!(self.mode, Mode::Draining(_)) { self.latency } else { 0 }
     }
 }
 
@@ -140,11 +180,12 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// `aec` goes in the echo-cancel slot and `noise` in the noise slot; [`Chain::activate`] checks they belong there.
     pub fn new(controls: Arc<ChainControls>, aec: Option<Box<dyn Stage>>, noise: Option<Box<dyn Stage>>) -> Self {
         Self {
             controls,
-            aec: aec.map(Slot::new),
-            noise: noise.map(Slot::new),
+            aec: aec.map(|s| Slot::new(s, StageRole::EchoCancel)),
+            noise: noise.map(|s| Slot::new(s, StageRole::Noise)),
             input_meter: Meter::new(),
             output_meter: Meter::new(),
             a: Box::new([0.0; BLOCK]),
@@ -155,24 +196,18 @@ impl Chain {
         }
     }
 
-    /// Activates every stage at the app's format and sizes the passthrough delays.
+    /// Checks each stage against the host profile and its slot, activates it at the app's format ([`Activation::HOST`]) on
+    /// the calling thread, and caches its latency and input count; sizes the passthrough delays. May allocate; may be
+    /// called again (the stages keep their state).
     pub fn activate(&mut self) -> Result<(), StageError> {
         for slot in [self.aec.as_mut(), self.noise.as_mut()].into_iter().flatten() {
-            slot.stage.activate(SAMPLE_RATE, BLOCK)?;
-            let lat = slot.stage.latency() as usize;
-            if lat > MAX_STAGE_LATENCY {
-                return Err(StageError(format!(
-                    "stage {} latency {lat} exceeds the passthrough limit {MAX_STAGE_LATENCY}",
-                    slot.stage.info().id
-                )));
-            }
-            slot.delay.set_delay(lat);
+            slot.activate()?;
         }
         Ok(())
     }
 
     /// The chain's current stream offset in samples: the enabled stages, plus any stage still
-    /// draining after being switched off.
+    /// draining after being switched off (each stage's latency as cached at activate).
     pub fn latency(&self) -> u32 {
         let c = &self.controls;
         self.aec.as_ref().map_or(0, |s| s.latency(c.aec.enabled.load(Relaxed)))
@@ -184,9 +219,9 @@ impl Chain {
         &self.controls
     }
 
-    /// The stages' slow statistics: (AEC, noise).
-    pub fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (self.aec.as_ref().map(|s| s.stage.stats()), self.noise.as_ref().map(|s| s.stage.stats()))
+    /// The echo canceller's estimates (its `aec-telemetry/0`), if there is one and it publishes them. Real-time.
+    pub fn aec_stats(&self) -> Option<AecStats> {
+        self.aec.as_ref().and_then(|s| s.stage.aec_telemetry()).map(|t| t.aec_stats())
     }
 
     /// Processes one block without timing.
@@ -221,9 +256,7 @@ impl Chain {
         // AEC: mic (+ reference) -> a
         let t0 = now();
         match self.aec.as_mut() {
-            Some(slot) => {
-                run_slot(slot, Want::new(want_aec, passthrough), test_starts, mic, Some(reference), &mut self.a, &mut self.c);
-            }
+            Some(slot) => run_slot(slot, Want::new(want_aec, passthrough), test_starts, mic, reference, &mut self.a, &mut self.c),
             None => *self.a = *mic,
         }
         let t1 = now();
@@ -231,12 +264,12 @@ impl Chain {
             report.aec_ticks = t1.wrapping_sub(t0);
         }
 
-        // Noise: a -> b
+        // Noise: a (+ the reference, if it takes one) -> b
         match self.noise.as_mut() {
             Some(slot) => {
-                let r = run_slot(slot, Want::new(want_noise, passthrough), test_starts, &self.a, None, &mut self.b, &mut self.c);
+                run_slot(slot, Want::new(want_noise, passthrough), test_starts, &self.a, reference, &mut self.b, &mut self.c);
                 if want_noise && !passthrough {
-                    report.noise = Some(r);
+                    report.noise = Some(StageReport::read(&*slot.stage));
                 }
             }
             None => *self.b = *self.a,
@@ -258,8 +291,8 @@ impl Chain {
 /// processed audio from the start.
 fn restart(slot: &mut Slot, discard: &mut Block) {
     slot.stage.reset();
-    let reference = if slot.needs_ref { Some(&*slot.prev_ref) } else { None };
-    let _ = slot.stage.process(ProcessIo { input: &slot.prev_in, reference, output: discard });
+    let ins = [&*slot.prev_in, &*slot.prev_ref];
+    slot.stage.process(ProcessIo::new(&ins[..slot.inputs], discard));
 }
 
 #[inline]
@@ -270,16 +303,14 @@ fn quiet(x: &Block) -> bool {
 /// Runs one slot for a block, handling on/off and passthrough transitions (see the module notes).
 /// `scratch` holds the old path's output during a transition. `test_starts`: passthrough comes on
 /// this block (a latency test), so a draining slot drops its latency now rather than at a quiet
-/// block mid-test.
-fn run_slot(
-    slot: &mut Slot, want: Want, test_starts: bool, input: &Block, reference: Option<&Block>, out: &mut Block, scratch: &mut Block,
-) -> StageReport {
-    let reference = if slot.needs_ref { reference } else { None };
-    let mut report = StageReport::default();
+/// block mid-test. A stage with two input ports gets `reference` on the second, as the chain got it (module notes).
+fn run_slot(slot: &mut Slot, want: Want, test_starts: bool, input: &Block, reference: &Block, out: &mut Block, scratch: &mut Block) {
+    let ins = [input, reference];
+    let ins = &ins[..slot.inputs];
     slot.mode = match (slot.mode, want) {
         // Steady states. The delay is fed in every one, so it is always primed.
         (Mode::On, Want::On) => {
-            report = slot.stage.process(ProcessIo { input, reference, output: out });
+            slot.stage.process(ProcessIo::new(ins, out));
             slot.delay.process(input, scratch);
             Mode::On
         }
@@ -306,13 +337,13 @@ fn run_slot(
         }
         // Same latency on both sides: crossfade.
         (Mode::On, Want::Passthrough) => {
-            let _ = slot.stage.process(ProcessIo { input, reference, output: scratch });
+            slot.stage.process(ProcessIo::new(ins, scratch));
             slot.delay.process(input, out);
             crossfade_into(scratch, out);
             Mode::Passthrough
         }
         (Mode::On, Want::Off) => {
-            let _ = slot.stage.process(ProcessIo { input, reference, output: scratch });
+            slot.stage.process(ProcessIo::new(ins, scratch));
             slot.delay.process(input, out);
             crossfade_into(scratch, out);
             Mode::Draining(0)
@@ -324,7 +355,7 @@ fn run_slot(
         (Mode::Passthrough | Mode::Draining(_), Want::On) => {
             slot.delay.process(input, scratch);
             restart(slot, out);
-            report = slot.stage.process(ProcessIo { input, reference, output: out });
+            slot.stage.process(ProcessIo::new(ins, out));
             crossfade_into(scratch, out);
             Mode::On
         }
@@ -332,7 +363,7 @@ fn run_slot(
         (Mode::Off, Want::On) => {
             slot.delay.process(input, scratch);
             restart(slot, out);
-            report = slot.stage.process(ProcessIo { input, reference, output: out });
+            slot.stage.process(ProcessIo::new(ins, out));
             dip_splice_into(input, out);
             Mode::On
         }
@@ -343,10 +374,9 @@ fn run_slot(
         }
     };
     *slot.prev_in = *input;
-    if let Some(r) = reference {
-        *slot.prev_ref = *r;
+    if slot.inputs == 2 {
+        *slot.prev_ref = *reference;
     }
-    report
 }
 
 #[cfg(test)]
@@ -357,7 +387,25 @@ mod tests {
     use super::*;
     use crate::config::ProcessingConfig;
     use crate::dsp::fade::SPLICE_FADE;
-    use crate::stage::{StageInfo, StageRole};
+    use crate::stage::{
+        AecTelemetry, AudioPorts, GainAdjustmentMetering, MONO_IN_OUT, MONO_WITH_REFERENCE, SpeechProbability, StageDescriptor, Text,
+        VENDOR, features, text,
+    };
+
+    static NOISE: StageDescriptor = StageDescriptor {
+        id: text("test.scaled"),
+        name: text("scaled"),
+        vendor: VENDOR,
+        url: text(""),
+        version: text("0"),
+        description: text(""),
+        features: std::borrow::Cow::Borrowed(&[features::DENOISE]),
+    };
+
+    /// [`NOISE`] with these tags instead.
+    fn descriptor(features: &[Text]) -> StageDescriptor {
+        StageDescriptor { features: features.to_vec().into(), ..NOISE.clone() }
+    }
 
     /// A test stage: scales by `gain` and delays by `lat` samples; counts resets and calls.
     struct Scaled {
@@ -369,27 +417,196 @@ mod tests {
     }
 
     impl Stage for Scaled {
-        fn info(&self) -> StageInfo {
-            StageInfo { id: "scaled", name: "scaled", role: StageRole::Noise, needs_reference: false, needs_worker: false }
+        fn descriptor(&self) -> &StageDescriptor {
+            &NOISE
         }
-        fn activate(&mut self, _sr: u32, _block: usize) -> Result<(), StageError> {
-            Ok(())
+        fn audio_ports(&self) -> &AudioPorts {
+            &MONO_IN_OUT
+        }
+        fn activate(&mut self, a: &Activation) -> Result<(), StageError> {
+            a.require_host("scaled")
         }
         fn latency(&self) -> u32 {
             self.lat
         }
-        fn process(&mut self, io: ProcessIo<'_>) -> StageReport {
+        fn process(&mut self, io: ProcessIo<'_>) {
             self.calls.fetch_add(1, Relaxed);
-            self.line.process(io.input, io.output);
+            self.line.process(io.main(), io.output);
             for s in io.output.iter_mut() {
                 *s *= self.gain;
             }
-            StageReport::default()
         }
         fn reset(&mut self) {
             self.line.reset();
             self.resets.fetch_add(1, Relaxed);
         }
+    }
+
+    /// Each block's first sample on the main input and on the second, if any.
+    type Seen = Arc<std::sync::Mutex<Vec<(f32, Option<f32>)>>>;
+
+    /// Records what it was given on each port, publishes every extension (or none), and can change its latency after
+    /// activate (which the chain mustn't see until the next one).
+    struct Wired {
+        descriptor: StageDescriptor,
+        ports: AudioPorts,
+        extensions: bool,
+        lat: Arc<AtomicUsize>,
+        seen: Seen,
+        blocks: f32,
+    }
+
+    impl Wired {
+        fn new(features: &[Text], ports: AudioPorts, extensions: bool) -> Self {
+            Self { descriptor: descriptor(features), ports, extensions, lat: Arc::default(), seen: Arc::default(), blocks: 0.0 }
+        }
+    }
+
+    impl Stage for Wired {
+        fn descriptor(&self) -> &StageDescriptor {
+            &self.descriptor
+        }
+        fn audio_ports(&self) -> &AudioPorts {
+            &self.ports
+        }
+        fn activate(&mut self, _: &Activation) -> Result<(), StageError> {
+            Ok(())
+        }
+        fn latency(&self) -> u32 {
+            self.lat.load(Relaxed) as u32
+        }
+        fn process(&mut self, io: ProcessIo<'_>) {
+            self.blocks += 1.0;
+            self.seen.lock().unwrap().push((io.main()[0], io.aux(1).map(|r| r[0])));
+            *io.output = *io.main();
+        }
+        fn reset(&mut self) {}
+        fn gain_adjustment(&self) -> Option<&dyn GainAdjustmentMetering> {
+            if self.extensions { Some(self) } else { None }
+        }
+        fn speech_probability(&self) -> Option<&dyn SpeechProbability> {
+            if self.extensions { Some(self) } else { None }
+        }
+        fn aec_telemetry(&self) -> Option<&dyn AecTelemetry> {
+            if self.extensions { Some(self) } else { None }
+        }
+    }
+
+    impl GainAdjustmentMetering for Wired {
+        fn gain_adjustment_db(&self) -> f32 {
+            -self.blocks
+        }
+    }
+
+    impl SpeechProbability for Wired {
+        fn speech_probability(&self) -> f32 {
+            self.blocks / 100.0
+        }
+    }
+
+    impl AecTelemetry for Wired {
+        fn aec_stats(&self) -> AecStats {
+            AecStats { echo_delay_ms: self.blocks, erle_db: 2.0 * self.blocks }
+        }
+    }
+
+    /// Blocks whose first sample is `v` (the mic) or `-v` (the reference), so each port's block can be told apart.
+    fn feed_marked(chain: &mut Chain, from: usize, to: usize) {
+        let mut out = [0.0f32; BLOCK];
+        for b in from..to {
+            chain.process(&[b as f32; BLOCK], &[-(b as f32); BLOCK], &mut out);
+        }
+    }
+
+    #[test]
+    fn a_stage_in_the_wrong_slot_is_refused() {
+        let c = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        let wired = |f: &[Text], p| -> Box<dyn Stage> { Box::new(Wired::new(f, p, false)) };
+        let refuse = |aec: Option<Box<dyn Stage>>, noise: Option<Box<dyn Stage>>, why: &str| {
+            let e = Chain::new(c.clone(), aec, noise).activate().unwrap_err();
+            assert!(e.0.contains(why), "{e} (wanted {why:?})");
+        };
+        refuse(None, Some(wired(&[features::ECHO_CANCEL], MONO_WITH_REFERENCE.clone())), "EchoCancel stage, not one for the Noise slot");
+        refuse(Some(wired(&[features::DENOISE], MONO_IN_OUT.clone())), None, "Noise stage, not one for the EchoCancel slot");
+        refuse(None, Some(wired(&[], MONO_IN_OUT.clone())), "Effect stage");
+        refuse(Some(wired(&[features::ECHO_CANCEL], MONO_IN_OUT.clone())), None, "non-main input for the reference");
+        let mut ok = Chain::new(
+            c.clone(),
+            Some(wired(&[features::ECHO_CANCEL], MONO_WITH_REFERENCE.clone())),
+            Some(wired(&[features::DENOISE], MONO_IN_OUT.clone())),
+        );
+        assert!(ok.activate().is_ok());
+    }
+
+    #[test]
+    fn each_port_gets_its_block_and_priming_replays_both() {
+        // The AEC slot gets the mic and the reference; the noise slot the AEC's output, and the reference only if it has a
+        // second port. Switched back on, each is primed with the previous block on every port it has.
+        for noise_ports in [&MONO_IN_OUT, &MONO_WITH_REFERENCE] {
+            let c = Arc::new(ChainControls::new(&ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() }));
+            let aec = Wired::new(&[features::ECHO_CANCEL], MONO_WITH_REFERENCE.clone(), false);
+            let noise = Wired::new(&[features::DENOISE], noise_ports.clone(), false);
+            let (aec_seen, noise_seen) = (aec.seen.clone(), noise.seen.clone());
+            let mut chain = Chain::new(c.clone(), Some(Box::new(aec)), Some(Box::new(noise)));
+            chain.activate().unwrap();
+            feed_marked(&mut chain, 1, 3);
+            c.aec.enabled.store(false, Relaxed);
+            c.noise.enabled.store(false, Relaxed);
+            feed_marked(&mut chain, 3, 6);
+            c.aec.enabled.store(true, Relaxed);
+            c.noise.enabled.store(true, Relaxed);
+            feed_marked(&mut chain, 6, 7);
+            let reference = |b: f32| (noise_ports.inputs.len() == 2).then_some(-b);
+            // Blocks 1, 2 live; 3 the switch-off block (still run, into the delay path); 6 primed with 5, then live.
+            assert_eq!(*aec_seen.lock().unwrap(), [
+                (1.0, Some(-1.0)),
+                (2.0, Some(-2.0)),
+                (3.0, Some(-3.0)),
+                (5.0, Some(-5.0)),
+                (6.0, Some(-6.0))
+            ]);
+            let n: Vec<_> = [1.0, 2.0, 3.0, 5.0, 6.0].map(|b| (b, reference(b))).into();
+            assert_eq!(*noise_seen.lock().unwrap(), n, "{} noise ports", noise_ports.inputs.len());
+        }
+    }
+
+    #[test]
+    fn the_report_and_the_aec_stats_come_from_the_extensions() {
+        for extensions in [true, false] {
+            let c = Arc::new(ChainControls::new(&ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() }));
+            let aec = Wired::new(&[features::ECHO_CANCEL], MONO_WITH_REFERENCE.clone(), extensions);
+            let noise = Wired::new(&[features::DENOISE], MONO_IN_OUT.clone(), extensions);
+            let mut chain = Chain::new(c.clone(), Some(Box::new(aec)), Some(Box::new(noise)));
+            chain.activate().unwrap();
+            let mut out = [0.0f32; BLOCK];
+            let r = chain.process(&[0.1; BLOCK], &[0.0; BLOCK], &mut out);
+            let n = r.noise.expect("the noise stage ran live");
+            if extensions {
+                assert_eq!((n.speech_probability, n.gain_reduction_db), (0.01, -1.0), "this block's values");
+                assert_eq!(chain.aec_stats(), Some(AecStats { echo_delay_ms: 1.0, erle_db: 2.0 }));
+            } else {
+                assert!(n.speech_probability.is_nan() && n.gain_reduction_db.is_nan());
+                assert_eq!(chain.aec_stats(), None);
+            }
+            c.passthrough.store(true, Relaxed);
+            assert_eq!(chain.process(&[0.1; BLOCK], &[0.0; BLOCK], &mut out).noise, None, "not in passthrough");
+        }
+    }
+
+    #[test]
+    fn the_latency_is_cached_at_activate() {
+        let c = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        let noise = Wired::new(&[features::DENOISE], MONO_IN_OUT.clone(), false);
+        let lat = noise.lat.clone();
+        lat.store(300, Relaxed);
+        let mut chain = Chain::new(c, None, Some(Box::new(noise)));
+        chain.activate().unwrap();
+        lat.store(200, Relaxed);
+        assert_eq!(chain.latency(), 300, "fixed until the next activate");
+        chain.activate().unwrap();
+        assert_eq!(chain.latency(), 200);
+        lat.store(MAX_STAGE_LATENCY + 1, Relaxed);
+        assert!(chain.activate().unwrap_err().0.contains("exceeds the passthrough limit"));
     }
 
     struct Rig {

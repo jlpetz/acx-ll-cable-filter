@@ -11,13 +11,15 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nf_core::config::ProcessingConfig;
+use nf_core::config::{GateConfig, GateMode, ProcessingConfig};
 use nf_core::controls::ChainControls;
-use nf_core::stage::{ProcessIo, Stage, StageError};
+use nf_core::dsp::noise_post::NoisePost;
+use nf_core::noise::NoiseModel;
+use nf_core::stage::{Activation, ProcessIo, Stage, StageError};
 use nf_core::{BLOCK, Block, SAMPLE_RATE, db_to_lin};
 
 use crate::synth::{Voice, add, convolve, delayed, pink_noise, room_impulse_response, scaled, speech_like};
-use crate::{Aec3Stage, RnnoiseStage, build_chain};
+use crate::{Aec3Stage, RNNOISE_LATENCY, RnnoiseModel, build_chain, rnnoise_stage};
 
 /// Blocks run before timing starts (1 s): first-touch pages, FFT set-up, AEC3's start-up.
 pub const WARM_UP: usize = 100;
@@ -35,6 +37,10 @@ pub struct Signals {
     pub mic: Vec<f32>,
     /// The far end (the speaker reference).
     pub far: Vec<f32>,
+    /// `noisy` through the RNNoise model alone, clamped as the noise stage clamps it, and its VAD per block: the
+    /// floor-and-gate row's input, made here, before any timing.
+    pub denoised: Vec<f32>,
+    pub vad: Vec<f32>,
 }
 
 impl Signals {
@@ -61,7 +67,15 @@ impl Signals {
         let echo = convolve(&far, &rir);
         let echo = scaled(&delayed(echo.get(..len).unwrap_or(&echo), 1920), 0.5);
         let mic = add(&echo, &noisy);
-        Self { noisy, mic, far }
+        let mut model = RnnoiseModel::new();
+        let mut denoised = vec![0.0f32; noisy.len()];
+        let mut vad = Vec::with_capacity(noisy.len() / BLOCK);
+        for (x, y) in noisy.as_chunks::<BLOCK>().0.iter().zip(denoised.as_chunks_mut::<BLOCK>().0) {
+            let clean = x.map(nf_core::dsp::sanitize);
+            vad.push(model.process_hop(&clean, y));
+            y.iter_mut().for_each(|v| *v = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 });
+        }
+        Self { noisy, mic, far, denoised, vad }
     }
 
     /// Whole blocks in each signal.
@@ -165,25 +179,50 @@ fn controls(cfg: ProcessingConfig) -> Arc<ChainControls> {
     Arc::new(ChainControls::new(&cfg))
 }
 
-/// RNNoise with the default floor and gate, on the noisy near end.
+/// The noise stage around RNNoise, with the default floor and gate, on the noisy near end.
 pub fn rnnoise(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
-    let mut s = RnnoiseStage::new(controls(ProcessingConfig::default()));
-    s.activate(SAMPLE_RATE, BLOCK)?;
+    let mut s = rnnoise_stage(controls(ProcessingConfig::default()))?;
+    s.activate(&Activation::HOST)?;
     let mut out = [0.0f32; BLOCK];
     Ok(time_blocks("RNNoise (noisy speech)", sig.blocks(), count, |b| {
-        black_box(s.process(ProcessIo { input: block(&sig.noisy, b), reference: None, output: &mut out }));
+        s.process(ProcessIo::new(&[block(&sig.noisy, b)], &mut out));
         black_box(&out);
     }))
+}
+
+/// The RNNoise model alone (`process_hop`: the ×32768 and ÷32768 scaling and nnnoiseless), on the noisy near end.
+pub fn rnnoise_model(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
+    let mut m = RnnoiseModel::new();
+    m.prepare()?;
+    let mut out = [0.0f32; BLOCK];
+    Ok(time_blocks("RNNoise model alone", sig.blocks(), count, |b| {
+        black_box(m.process_hop(block(&sig.noisy, b), &mut out));
+        black_box(&out);
+    }))
+}
+
+/// What the noise stage runs after its model (`NoisePost`: the dry path's delay, the floor mix at the default -60 dB, and
+/// the gate in Auto mode), on RNNoise's output and VAD for the noisy near end. Each block's model output is copied in
+/// first (480 samples, about 30 ns): `NoisePost` works in place.
+pub fn noise_post(sig: &Signals, count: Option<AllocCounter>) -> BlockTimes {
+    let c =
+        controls(ProcessingConfig { gate: GateConfig { mode: GateMode::Auto, ..GateConfig::default() }, ..ProcessingConfig::default() });
+    let mut post = NoisePost::new(RNNOISE_LATENCY);
+    let mut wet = [0.0f32; BLOCK];
+    time_blocks("floor + gate (NoisePost, auto gate)", sig.blocks(), count, |b| {
+        wet = *block(&sig.denoised, b);
+        black_box(post.process(block(&sig.noisy, b), &mut wet, &c.noise, sig.vad.get(b).copied().unwrap_or(f32::NAN)));
+        black_box(&wet);
+    })
 }
 
 /// AEC3 on the mic (echo, near end and noise) with the far end as its reference.
 pub fn aec3(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
     let mut s = Aec3Stage::new(controls(ProcessingConfig::default()))?;
-    s.activate(SAMPLE_RATE, BLOCK)?;
+    s.activate(&Activation::HOST)?;
     let mut out = [0.0f32; BLOCK];
     Ok(time_blocks("AEC3 (echo + near end + noise)", sig.blocks(), count, |b| {
-        let reference = Some(block(&sig.far, b));
-        black_box(s.process(ProcessIo { input: block(&sig.mic, b), reference, output: &mut out }));
+        s.process(ProcessIo::new(&[block(&sig.mic, b), block(&sig.far, b)], &mut out));
         black_box(&out);
     }))
 }
@@ -191,10 +230,10 @@ pub fn aec3(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, St
 /// AEC3 with an exact-zero reference, which the stage dithers.
 pub fn aec3_silent_reference(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
     let mut s = Aec3Stage::new(controls(ProcessingConfig::default()))?;
-    s.activate(SAMPLE_RATE, BLOCK)?;
+    s.activate(&Activation::HOST)?;
     let mut out = [0.0f32; BLOCK];
     Ok(time_blocks("AEC3, silent reference (dithered)", sig.blocks(), count, |b| {
-        black_box(s.process(ProcessIo { input: block(&sig.noisy, b), reference: Some(&SILENT), output: &mut out }));
+        s.process(ProcessIo::new(&[block(&sig.noisy, b), &SILENT], &mut out));
         black_box(&out);
     }))
 }
@@ -267,7 +306,7 @@ mod tests {
     #[test]
     fn signals_are_whole_blocks_of_equal_length() {
         let s = Signals::with_near(&[0.5; 1000], 0.1);
-        assert_eq!((s.noisy.len(), s.mic.len(), s.far.len()), (4800, 4800, 4800));
+        assert_eq!((s.noisy.len(), s.mic.len(), s.far.len(), s.denoised.len(), s.vad.len()), (4800, 4800, 4800, 4800, 10));
         assert_eq!(s.blocks(), 10);
         // The near end loops.
         assert!(s.noisy.iter().all(|&v| v == 0.5));

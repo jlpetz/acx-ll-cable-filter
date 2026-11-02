@@ -1,5 +1,5 @@
-//! Shared helpers for the offline harness tests: run a stage or chain block by block, build
-//! controls, compose test signals, and dump WAVs for listening.
+//! Shared helpers for the offline harness tests: the stages as the tests build them, test-signal composition, and WAV dumps
+//! for listening. Running stages and chains is `nf_stages::harness`'s.
 //!
 //! Each test binary uses a subset, hence the `dead_code` allowance.
 #![allow(dead_code)]
@@ -7,13 +7,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use nf_core::chain::Chain;
 use nf_core::config::ProcessingConfig;
 use nf_core::controls::ChainControls;
-use nf_core::stage::{ProcessIo, Stage, StageReport, StageStats};
+use nf_core::noise::NoiseStage;
+use nf_core::stage::{Activation, Stage};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
+#[allow(unused_imports)] // each test binary uses some of them
+pub use nf_stages::harness::{Run, peak_index, run_chain as run_chain_from, run_stage};
 use nf_stages::synth::{self, Voice};
-use nf_stages::{Aec3Stage, RnnoiseStage};
+use nf_stages::{Aec3Stage, rnnoise_stage};
 
 pub const SR: usize = SAMPLE_RATE as usize;
 
@@ -21,15 +23,16 @@ pub fn controls(cfg: ProcessingConfig) -> Arc<ChainControls> {
     Arc::new(ChainControls::new(&cfg))
 }
 
-pub fn rnnoise(cfg: ProcessingConfig) -> RnnoiseStage {
-    let mut s = RnnoiseStage::new(controls(cfg));
-    s.activate(SAMPLE_RATE, BLOCK).expect("activate RNNoise");
+/// The noise stage around RNNoise, activated.
+pub fn rnnoise(cfg: ProcessingConfig) -> NoiseStage {
+    let mut s = rnnoise_stage(controls(cfg)).expect("build the RNNoise stage");
+    s.activate(&Activation::HOST).expect("activate RNNoise");
     s
 }
 
 pub fn aec3() -> Aec3Stage {
     let mut s = Aec3Stage::new(controls(ProcessingConfig::default())).expect("build AEC3");
-    s.activate(SAMPLE_RATE, BLOCK).expect("activate AEC3");
+    s.activate(&Activation::HOST).expect("activate AEC3");
     s
 }
 
@@ -37,38 +40,9 @@ pub fn block(x: &[f32]) -> &Block {
     x.try_into().expect("a whole block")
 }
 
-/// A stage's output, its per-block reports, and its stats after each block.
-pub struct Run {
-    pub out: Vec<f32>,
-    pub reports: Vec<StageReport>,
-    pub stats: Vec<StageStats>,
-}
-
-/// Runs `stage` over `input` (and `reference`, block-aligned) as the chain would.
-pub fn run_stage(stage: &mut dyn Stage, input: &[f32], reference: Option<&[f32]>) -> Run {
-    assert_eq!(input.len() % BLOCK, 0, "whole blocks only");
-    let blocks = input.len() / BLOCK;
-    let mut run = Run { out: Vec::with_capacity(input.len()), reports: Vec::with_capacity(blocks), stats: Vec::new() };
-    let mut y = [0.0f32; BLOCK];
-    for (b, x) in input.as_chunks::<BLOCK>().0.iter().enumerate() {
-        let r = reference.map(|r| block(&r[b * BLOCK..(b + 1) * BLOCK]));
-        run.reports.push(stage.process(ProcessIo { input: x, reference: r, output: &mut y }));
-        run.stats.push(stage.stats());
-        run.out.extend_from_slice(&y);
-    }
-    run
-}
-
-/// Runs the chain over `mic` and `reference`.
-pub fn run_chain(chain: &mut Chain, mic: &[f32], reference: &[f32]) -> Vec<f32> {
-    assert_eq!(mic.len() % BLOCK, 0, "whole blocks only");
-    let mut out = Vec::with_capacity(mic.len());
-    let mut y = [0.0f32; BLOCK];
-    for (m, r) in mic.as_chunks::<BLOCK>().0.iter().zip(reference.as_chunks::<BLOCK>().0) {
-        chain.process(m, r, &mut y);
-        out.extend_from_slice(&y);
-    }
-    out
+/// Runs the chain over `mic` and `reference`, from its first output sample.
+pub fn run_chain(chain: &mut nf_core::chain::Chain, mic: &[f32], reference: &[f32]) -> Vec<f32> {
+    run_chain_from(chain, mic, reference, 0)
 }
 
 /// `ranges` moved later by `by` samples (to index a delayed output with input-time ranges).
@@ -123,7 +97,7 @@ pub fn dump(name: &str, x: &[f32]) {
     }
 }
 
-/// The index of the largest |x|.
-pub fn peak_index(x: &[f32]) -> usize {
-    x.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map_or(0, |(i, _)| i)
+/// A stage as a trait object, for the harness's `make` closures.
+pub fn boxed(s: impl Stage + 'static) -> Box<dyn Stage> {
+    Box::new(s)
 }

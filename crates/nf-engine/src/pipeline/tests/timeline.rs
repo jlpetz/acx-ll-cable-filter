@@ -12,7 +12,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use nf_core::stage::{ProcessIo, Stage};
+use nf_core::stage::{Activation, AecTelemetry, ProcessIo, Stage};
 use nf_stages::{Aec3Stage, synth};
 
 use super::events::VSink;
@@ -148,8 +148,8 @@ impl BlockProcessor for LagSpy {
         *out = *mic;
         ChainReport::default()
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (None, None)
+    fn aec_stats(&self) -> Option<AecStats> {
+        None
     }
 }
 
@@ -783,27 +783,27 @@ struct AecProc {
     stage: Aec3Stage,
     mic: Vec<f32>,
     out: Vec<f32>,
-    stats: Vec<StageStats>,
+    stats: Vec<AecStats>,
 }
 
 impl AecProc {
     fn new() -> Self {
         let mut stage = Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).unwrap();
-        stage.activate(SAMPLE_RATE, BLOCK).unwrap();
+        stage.activate(&Activation::HOST).unwrap();
         Self { stage, mic: Vec::new(), out: Vec::new(), stats: Vec::new() }
     }
 }
 
 impl BlockProcessor for AecProc {
     fn process<T: Ticks>(&mut self, mic: &Block, r: &Block, out: &mut Block, _t: &mut T) -> ChainReport {
-        self.stage.process(ProcessIo { input: mic, reference: Some(r), output: out });
+        self.stage.process(ProcessIo::new(&[mic, r], out));
         self.mic.extend_from_slice(mic);
         self.out.extend_from_slice(out);
-        self.stats.push(self.stage.stats());
+        self.stats.push(self.stage.aec_stats());
         ChainReport::default()
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (Some(self.stage.stats()), None)
+    fn aec_stats(&self) -> Option<AecStats> {
+        Some(self.stage.aec_stats())
     }
 }
 

@@ -4,8 +4,11 @@
 //! - **Config (1.4):** AEC3 on, sonora's noise suppressor and AGC off, and the high-pass on in
 //!   full band. `MaxProcessingRate::Rate48kHz` matters: the default (32 kHz) caps the capture path
 //!   at 16 kHz, and at 48 kHz I/O it allocates a full-band copy every frame.
+//! - **Ports (TODO 17):** the mic on the main input, the speaker reference on input 1 (non-main, CLAP's sidechain), the
+//!   echo-cancelled mic on the output. A host that connects no reference gets a silent one.
 //! - **Per block (1.5):** render (the reference) first, then capture (the mic), 1:1. Both inputs are
-//!   sanitised first: sonora's `f32::clamp` to ±1 lets a NaN through, and it would poison the filters.
+//!   sanitised first (`nf_core::dsp::sanitize_into`): sonora's `f32::clamp` to ±1 lets a NaN through, and it would
+//!   poison the filters.
 //! - **Denormals (1.10):** the reference is dithered at 1e-9 (about -180 dBFS) on every block, gaps
 //!   included. A silent reference otherwise decays AEC3's filter states into subnormals (sonora
 //!   #34): on the dev box an undithered zero reference costs 690 µs a block against 87 µs dithered
@@ -23,17 +26,22 @@
 //!   delay estimate, so AEC3 doesn't reconverge after a latency test. A reset with nothing processed
 //!   since the last one does nothing. This is our proposal; a clean start would mean building a new
 //!   stage off the audio thread.
+//! - **Telemetry:** `noise-filter.aec-telemetry/0` ([`AecTelemetry`]). sonora's `statistics()` is a cached reference, so
+//!   reading it per block allocates nothing.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use nf_core::controls::ChainControls;
+use nf_core::dsp::sanitize_into;
 use nf_core::rt::Dither;
-use nf_core::stage::{ProcessIo, Stage, StageError, StageInfo, StageReport, StageRole, StageStats};
+use nf_core::stage::{
+    Activation, AecStats, AecTelemetry, AudioPorts, MONO_WITH_REFERENCE, ProcessIo, Stage, StageDescriptor, StageError, VENDOR, features,
+    text,
+};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use sonora::config::{EchoCanceller, HighPassFilter as HpfConfig, MaxProcessingRate, Pipeline};
 use sonora::{AudioProcessing, Config, StreamConfig};
-
-use crate::{check_format, sanitize};
 
 /// The stream offset, 430 samples (8.96 ms), measured with an impulse and a silent reference by the
 /// `stream_offset_is_aec3_latency` test. It is AEC3's capture path (block framing and band
@@ -42,9 +50,19 @@ use crate::{check_format, sanitize};
 pub const AEC3_LATENCY: u32 = 430;
 /// The reference dither's amplitude: about -180 dBFS.
 const REFERENCE_DITHER: f32 = 1e-9;
+/// The reference dither's seed.
+const DITHER_SEED: u32 = 0x5EED_AEC3;
 
-const INFO: StageInfo =
-    StageInfo { id: "aec3", name: "WebRTC AEC3", role: StageRole::EchoCancel, needs_reference: true, needs_worker: false };
+/// What the AEC3 stage is.
+pub static AEC3_DESCRIPTOR: StageDescriptor = StageDescriptor {
+    id: text(nf_core::namespaced!(".", "echo-cancel")),
+    name: text("Echo canceller (WebRTC AEC3)"),
+    vendor: VENDOR,
+    url: text(""),
+    version: text(env!("CARGO_PKG_VERSION")),
+    description: text("WebRTC's AEC3 echo canceller (sonora), with the speaker reference on its second input"),
+    features: Cow::Borrowed(&[features::AUDIO_EFFECT, features::RESTORATION, features::MONO, features::ECHO_CANCEL]),
+};
 
 /// WebRTC AEC3 echo-cancel stage.
 pub struct Aec3Stage {
@@ -55,7 +73,7 @@ pub struct Aec3Stage {
     /// Something was processed since `new` or the last `reset`.
     dirty: bool,
     // Blocks inline, and sanitised by a kernel taking each block as its own argument, so the loops
-    // need no run-time overlap checks (see RnnoiseStage).
+    // need no run-time overlap checks (as in nf-core's noise stage).
     /// This block's mic and reference, sanitised (and the reference dithered).
     mic: Block,
     reference: Block,
@@ -74,7 +92,7 @@ impl Aec3Stage {
         Ok(Self {
             _controls: controls,
             apm,
-            dither: Dither::new(0x5EED_AEC3),
+            dither: Dither::new(DITHER_SEED),
             dirty: false,
             mic: [0.0; BLOCK],
             reference: [0.0; BLOCK],
@@ -93,14 +111,6 @@ impl Aec3Stage {
     }
 }
 
-/// `src` with non-finite samples zeroed.
-#[inline]
-fn sanitized(src: &Block, dst: &mut Block) {
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d = sanitize(s);
-    }
-}
-
 /// 48 kHz mono, AEC3 on, NS and AGC off, high-pass on in full band (1.4).
 pub(crate) fn build_apm() -> AudioProcessing {
     let config = Config {
@@ -116,28 +126,31 @@ pub(crate) fn build_apm() -> AudioProcessing {
 }
 
 impl Stage for Aec3Stage {
-    fn info(&self) -> StageInfo {
-        INFO
+    fn descriptor(&self) -> &StageDescriptor {
+        &AEC3_DESCRIPTOR
     }
 
-    fn activate(&mut self, sample_rate: u32, block: usize) -> Result<(), StageError> {
-        check_format(INFO.name, sample_rate, block)
+    fn audio_ports(&self) -> &AudioPorts {
+        &MONO_WITH_REFERENCE
+    }
+
+    fn activate(&mut self, activation: &Activation) -> Result<(), StageError> {
+        activation.require_host(&AEC3_DESCRIPTOR.name)
     }
 
     fn latency(&self) -> u32 {
         AEC3_LATENCY
     }
 
-    fn process(&mut self, io: ProcessIo<'_>) -> StageReport {
+    fn process(&mut self, io: ProcessIo<'_>) {
         self.dirty = true;
-        match io.reference {
-            Some(r) => sanitized(r, &mut self.reference),
+        match io.aux(1) {
+            Some(r) => sanitize_into(r, &mut self.reference),
             None => self.reference.fill(0.0),
         }
         self.dither.apply(&mut self.reference[..], REFERENCE_DITHER);
-        sanitized(io.input, &mut self.mic);
+        sanitize_into(io.main(), &mut self.mic);
         self.run(io.output);
-        StageReport::default()
     }
 
     fn reset(&mut self) {
@@ -152,13 +165,80 @@ impl Stage for Aec3Stage {
         self.run(&mut discard);
     }
 
+    fn aec_telemetry(&self) -> Option<&dyn AecTelemetry> {
+        Some(self)
+    }
+}
+
+impl AecTelemetry for Aec3Stage {
     /// AEC3's fullband ERLE (its linear filter's, so it understates the output's echo reduction) and
     /// its echo-delay estimate (4 ms steps; one step under the echo path's bulk delay in our tests).
-    fn stats(&self) -> StageStats {
+    fn aec_stats(&self) -> AecStats {
         let s = self.apm.statistics();
-        StageStats {
+        AecStats {
             echo_delay_ms: s.delay_ms.map_or(f32::NAN, |d| d as f32),
             erle_db: s.echo_return_loss_enhancement.map_or(f32::NAN, |e| e as f32),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nf_core::config::ProcessingConfig;
+    use nf_core::stage::{StageRole, check_host_profile};
+
+    use super::*;
+    use crate::synth::{Voice, add, convolve, delayed, room_impulse_response, scaled, speech_like, white_noise};
+
+    /// The stage's sanitising, written out: non-finite to 0, the rest clamped to ±INPUT_LIMIT.
+    fn sanitized(x: &Block) -> Block {
+        let limit = nf_core::dsp::INPUT_LIMIT;
+        x.map(|v| if v.is_finite() { v.clamp(-limit, limit) } else { 0.0 })
+    }
+
+    /// The stage is sonora driven directly: the same config, the reference sanitised and dithered with the same seed, the
+    /// mic sanitised, render then capture. Bit for bit, through NaNs, infinities and blocks without a reference port.
+    #[test]
+    fn the_stage_is_sonora_driven_directly() {
+        let len = 4 * 48_000;
+        let mut far = speech_like(len, Voice::LOW, 7).samples;
+        let echo = scaled(&delayed(&convolve(&far, &room_impulse_response(4800, 0.15, 8))[..len], 1920), 0.5);
+        let mut mic = add(&add(&echo, &speech_like(len, Voice::HIGH.at(-30.0), 9).samples), &white_noise(len, 1e-3, 10));
+        for i in (1000..len - 20).step_by(4801) {
+            mic[i] = f32::NAN;
+            far[i + 3] = f32::INFINITY;
+            mic[i + 9] = f32::NEG_INFINITY;
+        }
+        let mut stage = Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).expect("stage");
+        stage.activate(&Activation::HOST).expect("activate");
+        let mut apm = build_apm();
+        let mut dither = Dither::new(DITHER_SEED);
+        let (mut scratch, mut direct, mut y) = ([0.0f32; BLOCK], [0.0f32; BLOCK], [0.0f32; BLOCK]);
+        for (b, (mi, ri)) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0).enumerate() {
+            // Now and then no reference port at all: that reads as a silent reference.
+            let mut r = if b % 50 == 7 {
+                stage.process(ProcessIo::new(&[mi], &mut y));
+                [0.0; BLOCK]
+            } else {
+                stage.process(ProcessIo::new(&[mi, ri], &mut y));
+                sanitized(ri)
+            };
+            dither.apply(&mut r, REFERENCE_DITHER);
+            apm.process_render_f32(&[&r[..]], &mut [&mut scratch[..]]).expect("render");
+            apm.process_capture_f32(&[&sanitized(mi)[..]], &mut [&mut direct[..]]).expect("capture");
+            let first = y.iter().zip(&direct).position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(first, None, "block {b}: the stage differs from sonora");
+        }
+        assert!(stage.aec_stats().erle_db.is_finite(), "AEC3 converged enough to report");
+    }
+
+    #[test]
+    fn it_fits_the_host_profile_as_the_echo_canceller() {
+        let s = Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).expect("stage");
+        assert_eq!(check_host_profile(&s), Ok(StageRole::EchoCancel));
+        assert_eq!(s.descriptor().id, "noise-filter.echo-cancel");
+        assert_eq!(s.audio_ports().inputs[1].name, "Speaker reference");
+        assert!(s.aec_telemetry().is_some() && s.speech_probability().is_none() && s.gain_adjustment().is_none());
+        assert!(s.params().is_empty());
     }
 }

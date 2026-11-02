@@ -10,7 +10,7 @@ HOT's prefixes and isn't under COLD_PATHS (the modules and crates that run on ot
 its name isn't in COLD (a closure is never cold by name). The own path comes from demangling the v0
 symbol: the module an inherent or trait impl is written in, a closure's parent function, a generic
 function itself, not the types it's instantiated with. So
-`<nf_stages::rnnoise::RnnoiseStage as nf_core::stage::Stage>::process` is nf_stages', and std's
+`<nf_core::noise::NoiseStage as nf_core::stage::Stage>::process` is nf_core::noise's, and std's
 `drop_glue::<nf_core::dsp::delay::DelayLine>` isn't ours. One exception: a std generic instantiated
 with one of our closures is selected, as it can hold the closure's body (a thread's entry,
 `<{closure} as FnOnce>::call_once::{shim:vtable#0}`, or an iterator adapter that didn't inline).
@@ -92,16 +92,20 @@ sys.dont_write_bytecode = True  # no __pycache__ in tools/ if another tool impor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Ours, by own-path prefix: what runs per block or per packet on the audio thread (the chain, the
-# DSP, the stages, the engine's capture, conversion and render loops, and the latency test's tap,
-# which `audio.rs` feeds). nf_core::latency's analysis and sweep run off the audio thread and may
-# allocate, so they aren't here; RollingStats (latency::stats) runs per block.
+# DSP, the stage interface and the noise stage, the stages and models, the engine's capture,
+# conversion and render loops, and the latency test's tap, which `audio.rs` feeds). nf_core::latency's
+# analysis and sweep run off the audio thread and may allocate, so they aren't here; RollingStats
+# (latency::stats) runs per block.
 HOT = ["nf_core::dsp", "nf_core::chain", "nf_core::rt", "nf_core::latency::stats", "nf_core::telemetry",
-       "nf_stages", "nf_engine"]
+       "nf_core::noise", "nf_core::stage", "nf_stages", "nf_engine"]
 # Code that never runs on the audio thread: parts of HOT, and the crates that call into HOT from
 # their own threads. A function under one is left out, and so is one that names a closure written
 # under one (`is_hot`).
 COLD_PATHS = [
+    "nf_core::stage::check_host_profile",  # the host-profile check, at activate (and its closures)
+    "nf_core::stage::state",  # state save and load: never on the audio thread while it runs
     "nf_stages::synth", "nf_stages::bench",  # test signals, the bench command (the main thread)
+    "nf_stages::harness",  # the offline harness: the `process` and `quality` commands, the tests
     "nf_engine::api", "nf_engine::control", "nf_engine::errors",  # the caller's and the control thread
     "nf_engine::devices",  # enumeration (its own worker), and the lookup a start makes
     "nf_engine::latency_test",  # the latency test's thread: the probe, its capture and the analysis
@@ -109,10 +113,11 @@ COLD_PATHS = [
 ]
 # The standard library's crates: their generics are selected when instantiated with one of our closures
 STD_CRATES = {"core", "alloc", "std"}
-# Functions, by their last name, that run off the hot path: construction, activation, reset (a fill
-# LLVM turns into a memset), formatting, clones, comparisons. Add a cold helper here when it shows.
-COLD = {"new", "default", "activate", "reset", "fmt", "clone", "clone_from", "eq", "ne", "drop", "info",
-        "stats"}
+# Functions, by their last name, that run off the hot path: construction, activation (a model's
+# `prepare`), reset (a fill LLVM turns into a memset), a stage's state, formatting, clones,
+# comparisons. Add a cold helper here when it shows.
+COLD = {"new", "default", "activate", "prepare", "build_chain", "reset", "save_state", "load_state", "fmt", "clone",
+        "clone_from", "eq", "ne", "drop", "info", "stats"}
 
 # A call that ends in a panic: such a call is on a cold branch, so the loop stays in the table
 PANIC = re.compile(r"^<?(core|std)::panicking::|(^|::)(unwrap_failed|expect_failed|assert_failed\w*|handle_error"

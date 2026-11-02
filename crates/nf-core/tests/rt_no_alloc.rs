@@ -17,9 +17,13 @@ use nf_core::dsp::gate::Gate;
 use nf_core::dsp::meter::Meter;
 use nf_core::dsp::mix::FloorMix;
 use nf_core::dsp::noise_post::NoisePost;
+use nf_core::dsp::reblock::Reblocker;
 use nf_core::dsp::slip::{Slip, SlipResampler};
 use nf_core::latency::stats::RollingStats;
-use nf_core::stage::{ProcessIo, Stage, StageError, StageInfo, StageReport, StageRole};
+use nf_core::noise::{DelayModel, NoiseStage, param as noise_param};
+use nf_core::stage::{
+    Activation, AudioPorts, MONO_IN_OUT, MONO_WITH_REFERENCE, ProcessIo, Stage, StageDescriptor, StageError, Text, VENDOR, features, text,
+};
 use nf_core::{BLOCK, Block};
 
 struct Counting;
@@ -134,24 +138,48 @@ fn dsp_blocks_do_not_allocate() {
     let _ = Slip::None;
 }
 
-/// A stage that only scales (it must not allocate either, or the chain test would blame the chain).
-struct Scale(f32);
+/// A stage that only scales (it must not allocate either, or the chain test would blame the chain), CLAP-shaped: in the
+/// AEC slot with the echo-cancel role and a reference port (which it mixes in a little), in the noise slot as a denoiser.
+struct Scale {
+    gain: f32,
+    descriptor: StageDescriptor,
+    ports: AudioPorts,
+}
+
+impl Scale {
+    fn descriptor(features: &[Text]) -> StageDescriptor {
+        let t = text;
+        let (id, name, url, version, description) = (t("test.scale"), t("scale"), t(""), t("0"), t(""));
+        StageDescriptor { id, name, vendor: VENDOR, url, version, description, features: features.to_vec().into() }
+    }
+
+    fn aec(gain: f32) -> Self {
+        Self { gain, descriptor: Self::descriptor(&[features::ECHO_CANCEL]), ports: MONO_WITH_REFERENCE.clone() }
+    }
+
+    fn noise(gain: f32) -> Self {
+        Self { gain, descriptor: Self::descriptor(&[features::DENOISE]), ports: MONO_IN_OUT.clone() }
+    }
+}
 
 impl Stage for Scale {
-    fn info(&self) -> StageInfo {
-        StageInfo { id: "scale", name: "scale", role: StageRole::Noise, needs_reference: false, needs_worker: false }
+    fn descriptor(&self) -> &StageDescriptor {
+        &self.descriptor
     }
-    fn activate(&mut self, _sample_rate: u32, _block: usize) -> Result<(), StageError> {
-        Ok(())
+    fn audio_ports(&self) -> &AudioPorts {
+        &self.ports
+    }
+    fn activate(&mut self, a: &Activation) -> Result<(), StageError> {
+        a.require_host("scale")
     }
     fn latency(&self) -> u32 {
         480
     }
-    fn process(&mut self, io: ProcessIo<'_>) -> StageReport {
-        for (o, i) in io.output.iter_mut().zip(io.input) {
-            *o = *i * self.0;
+    fn process(&mut self, io: ProcessIo<'_>) {
+        let (x, r) = (io.main(), io.aux(1).unwrap_or(&[0.0; BLOCK]));
+        for ((o, i), r) in io.output.iter_mut().zip(x).zip(r) {
+            *o = *i * self.gain - 0.1 * r;
         }
-        StageReport::default()
     }
     fn reset(&mut self) {}
 }
@@ -159,7 +187,7 @@ impl Stage for Scale {
 #[test]
 fn the_chain_does_not_allocate_through_toggles_and_passthrough() {
     let controls = Arc::new(ChainControls::new(&ProcessingConfig::default()));
-    let mut chain = Chain::new(controls.clone(), Some(Box::new(Scale(0.9))), Some(Box::new(Scale(0.5))));
+    let mut chain = Chain::new(controls.clone(), Some(Box::new(Scale::aec(0.9))), Some(Box::new(Scale::noise(0.5))));
     chain.activate().expect("activate");
     let reference = [0.0f32; BLOCK];
     let mut out = [0.0f32; BLOCK];
@@ -176,8 +204,64 @@ fn the_chain_does_not_allocate_through_toggles_and_passthrough() {
                 ticks += 1;
                 ticks
             });
-            let _ = (r, chain.latency());
+            let _ = (r, chain.latency(), chain.aec_stats());
         }
     });
     assert_eq!(n, 0, "allocations in Chain::process");
+}
+
+/// The noise stage around a model of every hop the re-blocker handles, with and without lookahead: once built and
+/// activated, its blocks, resets, extensions and params allocate nothing, whatever the gate and floor do.
+#[test]
+fn the_noise_stage_does_not_allocate_at_any_hop() {
+    for hop in [160usize, 240, 256, 480, 512, 768, 960, 1024] {
+        for lookahead in [0, 1] {
+            let controls = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+            let model = DelayModel::new(hop, ((2 + lookahead) * hop) as u32).with_vad();
+            let mut s = NoiseStage::new(controls.clone(), Box::new(model)).expect("stage");
+            s.activate(&Activation::HOST).expect("activate");
+            let mut out = [0.0f32; BLOCK];
+            let n = allocations_in(|| {
+                let mut sum = 0.0f64;
+                for blk in 0..300 {
+                    let x = tone(blk);
+                    s.process(ProcessIo::new(&[&x], &mut out));
+                    let sp = s.speech_probability().map_or(f32::NAN, |e| e.speech_probability());
+                    let gr = s.gain_adjustment().map_or(f32::NAN, |e| e.gain_adjustment_db());
+                    sum += f64::from(sp) + f64::from(gr);
+                    // Every param, written and read back, one a block; and a bad value or id, refused without a String.
+                    let id = (blk % 9) as u32 + 1;
+                    let info = &s.params()[id as usize - 1];
+                    let v = info.min + (info.max - info.min) * ((blk % 7) as f64 / 6.0);
+                    let _ = s.set_param(id, if id == noise_param::GATE_MODE { (blk % 3) as f64 } else { v });
+                    sum += s.param_value(id).unwrap_or(0.0);
+                    let _ = (s.set_param(id, f64::NAN), s.set_param(99, 0.0));
+                    if blk % 50 == 49 {
+                        s.reset();
+                        s.reset(); // the second is a no-op
+                    }
+                    controls.noise.floor_db.store(-60.0 + (blk / 40 % 4) as f32 * 15.0);
+                }
+                std::hint::black_box((sum, &out));
+            });
+            assert_eq!(n, 0, "hop {hop}, lookahead {lookahead}: allocations in the noise stage");
+        }
+    }
+}
+
+#[test]
+fn the_reblocker_does_not_allocate() {
+    for hop in [160usize, 256, 512, 768, 1024] {
+        let mut r = Reblocker::new(hop);
+        let mut out = [0.0f32; BLOCK];
+        let n = allocations_in(|| {
+            for blk in 0..100 {
+                r.process(&tone(blk), &mut out, |i, o| o.copy_from_slice(i));
+                if blk == 50 {
+                    r.reset();
+                }
+            }
+        });
+        assert_eq!(n, 0, "hop {hop}");
+    }
 }

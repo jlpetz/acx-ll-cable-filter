@@ -1,9 +1,10 @@
 # 17. One stage format (CLAP) for echo cancel, noise filter and effects
 
-Status: the owner chose CLAP for plugins on 2026-10-26, then asked whether the noise filter and AEC
-should use the same format. The proposal below says yes, and awaits the owner's OK.
+Status: the owner chose CLAP for plugins on 2026-10-26, and on 2026-11-02 OK'd the proposal below: the
+AEC and the noise filter are CLAP-shaped stages too ("the best and most modern alt to VST3"). The stage
+interface v0 is built (2026-11-02, "Built" below); the `.clap` export and the fx-host are next.
 
-## Every stage CLAP-shaped (proposal, 2026-10-26)
+## Every stage CLAP-shaped (proposed 2026-10-26; the owner's OK, 2026-11-02)
 - **Two inputs is not a problem for the AEC.** CLAP's audio-ports extension allows one main input
   and output (at index 0) plus further, non-main ports. A second input port is the usual sidechain.
   - **AEC stage:** main input = mic; second input port = speaker reference (already resampled to the
@@ -91,8 +92,64 @@ Publishing is tentative ('should probably publish the spec').
 - **Alternative sandbox: WCLAP** (CLAP compiled to wasm32, run in-process under Wasmtime). It costs
   about 1.5× CPU and is immature (`wclap-bridge` is properly tested only on macOS).
 
+## Built (2026-11-02): the stage interface v0
+The decisions in this section are ours, within the owner's 2026-11-02 decision, unless a line says otherwise.
+- **The trait** (`crates/nf-core/src/stage/`): `nf_core::stage::Stage`, CLAP's model in Rust, in-process, no
+  FFI and no clack dependency.
+  - descriptor (id, name, vendor, url, version, description, feature tags; the role is parsed from a tag). Its text,
+    the ports' and the params' are `Cow<'static, str>` (`nf_core::stage::Text`): literals for our stages, owned
+    strings for what is only known at run time (a pack's manifest, a third-party plugin's descriptor in the fx-host);
+  - audio ports (main mono in and out at index 0; the AEC's speaker reference on a non-main input);
+  - `activate(&Activation)` (always `Activation::HOST`, 48000/480/480);
+  - `process(ProcessIo { inputs, output })`, `reset`, `latency`;
+  - params (list, value, set), state (a `b"NFST"` blob of the params). `set_param` takes `&mut self`: whoever holds
+    the stage calls it, on the processing thread between blocks while it is active, which is where CLAP delivers
+    its in-events. No other thread reaches a stage;
+  - extensions as typed getters returning `Option<&dyn Ext>`: `clap.gain-adjustment-metering/0`, and ours
+    `noise-filter.speech-probability/0` and `noise-filter.aec-telemetry/0`.
+- **The host profile** is `doc/spec/host-profile-v0.md`. `check_host_profile` enforces its role, port and param
+  rules; `Chain::activate` and the harness run it, and the chain refuses a stage in the wrong slot.
+- **Our stages on it:**
+  - AEC3 (`noise-filter.echo-cancel`): ports "Mic" + "Speaker reference", latency 430, no params, telemetry.
+  - The noise stage (`noise-filter.denoise`, `nf_core::noise::NoiseStage`): any model through an internal
+    `NoiseModel` trait (#3), RNNoise now; the floor and gate inside it as params 1-9 over `ChainControls`' atomics
+    (the owner's decision: inside the noise stage); gain adjustment always; speech probability when the model
+    has a VAD.
+- **The chain is their host:**
+  - bypass, passthrough and priming stay host-level slot state (no `IS_BYPASS` param);
+  - the latency is cached at activate;
+  - the reference is the only sidechain source, the same block in every slot (not delayed by upstream slots, so
+    the engine's lead holds for the AEC slot only; a later slot's sidechain leads by the upstream latency on top);
+  - `ChainReport::noise` and `Chain::aec_stats` are read from the extensions.
+- **The engine builds its chain with `nf_stages::build_chain`**, the constructor the offline tools use.
+- **Unchanged:** the engine's behaviour, latency, budget and readout. The output is bit-identical to the tree
+  before (`crates/nf-stages/tests/refactor_parity.rs`, 20 s of toggled scenes with and without AEC3: outputs,
+  reports, meters and latencies).
+- **Deviations from CLAP that the `.clap` export must adapt** (also in the host profile):
+  - the host chooses the rate and any frame count in `[min, max]`, but our stages take only 48 kHz in 480-frame
+    blocks: the wrapper buffers host blocks into 480 (reuse `nf_core::dsp::reblock`), adds that delay to its reported
+    latency, and resamples or refuses other rates;
+  - `activate` runs on the processing thread (easyfft's per-thread warm-up): a foreign host's first block would
+    allocate;
+  - AEC3's `reset` keeps the converged echo path and delay estimate, where CLAP's clears all processing state;
+  - the gain adjustment is measured over the block (output against latency-aligned input), not the last sample, and
+    is NaN before the first block where the draft says zero (map it to 0 dB); the draft id
+    `clap.gain-adjustment-metering/0` may change;
+  - `start/stop_processing`, `deactivate`, process status, `steady_time` and events aren't modelled: no-ops or
+    constants in the export.
+- **Provisional:** the namespace `noise-filter` (ids `noise-filter.*`, tags `noise-filter:*`) is one macro,
+  `nf_core::namespaced!`. Nothing persists the ids yet.
+- **Two paths write the noise params:** `ChainControls::apply` (the GUI and the config, from any thread, unclamped:
+  tests use a -200 dB floor) and `set_param` (clamped, by the stage's holder). Harmless while nothing in the app calls
+  `set_param`; whether the GUI writes through params is TODO 15's call.
+- **Params of a stage's own** (an effect, a pack's `controls[]`) have no path from the GUI yet. Our proposal: a
+  lock-free single-producer queue of (slot, id, value) that `Chain::process` drains into each slot's `set_param`
+  before running it, built with TODO 15 or the first effect.
+
 ## Next
-1. The owner's OK on making the AEC and noise filter CLAP-shaped stages too.
-2. Then the stage interface and host profile v0 in phase 0 (#2 runs stages through it).
-3. clack-host in an fx-host process for third-party plugins.
+1. Freeze the namespace (reverse-DNS) and the ids before anything is published. Recheck the CLAP facts the code
+   cites (the param flag bits, `IS_ENUM` requiring `IS_STEPPED`, the standard feature tags, the gain-adjustment
+   draft) against the headers then.
+2. The `.clap` export of our stages (clack-plugin, or nih-plug's ISC export), adapting the deviations above.
+3. clack-host in an fx-host process for third-party plugins, with the profile's gui, log and thread-check.
 4. VST3 hosting later.

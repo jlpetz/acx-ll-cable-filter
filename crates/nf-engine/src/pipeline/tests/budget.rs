@@ -52,8 +52,8 @@ impl BlockProcessor for Offset {
         *out = *mic;
         ChainReport::default()
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (None, None)
+    fn aec_stats(&self) -> Option<AecStats> {
+        None
     }
     fn latency(&self) -> u32 {
         self.0

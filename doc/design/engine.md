@@ -70,8 +70,10 @@ Once, when the thread starts:
 
 For each run:
 - Resolve the devices (cheap, so a run waiting for a device fails before building anything), then
-  build the stages *inside the scope* (`RnnoiseStage::new`, `Aec3Stage::new` when AEC is on),
-  `Chain::new` and `activate`.
+  build and activate the chain *inside the scope* with `nf_stages::build_chain` (AEC3 when AEC is on,
+  then the noise stage around RNNoise; `Chain::activate` checks each stage against the host profile,
+  activates it at 48 kHz in 480-frame blocks on this thread, and caches its latency). The offline tools
+  use the same constructor, so the live chain and a rerun can't drift apart.
 - Open the mic, output, loopback and keep-alive streams.
 - If `start()` has given up meanwhile (a driver slower than the start timeout), stop here: a newer
   run may already have the devices. The same check comes again before the streams start.
@@ -131,7 +133,8 @@ error and stop):
    - **Timing:** whole-block µs into `RollingStats<100>`; AEC and noise ticks.
 4. **Once a second (every 100 blocks):**
    - publish p50/p99/max timings, latency median/p95 and its budget (each part's mean and p95, and
-     the run's totals), drift ppm, fills (ms), slip counts and AEC stats (`chain.stage_stats()`);
+     the run's totals), drift ppm, fills (ms), slip counts and AEC stats (`chain.aec_stats()`, AEC3's
+     `aec-telemetry/0` extension);
    - publish `rt_heap_allocations = thread_scope_fallbacks() - baseline` (must stay 0; log once,
      from the control thread, if it grows) and `rt_pool_allocations_per_s` (the per-second growth of
      `thread_scope_allocs()`; nonzero with AEC3, because sonora 0.2.0 allocates per block, served
@@ -583,7 +586,7 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   drain thread holds while it appends: `ChainRecorder::copy_from(n)` copies the blocks from the nth on while it runs (the
   quality echo test's calibration reads its marker so, every 20 ms). Neither thread is the audio thread, which only pushes into
   the ring.
-- **Rerunning it offline:** the engine builds its chain as `nf_stages::build_chain` does and warms it up with three dithered
+- **Rerunning it offline:** the engine builds its chain with `nf_stages::build_chain` and warms it up with three dithered
   silent blocks (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recorded mic and
   reference are dithered already. So a chain built with the run's processing settings, warmed up and fed the recording block by
   block reproduces its output sample for sample (`the_live_chain_reruns_offline_sample_for_sample`, AEC3 and RNNoise behind

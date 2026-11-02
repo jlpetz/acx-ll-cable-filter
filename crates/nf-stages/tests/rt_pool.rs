@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use nf_core::config::{GateConfig, GateMode, ProcessingConfig};
 use nf_core::controls::ChainControls;
-use nf_core::stage::{ProcessIo, Stage};
+use nf_core::stage::{Activation, ProcessIo, Stage};
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_mem::{PageKind, PagePolicy, RtAllocator, RtScope};
 use nf_stages::synth::{Voice, add, pink_noise, speech_like};
-use nf_stages::{RnnoiseStage, build_chain};
+use nf_stages::{build_chain, rnnoise_stage};
 
 #[global_allocator]
 static GLOBAL: RtAllocator = RtAllocator::new();
@@ -66,15 +66,20 @@ fn start_on_a_fresh_thread(warm: bool, start: impl FnOnce() + Send + 'static) ->
 fn noise_stage_start(controls: &Arc<ChainControls>, input: &Arc<Vec<f32>>) -> impl FnOnce() + Send + 'static {
     let (controls, input) = (controls.clone(), input.clone());
     move || {
-        let mut stage = RnnoiseStage::new(controls);
-        let ok = stage.activate(SAMPLE_RATE, BLOCK).is_ok();
-        let mut y = [0.0f32; BLOCK];
-        for x in input.as_chunks::<BLOCK>().0 {
-            std::hint::black_box(stage.process(ProcessIo { input: x, reference: None, output: &mut y }));
-        }
-        std::hint::black_box(&y);
-        drop(stage);
-        assert!(ok, "activate failed"); // formats only on failure
+        let ok = match rnnoise_stage(controls) {
+            Ok(mut stage) => {
+                let ok = stage.activate(&Activation::HOST).is_ok();
+                let mut y = [0.0f32; BLOCK];
+                for x in input.as_chunks::<BLOCK>().0 {
+                    stage.process(ProcessIo::new(&[x], &mut y));
+                }
+                std::hint::black_box(&y);
+                drop(stage);
+                ok
+            }
+            Err(_) => false,
+        };
+        assert!(ok, "the stage failed to build or activate"); // formats only on failure
     }
 }
 

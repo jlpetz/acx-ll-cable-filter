@@ -18,7 +18,7 @@ use nf_core::dsp::meter::MeterBallistics;
 use nf_core::dsp::slip::{Slip, SlipResampler};
 use nf_core::latency::stats::RollingStats;
 use nf_core::rt::Dither;
-use nf_core::stage::StageStats;
+use nf_core::stage::AecStats;
 use nf_core::telemetry::{LatencyBudget, Telemetry};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
@@ -161,7 +161,8 @@ pub(crate) trait Ticks {
 /// The chain, as the pipeline drives it.
 pub(crate) trait BlockProcessor {
     fn process<T: Ticks>(&mut self, mic: &Block, reference: &Block, out: &mut Block, ticks: &mut T) -> ChainReport;
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>);
+    /// The echo canceller's estimates (`Chain::aec_stats`): once a second, and per block while the recorder is armed.
+    fn aec_stats(&self) -> Option<AecStats>;
     /// The live settings it reads each block, for the chain recorder (the tests' stand-ins have none).
     fn params(&self) -> ChainParams {
         ChainParams::default()
@@ -177,8 +178,8 @@ impl BlockProcessor for Chain {
     fn process<T: Ticks>(&mut self, mic: &Block, reference: &Block, out: &mut Block, ticks: &mut T) -> ChainReport {
         self.process_timed(mic, reference, out, || ticks.ticks())
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        Chain::stage_stats(self)
+    fn aec_stats(&self) -> Option<AecStats> {
+        Chain::aec_stats(self)
     }
     #[inline]
     fn params(&self) -> ChainParams {
@@ -611,7 +612,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// AEC3's estimates, the chain's settings). A full ring loses the block, counted.
     fn record<P: BlockProcessor>(&mut self, proc: &P, head: u64, t_capture: Option<f64>, (discarded, skipped): (u64, i64)) {
         let Some(rec) = self.recorder.as_mut() else { return };
-        let (aec, _) = proc.stage_stats();
+        let aec = proc.aec_stats();
         let block = ChainBlock {
             index: self.blocks,
             capture_qpc_hns: t_capture.unwrap_or(f64::NAN),
@@ -964,7 +965,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.reference_coarse_drops.store(c.reference_drops, Relaxed);
         tel.tap_overflows.store(c.tap_overflows, Relaxed);
 
-        let (aec, _) = proc.stage_stats();
+        let aec = proc.aec_stats();
         if let Some(a) = aec {
             tel.aec_delay_ms.store(a.echo_delay_ms);
             tel.aec_erle_db.store(a.erle_db);
@@ -1212,8 +1213,8 @@ mod tests {
             *out = *mic;
             ChainReport::default()
         }
-        fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-            (None, None)
+        fn aec_stats(&self) -> Option<AecStats> {
+            None
         }
     }
 
@@ -1226,8 +1227,8 @@ mod tests {
             *out = *mic;
             ChainReport::default()
         }
-        fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-            (Some(StageStats { echo_delay_ms: 52.0, erle_db: 12.0 }), None)
+        fn aec_stats(&self) -> Option<AecStats> {
+            Some(AecStats { echo_delay_ms: 52.0, erle_db: 12.0 })
         }
     }
 
@@ -2203,8 +2204,8 @@ mod tests {
             let m = MeterReading { peak: self.peak, mean_square: self.mean_square, clipped: false, near_clip: false };
             ChainReport { input: Some(m), output: Some(m), noise: self.noise, ..ChainReport::default() }
         }
-        fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-            (None, None)
+        fn aec_stats(&self) -> Option<AecStats> {
+            None
         }
     }
 

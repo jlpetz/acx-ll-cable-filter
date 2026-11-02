@@ -1,6 +1,8 @@
 //! The real-time rule (CLAUDE.md) for the stages: after `build_chain` (which warms up the calling
 //! thread), the RNNoise chain's per-block processing makes no heap allocation, and an AEC3 chain
-//! makes only sonora 0.2.0's own (sonora-nnnoiseless.md 1.7; upstream PR #40 removes them).
+//! makes only sonora 0.2.0's own (sonora-nnnoiseless.md 1.7; upstream PR #40 removes them). The
+//! per-block reads of the stages' extensions and params (the speech probability, the gain, AEC3's
+//! telemetry, `param_value` and `set_param`) make none either.
 //!
 //! A counting global allocator (this test binary only) counts per thread, so tests running in
 //! parallel don't disturb each other. Same pattern as nf-core's `tests/rt_no_alloc.rs`.
@@ -14,10 +16,10 @@ use std::sync::atomic::Ordering::Relaxed;
 use common::*;
 use nf_core::chain::Chain;
 use nf_core::config::{GateConfig, GateMode, ProcessingConfig};
-use nf_core::stage::{ProcessIo, Stage};
+use nf_core::stage::{Activation, ProcessIo, Stage};
 use nf_core::{BLOCK, Block};
-use nf_stages::build_chain;
 use nf_stages::synth::*;
+use nf_stages::{build_chain, rnnoise_stage};
 
 struct Counting;
 
@@ -173,14 +175,14 @@ fn an_aec3_chain_allocates_only_inside_sonora() {
     let _ = per_block(&mut chain, &s, 0..warm, |_| {});
     for b in 0..warm {
         let (m, r) = s.block(b);
-        aec.process(ProcessIo { input: m, reference: Some(r), output: &mut out });
+        aec.process(ProcessIo::new(&[m, r], &mut out));
     }
     let chain_counts = per_block(&mut chain, &s, warm..warm + 400, |_| {});
     let aec_counts: Vec<usize> = (warm..warm + 400)
         .map(|b| {
             let (m, r) = s.block(b);
             allocations_in(|| {
-                aec.process(ProcessIo { input: m, reference: Some(r), output: &mut out });
+                aec.process(ProcessIo::new(&[m, r], &mut out));
             })
         })
         .collect();
@@ -201,4 +203,58 @@ fn activating_on_another_thread_leaves_the_first_block_to_allocate() {
     let counts = std::thread::spawn(move || per_block(&mut chain, &s, 0..3, |_| {})).join().expect("thread");
     assert!(counts[0] > 0, "the first block on a new thread sets up easyfft");
     assert_eq!(&counts[1..], &[0, 0]);
+}
+
+#[test]
+fn the_extensions_and_params_do_not_allocate_per_block() {
+    // What the engine and a future host read and write each block: the noise stage's speech probability, its gain and
+    // its params, and AEC3's telemetry (sonora hands out a cached reference).
+    let s = signals(2);
+    let mut noise =
+        rnnoise(ProcessingConfig { gate: GateConfig { mode: GateMode::Auto, ..GateConfig::default() }, ..ProcessingConfig::default() });
+    let mut aec = aec3();
+    let mut out = [0.0f32; BLOCK];
+    for b in 0..20 {
+        let (m, r) = s.block(b);
+        noise.process(ProcessIo::new(&[m], &mut out));
+        aec.process(ProcessIo::new(&[m, r], &mut out));
+    }
+    let counts: Vec<usize> = (20..200)
+        .map(|b| {
+            let (m, r) = s.block(b);
+            noise.process(ProcessIo::new(&[m], &mut out));
+            aec.process(ProcessIo::new(&[m, r], &mut out));
+            allocations_in(|| {
+                let sp = noise.speech_probability().map_or(f32::NAN, |e| e.speech_probability());
+                let gr = noise.gain_adjustment().map_or(f32::NAN, |e| e.gain_adjustment_db());
+                let stats = aec.aec_telemetry().map(|t| t.aec_stats());
+                let id = (b % 9) as u32 + 1;
+                let v = noise.param_value(id).unwrap_or(0.0);
+                let set = (noise.set_param(id, v), noise.set_param(id, f64::NAN), noise.set_param(42, 1.0));
+                let _ = std::hint::black_box((sp, gr, stats, set));
+            })
+        })
+        .collect();
+    assert_eq!(counts.iter().sum::<usize>(), 0, "{counts:?}");
+}
+
+#[test]
+fn resetting_an_unused_noise_stage_keeps_its_spare() {
+    // The stage resets its model only when it processed something since its last reset, so unused resets cost nothing
+    // and leave the pristine spare for the first real one.
+    let s = signals(1);
+    let mut stage = rnnoise_stage(controls(ProcessingConfig::default())).expect("stage");
+    stage.activate(&Activation::HOST).expect("activate");
+    let mut out = [0.0f32; BLOCK];
+    let mut process = |stage: &mut dyn Stage, b: usize| stage.process(ProcessIo::new(&[s.block(b).0], &mut out));
+    let unused = allocations_in(|| {
+        stage.reset();
+        stage.reset();
+    });
+    process(&mut stage, 0);
+    let first = allocations_in(|| stage.reset());
+    process(&mut stage, 1);
+    let second = allocations_in(|| stage.reset());
+    assert_eq!((unused, first), (0, 0), "unused resets, then the spare");
+    assert!((1..=12).contains(&second), "the second real reset builds a fresh state: {second} allocations");
 }

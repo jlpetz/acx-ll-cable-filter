@@ -19,10 +19,8 @@ use nf_core::controls::ChainControls;
 use nf_core::dsp::drift::DriftController;
 use nf_core::dsp::slip::SlipResampler;
 use nf_core::rt::Dither;
-use nf_core::stage::Stage;
 use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, SAMPLE_RATE};
-use nf_stages::{Aec3Stage, RnnoiseStage};
 use rtrb::Producer;
 use wasapi::{DeviceEnumerator, Direction, Role};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -382,11 +380,9 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
         }
     }
 
-    let noise: Box<dyn Stage> = Box::new(RnnoiseStage::new(controls.clone()));
-    let aec: Option<Box<dyn Stage>> =
-        if aec_wanted { Some(Box::new(Aec3Stage::new(controls.clone()).map_err(|e| StartFailure::Stage(e.0))?)) } else { None };
-    let mut chain = Chain::new(controls.clone(), aec, Some(noise));
-    chain.activate().map_err(|e| StartFailure::Stage(e.0))?;
+    // Built and activated here, inside the thread's real-time scope, by the one constructor the offline tools use too, so a
+    // chain recording reruns offline exactly (engine.md, "The chain recorder").
+    let chain = nf_stages::build_chain(controls.clone(), aec_wanted).map_err(|e| StartFailure::Stage(e.0))?;
 
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
     // Exclusive mode where asked (the default; engine.md, "Exclusive mode"): a device that refuses it runs shared, with a
@@ -847,8 +843,9 @@ mod tests {
             let controls = Arc::new(ChainControls::new(&nf_core::config::ProcessingConfig::default()));
             for _ in 0..3 {
                 let ((), allocs, frees) = crate::test_alloc::count(|| {
-                    let mut s = RnnoiseStage::new(controls.clone());
-                    s.activate(SAMPLE_RATE, BLOCK).unwrap();
+                    use nf_core::stage::{Activation, Stage};
+                    let mut s = nf_stages::rnnoise_stage(controls.clone()).unwrap();
+                    s.activate(&Activation::HOST).unwrap();
                     drop(s);
                 });
                 assert!(allocs > 0);

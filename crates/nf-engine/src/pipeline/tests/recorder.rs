@@ -34,8 +34,8 @@ impl BlockProcessor for Spy {
         self.out.extend_from_slice(out);
         ChainReport::default()
     }
-    fn stage_stats(&self) -> (Option<StageStats>, Option<StageStats>) {
-        (Some(StageStats { echo_delay_ms: 40.0, erle_db: 9.5 }), None)
+    fn aec_stats(&self) -> Option<AecStats> {
+        Some(AecStats { echo_delay_ms: 40.0, erle_db: 9.5 })
     }
 }
 

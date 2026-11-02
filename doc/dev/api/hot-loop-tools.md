@@ -23,7 +23,7 @@ Two kinds of claim aren't backed by a source read here, and are marked:
 1. **Read the bin's post-LTO asm, never a lib's.** A lib's asm, e.g. from
    `cargo rustc --release -p nf-core -- --emit asm`, is pre-LTO. It has the same functions and makes a
    believable table. By default the tool reads the newest asm with a `main` under any target dir's
-   `release/build/nf-app/` (`binary_asm`, `tools/hot_loop_spills.py:740-772`). A newer lib asm is
+   `release/build/nf-app/` (`binary_asm`, `tools/hot_loop_spills.py:745-777`). A newer lib asm is
    passed over with a note on stderr, and an asm with no `main` named on the command line is refused
    (exit 1). `nf-app`'s `main` runs the whole app now (`crates/nf-app/src/main.rs`), so the bin's asm
    holds the audio path: 202 MB and 9.0 M lines, with `main` at line 85 148.
@@ -143,9 +143,9 @@ the exe.
   `target/NAME/release/build/nf-app/<hash>/out/noise_filter.s` (seen under `target/review-perf/` and
   `target/agent-app/`).
 - **The default asm** is the newest one that has a `main`, in any of those dirs, or in the old
-  layout's `deps/noise_filter-*.s` (`BIN_ASM`, `:150-151`). The name under `build/nf-app/` doesn't
+  layout's `deps/noise_filter-*.s` (`BIN_ASM`, `:155-156`). The name under `build/nf-app/` doesn't
   matter. An asm there with no `main`, such as a lib target's, is passed over with a note. The libs'
-  `build/nf-*/…` asm (`LIB_ASM`, `:154-155`) is never read: it is only named, in a note, when it is
+  `build/nf-*/…` asm (`LIB_ASM`, `:159-160`) is never read: it is only named, in a note, when it is
   newer than the asm read.
 - `codegen-units = 1` (`Cargo.toml:47`) gives one `.s` file. TMR's was 225 MB and 10.2 M lines, and
   ours is 202 MB and 9.0 M lines. The tool streams the file and reads ours in about 2 s.
@@ -153,14 +153,18 @@ the exe.
   (`TMR/tools/README.md:25-26`).
 - Release builds have line tables (`Cargo.toml:49`). The tool skips their `.cv_loc` and `.Ltmp` lines.
 
-### What it selects (`:94-115`, `is_hot` `:493-507`)
+### What it selects (`:94-120`, `is_hot` `:498-512`)
 Only code that runs on the audio thread.
 - **Own path.** A function is ours when its demangled own path is under a `HOT` prefix. The own path
   is the module an impl is written in, a closure's parent function, or a generic function itself,
   never the types it is instantiated with. The prefixes are `nf_core::{dsp, chain, rt, latency::stats,
-  telemetry}`, `nf_stages` and `nf_engine`.
+  telemetry, noise, stage}`, `nf_stages` and `nf_engine`. The noise stage's per-block loops are
+  `<nf_core::noise::NoiseStage as nf_core::stage::Stage>::process`'s, and a model's are its `process_hop`.
 - **Exclusions.** A function under `COLD_PATHS` is left out:
-  - `nf_stages::{synth, bench}`: test signals and the `bench` command;
+  - `nf_core::stage::check_host_profile` (at activate, with its closures) and `nf_core::stage::state` (state
+    save and load, never on the audio thread while it runs);
+  - `nf_stages::{synth, bench, harness}`: test signals, the `bench` command, and the offline harness (the
+    `process` and `quality` commands, the tests);
   - `nf_engine::{api, control, errors, devices}`: the caller's thread, the control thread and
     enumeration;
   - `nf_engine::latency_test`: the latency test's own thread. The tap it reads is fed by
@@ -168,20 +172,20 @@ Only code that runs on the audio thread.
   - `nf_gui` and `nf_app`, which aren't in `HOT` anyway: listing them keeps one of our generics out
     when it is instantiated with their closure (next bullet).
 
-  So is a function whose last name is in `COLD`: `new`, `default`, `activate`, `reset`, `fmt`,
-  `clone`, and so on.
+  So is a function whose last name is in `COLD`: `new`, `default`, `activate`, a model's `prepare`,
+  `build_chain`, `reset`, a stage's `save_state` and `load_state`, `fmt`, `clone`, and so on.
 - **Closures decide the thread.** A function that names a closure written under `COLD_PATHS` (in its
   generic arguments or self type) runs on that code's thread, so it is left out whatever its own path:
   the control thread's `__rust_begin_short_backtrace::<Inner::ensure_control_thread::{closure#0}, ()>`,
   or `nf_core::chain::run_slot::<live::tick::{closure#0}>` if the GUI ever instantiated one.
 - **`--paths` inside a `COLD_PATHS` entry lifts it.** `--paths nf_stages::synth` reads the synth
-  module; the other entries still apply (`cold_paths`, `:487-490`).
+  module; the other entries still apply (`cold_paths`, `:492-495`).
 - **Std wrappers.** A std generic instantiated with one of our closures is selected too, because it
   can hold that closure's body. The audio thread's entry is one:
   `std::sys::backtrace::__rust_begin_short_backtrace::<audio::spawn::{closure#0}, ()>`, from
   `crates/nf-engine/src/audio.rs:96-97`.
 - **Names are full demangled paths**, e.g. `nf_core::dsp::meter::Meter::measure` and
-  `<nf_stages::rnnoise::RnnoiseStage as nf_core::stage::Stage>::process`. Generic arguments are shortened
+  `<nf_core::noise::NoiseStage as nf_core::stage::Stage>::process`. Generic arguments are shortened
   (`Box<dyn Stage>`). A closure in a generic argument keeps its function and the module or type
   before it (`audio::spawn::{closure#0}`, the GUI's `Saver::spawn::{closure#0}`). `--detail` matches
   a substring of this name; the table cuts names at 64 characters.
@@ -208,19 +212,19 @@ Only code that runs on the audio thread.
     `read` (indirect calls such as `dyn Stage` or COM, a `memcpy` of computed size, a helper that
     didn't inline).
 - **Notes (stderr, no failure):** a newer asm passed over for having no `main`, and newer libs'
-  asm, by default (`:765-771`); source files changed after the asm was built (`:775-782`).
+  asm, by default (`:770-776`); source files changed after the asm was built (`:780-787`).
 - **Failures (exit 1):** an asm named on the command line with no `main`; by default, no bin asm with
-  a `main` (`:746-763`); no v0 (`_R`) symbols (`:796-797`); no hot loop found (`:844-845`); `--max N`
+  a `main` (`:751-768`); no v0 (`_R`) symbols (`:801-802`); no hot loop found (`:849-850`); `--max N`
   exceeded. Rust 1.101 nightly mangles with v0 by default: TMR's asm and our debug rlibs both have
   `_R` symbols.
 
 ### How it differs from TMR's tool, and how it was checked
 - **Selection.** TMR's tool matches raw symbol substrings (`TMR/tools/hot_loop_spills.py:167-188`),
-  which also picks up std generics instantiated over its types. Ours demangles v0 (`:177-480`). On
+  which also picks up std generics instantiated over its types. Ours demangles v0 (`:182-485`). On
   TMR's asm, the demangler parsed all 7020 function and static symbols with no failure, and all 269 of
   nf-core's debug rlib.
 - **Frame pointers.** In a function that sets one (`.seh_setframe %rbp`), `(%rbp)` operands count as
-  stack (`:806`). TMR's tool counts them as memory: its `OFF_STACK` matches any `%r…` base but `%rsp`
+  stack (`:811`). TMR's tool counts them as memory: its `OFF_STACK` matches any `%r…` base but `%rsp`
   (`TMR/…:86`), so `%rbp` and `%rip` operands counted too.
 - **Memory accesses.** `lea` and `nop` don't count. A `%rip` operand doesn't make a loop hot-shaped.
   An array on the stack walked through an index register does (a scratch block on the stack).
@@ -253,11 +257,11 @@ Ours adds:
   dithers the mic and AEC3's reference instead (`Dither`, about -180 dBFS).
 
 ### Keeping it in step with the code
-- An audio-thread module in a new crate or path: add its prefix to `HOT` (`:98-99`).
+- An audio-thread module in a new crate or path: add its prefix to `HOT` (`:99-100`).
 - An off-thread module inside `HOT`, or a new crate that calls into it from its own thread: add it to
-  `COLD_PATHS` (`:103-109`), then check `--functions`.
-- A cold helper that has a loop: add it to `COLD` (`:114-115`).
-- New device or timing calls: add them to `COLD_CALLS` (`:121-126`).
+  `COLD_PATHS` (`:104-113`), then check `--functions`.
+- A cold helper that has a loop: add it to `COLD` (`:119-120`).
+- New device or timing calls: add them to `COLD_CALLS` (`:126-131`).
 - If `nf-app` gains a lib target, its asm lands under `build/nf-app/` too. Having no `main`, it is
   passed over with a note.
 - After changing the selection, run `python tools/test_hot_loop_spills.py`.

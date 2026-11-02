@@ -1,4 +1,5 @@
-//! `process IN.wav OUT.wav`: the same `Chain` and stages as the engine, offline. The input (and the
+//! `process IN.wav OUT.wav`: the same `Chain` and stages as the engine (`nf_stages::build_chain`), offline, run
+//! block by block by TODO 2's harness (`nf_stages::harness::run_chain`). The input (and the
 //! `--ref` reference) must be 48 kHz; more channels are averaged to mono. The output is 48 kHz mono
 //! float, as long as the input. By default it is the stream the live app would send, so it lags the
 //! input by the chain's latency, which is printed; `--align` removes that lag.
@@ -12,10 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nf_core::chain::Chain;
+use nf_core::SAMPLE_RATE;
 use nf_core::controls::ChainControls;
-use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use nf_engine::ProcessingConfig;
+use nf_stages::harness::run_chain;
 
 use super::fixed;
 use crate::cli::ProcessArgs;
@@ -101,33 +102,6 @@ pub fn process_files(args: &ProcessArgs) -> Result<Processed, Failure> {
 
 fn write_output(path: &Path, out: &[f32]) -> Result<(), Failure> {
     wav::write_mono_f32(path, out)
-}
-
-/// Runs `mic` and `reference` (silence past its end) through `chain` in blocks, and returns as
-/// many samples as `mic`: the chain's output from sample `skip` on, flushed with silence so the
-/// tail comes out too. `skip` = the chain's latency aligns the output with the input.
-pub fn run_chain(chain: &mut Chain, mic: &[f32], reference: &[f32], skip: usize) -> Vec<f32> {
-    let blocks = (mic.len() + skip).div_ceil(BLOCK);
-    let mut out = Vec::with_capacity(blocks * BLOCK);
-    let (mut m, mut r, mut y) = ([0.0f32; BLOCK], [0.0f32; BLOCK], [0.0f32; BLOCK]);
-    for b in 0..blocks {
-        fill(&mut m, mic, b * BLOCK);
-        fill(&mut r, reference, b * BLOCK);
-        chain.process(&m, &r, &mut y);
-        out.extend_from_slice(&y);
-    }
-    out.drain(..skip.min(out.len()));
-    out.truncate(mic.len());
-    out
-}
-
-/// `block` = `x[from..from + BLOCK]`, with silence past the end of `x`.
-fn fill(block: &mut Block, x: &[f32], from: usize) {
-    let src = x.get(from..).unwrap_or(&[]);
-    let n = src.len().min(BLOCK);
-    let (head, tail) = block.split_at_mut(n);
-    head.copy_from_slice(&src[..n]);
-    tail.fill(0.0);
 }
 
 #[cfg(test)]
@@ -307,14 +281,5 @@ mod tests {
         assert_eq!(process_files(&a).unwrap().frames, 0);
         assert!(read(&dir.join("out.wav")).is_empty());
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn blocks_are_filled_with_silence_past_the_end() {
-        let mut b = [1.0f32; BLOCK];
-        fill(&mut b, &[0.5; 10], 4);
-        assert!(b[..6].iter().all(|&v| v == 0.5) && b[6..].iter().all(|&v| v == 0.0));
-        fill(&mut b, &[0.5; 10], 50);
-        assert!(b.iter().all(|&v| v == 0.0));
     }
 }

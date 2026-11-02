@@ -50,3 +50,82 @@ exactly as the live engine calls it:
 3. Plus AEC3 (#10), on recorded mic and loopback pairs. The owner records them on a desktop with
    speakers.
 4. Then each new model as it lands (#5).
+
+## Built (2026-11-02)
+The harness runs every stage through the CLAP-shaped interface (#17), all in plain `cargo test --workspace`. The
+fixtures are synthetic and built in memory (`nf_stages::synth`); WAVs go only to temp test folders or to
+`NF_STAGES_WAV_DIR`, for listening.
+- **Code** (`crates/nf-stages/src/harness.rs`, not real-time code):
+  - `run_chain`: moved from nf-app; `process` and `quality` use it;
+  - `chain_for`: one stage in its role's slot, called as the engine calls it;
+  - `run_stage` and `run_model`;
+  - `impulse_offset`, `gcc_offset` (GCC-PHAT, max lag `2 × declared + 480`) and `model_offset` (hop by hop);
+  - `parity`, the hook for model references later;
+  - `scenes`: noisy speech, the echo room (RIR, 40 ms, ×0.5), double talk, impulses at block phases 0, 17, 301
+    and 479, and dithered silence;
+  - **the checks, callable outside the tests** (TODO 5's pack loader will run them on a pack), each returning what it
+    measured or why it failed:
+    - `check_latency(make, impulse_amp)`: an impulse at the four block phases (optional: a neural model may suppress
+      a click) and GCC-PHAT on speech within 0.1 sample at > 25 dB, against `latency()`;
+    - `check_model(make, impulse_amp)`: the same on a model hop by hop, against `latency_samples - hop`;
+    - `check_profile(make)`: `check_host_profile`, activation (twice, the latency unmoved, at most 4096), each
+      param's range, clamping and NaN refusal, the state round trip, and an idle reset changing nothing.
+    Their own tests feed them stages and models that misreport by -1, +1 and a hop: both measurements catch each.
+- **Check 1, latency conformance** (`tests/conformance.rs`, through `check_latency` and `check_model`):
+  - the impulse offset equals `latency()` exactly at all four phases: RNNoise 480 (a 1e-6 impulse, floor off),
+    AEC3 430 (0.5, silent reference);
+  - GCC-PHAT on speech in pink noise at 30 dB: RNNoise 479.987 at 36.5 dB, AEC3 429.972 at 40.0 dB;
+  - the RNNoise model hop by hop: 480 = `latency_samples - hop` (960 - 480);
+  - the chain's measured offset equals `chain.latency()` for AEC on/off × noise on/off × passthrough on/off (0,
+    480, 430, 910);
+  - the re-blocker, with a pure-delay model at hops 160, 240, 256, 480, 512, 768, 960 and 1024, with and without
+    a frame of lookahead, through a chain: the latency follows #3's formula, the output is the input delayed by it
+    sample for sample, and a 0 dB floor gives exactly the delayed dry signal.
+- **Check 2, parity:**
+  - the noise stage around RNNoise (floor off, gate off) is bit-equal to nnnoiseless driven directly (×32768 in,
+    ÷32768 out, clamped): 288 000 samples, loud clipped blocks included;
+  - AEC3 is bit-equal to sonora driven directly with the same sanitising and dither seed (a unit test in
+    `src/aec3.rs`): 4 s, with NaN and infinite samples and blocks without a reference.
+- **Check 3, CPU per frame** (`tests/timing.rs --release --ignored`, `noise-filter bench`; the dev VM, relative
+  numbers only), p50 / p99 in µs:
+
+  | Row | p50 | p99 |
+  |---|---|---|
+  | the noise stage around RNNoise | 34.1-34.3 | 43.5-59.6 |
+  | the RNNoise model alone | 34.5-35.6 | 44.4-44.8 |
+  | floor + gate (`NoisePost`, auto gate) | 0.4-0.5 | 0.7-0.8 |
+  | AEC3 | 49.1-49.4 | 66.3-66.9 |
+  | the chain, meters + RNNoise | 35.2-35.3 | 44.8-45.6 |
+  | the chain, meters + AEC3 + RNNoise | 85.8-85.9 | 106.4 |
+
+  Before the refactor, the same runs gave 34.1 (the stage), 37.8 and 90.3 (the chains): no regression. nf-app's
+  bench test checks that the model and floor+gate rows allocate nothing once warm.
+- **Check 4, the host profile and the interface:** `check_profile` on every stage; other formats refused; the noise
+  params' defaults equal the config defaults; `set_param` clamps and reads back; the state round-trips and ignores
+  unknown ids; each stage has its own extensions and not the other's.
+- **Huge finite input:** a sample of about 1e17 or more used to overflow RNNoise's ×32768 to inf and abort inside
+  easyfft (already so before this work). Stages now clamp their sanitised input to ±1e4; `f32::MAX` and 1e17 samples
+  through the RNNoise stage and through `build_chain` with and without AEC3 come out finite (both tests abort
+  without the clamp). The refactor guard still matches bit for bit.
+- **Allocation tests:**
+  - none for the noise stage around a pure-delay model at every hop, its resets, extensions and params, nor for
+    the re-blocker (nf-core);
+  - none for RNNoise's extensions and params, AEC3's telemetry, per block, nor for the RNNoise chain (nf-stages);
+  - the AEC3 chain makes only sonora's own allocations.
+- **On the fetched test audio** (`tests/test_audio.rs`, ignored; `NF_TEST_AUDIO` or the local cache):
+  - the 10 `speech_*` takes, in cafe noise at 10 dB, through the chain: GCC-PHAT 479.99-480.00 against 480, the
+    noise cut by 11.7-34.1 dB in pauses;
+  - the ICASSP 2022 double-talk pair through AEC3: 429.91 against 430; AEC3 reports a 160 ms echo delay and ERLE
+    6.4 dB.
+- **Refactor guard** (`tests/refactor_parity.rs`, ignored, kept):
+  - plays 20 s of toggled scenes through `build_chain` with and without AEC3, recording outputs, reports, meters
+    and latencies; it uses only APIs a stage refactor leaves alone;
+  - the golden was recorded on the tree before the stage interface, and the tree after matches it bit for bit, in
+    debug and release.
+
+## Next
+1. Recorded mic + loopback pairs from the owner's desktop with speakers (order step 3), run as `test_audio.rs` runs the
+   ICASSP pair.
+2. Each new model as it lands (#5): `check_model`, `check_latency` and `check_profile`, and its conformance pair through
+   `parity`; UL-UNAS's `0174.wav` (shifted by 256 at 16 kHz) in an ignored test.
+3. The timing rows on the owner's desktops (`noise-filter bench`).

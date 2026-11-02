@@ -1,8 +1,9 @@
 //! Live controls: atomics the control or UI thread writes and the audio thread reads once per block.
 //!
-//! These play the part CLAP parameters would: each stage holds an `Arc` to its controls and loads a
-//! plain `Copy` snapshot at the start of `process`. Relaxed loads are enough: each value stands
-//! alone, and one block of skew between two of them is harmless.
+//! Each stage holds an `Arc` to its controls and loads a plain `Copy` snapshot at the start of `process`. Relaxed loads are
+//! enough: each value stands alone, and one block of skew between two of them is harmless. They are where the values of the
+//! noise stage's CLAP params live (`noise::NoiseStage`, TODO 17): its params extension declares ids, ranges and flags over
+//! these same atomics, and [`ChainControls::apply`] still writes them whole (without the params' clamping).
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU8};
@@ -10,17 +11,19 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use crate::atomic::AtomicF32;
 use crate::config::{GateConfig, GateMode, ProcessingConfig};
 
-/// Gate settings, readable per block as [`GateParams`].
+/// Gate settings, readable per block as [`GateParams`]. The fields are the crate's, so the noise stage's params can read
+/// and write them one by one.
 #[derive(Debug)]
 pub struct GateControls {
-    mode: AtomicU8,
-    threshold_db: AtomicF32,
-    auto_margin_db: AtomicF32,
-    attack_ms: AtomicF32,
-    release_ms: AtomicF32,
-    hold_ms: AtomicF32,
-    range_db: AtomicF32,
-    use_vad: AtomicBool,
+    /// [`GateMode::to_u8`].
+    pub(crate) mode: AtomicU8,
+    pub(crate) threshold_db: AtomicF32,
+    pub(crate) auto_margin_db: AtomicF32,
+    pub(crate) attack_ms: AtomicF32,
+    pub(crate) release_ms: AtomicF32,
+    pub(crate) hold_ms: AtomicF32,
+    pub(crate) range_db: AtomicF32,
+    pub(crate) use_vad: AtomicBool,
 }
 
 /// One block's view of [`GateControls`].
