@@ -26,7 +26,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 2. [dsp] Offline harness: WAV in, WAV out, through the whole chain
-**Priority**: High (phase 0) | **Status**: not started.
+**Priority**: High (phase 0) | **Status**: partly: `noise-filter process` runs a WAV (and `--ref`) through the chain offline, `--warm-up` reruns a live chain recording exactly, and `bench` times the stages; the conformance checks and the stage interface (#17) aren't built.
 - Runs the same chain the live app runs (AEC → noise stage with its floor/gate), through the same stage interface (#17), on WAV files, faster than real time, with no audio devices. It's the base for #3's conformance test, #13 layer 0 and #14's batch scoring.
 - Checks: the measured stream offset equals each model's declared `latency_samples − hop` to the sample (the hop of buffering only shows live, #13); output matches each model's reference; CPU per frame (p50/p99/max).
 - Runs under `cargo test`, which the project rules allow on the dev box. `cargo bench` isn't on that list: ask the owner, or time frames in an ignored test.
@@ -87,13 +87,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 8. [engine] Audio I/O: mic capture, cable render, loopback reference
-**Priority**: High (phase 1) | **Status**: built in v0 (nf-engine) and reviewed 2026-10-26; live test pending (VB-CABLE).
+**Priority**: High (phase 1) | **Status**: built in v0 (nf-engine), reviewed 2026-10-26, run live on VB-CABLE 2026-11-01/02 (bursty delivery found and handled; exclusive streams added, #13).
 - `wasapi` crate. Exclusive mode by default for the mic (3.33 ms) and the output (2 ms; never on Windows' default playback device), falling back to shared (IAudioClient3 small periods where the driver allows, else 10 ms) with a note (owner, 2026-11-02).
 - Mic in RAW mode where supported. The reference is a loopback of the chosen speakers, zero-filled through silence. `SetDuckingPreference(TRUE)` on our sessions.
 - **Requirement:** every audio thread (capture, DSP, render, inference worker) registers with MMCSS "Pro Audio" (`AvSetMmThreadCharacteristicsW`). MMCSS gives it priority 23-26 (High category; `SystemResponsiveness` keeps 20% for others) and tags it Deadline QoS. Without the tag, a minimised or occluded window puts the process at Low QoS. MMCSS priority also weighs foreground state, so check dropouts with the window minimised in phase 1.
 - Threads are joined by SPSC rings; no allocation or locks on audio threads; device-change rebuilds on a control thread.
-- The output target (one period + one block + margin, before each write) holds a block more than one period of wake jitter needs: measuring whether period + margin is enough would take 10 ms off the latency.
-**Next**: live on VB-CABLE: dropouts with the window minimised, the readout, then the smaller output target.
+- The output target (one period + one block + margin) now starts at 14 ms with the exclusive output and walks down with the adaptive target (6.8 ms on the cables, #13).
+**Next**: dropouts with the window minimised and a long soak; real hardware's delivery (#21).
 **Detail**: `doc/todo/8-audio-io.md`
 
 ---
@@ -154,10 +154,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built and first run 2026-11-01: the noise test works (-27 dB noise, -0.6 dB speech); the echo test found #10's reference gaps.
 - Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
-- Test audio (2026-11-01): `python -I tools/fetch_test_audio.py` fetches a licence-checked starter set (19 takes: speech, noise, music, an AEC pair) into `%LOCALAPPDATA%
-oise-filter	est-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-catalogue-2026-11-01.md`.
+- Test audio (2026-11-01): `python -I tools/fetch_test_audio.py` fetches a licence-checked starter set (19 takes: speech, noise, music, an AEC pair) into `%LOCALAPPDATA%\noise-filter\test-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-catalogue-2026-11-01.md`.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
-**Next**: rerun the echo test once #10's gaps are fixed. Phase 0: the batch CLI with #2, playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback. Phase 2: AECMOS. Later: the Lab page (#15).
+**Next**: phase 0: the batch CLI with #2 (the echo test's live half is done: #10), playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback (the chain recorder, `quality --save`, is its first part). Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`
 
 ---
