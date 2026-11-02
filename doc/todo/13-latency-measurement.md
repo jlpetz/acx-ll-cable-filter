@@ -326,6 +326,17 @@ and "The output target"). What each should take off the cables' readout of 64 ms
 - The chain's 9-10 ms comes on top of all of these; the cable's own transit (52-62 ms, cable-only) isn't in the readout,
   and the latency test's "app + output cable" says whether exclusive mode changes it.
 
+## Soak runs (built 2026-11-02)
+`run --seconds N` (up to a day) stops after N seconds and, like any `run`, ends with a summary of the whole run (app.md):
+the dropouts (and the reference's after its first 5 s), the output's events, the readout (the seconds' medians, and their
+p95s with the worst second), the budget's means and the median second's p95s, the drift, the output target, clipped seconds
+and real-time heap allocations. After the loop it waits for one more once-a-second publication (up to 1.5 s,
+`Telemetry::publishes`) and counts it, so an event in the final second isn't lost. Exit 6 when it wasn't clean (mic glitches
+or stalls, output underruns or coarse drops, a fault, or a real-time heap allocation), 3 when Ctrl+C cut it short, else 0: a
+30-60 minute soak reads as one result. Only with `--seconds`: a run without it exits 0 whatever its summary says (ours: an
+interactive run isn't a test, and the adaptive target allows up to three underruns a run). The latency p95 is the seconds'
+p95s (their median and the worst), not one over every block, which would need a per-block histogram in the engine.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

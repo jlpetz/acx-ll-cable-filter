@@ -245,8 +245,10 @@ pub(crate) struct EventRender<D> {
     handed: u64,
     /// Silence put in where the ring was short: frames of the device's stream the pipeline didn't write.
     inserted: u64,
-    /// Short or late events since the pipeline last asked ([`RenderSink::take_underruns`]).
+    /// Short or late events, and the silence put in, since the pipeline last asked ([`RenderSink::take_underruns`],
+    /// [`RenderSink::take_silence`]).
     underruns: u64,
+    silence: u64,
     /// Late events, and events in all, over the run.
     late: u64,
     events: u64,
@@ -270,6 +272,7 @@ impl<D: PeriodDevice> EventRender<D> {
             handed: 0,
             inserted: 0,
             underruns: 0,
+            silence: 0,
             late: 0,
             events: 0,
             last_answer_hns: None,
@@ -335,6 +338,7 @@ impl<D: PeriodDevice> EventRender<D> {
             let periods = ((past.min(MAX_LATE_FRAMES) / period) as u64).saturating_add(1);
             let stale = periods.saturating_mul(self.period as u64);
             self.inserted = self.inserted.saturating_add(stale);
+            self.silence = self.silence.saturating_add(stale);
             self.handed = self.handed.saturating_add(stale);
             self.late = self.late.saturating_add(1);
             self.underruns = self.underruns.saturating_add(1);
@@ -353,6 +357,7 @@ impl<D: PeriodDevice> EventRender<D> {
         self.handed = self.handed.saturating_add(self.period as u64);
         if n < self.period {
             self.inserted = self.inserted.saturating_add((self.period - n) as u64);
+            self.silence = self.silence.saturating_add((self.period - n) as u64);
             self.underruns = self.underruns.saturating_add(1);
         }
         Ok(())
@@ -393,6 +398,10 @@ impl<D: PeriodDevice> RenderSink for EventRender<D> {
 
     fn take_underruns(&mut self) -> u64 {
         std::mem::take(&mut self.underruns)
+    }
+
+    fn take_silence(&mut self) -> u64 {
+        std::mem::take(&mut self.silence)
     }
 }
 
@@ -616,17 +625,18 @@ mod tests {
             r.device_mut().tick();
             r.service().unwrap();
         }
-        assert_eq!((r.padding(), r.take_underruns()), (Ok(0), 0));
+        assert_eq!((r.padding(), r.take_underruns(), r.take_silence()), (Ok(0), 0, 0));
         // The ring is empty at the fifth: silence, counted, and off the clock.
         r.device_mut().tick();
         r.service().unwrap();
-        assert_eq!(r.take_underruns(), 1);
-        assert_eq!(r.take_underruns(), 0, "taken once");
+        assert_eq!((r.take_underruns(), r.take_silence()), (1, 96));
+        assert_eq!((r.take_underruns(), r.take_silence()), (0, 0), "taken once");
         assert_eq!(r.counts(), (96, 0, 5));
         r.write(&ramp[..50]).unwrap();
         r.device_mut().tick();
         r.service().unwrap();
         assert_eq!((r.take_underruns(), r.counts().0), (1, 96 + 46), "a short ring: what there is, then silence");
+        assert_eq!(r.take_silence(), 46);
         // Played so far: the ramp, a period of silence, 50 frames and 46 of silence.
         r.device_mut().tick();
         r.device_mut().tick();
@@ -644,7 +654,7 @@ mod tests {
         r.device_mut().tick();
         r.service().unwrap();
         assert_eq!((r.device().stale, r.take_underruns()), (3, 1), "late: three stale periods");
-        assert_eq!(r.counts().1, 1);
+        assert_eq!((r.counts().1, r.take_silence()), (1, 3 * 96), "and their silence, reported");
         assert_eq!(r.counts().0, 96 + 46 + 3 * 96, "and out of the clock: the next frame handed is still the pipeline's next");
         let dev = r.device_mut().clock().unwrap().unwrap().pos_frames;
         assert_eq!(dev - r.clock().unwrap().unwrap().pos_frames, (96 + 46 + 3 * 96) as f64);

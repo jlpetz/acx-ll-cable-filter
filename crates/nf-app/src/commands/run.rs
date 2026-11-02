@@ -1,23 +1,42 @@
 //! `run`: the engine without the window. It prints the streams once started, then a status line a
-//! second, until Ctrl+C (or the console closing) stops it cleanly.
+//! second, until Ctrl+C (or the console closing) stops it cleanly, or `--seconds` have passed (a soak). Then a summary of the
+//! whole run: its dropouts, the output's events, the latency and its budget, the drift (a [`Tally`] of the status lines'
+//! snapshots, and one more publication's after the loop, so the last moments count). A soak's exit code says whether it was
+//! clean: nothing glitched and no real-time heap allocation (app.md, "Exit codes"); a run without `--seconds` exits 0.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use nf_engine::{EngineConfig, EngineState, EngineStatus, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot};
+use nf_engine::{
+    BudgetTotals, EngineConfig, EngineState, EngineStatus, LatencyBudget, OutputEvents, REFERENCE_TARGET_HIGH_MS, StreamInfo,
+    TelemetrySnapshot,
+};
 
-use super::{db, fixed, list_devices};
-use crate::cli::{ADAPTIVE_WAIT_S, EngineArgs};
+use super::{budget_text, db, fixed, list_devices};
+use crate::cli::{ADAPTIVE_WAIT_S, RunArgs};
 use crate::exit::Failure;
 use crate::{config, console};
 
-pub fn run(args: &EngineArgs) -> Result<(), Failure> {
-    let cfg = config::engine_config(args, list_devices)?;
+pub fn run(args: &RunArgs) -> Result<(), Failure> {
+    let cfg = config::engine_config(&args.engine, list_devices)?;
     let engine = start(&cfg)?;
     say!("{LEGEND}");
+    if let Some(n) = args.seconds {
+        say!("Running for {n} s (Ctrl+C stops it sooner), then a summary of the run.");
+    }
     let first = engine.status();
     let (mut last_message, mut last_warnings, mut last_notes) = (first.message, first.warnings, first.notes);
     let mut ctrl_c = console::CtrlCWatch::default();
-    while !console::sleep_unless_stopped(Duration::from_secs(1)) {
+    let started = Instant::now();
+    let limit = args.seconds.map(|n| Duration::from_secs(u64::from(n)));
+    let mut tally = Tally::new(&engine.telemetry());
+    let mut cut_short = false;
+    loop {
+        let wait = limit.map_or(Duration::from_secs(1), |l| l.saturating_sub(started.elapsed()).min(Duration::from_secs(1)));
+        if console::sleep_unless_stopped(wait) {
+            cut_short = limit.is_some_and(|l| started.elapsed() < l);
+            break;
+        }
         let status = engine.status();
         if status.message != last_message {
             if let Some(m) = &status.message {
@@ -40,12 +59,441 @@ pub fn run(args: &EngineArgs) -> Result<(), Failure> {
         if let Some(w) = ctrl_c.check() {
             say!("{w}");
         }
-        say!("{}", status_line(&engine.telemetry(), status.retrying));
+        let t = engine.telemetry();
+        // The clip latch is held until a line shows it (TODO 12).
+        let clipped = engine.take_clip();
+        tally.see(&t, clipped);
+        say!("{}", status_line(&t, status.retrying, clipped));
+        if limit.is_some_and(|l| started.elapsed() >= l) {
+            break;
+        }
     }
+    // The counters are published once a second: one more publication brings the last moments' events in (a glitch in the
+    // final second would be lost otherwise).
+    if let Some(t) = next_publication(&engine) {
+        tally.see(&t, engine.take_clip());
+    }
+    // Before the stop: the targets read 0 while stopped.
+    let (end, status, fixed_target) = (engine.telemetry(), engine.status(), engine.buffer_targets().output_ms);
     engine.stop();
     say!("Stopped.");
+    let summary = tally.summary(started.elapsed().as_secs_f64(), &end, &status, fixed_target);
+    say!("{}", summary.text());
     console::finished();
-    Ok(())
+    summary.result(cut_short, limit.is_some())
+}
+
+/// The longest wait for the engine's next publication (it comes once a second).
+const PUBLICATION_WAIT: Duration = Duration::from_millis(1500);
+
+/// Waits for the engine's next once-a-second publication (up to [`PUBLICATION_WAIT`]) and returns the telemetry then: its
+/// counters include everything up to about now. `None` when none came (the engine isn't running).
+pub(super) fn next_publication(engine: &nf_engine::Engine) -> Option<TelemetrySnapshot> {
+    let from = engine.telemetry().publishes;
+    let since = Instant::now();
+    while since.elapsed() < PUBLICATION_WAIT {
+        std::thread::sleep(Duration::from_millis(20));
+        let t = engine.telemetry();
+        if t.publishes != from {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// "1 restart", "2 restarts".
+fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Seconds into a run after which the reference's gaps and jumps count as more than its start-up's (it aligns and centres its
+/// timeline in the first 2.5 s, and may raise its target there: engine.md, "The reference").
+const STARTUP_S: u32 = 5;
+
+/// The counters a run's summary adds up, as one snapshot has them (each run's since its start).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub capture_glitches: u64,
+    pub stalls: u64,
+    pub reference_gaps: u64,
+    pub reference_jumps: u64,
+    pub reference_slips: u64,
+    pub output: OutputEvents,
+}
+
+impl Counts {
+    fn of(t: &TelemetrySnapshot) -> Self {
+        Self {
+            capture_glitches: t.capture_glitches,
+            stalls: t.stalls,
+            reference_gaps: t.reference_gaps,
+            reference_jumps: t.reference_coarse_drops,
+            reference_slips: t.reference_slips,
+            output: OutputEvents::of(t),
+        }
+    }
+
+    /// From `before` to `after`; after a restart (the block count went down) the new run's from its start.
+    fn between(before: &TelemetrySnapshot, after: &TelemetrySnapshot) -> Self {
+        let (b, a) = (Self::of(before), Self::of(after));
+        if after.blocks < before.blocks {
+            return a;
+        }
+        Self {
+            capture_glitches: a.capture_glitches.saturating_sub(b.capture_glitches),
+            stalls: a.stalls.saturating_sub(b.stalls),
+            reference_gaps: a.reference_gaps.saturating_sub(b.reference_gaps),
+            reference_jumps: a.reference_jumps.saturating_sub(b.reference_jumps),
+            reference_slips: a.reference_slips.saturating_sub(b.reference_slips),
+            output: OutputEvents::between(before, after),
+        }
+    }
+
+    fn add(&mut self, d: &Counts) {
+        self.capture_glitches += d.capture_glitches;
+        self.stalls += d.stalls;
+        self.reference_gaps += d.reference_gaps;
+        self.reference_jumps += d.reference_jumps;
+        self.reference_slips += d.reference_slips;
+        let (o, e) = (&mut self.output, &d.output);
+        o.underruns += e.underruns;
+        o.deficits += e.deficits;
+        o.zero_frames += e.zero_frames;
+        o.coarse_drops += e.coarse_drops;
+        o.dropped_frames += e.dropped_frames;
+        o.slips += e.slips;
+        o.slip_net += e.slip_net;
+        o.reanchors += e.reanchors;
+    }
+
+    fn less(&self, earlier: &Counts) -> Counts {
+        Counts {
+            reference_gaps: self.reference_gaps.saturating_sub(earlier.reference_gaps),
+            reference_jumps: self.reference_jumps.saturating_sub(earlier.reference_jumps),
+            ..*self
+        }
+    }
+}
+
+/// A run's once-a-second snapshots added up (the status lines'), across the engine's own restarts (a fault and its retry, a
+/// device change): the counters, the latency budget's totals, each second's readout median and p95, and the seconds it
+/// wasn't running or the input clipped.
+#[derive(Clone, Debug)]
+pub struct Tally {
+    last: TelemetrySnapshot,
+    seconds: u32,
+    /// Seconds the engine wasn't running (stopped by a fault, retrying), and the runs that started over.
+    not_running: u32,
+    restarts: u32,
+    counts: Counts,
+    /// The counts at [`STARTUP_S`], for the reference's after its start-up.
+    at_startup: Option<Counts>,
+    budget: BudgetTotals,
+    /// Each second's readout median and p95, and its budget's p95s (while the readout is valid), with the second's number.
+    medians: Vec<f32>,
+    p95s: Vec<(u32, f32)>,
+    budget_p95s: Vec<LatencyBudget>,
+    clipped: u32,
+    /// The most real-time heap allocations a run published (they must stay 0).
+    rt_heap: u64,
+}
+
+/// What a run comes to ([`Tally::summary`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    pub seconds: f64,
+    pub running_s: u32,
+    pub restarts: u32,
+    pub counts: Counts,
+    /// The reference's gaps and jumps after its start-up's [`STARTUP_S`] (`None` for a shorter run).
+    pub reference_after_startup: Option<(u64, u64)>,
+    pub budget: Option<LatencyBudget>,
+    /// The seconds' readout medians (low, median, high), their p95s (median, worst and its second), and the median second's
+    /// budget p95s.
+    pub readout_medians: Option<(f32, f32, f32)>,
+    pub readout_p95: Option<(f32, f32, u32)>,
+    pub budget_p95: Option<LatencyBudget>,
+    pub output_drift_ppm: f32,
+    pub reference_drift_ppm: f32,
+    pub reference: Option<(f32, f32, bool)>,
+    pub target: String,
+    pub clipped_s: u32,
+    pub seen_s: u32,
+    pub rt_heap: u64,
+    /// The streams' devices, from the status.
+    pub mic: String,
+    pub output: String,
+}
+
+impl Tally {
+    /// From the snapshot before the first status line (just after the start).
+    pub fn new(first: &TelemetrySnapshot) -> Self {
+        Self {
+            last: *first,
+            seconds: 0,
+            not_running: 0,
+            restarts: 0,
+            counts: Counts::default(),
+            at_startup: None,
+            budget: BudgetTotals::default(),
+            medians: Vec::new(),
+            p95s: Vec::new(),
+            budget_p95s: Vec::new(),
+            clipped: 0,
+            rt_heap: 0,
+        }
+    }
+
+    /// One second's snapshot, and whether the input clipped since the last (the clip latch, taken).
+    pub fn see(&mut self, t: &TelemetrySnapshot, clipped: bool) {
+        self.seconds += 1;
+        let restarted = t.blocks < self.last.blocks;
+        if restarted {
+            self.restarts += 1;
+        }
+        self.counts.add(&Counts::between(&self.last, t));
+        let base = if restarted { BudgetTotals::default() } else { self.last.budget_totals };
+        let b = &t.budget_totals;
+        if b.blocks > base.blocks {
+            self.budget.blocks += b.blocks - base.blocks;
+            self.budget.mic_ms += b.mic_ms - base.mic_ms;
+            self.budget.wait_ms += b.wait_ms - base.wait_ms;
+            self.budget.chain_ms += b.chain_ms - base.chain_ms;
+            self.budget.queue_ms += b.queue_ms - base.queue_ms;
+            self.budget.render_ms += b.render_ms - base.render_ms;
+        }
+        if t.state != EngineState::Running {
+            self.not_running += 1;
+        } else if t.latency_valid {
+            self.medians.push(t.latency_ms_median);
+            self.p95s.push((self.seconds, t.latency_ms_p95));
+            self.budget_p95s.push(t.budget_p95);
+        }
+        if self.seconds == STARTUP_S {
+            self.at_startup = Some(self.counts);
+        }
+        self.clipped += u32::from(clipped);
+        self.rt_heap = self.rt_heap.max(t.rt_heap_allocations);
+        self.last = *t;
+    }
+
+    /// The run's summary: `seconds` it ran, its last snapshot `end` (before the stop), its status, and the output's fixed
+    /// target (`BufferTargets::output_ms`).
+    pub fn summary(&self, seconds: f64, end: &TelemetrySnapshot, status: &EngineStatus, fixed_target_ms: f32) -> Summary {
+        let mut medians = self.medians.clone();
+        medians.sort_by(f32::total_cmp);
+        let mid = |v: &[f32]| v.get(v.len() / 2).copied();
+        let readout_medians = match (medians.first(), mid(&medians), medians.last()) {
+            (Some(&lo), Some(m), Some(&hi)) => Some((lo, m, hi)),
+            _ => None,
+        };
+        let mut p95: Vec<f32> = self.p95s.iter().map(|p| p.1).collect();
+        p95.sort_by(f32::total_cmp);
+        let worst = self.p95s.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1));
+        let readout_p95 = mid(&p95).zip(worst).map(|(m, (at, w))| (m, w, at));
+        // Each part's median second.
+        let part = |f: fn(&LatencyBudget) -> f32| {
+            let mut v: Vec<f32> = self.budget_p95s.iter().map(f).collect();
+            v.sort_by(f32::total_cmp);
+            mid(&v).unwrap_or(f32::NAN)
+        };
+        let budget_p95 = (!self.budget_p95s.is_empty()).then(|| LatencyBudget {
+            mic_ms: part(|b| b.mic_ms),
+            wait_ms: part(|b| b.wait_ms),
+            chain_ms: part(|b| b.chain_ms),
+            queue_ms: part(|b| b.queue_ms),
+            render_ms: part(|b| b.render_ms),
+        });
+        let device = |s: Option<&StreamInfo>| s.map_or_else(|| "--".to_owned(), |s| s.device_name.clone());
+        Summary {
+            seconds,
+            running_s: self.seconds - self.not_running,
+            restarts: self.restarts,
+            counts: self.counts,
+            reference_after_startup: self.at_startup.map(|s| {
+                let after = self.counts.less(&s);
+                (after.reference_gaps, after.reference_jumps)
+            }),
+            budget: self.budget.means_since(&BudgetTotals::default()),
+            readout_medians,
+            readout_p95,
+            budget_p95,
+            output_drift_ppm: end.output_drift_ppm,
+            reference_drift_ppm: end.reference_drift_ppm,
+            reference: (end.reference_target_ms > 0.0).then_some((end.reference_fill_ms, end.reference_target_ms, end.reference_stamped)),
+            target: nf_engine::output_target_text(end.output_target_ms, end.output_adaptive, fixed_target_ms),
+            clipped_s: self.clipped,
+            seen_s: self.seconds,
+            rt_heap: self.rt_heap,
+            mic: device(status.mic.as_ref()),
+            output: device(status.output.as_ref()),
+        }
+    }
+}
+
+impl Summary {
+    /// What glitched, as phrases: mic glitches and stalls, output underruns and coarse drops, and a fault that stopped the
+    /// filter (seconds not running, or a restart). Empty for a clean run. Reference gaps and jumps aren't here: the start-up
+    /// has a few by design, and they touch the echo canceller's reference, not the audio.
+    pub fn glitches(&self) -> Vec<String> {
+        let c = &self.counts;
+        let mut g = Vec::new();
+        let mut add = |n: u64, one: &str, many: &str| {
+            if n > 0 {
+                g.push(count(n, one, many));
+            }
+        };
+        add(c.capture_glitches, "mic glitch", "mic glitches");
+        add(c.stalls, "mic stall", "mic stalls");
+        add(c.output.underruns, "output underrun", "output underruns");
+        add(c.output.coarse_drops, "output coarse drop", "output coarse drops");
+        add(u64::from(self.seen_s - self.running_s), "s not running (a fault)", "s not running (a fault)");
+        add(u64::from(self.restarts), "restart", "restarts");
+        g
+    }
+
+    /// What wasn't clean: what glitched, and real-time heap allocations (the real-time rule broken: they must stay 0).
+    pub fn problems(&self) -> Vec<String> {
+        let mut p = self.glitches();
+        if self.rt_heap > 0 {
+            p.push(count(self.rt_heap, "real-time heap allocation", "real-time heap allocations"));
+        }
+        p
+    }
+
+    /// The exit. A soak (`soak`: `--seconds`): 6 when it wasn't clean (even when Ctrl+C cut it short), else 3 when Ctrl+C cut it
+    /// short, else OK. A run without `--seconds` is someone using the filter, not a test: OK whatever its summary says.
+    pub fn result(&self, cut_short: bool, soak: bool) -> Result<(), Failure> {
+        if !soak {
+            return Ok(());
+        }
+        let p = self.problems();
+        if !p.is_empty() {
+            return Err(Failure::glitched(format!("The soak wasn't clean: {} (the summary above).", p.join(", "))));
+        }
+        if cut_short {
+            return Err(Failure::no_result(format!(
+                "Stopped after {} s, before --seconds ran out: no glitch until then.",
+                fixed(self.seconds, 0)
+            )));
+        }
+        Ok(())
+    }
+
+    /// The summary's lines.
+    pub fn text(&self) -> String {
+        let ms = |v: f32| fixed(f64::from(v), 1);
+        let c = &self.counts;
+        let mut s =
+            format!("Summary: {} s, {} of them running; mic {}, output {}", fixed(self.seconds, 0), self.running_s, self.mic, self.output);
+        if self.restarts > 0 {
+            let _ = write!(s, "; the filter restarted {} times", self.restarts);
+        }
+        let after = self
+            .reference_after_startup
+            .map_or(String::new(), |(gaps, jumps)| format!(" ({gaps} and {jumps} after the first {STARTUP_S} s)"));
+        let _ = write!(
+            s,
+            "
+  {:<15}mic glitches {}, mic stalls {}, output underruns {}; reference gaps {} and jumps {}{after}",
+            "dropouts", c.capture_glitches, c.stalls, c.output.underruns, c.reference_gaps, c.reference_jumps
+        );
+        let _ = write!(
+            s,
+            "
+  {:<15}{}",
+            "output events",
+            c.output.text()
+        );
+        if let Some((lo, m, hi)) = self.readout_medians {
+            let _ = write!(
+                s,
+                "
+  {:<15}readout {} ms (the seconds' medians {} to {})",
+                "latency",
+                ms(m),
+                ms(lo),
+                ms(hi)
+            );
+            if let Some((p, worst, at)) = self.readout_p95 {
+                let _ = write!(s, ", p95 {} ms (the worst second's {}, at {at} s)", ms(p), ms(worst));
+            }
+        } else {
+            let _ = write!(
+                s,
+                "
+  {:<15}no readout (off, or no clock yet)",
+                "latency"
+            );
+        }
+        if let Some(b) = &self.budget {
+            let _ = write!(
+                s,
+                "
+  {:<15}{}, means over the run",
+                "budget",
+                budget_text(b)
+            );
+        }
+        if let Some(b) = &self.budget_p95 {
+            let _ = write!(
+                s,
+                "
+  {:<15}mic delivery {}, wait {}, output queue {}, render side {} ms (the median second's)",
+                "budget p95s",
+                ms(b.mic_ms),
+                ms(b.wait_ms),
+                ms(b.queue_ms),
+                ms(b.render_ms)
+            );
+        }
+        let ppm = |v: f32| if v.is_finite() { format!("{v:+.1}") } else { "--".into() };
+        let _ = write!(
+            s,
+            "
+  {:<15}output {} ppm",
+            "drift",
+            ppm(self.output_drift_ppm)
+        );
+        if let Some((lead, target, stamped)) = self.reference {
+            let _ = write!(
+                s,
+                ", reference {} ppm; the reference's lead {} ms{} (target {}), {} slips",
+                ppm(self.reference_drift_ppm),
+                ms(lead),
+                if stamped { "" } else { " by delivery" },
+                ms(target),
+                c.reference_slips
+            );
+        }
+        if !self.target.is_empty() {
+            let _ = write!(
+                s,
+                "
+  {:<15}{}",
+                "output", self.target
+            );
+        }
+        let _ = write!(
+            s,
+            "
+  {:<15}clipped in {} of {} s; real-time heap allocations {}",
+            "input", self.clipped_s, self.seen_s, self.rt_heap
+        );
+        let p = self.problems();
+        let result = if p.is_empty() {
+            format!("clean: no glitch and no real-time heap allocation in {} s", fixed(self.seconds, 0))
+        } else {
+            format!("not clean: {}", p.join(", "))
+        };
+        let _ = write!(
+            s,
+            "
+  {:<15}{result}",
+            "result"
+        );
+        s
+    }
 }
 
 /// Before `latency` or `quality` measures: with the adaptive output target (the default) it measures the delivery at the
@@ -203,7 +651,8 @@ pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig) -> Result<()
 }
 
 /// What the status line's columns are.
-pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency median/p95 (mic capture to cable play-out), \
+pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS (the input before any processing; CLIP: it clipped \
+     since the last line, near-clip: within 0.1 dB of full scale); latency median/p95 (mic capture to cable play-out), \
      then its budget's means in ms [mic delivery+wait+output queue+render side] (the chain's offset, given at the start, \
      isn't in it), and with the adaptive output target (unless --no-adaptive-output) the output queue's target now; CPU \
      p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic block \
@@ -213,8 +662,8 @@ pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency m
      in WASAPI exclusive mode (out, mic); real-time heap allocations (pool allocations per second). Ctrl+C stops.";
 
 /// One line of live telemetry. `retrying`: stopped by a fault, with the engine set to restart by
-/// itself (`EngineStatus::retrying`).
-pub fn status_line(t: &TelemetrySnapshot, retrying: bool) -> String {
+/// itself (`EngineStatus::retrying`). `clipped`: the input clipped since the last line (the clip latch, taken: TODO 12).
+pub fn status_line(t: &TelemetrySnapshot, retrying: bool, clipped: bool) -> String {
     let state = match t.state {
         EngineState::Running => "running",
         EngineState::Starting => "starting",
@@ -222,7 +671,7 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool) -> String {
         EngineState::Stopped => "stopped",
         EngineState::Error => "error",
     };
-    let clip = if t.clip_latched {
+    let clip = if clipped {
         " CLIP"
     } else if t.near_clip {
         " near-clip"
@@ -433,21 +882,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            status_line(&t, false),
+            status_line(&t, false, true),
             "running  in -12.3/-30.0 dBFS CLIP  out -inf/--  lat 21.3/23.0 ms [10.7+0.0+6.0+5.0]  cpu 131 µs  drift +12/-3 ppm  \
              drops 1/2/3  rt 0 (4300/s)"
         );
-        assert!(LEGEND.contains("[mic delivery+wait+output queue+render side]"));
+        // The latch shows on the line that took it (a clip since the last line), not on every line after.
+        assert!(status_line(&t, false, false).starts_with("running  in -12.3/-30.0 dBFS  out"), "{}", status_line(&t, false, false));
+        assert!(LEGEND.contains("[mic delivery+wait+output queue+render side]") && LEGEND.contains("CLIP: it clipped since the last line"));
         let idle = TelemetrySnapshot { state: EngineState::Error, near_clip: true, output_drift_ppm: f32::NAN, ..Default::default() };
-        let line = status_line(&idle, false);
+        let line = status_line(&idle, false, false);
         assert!(line.starts_with("error    in 0.0/0.0 dBFS near-clip"), "{line}");
         assert!(line.contains("lat --") && line.contains("drift --/0 ppm"), "{line}");
         // A fault the engine is retrying by itself says so
-        assert!(status_line(&idle, true).starts_with("retrying in 0.0/0.0 dBFS"), "{}", status_line(&idle, true));
+        assert!(status_line(&idle, true, false).starts_with("retrying in 0.0/0.0 dBFS"), "{}", status_line(&idle, true, false));
         let stopped = TelemetrySnapshot { state: EngineState::Stopped, ..Default::default() };
-        assert!(status_line(&stopped, true).starts_with("retrying "));
-        assert!(status_line(&stopped, false).starts_with("stopped "));
-        assert!(status_line(&t, true).starts_with("running "), "a running engine isn't retrying");
+        assert!(status_line(&stopped, true, false).starts_with("retrying "));
+        assert!(status_line(&stopped, false, false).starts_with("stopped "));
+        assert!(status_line(&t, true, false).starts_with("running "), "a running engine isn't retrying");
     }
 
     /// The new counters appear once they count something: mic stalls, and coarse drops on the
@@ -455,14 +906,14 @@ mod tests {
     #[test]
     fn stalls_and_coarse_drops_show_once_there_are_any() {
         let quiet = TelemetrySnapshot { state: EngineState::Running, capture_glitches: 1, ..Default::default() };
-        let line = status_line(&quiet, false);
+        let line = status_line(&quiet, false, false);
         assert!(line.contains("drops 1/0/0  rt 0") && !line.contains("stalls") && !line.contains("coarse"), "{line}");
         let t = TelemetrySnapshot { stalls: 2, ..quiet };
-        assert!(status_line(&t, false).contains("drops 1/0/0 stalls 2  rt 0"), "{}", status_line(&t, false));
+        assert!(status_line(&t, false, false).contains("drops 1/0/0 stalls 2  rt 0"), "{}", status_line(&t, false, false));
         let t = TelemetrySnapshot { reference_coarse_drops: 4, ..quiet };
-        assert!(status_line(&t, false).contains("drops 1/0/0 coarse 0/4  rt 0"), "{}", status_line(&t, false));
+        assert!(status_line(&t, false, false).contains("drops 1/0/0 coarse 0/4  rt 0"), "{}", status_line(&t, false, false));
         let t = TelemetrySnapshot { stalls: 1, output_coarse_drops: 3, reference_coarse_drops: 5, ..quiet };
-        assert!(status_line(&t, false).contains("drops 1/0/0 stalls 1 coarse 3/5  rt 0"), "{}", status_line(&t, false));
+        assert!(status_line(&t, false, false).contains("drops 1/0/0 stalls 1 coarse 3/5  rt 0"), "{}", status_line(&t, false, false));
         assert!(LEGEND.contains("stalls") && LEGEND.contains("coarse"));
     }
 
@@ -470,11 +921,15 @@ mod tests {
     #[test]
     fn the_reference_lead_shows_with_a_reference() {
         let quiet = TelemetrySnapshot { state: EngineState::Running, ..Default::default() };
-        assert!(!status_line(&quiet, false).contains("ref "), "{}", status_line(&quiet, false));
+        assert!(!status_line(&quiet, false, false).contains("ref "), "{}", status_line(&quiet, false, false));
         let t = TelemetrySnapshot { reference_fill_ms: 23.36, reference_target_ms: 23.4, reference_stamped: true, ..quiet };
-        assert!(status_line(&t, false).contains("drift 0/0 ppm  ref 23.4/23.4 ms  drops 0/0/0"), "{}", status_line(&t, false));
+        assert!(
+            status_line(&t, false, false).contains("drift 0/0 ppm  ref 23.4/23.4 ms  drops 0/0/0"),
+            "{}",
+            status_line(&t, false, false)
+        );
         let t = TelemetrySnapshot { reference_target_ms: 31.0, reference_stamped: false, ..t };
-        assert!(status_line(&t, false).contains("ref 23.4/31.0 ms by delivery high  drops"), "{}", status_line(&t, false));
+        assert!(status_line(&t, false, false).contains("ref 23.4/31.0 ms by delivery high  drops"), "{}", status_line(&t, false, false));
         assert!(LEGEND.contains("lead/target"));
     }
 
@@ -493,14 +948,141 @@ mod tests {
             mic_exclusive: true,
             ..Default::default()
         };
-        let line = status_line(&t, false);
+        let line = status_line(&t, false, false);
         assert!(line.contains("lat 18.3/19.0 ms [10.3+0.0+5.0+3.0] target 5.0  cpu"), "{line}");
         assert!(line.contains("drops 0/0/0  excl out+mic  rt 0"), "{line}");
         let shared = TelemetrySnapshot { output_adaptive: false, output_exclusive: false, ..t };
-        let line = status_line(&shared, false);
+        let line = status_line(&shared, false, false);
         assert!(line.contains("[10.3+0.0+5.0+3.0]  cpu") && line.contains("drops 0/0/0  excl mic  rt"), "{line}");
-        assert!(!status_line(&TelemetrySnapshot { mic_exclusive: false, ..shared }, false).contains("excl"));
+        assert!(!status_line(&TelemetrySnapshot { mic_exclusive: false, ..shared }, false, false).contains("excl"));
         assert!(LEGEND.contains("--no-adaptive-output") && LEGEND.contains("'excl'"));
+    }
+
+    /// One second of a running engine: `s` seconds in (100 blocks a second), its budget's totals so far (1 + 6 + 6 + 4 ms a
+    /// block) and its readout, as `f` changes them.
+    fn second(s: u64, f: impl Fn(&mut TelemetrySnapshot)) -> TelemetrySnapshot {
+        let n = 100 * s;
+        let mut t = TelemetrySnapshot {
+            state: EngineState::Running,
+            blocks: n,
+            latency_valid: s > 0,
+            latency_ms_median: 17.0,
+            latency_ms_p95: 18.0,
+            budget_p95: nf_engine::LatencyBudget { mic_ms: 1.5, wait_ms: 6.5, chain_ms: 10.0, queue_ms: 7.0, render_ms: 4.5 },
+            budget_totals: BudgetTotals {
+                blocks: n,
+                mic_ms: n as f64,
+                wait_ms: 6.0 * n as f64,
+                chain_ms: 10.0 * n as f64,
+                queue_ms: 6.0 * n as f64,
+                render_ms: 4.0 * n as f64,
+            },
+            output_slips: s,
+            output_slip_net: -(s as i64),
+            reference_target_ms: 18.0,
+            reference_fill_ms: 18.1,
+            reference_stamped: true,
+            output_target_ms: 14.0,
+            output_adaptive: true,
+            ..Default::default()
+        };
+        f(&mut t);
+        t
+    }
+
+    /// A soak's tally: the counters summed over its seconds, the budget's means over the run, the seconds' readout medians and
+    /// p95s (the worst second named), the reference's gaps after its start-up, the clipped seconds; and its exit: clean, or
+    /// cut short by Ctrl+C (3).
+    #[test]
+    fn a_run_tallies_its_seconds_into_a_summary() {
+        let mut tally = Tally::new(&second(0, |_| {}));
+        for s in 1..=10u64 {
+            tally.see(
+                &second(s, |t| {
+                    // Two gaps in the start-up, one more at 8 s; one bad second's p95.
+                    t.reference_gaps = if s >= 8 { 3 } else { 2 };
+                    if s == 7 {
+                        t.latency_ms_p95 = 25.0;
+                    }
+                }),
+                s == 3,
+            );
+        }
+        let end = second(10, |t| t.reference_gaps = 3);
+        let status = EngineStatus { output: Some(stream("CABLE Input")), ..Default::default() };
+        let sum = tally.summary(10.02, &end, &status, 14.0);
+        assert_eq!((sum.counts.output.slips, sum.counts.output.slip_net, sum.counts.reference_gaps), (10, -10, 3));
+        assert_eq!(sum.reference_after_startup, Some((1, 0)), "one gap after the first 5 s");
+        assert_eq!((sum.readout_medians, sum.readout_p95), (Some((17.0, 17.0, 17.0)), Some((18.0, 25.0, 7))));
+        let b = sum.budget.unwrap();
+        assert!((b.mic_ms - 1.0).abs() < 1e-6 && (b.readout_ms() - 17.0).abs() < 1e-4, "{b:?}");
+        assert_eq!((sum.clipped_s, sum.seen_s, sum.running_s, sum.restarts), (1, 10, 10, 0));
+        assert!(sum.glitches().is_empty() && sum.result(false, true).is_ok());
+        assert_eq!(sum.result(true, true).unwrap_err().exit, crate::exit::Exit::NoResult, "a soak cut short");
+        assert!(sum.result(true, false).is_ok(), "a run without --seconds stopped with Ctrl+C");
+        let text = sum.text();
+        for part in [
+            "Summary: 10 s, 10 of them running; mic --, output CABLE Input",
+            "dropouts       mic glitches 0, mic stalls 0, output underruns 0; reference gaps 3 and jumps 0 (1 and 0 after the first 5 s)",
+            "output events  no underruns, zeros, drops or re-anchors; 10 slips (net -10 samples)",
+            "latency        readout 17.0 ms (the seconds' medians 17.0 to 17.0), p95 18.0 ms (the worst second's 25.0, at 7 s)",
+            "budget         mic delivery 1.0 + wait 6.0 + output queue 6.0 + render side 4.0 = readout 17.0 ms",
+            "budget p95s    mic delivery 1.5, wait 6.5, output queue 7.0, render side 4.5 ms (the median second's)",
+            "drift          output +0.0 ppm, reference +0.0 ppm; the reference's lead 18.1 ms (target 18.0), 0 slips",
+            "output         output target 14.0 ms at the end (adaptive, at the fixed target",
+            "input          clipped in 1 of 10 s; real-time heap allocations 0",
+            "result         clean: no glitch and no real-time heap allocation in 10 s",
+        ] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
+    }
+
+    /// Glitches decide a soak's exit (6, even when Ctrl+C cut it short): mic glitches and stalls, output underruns and coarse
+    /// drops, and a fault (seconds not running, a restart); and so do real-time heap allocations. The counters are summed
+    /// across the restart, which starts them afresh. A run without `--seconds` exits 0 whatever happened.
+    #[test]
+    fn a_run_that_glitched_exits_with_6() {
+        let mut tally = Tally::new(&second(0, |_| {}));
+        tally.see(&second(1, |t| t.render_underruns = 2), false);
+        tally.see(&second(2, |t| t.render_underruns = 2), false);
+        // A fault: stopped for a second, then a fresh run whose counters start again.
+        tally.see(&second(2, |t| t.state = EngineState::Error), false);
+        tally.see(&second(1, |t| t.capture_glitches = 1), false);
+        let sum = tally.summary(4.0, &second(1, |_| {}), &EngineStatus::default(), 14.0);
+        assert_eq!((sum.counts.output.underruns, sum.counts.capture_glitches, sum.restarts, sum.running_s), (2, 1, 1, 3));
+        assert_eq!(sum.glitches(), ["1 mic glitch", "2 output underruns", "1 s not running (a fault)", "1 restart"]);
+        for cut_short in [false, true] {
+            let f = sum.result(cut_short, true).unwrap_err();
+            assert_eq!(f.exit, crate::exit::Exit::Glitched);
+            assert!(f.message.starts_with("The soak wasn't clean: 1 mic glitch, 2 output underruns"), "{}", f.message);
+            assert!(sum.result(cut_short, false).is_ok(), "not a soak");
+        }
+        assert!(sum.text().contains("result         not clean: 1 mic glitch, 2 output underruns"), "{}", sum.text());
+        // Real-time heap allocations alone: not clean either.
+        let mut heap = Tally::new(&second(0, |_| {}));
+        heap.see(&second(1, |t| t.rt_heap_allocations = 3), false);
+        let sum = heap.summary(1.0, &second(1, |_| {}), &EngineStatus::default(), 14.0);
+        assert!(sum.glitches().is_empty() && sum.problems() == ["3 real-time heap allocations"], "{:?}", sum.problems());
+        assert_eq!(sum.result(false, true).unwrap_err().exit, crate::exit::Exit::Glitched);
+        assert!(sum.text().contains("result         not clean: 3 real-time heap allocations"), "{}", sum.text());
+        // Reference gaps alone aren't glitches: the start-up has some.
+        let mut quiet = Tally::new(&second(0, |_| {}));
+        quiet.see(&second(1, |t| t.reference_gaps = 3), false);
+        assert!(quiet.summary(1.0, &second(1, |_| {}), &EngineStatus::default(), 14.0).glitches().is_empty());
+    }
+
+    fn stream(name: &str) -> StreamInfo {
+        StreamInfo {
+            device_name: name.into(),
+            sample_rate: 48_000,
+            channels: 2,
+            period_ms: 10.0,
+            low_latency: false,
+            autoconvert: false,
+            raw: false,
+            exclusive: None,
+            exclusive_refused: None,
+        }
     }
 
     #[test]

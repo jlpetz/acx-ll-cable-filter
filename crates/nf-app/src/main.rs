@@ -63,6 +63,7 @@ mod config;
 mod console;
 mod cpu_check;
 mod exit;
+mod health;
 mod instance;
 mod logger;
 mod mutex;
@@ -221,11 +222,56 @@ pub fn message_box(caption: &str, text: &str) {
     unsafe { MessageBoxW(None, &text, &caption, MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
 }
 
-/// A fresh, empty folder for one test's files.
+/// A fresh, empty folder for one test's files ([`TestDir`]).
 #[cfg(test)]
-fn test_dir(name: &str) -> PathBuf {
+fn test_dir(name: &str) -> TestDir {
     let dir = std::env::temp_dir().join("nf-app-tests").join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temp folder");
-    dir
+    TestDir(dir)
+}
+
+/// A test's folder in %TEMP%: removed when the test drops it, and the shared `nf-app-tests` folder too once it's empty (other
+/// tests running meanwhile keep theirs), so test runs don't pile folders up there.
+#[cfg(test)]
+struct TestDir(PathBuf);
+
+#[cfg(test)]
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(parent) = self.0.parent() {
+            // Only once empty: another test's folder may still be in it.
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A test's folder is there while the test holds it, and gone when it drops it.
+    #[test]
+    fn a_test_folder_is_removed_when_dropped() {
+        let dir = super::test_dir("cleanup");
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        let path = dir.to_path_buf();
+        assert!(path.join("f.txt").exists());
+        drop(dir);
+        assert!(!path.exists());
+    }
 }

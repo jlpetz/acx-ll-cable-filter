@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use nf_core::{BLOCK, Block};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
-use crate::api::{ChainBlock, ChainParams, ChainRecording, EngineError, GateMode, GateParams, MAX_CHAIN_RECORDING_S};
+use crate::api::{ChainBlock, ChainParams, ChainRecording, EngineError, GateMode, GateParams, MAX_CHAIN_RECORDING_S, OutputFacts};
 use crate::control::{Inner, lock};
 use crate::handover::{self, End, Handed, Port};
 
@@ -78,6 +78,22 @@ impl ChainItem {
                 },
             },
             budget: None,
+            output: OutputFacts {
+                index: 0,
+                padding: 0,
+                pending: 0,
+                fill: 0.0,
+                target: 0,
+                slip: 0,
+                zeros: 0,
+                dropped: 0,
+                skipped: false,
+                underrun: false,
+                reanchored: false,
+                silence: 0,
+                clock_pos: 0.0,
+                clock_qpc_hns: 0.0,
+            },
         },
         lost: 0,
         mic: [0.0; BLOCK],

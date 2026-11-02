@@ -2,6 +2,7 @@
 //! `main` prints the failure. The window (`gui`) is in main.rs.
 
 mod bench;
+mod check;
 mod devices;
 mod latency;
 mod process;
@@ -24,6 +25,7 @@ pub fn run_cli(command: &Command) -> Result<(), Failure> {
             Ok(())
         }
         Command::Devices => devices::devices(),
+        Command::DeviceCheck(args) => check::check(args),
         Command::Run(args) => run::run(args),
         Command::Latency(args) => latency::latency(args),
         Command::Quality(args) => quality::quality(args),
@@ -51,7 +53,7 @@ fn db(v: f32) -> String {
 }
 
 /// `v` to `places` decimals, `--` if it isn't finite.
-fn fixed(v: f64, places: usize) -> String {
+pub(crate) fn fixed(v: f64, places: usize) -> String {
     if v.is_finite() { format!("{v:.places$}") } else { "--".into() }
 }
 

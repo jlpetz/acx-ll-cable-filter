@@ -523,6 +523,7 @@ mod tests {
                     aec_erle_db: f32::NAN,
                     settings: ChainParams::default(),
                     budget: None,
+                    output: Default::default(),
                 }
             })
             .collect();
@@ -780,6 +781,7 @@ mod tests {
                     aec_erle_db: f32::NAN,
                     settings: ChainParams::default(),
                     budget: None,
+                    output: Default::default(),
                 }
             })
             .collect();

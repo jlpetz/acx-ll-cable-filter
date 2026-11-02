@@ -11,7 +11,9 @@
 //!     has no result. The windows that reach it, less any that found the delay a pitch period off their neighbours, make a
 //!     delay track (linear between their centres, held beyond them), which the recording is read along to give the aligned
 //!     recording. Their spread and a straight-line fit (the drift, in ppm) are reported, with a warning when the delay moved by
-//!     more than 2 ms.
+//!     more than 2 ms. Each step of the track over 2 ms is looked into ([`delay_steps`]): a run of digital silence in the
+//!     recording there, about as long as the step, is samples inserted after the filter (on the dev VM's cables, most likely
+//!     the output cable's own, or the recorder's filling a jump of the capture's position: TODO 9), and the warning says so.
 //! - **Regions**, in the clean signal's time, and only as far as the recording reaches:
 //!   - near busy: within 50 ms of near speech activity; far busy: from 50 ms before far activity to 50 ms plus the echo's
 //!     150 ms tail after it;
@@ -61,8 +63,11 @@ const WINDOW_SEARCH_S: f64 = 0.05;
 const MIN_WINDOW_SPEECH_S: f64 = 0.5;
 /// The coarse delay's envelope frames (5 ms).
 const ENVELOPE_FRAME: usize = 240;
-/// A delay that moves by more than this over the take earns a warning.
+/// A delay that moves by more than this over the take earns a warning, and a step between two windows by more than it is
+/// looked into ([`delay_steps`]).
 const DELAY_MOVE_WARN_MS: f64 = 2.0;
+/// A run of exact zeros in the recording at least this long (1 ms) can be a hole in it.
+const MIN_SILENCE: usize = 48;
 /// A window this far from the median delay of the windows around it lined up a pitch period off, and is left out.
 const MAX_SLIP_MS: f64 = 3.0;
 /// The noise test's metrics skip the scene's first second, while the noise filter converges.
@@ -201,7 +206,86 @@ pub struct Analysis {
     /// The recording read along the delay track, as long as the clean signal (zeros where the recording doesn't reach).
     pub aligned: Vec<f32>,
     pub metrics: Metrics,
+    /// Where the delay stepped during the take, and the silence in the recording that explains a step, if any.
+    pub delay_steps: Vec<DelayStep>,
     pub warnings: Vec<String>,
+}
+
+/// A step of the path's delay between two windows of the alignment (TODO 9).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DelayStep {
+    /// About where in the scene (s): at the silence that explains it, else midway between the two windows' centres.
+    pub at_s: f64,
+    /// How far the delay moved (ms; positive: the recording came later).
+    pub ms: f64,
+    /// A run of digital silence (exact zeros) in the recording between the two windows, about as long as the step: where it
+    /// starts in the recording (s) and how long it is (ms). Silence inserted into the stream after the filter delays everything
+    /// after it by its length.
+    pub silence: Option<(f64, f64)>,
+}
+
+/// The steps of the delay `track` (each window's centre in the clean signal, and its delay, in samples) over
+/// [`DELAY_MOVE_WARN_MS`], each with the run of exact zeros in `recording` between the two windows that is closest to its
+/// length, when that's within 2 ms or a quarter of the step (a step the delay grew by; a drop has no silence to show).
+pub fn delay_steps(track: &[(f64, f64)], recording: &[f32]) -> Vec<DelayStep> {
+    let fs = f64::from(SAMPLE_RATE);
+    let min_step = DELAY_MOVE_WARN_MS * 1e-3 * fs;
+    let mut steps = Vec::new();
+    for w in track.windows(2) {
+        let ((c0, d0), (c1, d1)) = (w[0], w[1]);
+        let step = d1 - d0;
+        if step.abs() <= min_step {
+            continue;
+        }
+        let (from, to) = ((c0 + d0).max(0.0) as usize, ((c1 + d1).max(0.0) as usize).min(recording.len()));
+        let silence = (step > 0.0)
+            .then(|| {
+                zero_runs(recording.get(from..to).unwrap_or(&[]))
+                    .map(|(at, n)| (from + at, n))
+                    .min_by(|a, b| (a.1 as f64 - step).abs().total_cmp(&(b.1 as f64 - step).abs()))
+            })
+            .flatten()
+            .filter(|&(_, n)| (n as f64 - step).abs() <= (2e-3 * fs).max(0.25 * step));
+        steps.push(DelayStep {
+            at_s: silence.map_or((c0 + c1) / 2.0, |(at, _)| at as f64 - d0) / fs,
+            ms: step * 1e3 / fs,
+            silence: silence.map(|(at, n)| (at as f64 / fs, n as f64 * 1e3 / fs)),
+        });
+    }
+    steps
+}
+
+/// The runs of exact zeros in `x` at least [`MIN_SILENCE`] long: (start, length).
+fn zero_runs(x: &[f32]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < x.len() {
+            if x[i] != 0.0 {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < x.len() && x[i] == 0.0 {
+                i += 1;
+            }
+            if i - start >= MIN_SILENCE {
+                return Some((start, i - start));
+            }
+        }
+        None
+    })
+}
+
+/// A sentence a step: where, how far, and what explains it.
+fn step_text(s: &DelayStep) -> String {
+    let at = format!("It stepped by {:+.1} ms about {:.1} s into the scene", s.ms, s.at_s);
+    match s.silence {
+        Some((t, ms)) => format!(
+            "{at}, where the recording holds {ms:.1} ms of digital silence ({t:.2} s into it): samples inserted after the filter, \
+             by the output cable or the recording (the filter's own output events are listed below)."
+        ),
+        None => format!("{at}; no silence in the recording explains it (compare the filter's output events below)."),
+    }
 }
 
 /// Why the recording couldn't be aligned, with what the windows found if there were any.
@@ -214,6 +298,7 @@ pub struct AlignmentFailure {
 /// Aligns `recording` (which starts `lead` samples before the scene was played) with the scene's clean speech, and measures it.
 pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis, AlignmentFailure> {
     let (alignment, track) = align(scene, recording, lead)?;
+    let delay_steps = delay_steps(&track, recording);
     let len = scene.clean.len();
     let (aligned, covered) = follow(recording, &track, len);
     let fs = f64::from(SAMPLE_RATE);
@@ -233,12 +318,17 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
         ));
     }
     if alignment.delay_spread_ms() > DELAY_MOVE_WARN_MS {
-        warnings.push(format!(
+        let mut w = format!(
             "The path's delay moved by {:.1} ms during the take (drift {:+.1} ppm): the recording was aligned window by window, but \
              the levels near each move are less certain. Check the filter's drift and dropouts below.",
             alignment.delay_spread_ms(),
             alignment.drift_ppm
-        ));
+        );
+        for step in &delay_steps {
+            w.push(' ');
+            w.push_str(&step_text(step));
+        }
+        warnings.push(w);
     }
     if alignment.windows_aligned < alignment.windows {
         warnings.push(format!(
@@ -312,7 +402,7 @@ pub fn analyse(scene: &Scene, recording: &[f32], lead: usize) -> Result<Analysis
             warnings.push(format!("There was too little {name} ({seconds:.2} s) to measure it well; make the scene longer (--seconds)."));
         }
     }
-    Ok(Analysis { alignment, aligned, metrics, warnings })
+    Ok(Analysis { alignment, aligned, metrics, delay_steps, warnings })
 }
 
 /// One alignment window: its centre in the clean signal, and the delay and the coefficient found there (NaN and 0 when the
@@ -776,6 +866,87 @@ mod tests {
         // Exact away from the step: up to the centre of the window before it, and from the centre of the window after it
         assert_eq!(a.aligned[..11 * FS], processed[..11 * FS]);
         assert_eq!(a.aligned[13 * FS..], processed[13 * FS..]);
+        // The step is found, at the silence that made it.
+        assert_eq!(a.delay_steps.len(), 1, "{:?}", a.delay_steps);
+        let step = a.delay_steps[0];
+        assert!((step.ms - 3.0).abs() < 0.01 && (step.at_s - 12.0).abs() < 0.01, "{step:?}");
+        let (at, ms) = step.silence.unwrap();
+        assert!((at - (LEAD + 2_500 + 12 * FS) as f64 / 48_000.0).abs() < 1e-6 && (ms - 3.0).abs() < 1e-9, "{step:?}");
+
+        // The output cable's (TODO 9): 581 samples (12.1 ms) of silence inside a window, 12.3 s in, as the dev VM's quality
+        // takes had them. The warning says where, and that the silence explains it.
+        let mut holed = processed[..12 * FS + 14_400].to_vec();
+        holed.extend(std::iter::repeat_n(0.0, 581));
+        holed.extend_from_slice(&processed[12 * FS + 14_400..]);
+        let a = analyse(&scene, &recording(&holed, 2_500), LEAD).unwrap();
+        assert!((a.alignment.delay_spread_ms() - 12.1).abs() < 0.05, "{:?}", a.alignment);
+        let step = *a.delay_steps.first().unwrap();
+        assert!((step.ms - 12.1).abs() < 0.05 && (step.at_s - 12.3).abs() < 0.01, "{:?}", a.delay_steps);
+        assert!((step.silence.unwrap().1 - 12.1).abs() < 0.05, "{step:?}");
+        let w = a.warnings.iter().find(|w| w.contains("moved by 12.1 ms")).unwrap();
+        assert!(
+            w.contains("It stepped by +12.1 ms about 12.3 s into the scene, where the recording holds 12.1 ms of digital silence"),
+            "{w}"
+        );
+        assert!(w.contains("samples inserted after the filter, by the output cable or the recording"), "{w}");
+    }
+
+    /// A saved take's delay steps (TODO 9), rerun from its files: `NF_QUALITY_TAKE=DIR` (a `quality --save` folder of the
+    /// synthetic scene, whose clean speech `build` makes again) and `NF_QUALITY_TEST=echo|noise` (echo by default); the scene's
+    /// length is input.wav's. Ignored (it reads files): `NF_QUALITY_TAKE=DIR cargo test -p nf-app --release a_saved_takes_delay
+    /// -- --ignored --nocapture`. On the dev VM's takes of 2026-11-01 it finds one step in each of echo-7, echo-8, echo-9 and
+    /// d25-base (+10.6, +9.9, +11.1 and +12.9 ms), each at a run of zeros in the recording as long within 0.8 ms (10.6, 9.2,
+    /// 11.1 and 12.1 ms), and none in echo-6 and echo-10 (their delay held within 2.1 ms).
+    #[test]
+    #[ignore]
+    fn a_saved_takes_delay_steps() {
+        let Ok(dir) = std::env::var("NF_QUALITY_TAKE") else { return };
+        let dir = std::path::Path::new(&dir);
+        let read = |name: &str| crate::wav::read_mono_48k(&dir.join(name)).unwrap().samples;
+        let (input, recording) = (read("input.wav"), read("recording.wav"));
+        let test = if std::env::var("NF_QUALITY_TEST").is_ok_and(|t| t == "noise") { QualityTest::Noise } else { QualityTest::Echo };
+        let seconds = input.len() as f32 / FS as f32;
+        let scene = build(test, seconds, None, DEFAULT_ECHO_DELAY_MS, &UserAudio::default()).unwrap();
+        assert_eq!(scene.clean, read("clean.wav"), "the take's scene: its test (NF_QUALITY_TEST) and length");
+        let a = analyse(&scene, &recording, LEAD).unwrap();
+        let al = &a.alignment;
+        println!(
+            "{}: {} of {} windows, delay {:.2} to {:.2} ms past the lead",
+            dir.display(),
+            al.windows_aligned,
+            al.windows,
+            (al.delay_low - LEAD as f64) / 48.0,
+            (al.delay_high - LEAD as f64) / 48.0
+        );
+        for s in &a.delay_steps {
+            println!("  {}", step_text(s));
+        }
+    }
+
+    /// The steps of a delay track over 2 ms, each with the silence between its windows that's about as long; a drop, or a
+    /// step no silence of its length explains, has none.
+    #[test]
+    fn delay_steps_find_the_silence_that_explains_them() {
+        let mut rec = vec![0.25f32; 400_000];
+        // 576 zeros (12 ms) between the second and third windows, and a 60-sample run (1.25 ms) there too, which doesn't fit.
+        rec[190_000..190_576].fill(0.0);
+        rec[200_000..200_060].fill(0.0);
+        let track = [(48_000.0, 9_000.0), (144_000.0, 9_010.0), (240_000.0, 9_586.0), (336_000.0, 9_100.0)];
+        let steps = delay_steps(&track, &rec);
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert!((steps[0].ms - 12.0).abs() < 1e-9 && steps[0].silence == Some((190_000.0 / 48_000.0, 12.0)), "{:?}", steps[0]);
+        assert!((steps[0].at_s - (190_000.0 - 9_010.0) / 48_000.0).abs() < 1e-9);
+        // The drop back has no silence to show, and is placed between its windows.
+        assert!(steps[1].ms < -10.0 && steps[1].silence.is_none() && (steps[1].at_s - 6.0).abs() < 1e-9, "{:?}", steps[1]);
+        // Without the 12 ms run, the 1.25 ms one doesn't explain a 12 ms step.
+        rec[190_000..190_576].fill(0.25);
+        assert_eq!(delay_steps(&track, &rec)[0].silence, None);
+        assert!(
+            step_text(&delay_steps(&track, &rec)[0])
+                .ends_with("no silence in the recording explains it (compare the filter's output events below).")
+        );
+        // Steps under 2 ms aren't steps.
+        assert!(delay_steps(&[(0.0, 100.0), (96_000.0, 190.0)], &rec).is_empty());
     }
 
     #[test]

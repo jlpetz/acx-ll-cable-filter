@@ -331,6 +331,10 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     if let Some(b) = &r.budget {
         lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
     }
+    if let Some(e) = &r.output {
+        // What the output side did meanwhile (TODO 9): a spread these don't explain is the devices' own.
+        lines.push(format!("Output during the test: {}", e.text()));
+    }
     if r.valid > 0 {
         lines.push(format!("Confidence: {} dB (lowest)", fixed(r.confidence_db_min, 1)));
     }
@@ -611,6 +615,14 @@ mod tests {
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.1),
             budget: Some(LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
+            output: Some(nf_engine::OutputEvents {
+                underruns: 1,
+                deficits: 1,
+                zero_frames: 480,
+                slips: 4,
+                slip_net: -2,
+                ..Default::default()
+            }),
             chain_ms: 10.0,
             confidence_db_min: 18.04,
             conditions: "mic 10 ms, RAW".to_owned(),
@@ -623,6 +635,7 @@ mod tests {
             "Chain: 10.0 ms",
             "Live readout during the test: 12.1 ms",
             "Its budget (means over the test): mic 10.5 + wait 0.0 + output queue 22.0 + render 5.0 ms, chain 10.0 ms on top",
+            "Output during the test: 1 underrun, 1 deficit (10.0 ms of zeros); 4 slips (net -2 samples)",
             "Confidence: 18.0 dB (lowest)",
             "Warning: One repetition was too quiet",
             "Conditions: mic 10 ms, RAW",

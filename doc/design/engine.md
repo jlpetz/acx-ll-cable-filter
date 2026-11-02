@@ -125,13 +125,19 @@ error and stop):
      Push it (in ms) to `RollingStats<100>`, and its budget ("The latency budget" below). It times the block's first
      *output* sample, so the chain's offset isn't in it.
    - **Telemetry:** meters (dBFS, through display ballistics: a 1 s peak hold falling at 20 dB/s,
-     and a 300 ms power-domain RMS), clip latch (`clip_latched |= clipped`), near-clip, speech
+     and a 300 ms power-domain RMS), clip latch (`clip_latched |= clipped`; the window's reset clears it, and `run`'s
+     status line takes it, `Engine::take_clip`, a swap, so each line shows a clip since the last: TODO 12), near-clip, speech
      probability, and the noise stage's reduction (`noise_reduction_db`: its output against its
      latency-aligned input, the floor mix and gate included).
    - **Timing:** whole-block µs into `RollingStats<100>`; AEC and noise ticks.
 4. **Once a second (every 100 blocks):**
    - publish p50/p99/max timings, latency median/p95 and its budget (each part's mean and p95, and
-     the run's totals), drift ppm, fills (ms), slip counts and AEC stats (`chain.stage_stats()`);
+     the run's totals), drift ppm, fills (ms), slip counts and AEC stats (`chain.stage_stats()`), and the output's events
+     (`OutputEvents`, TODO 9: underruns and the silence an exclusive output's device played in our stream where its ring ran
+     short, deficits and the zeros they wrote, coarse drops and the samples dropped, slips and their net, the fill
+     calibration's re-anchors; `OutputEvents::between` gives a span's, which the quality and latency reports and `run`'s
+     summary print, `OutputEvents::text` in one phrase); last, a publication count (`Telemetry::publishes`, `Release`), so a
+     reader can wait for the next second's counters (`run`'s summary and `devices --check` do, before they stop);
    - publish `rt_heap_allocations = thread_scope_fallbacks() - baseline` (must stay 0; log once,
      from the control thread, if it grows) and `rt_pool_allocations_per_s` (the per-second growth of
      `thread_scope_allocs()`; nonzero with AEC3, because sonora 0.2.0 allocates per block, served
@@ -548,6 +554,19 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
     position it skipped without zero-filling (a gap over 100 ms; the stream index doesn't count it);
   - AEC3's own delay and ERLE estimates after the block (cached by sonora: a reference, no work);
   - the block's latency budget ("The latency budget"), while the readout is on and the block had one;
+  - what the output side did, `OutputFacts` (TODO 9; a few stores a block, always): the device-stream index the block's first
+    sample went to, the device's padding and our pending samples before the write, the fill the drift loop read and its
+    target, the slip (-1, 0, +1), zeros written (a deficit; not the first block's starting fill), pending samples dropped,
+    whether the block itself was dropped (skipped), an underrun, a re-anchor, the silence an exclusive device played since
+    the block before (`RenderSink::take_silence`; its clock leaves it out, so the fill doesn't see it and every later sample
+    plays that much later until the loop slips it back), and the device's clock reading the block used (position in our
+    stream's frames and its QPC time; `nf_engine::clock_drift` fits each clock's drift from those and the mic's stamps, for
+    `devices --check`). Block to block the index moves by the last
+    block's length (480 and its slip, or nothing when it was skipped) plus this block's zeros less its dropped samples
+    (`pipeline/tests/budget.rs`, `the_output_facts_follow_the_stream_block_for_block`, through bursts, a dry device, a mic
+    stall's dry spell and overfull burst, a 1024-frame device and a lagging clock; the facts add up to the counters). So the
+    chain's output maps onto the device's stream sample for sample, and a move of the output path's delay that the facts
+    don't show happened after the device took the samples;
   - the chain's live settings after the block (`nf_core::controls::ChainParams`: on/off, passthrough, floor, gate; a dozen
     relaxed loads), so a change during the recording (an `Engine::apply`, a latency test) shows;
   - the reference's take, `ReferenceFacts`, which `Reference::take` fills in as it goes (a few stores a block, always): the
@@ -605,6 +624,11 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   device's delivery for the reference's replays.
 - The audio loop's logic should be split so its per-block bookkeeping can be driven by a fake
   stream in a test: a trait over capture/render that the WASAPI wrappers implement.
+- The output path's delay: the cables' bursts at 300 ppm move it by nothing but slips for two minutes (no zeros, drops,
+  underruns or re-anchors; the readout's 1 s means within a millisecond:
+  `the_cables_bursts_move_the_output_path_by_its_slips_alone`). The 9-13 ms steps the dev VM's quality takes saw (TODO 9)
+  were silence inserted between the filter's output and the test's capture: the cable's, unless the next take's capture gaps
+  show the test's recorder filled a position jump (TODO 8's detail, "The output path's 9-13 ms steps").
 - Exclusive mode the same way: `EventRender` over a `PeriodDevice` (the WASAPI one is `ExclusiveRenderDevice`), the
   period and format choices, the retries and the fall-back as pure functions; `pipeline/tests/exclusive.rs` drives a
   2 ms device on its own clock against steady and bursty mic delivery, a thread stalled mid-run and before its first

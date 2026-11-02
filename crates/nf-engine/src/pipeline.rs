@@ -23,7 +23,7 @@ use nf_core::telemetry::{LatencyBudget, Telemetry};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
-use crate::api::ChainBlock;
+use crate::api::{ChainBlock, OutputFacts};
 use crate::budget::{self, BudgetStats, WakeLog};
 use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
@@ -107,6 +107,12 @@ pub(crate) trait RenderSink {
     /// Underruns the sink saw itself since the last call: an event-driven exclusive output whose ring was short of a period
     /// at a device event, or that answered one late (`exclusive::EventRender`). 0 for a stream the device drains by itself.
     fn take_underruns(&mut self) -> u64 {
+        0
+    }
+    /// Silence the sink's device played in our stream since the last call, in frames: an event-driven exclusive output's ring
+    /// short at an event, or the periods of an event answered late. [`Self::clock`] leaves it out of the position, so the
+    /// fill doesn't see it; every later sample plays that much later. 0 for a stream the device drains by itself.
+    fn take_silence(&mut self) -> u64 {
         0
     }
 }
@@ -221,6 +227,16 @@ pub(crate) struct Counters {
     /// Output coarse drops: times the fill ran over target + 2 blocks and whole blocks were dropped
     /// back to within half a block (one per event), plus pending overflows.
     pub output_drops: u64,
+    /// The output's deficits after the first block (zeros written to top the device up to the target) and the zeros; the
+    /// samples coarse drops and pending overflows took; the slips' net (inserted less dropped); and the fill calibration's
+    /// re-anchors (telemetry's `OutputEvents`, TODO 9).
+    pub output_deficits: u64,
+    pub output_zero_frames: u64,
+    pub output_dropped_frames: u64,
+    pub output_slip_net: i64,
+    pub output_reanchors: u64,
+    /// Silence an exclusive output's device played in our stream where its ring ran short ([`RenderSink::take_silence`]).
+    pub output_silence_frames: u64,
     /// Blocks whose reference was (partly) zeros for samples that hadn't arrived: none had yet, or
     /// they came late and were discarded when they did (the timeline kept whole; reference.rs).
     pub reference_gaps: u64,
@@ -331,6 +347,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     pub(crate) last_latency_ms: Option<f32>,
     /// This block's latency budget, while the readout is on and it had one (the chain recorder's).
     pub(crate) last_budget: Option<LatencyBudget>,
+    /// What the output side did at this block (the chain recorder's).
+    pub(crate) last_output: OutputFacts,
 }
 
 impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
@@ -384,6 +402,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             last_pool_allocs: None,
             last_latency_ms: None,
             last_budget: None,
+            last_output: OutputFacts::default(),
         }
     }
 
@@ -626,6 +645,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             aec_erle_db: aec.map_or(f32::NAN, |a| a.erle_db),
             settings: proc.params(),
             budget: self.last_budget,
+            output: self.last_output,
         };
         rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
     }
@@ -657,13 +677,29 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// fill with this wake's queued blocks written.
     fn push_output<S: RenderSink>(&mut self, sink: &mut S, times: Option<BlockTimes>) -> Result<(), Hr> {
         self.last_budget = None;
+        // A failed call below leaves the block without facts, as without a budget.
+        self.last_output = OutputFacts::default();
         // What the sink saw itself (an exclusive output's ring short at an event). Before the first block it's the output
         // running before the mic, as a shared device's dry start is.
         let sink_dry = sink.take_underruns();
+        // And the silence its device played meanwhile; before the first block, as its underruns, it isn't counted.
+        let silence = sink.take_silence();
+        let silence = if self.out_started { silence } else { 0 };
+        self.counters.output_silence_frames += silence;
         let mut padding = sink.padding()?;
+        let reanchors = self.fill_offset.reanchors;
+        let mut facts = OutputFacts {
+            padding: u32::try_from(padding).unwrap_or(u32::MAX),
+            pending: u32::try_from(self.pending_len).unwrap_or(u32::MAX),
+            silence: u32::try_from(silence).unwrap_or(u32::MAX),
+            ..OutputFacts::default()
+        };
         // One clock reading per block, for the fill and the readout. An error costs only this
         // block's estimate and readout; the next write reports a dead stream.
         let clock = sink.clock().ok().flatten();
+        if let Some(c) = clock {
+            (facts.clock_pos, facts.clock_qpc_hns) = (c.pos_frames, c.qpc_hns);
+        }
         let backlog = self.mic.len() / BLOCK * BLOCK;
         let low = padding < self.out_period;
         if padding == 0 && self.out_started {
@@ -681,9 +717,11 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let dry = self.out_started && (sink_dry > 0 || (low && padding == 0) || short);
         // What the adaptive target measures a block's lateness on: the fill before its calibration (out_target.rs).
         let (raw, clocked) = self.raw_fill(clock, padding + self.pending_len);
+        facts.fill = fill as f32;
         if dry {
             // Once a block, as the shared path counts one: a dry spell of many short device events is one underrun.
             self.counters.render_underruns += 1;
+            facts.underrun = true;
             if let Some(t) = self.adaptive.as_mut().and_then(|a| a.underrun(raw, clocked)) {
                 self.set_out_target(t);
             }
@@ -710,6 +748,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
                     added = n;
                 }
             }
+            // The first block's zeros are the starting fill, not a deficit.
+            if self.out_started && added > 0 {
+                self.counters.output_deficits += 1;
+                self.counters.output_zero_frames += added as u64;
+                facts.zeros = u32::try_from(added).unwrap_or(u32::MAX);
+            }
             // Zeros raise the estimate and the padding alike; moving pending to the device neither.
             self.out_drift.reset((queued + added as f64) as f32);
             self.out_draining = false;
@@ -732,6 +776,9 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.consume_pending(from_pending);
             drop_block = excess - from_pending as f64 > (BLOCK / 2) as f64;
             let removed = from_pending + if drop_block { BLOCK } else { 0 };
+            self.counters.output_dropped_frames += removed as u64;
+            facts.dropped = u32::try_from(from_pending).unwrap_or(u32::MAX);
+            facts.skipped = drop_block;
             self.out_draining = excess - removed as f64 > (BLOCK / 2) as f64;
             self.out_drift.reset((queued - removed as f64) as f32);
             if let Some(a) = self.adaptive.as_mut() {
@@ -745,21 +792,35 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             slip = self.out_drift.update(fill as f32);
         }
         self.out_started = true;
+        facts.target = u32::try_from(self.out_target).unwrap_or(u32::MAX);
+        facts.reanchored = self.fill_offset.reanchors != reanchors;
+        self.counters.output_reanchors = self.fill_offset.reanchors;
+        // Where this block's first sample lands in the device stream (or would have, dropped).
+        let index = self.written_total + self.pending_len as u64;
+        facts.index = index;
 
         if !drop_block {
             if slip != Slip::None {
                 self.counters.output_slips += 1;
+                let net: i8 = if slip == Slip::Insert { 1 } else { -1 };
+                self.counters.output_slip_net += i64::from(net);
+                facts.slip = net;
             }
-            // Where this block's first sample lands in the device stream, and what's queued ahead of it.
-            let index = self.written_total + self.pending_len as u64;
-            let ahead = self.queue_ahead(clock, index, padding + self.pending_len);
             let m = slip.produced_len().min(BLOCK + 1);
             self.out_rs.resample(&self.out_blk[..], &mut self.slipped[..m]);
-            self.append_pending(m);
+            let pending_before = self.pending_len;
+            let overflowed = self.append_pending(m);
+            facts.dropped = facts.dropped.saturating_add(u32::try_from(overflowed).unwrap_or(u32::MAX));
+            // The oldest pending samples made room: the block's first sample went that much sooner, and that much less is
+            // queued ahead of it (neither the clock nor the calibration moved meanwhile).
+            let index = index.saturating_sub(overflowed as u64);
+            facts.index = index;
+            let ahead = self.queue_ahead(clock, index, padding + pending_before.saturating_sub(overflowed));
             if let (Some(times), Some(c)) = (times, clock) {
                 self.readout(c, index, ahead, times);
             }
         }
+        self.last_output = facts;
         self.flush_pending(sink, padding)?;
         Ok(())
     }
@@ -833,18 +894,21 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
     }
 
-    fn append_pending(&mut self, m: usize) {
+    /// Queues `m` slipped samples behind the pending ones; returns how many of the oldest pending ones it dropped to make room.
+    fn append_pending(&mut self, m: usize) -> usize {
         let m = m.min(self.slipped.len()).min(self.pending.len());
         let over = (self.pending_len + m).saturating_sub(self.pending.len());
         if over > 0 {
             self.consume_pending(over);
             self.counters.output_drops += 1;
+            self.counters.output_dropped_frames += over as u64;
         }
         let start = self.pending_len;
         if let (Some(dst), Some(src)) = (self.pending.get_mut(start..start + m), self.slipped.get(..m)) {
             dst.copy_from_slice(src);
             self.pending_len += m;
         }
+        over
     }
 
     /// Drops the `n` oldest pending samples.
@@ -961,6 +1025,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.render_underruns.store(c.render_underruns, Relaxed);
         tel.reference_gaps.store(c.reference_gaps, Relaxed);
         tel.output_coarse_drops.store(c.output_drops, Relaxed);
+        tel.output_deficits.store(c.output_deficits, Relaxed);
+        tel.output_zero_frames.store(c.output_zero_frames, Relaxed);
+        tel.output_dropped_frames.store(c.output_dropped_frames, Relaxed);
+        tel.output_slip_net.store(c.output_slip_net, Relaxed);
+        tel.output_reanchors.store(c.output_reanchors, Relaxed);
+        tel.output_silence_frames.store(c.output_silence_frames, Relaxed);
         tel.reference_coarse_drops.store(c.reference_drops, Relaxed);
         tel.tap_overflows.store(c.tap_overflows, Relaxed);
 
@@ -977,6 +1047,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 
         tel.near_clip.store(self.near_clip_period, Relaxed);
         self.near_clip_period = false;
+        // Last: a reader that sees it move has this second's counters.
+        tel.published();
     }
 }
 
@@ -1028,6 +1100,8 @@ struct FillOffset {
     ring_next: usize,
     /// While re-anchoring: the median of the readings before the event.
     before: Option<f64>,
+    /// Re-anchors started (the device ran dry, or its clock jumped), for the output's events.
+    reanchors: u64,
 }
 
 /// Readings compared across a re-anchor: 32 blocks, a whole cycle of a 1024-frame device period
@@ -1036,7 +1110,16 @@ const OFFSET_RING: usize = 32;
 
 impl FillOffset {
     fn new(period: usize) -> Self {
-        Self { lo: 0.0, width: period.max(1) as f64, primed: false, ring: [0.0; OFFSET_RING], ring_len: 0, ring_next: 0, before: None }
+        Self {
+            lo: 0.0,
+            width: period.max(1) as f64,
+            primed: false,
+            ring: [0.0; OFFSET_RING],
+            ring_len: 0,
+            ring_next: 0,
+            before: None,
+            reanchors: 0,
+        }
     }
 
     /// The sawtooth may have moved (the device ran dry): re-anchor from the next readings.
@@ -1044,6 +1127,7 @@ impl FillOffset {
         if !self.primed || self.before.is_some() {
             return;
         }
+        self.reanchors += 1;
         match self.median() {
             Some(m) => self.before = Some(m),
             None => self.primed = false,

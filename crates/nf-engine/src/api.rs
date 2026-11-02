@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use nf_core::config::{DeviceSelection, EngineConfig, GateConfig, GateMode, IoConfig, ProcessingConfig};
 pub use nf_core::controls::{ChainParams, GateParams};
-pub use nf_core::telemetry::{BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot};
+pub use nf_core::telemetry::{
+    BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot,
+};
 
 /// Endpoint direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -224,6 +226,9 @@ pub struct LatencyReport {
     pub budget: Option<LatencyBudget>,
     /// The chain's own stream offset during the test (passthrough: the enabled stages' latency).
     pub chain_ms: f32,
+    /// What the output side did from the sweeps' start to their end (its underruns, zeros, drops, slips and re-anchors): a
+    /// spread between sweeps that these don't explain is the devices' own (TODO 9). `None` until the sweeps have run.
+    pub output: Option<OutputEvents>,
     /// Lowest arrival confidence among valid repetitions, in dB.
     pub confidence_db_min: f32,
     /// Engine periods, RAW, autoconvert and the devices used, for the record.
@@ -235,7 +240,7 @@ pub struct LatencyReport {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LatencyProgress {
     Running { fraction: f32, stage: &'static str },
-    Done(LatencyReport),
+    Done(Box<LatencyReport>),
     Failed(String),
     Cancelled,
 }
@@ -475,6 +480,113 @@ impl ReferenceFacts {
     }
 }
 
+/// What the output side did at one block ([`ChainBlock::output`]; engine.md, "The audio thread": the output slip and the coarse
+/// corrections). Counts are samples at 48 kHz. The output path's delay moves only by what these show (slips, zeros, drops, and
+/// an exclusive device's `silence`) and by what the device and its driver do after taking the samples, which the engine doesn't
+/// see (TODO 9).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputFacts {
+    /// The stream index where the block's first sample went: the frames written before it, the prefill and our pending
+    /// samples included. Block to block it moves by the last block's length (479, 480 or 481, or 0 when it was `skipped`) plus
+    /// this block's `zeros` less its `dropped`; for a skipped block, where it would have gone. An exclusive output's device
+    /// stream has its `silence` too: there the block went that far on, summed over the run.
+    pub index: u64,
+    /// The device's padding when the block was written (before any of it), and our samples pending behind it.
+    pub padding: u32,
+    pub pending: u32,
+    /// The fill the drift loop read (samples, calibrated to the padding: telemetry's `output_fill_ms`), and the target it holds.
+    pub fill: f32,
+    pub target: u32,
+    /// The block's slip: -1 (a sample dropped), 0, or +1 (one inserted).
+    pub slip: i8,
+    /// Zeros written at this block to top the device up to the target (a deficit; the first block's starting fill isn't one).
+    pub zeros: u32,
+    /// Pending samples dropped at this block (written before it, not yet given to the device): in a coarse drop, or because
+    /// they overflowed.
+    pub dropped: u32,
+    /// The block itself was dropped in a coarse drop: none of it went to the device (its 480 samples count in the output's
+    /// dropped samples).
+    pub skipped: bool,
+    /// An underrun counted at this block: the device found dry, a deficit, or an exclusive output's ring short since the last block.
+    pub underrun: bool,
+    /// The fill's calibration to the padding started over at this block (the device ran dry, or its clock jumped).
+    pub reanchored: bool,
+    /// Silence an exclusive output's device played in our stream since the block before, where its ring ran short at an
+    /// event or an event was answered late (frames; always with `underrun`). Every later sample plays that much later, until
+    /// the drift loop slips it back out. 0 for a shared output.
+    pub silence: u32,
+    /// The device's clock as the block read it: its position in our stream's frames (an exclusive device's `silence` left
+    /// out), and the QPC time that position belongs to (100 ns units). NaN without a reading (its first few ms). Against the
+    /// mic's index and stamps they give the clocks' drift ([`clock_drift`]).
+    pub clock_pos: f64,
+    pub clock_qpc_hns: f64,
+}
+
+impl Default for OutputFacts {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            padding: 0,
+            pending: 0,
+            fill: 0.0,
+            target: 0,
+            slip: 0,
+            zeros: 0,
+            dropped: 0,
+            skipped: false,
+            underrun: false,
+            reanchored: false,
+            silence: 0,
+            clock_pos: f64::NAN,
+            clock_qpc_hns: f64::NAN,
+        }
+    }
+}
+
+/// A clock's drift against the mic's, fitted over a chain recording's blocks ([`clock_drift`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DriftFit {
+    /// Positive when the clock runs fast against the mic's (it plays or captures more samples in the mic's second).
+    pub ppm: f64,
+    /// About two standard errors of `ppm` (a 95% interval), from the fits' residuals: the stamps' scatter, or the
+    /// delivery's.
+    pub uncertainty_ppm: f64,
+    /// The span fitted, in seconds.
+    pub seconds: f64,
+}
+
+/// How the mic's own clock was read for [`ClockDrift`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicTiming {
+    /// By its packets' QPC stamps (`ChainBlock::capture_qpc_hns`).
+    Stamps,
+    /// By when its packets were delivered (`ChainBlock::mic_wake_hns`): without trusted stamps, noisier.
+    Delivery,
+}
+
+/// The output's and the reference's clocks against the mic's, measured over a chain recording's blocks rather than read from
+/// the drift loops, whose estimates take a minute or more to settle (the output's loop is a PI controller with a natural
+/// frequency of about 0.17 rad/s; bursty delivery gives it a start-up transient of hundreds of ppm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockDrift {
+    /// How the mic's clock was read; `None` when it couldn't be (no stamps and no wakes, or too short a span).
+    pub mic: Option<MicTiming>,
+    /// The output device's clock, from its position readings ([`OutputFacts::clock_pos`]).
+    pub output: Option<DriftFit>,
+    /// The echo reference's (the speakers' loopback), from its timeline's index and the tap times its stamped lead readings
+    /// give ([`ReferenceFacts`]); `None` without a reference or its stamps.
+    pub reference: Option<DriftFit>,
+}
+
+/// The clocks' drift over `blocks` (a chain recording's, in order; leave out a start-up that shouldn't count). Each clock is
+/// a straight line of time against its sample index: the mic's from its stamps (or its delivery), the output's from its
+/// position readings, the loopback's from its timeline and stamps; each line is fitted by least squares with its own
+/// intercept on each stretch between the steps that break it (a mic position skip, an output underrun or re-anchor, a
+/// reference restart), so a glitch moves no slope. Needs three seconds of each; `None` for a clock it can't fit.
+pub fn clock_drift(blocks: &[ChainBlock]) -> ClockDrift {
+    crate::clock_fit::clock_drift(blocks)
+}
+
 /// One block the chain processed, as the chain recorder saw it ([`Engine::record_chain`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChainBlock {
@@ -511,6 +623,9 @@ pub struct ChainBlock {
     /// `readout_ms()` is the readout. `None` while the readout is off, without the mic's stamps or the output's clock (its
     /// first few ms), or for a block the output dropped.
     pub budget: Option<LatencyBudget>,
+    /// What the output side did at this block: where it went in the device's stream, the fill and target, and its slip, zeros,
+    /// drops, underrun and re-anchor.
+    pub output: OutputFacts,
 }
 
 /// What [`ChainRecorder::stop`] gives: every block the chain processed while it recorded, the chain's input and output.
@@ -671,6 +786,12 @@ impl Engine {
     /// Clears the input clip latch.
     pub fn reset_clip(&self) {
         self.inner.telemetry.reset_clip()
+    }
+
+    /// Whether the raw input clipped since the latch was last cleared (or taken), clearing it: a console line a second shows
+    /// each clip once (TODO 12).
+    pub fn take_clip(&self) -> bool {
+        self.inner.telemetry.take_clip()
     }
 
     /// Starts a latency test. The engine must be running, with the mic set to the loop's input.

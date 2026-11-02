@@ -120,7 +120,11 @@ Notes:
       the same scene (#10's detail file).
     - With the chain recorder (`--save` now also writes what the chain got and gave, rerunnable exactly offline), six
       takes: far-only turns a median of 57-60 dB each, as offline. In three of the six the analysis saw the output path's
-      delay move by 11-13 ms during the take (2 ms in the others): the output side (#9), not the echo.
+      delay move by 11-13 ms during the take (2 ms in the others): the output side (#9), not the echo. Looked into
+      2026-11-02: each was one step at a run of 9-12 ms of digital silence in the recording, inserted between the filter's
+      output and the test capture: the cable's, unless the next take's capture gaps show our recorder filled a position jump
+      (`play_record` zero-fills one; the old takes kept no gap counts) (#8's detail file, "The output path's 9-13 ms steps"). The report now prints the output's events
+      over the take, and its delay warning names each step and the silence that explains it.
   - **The echo delay, calibrated in each take (built 2026-11-01, not yet run live).** The fixed 100 ms was too generous: a
     real speaker's echo follows the loopback tap by the output's latency and the air, often only 10-30 ms, and the engine's
     lead (12-14 ms on the cables) has to fit under it. `--echo-delay MS` (0-300, default 25) is now the echo's delay after

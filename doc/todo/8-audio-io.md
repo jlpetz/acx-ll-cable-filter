@@ -128,3 +128,37 @@ its loopback is sometimes steady, sometimes 0-1440 a wake. The traces are in `%L
   handling bursts either way.
 - **What it costs:** about 6 ms of mic age on average beyond a block, and the output target's spare block (10 ms) exists
   to absorb it (#13's budget). Our own driver (#19) can deliver on the engine's schedule instead.
+
+## The output path's 9-13 ms steps (#9; looked into 2026-11-02)
+In three of six 60 s quality takes (2026-11-01, #14's detail file) the analysis saw the path's delay move by 11-13 ms.
+Rerun from the saved takes (`C:\Users\Administrator\Downloads\nf-quality\`; `analysis.rs`'s ignored
+`a_saved_takes_delay_steps`, and each chain recording's output against its capture, window by window):
+- **Each move is one step, at a run of zeros as long.** The capture of the output cable holds one run of exact zeros mid-take,
+  as long as the step within 0.8 ms: echo-7 +10.6 ms (10.6 ms of zeros, 28.1 s into the recording), echo-8 +9.9 (9.2), echo-9
+  +11.1 (11.1), d25-base +12.9 (12.1); echo-6's 1.4 ms move is a 74-sample run, and echo-10 has none. The content runs on
+  unbroken across each run (the lag after it is the lag before plus the run): samples were inserted, none lost.
+- **Not the engine.** The chain's output against the capture steps there, while the probe's input against the chain's mic
+  holds (no step in five of the six). In d25-base, whose chain recording has the budget, the readout holds at 62.5-64.0 ms
+  across the step (blocks 1480-1500), the queue at 16-28 ms (never near dry) and the mic index moves 480 a block. A deficit's
+  zeros, a coarse drop, a re-anchor of `FillOffset` or the adaptive target's walk (not in those takes) would move the readout,
+  which the output's own clock times; and in the event simulations each is temporary (the loop pulls the path back to the
+  target within seconds), where these held for the rest of the take. The cables' bursts move the path by its slips alone
+  (`pipeline/tests/budget.rs`, `the_cables_bursts_move_the_output_path_by_its_slips_alone`).
+- **So the silence came in after the filter's output**, between CABLE Input and the test's capture of CABLE Output, and
+  the path was that much longer from then on; about once a minute here. Most likely the cable's own: but the test's
+  recorder (`play_record.rs`) zero-fills a jump of the capture's device position, and the old takes kept no gap counts, so
+  a position jump of the cable's capture side filled by us isn't ruled out. The next take's dropouts line says (a capture gap
+  about the step's length: the position jumped and our recorder filled it; none: the cable wrote the zeros). Either way the
+  cable's timeline ran on without the audio, so an app reading it would hear the hole too. The input cable does the same: echo-5's chain
+  mic has 534 zeros (11.1 ms) at 8.85 s, the flip the calibration saw (#14's detail file). There the blocks' age at their
+  wake holds at 19 ms either side (blocks 700-1100), so the cable's timeline ran on through the hole and its content came
+  that much later: whether the cable wrote the zeros or its position jumped and the capture filled the gap (the reports'
+  capture gaps and mic glitches would tell; they weren't kept), an app reading the cable gets an 11 ms hole and a longer
+  transit, not an artifact of our capture. It's the bursts' story (above): a cable with no clock moves audio on its own
+  timer. Real devices: to see. Our own driver (#19) won't.
+- **Shown now:** the output's events per block (`OutputFacts`; `chain_blocks.csv`'s `out_*` columns: the stream index each
+  block went to, padding, pending, fill, target, slip, zeros, dropped, skipped, underrun, re-anchor, the silence an exclusive
+  device played since the block before, and the clock reading), over a take or a test
+  (the quality report's and `latency`'s "output events" line) and over a run (`run`'s summary); and the quality analysis
+  names each step of the delay and the silence that explains it (`analysis::delay_steps`, in the delay warning). The next live
+  take should show the output's events clean (slips only) where its delay steps, and the warning naming the silence.
