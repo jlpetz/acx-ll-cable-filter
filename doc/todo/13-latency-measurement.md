@@ -337,6 +337,23 @@ or stalls, output underruns or coarse drops, a fault, or a real-time heap alloca
 interactive run isn't a test, and the adaptive target allows up to three underruns a run). The latency p95 is the seconds'
 p95s (their median and the worst), not one over every block, which would need a per-block histogram in the engine.
 
+## Soak (2026-11-02)
+`run --mic "CABLE-A Output" --output "CABLE Input" --aec --reference "CABLE-B Input" --seconds 1800` on the dev VM's cables,
+the defaults (exclusive mic and output, the adaptive target), a silent mic (nothing played into cable A), the engine-track
+build (bf5534e). The log is `Downloads\nf-scratch\soak-1.txt` (outside the repo). Exit 6: it glitched once.
+- **Latency:** readout 20.4 ms median (the seconds' medians 18.7-28.0; the worst, 28.3 ms, at 137 s, just after the
+  underrun below), p95 20.7; budget 0.8 + 6.8 + 8.9 + 5.5 = 22.0 ms, the chain's 19.0 on top: 40.9 ms. CPU about 100 us
+  a block; 0 real-time heap allocations; 0 mic glitches or stalls.
+- **One output underrun, at about 122 s:** the adaptive target's first walk down (14 to 9.9 ms in 9 s, heading for about
+  6.8) went under what the cable needed. The strike put it back to 14 ms; it walked down again from 233 s, held at 10.9
+  from 270 s, and came down to 6.8 by 751 s, with no underrun in the 17 minutes after. As designed (at most three strikes),
+  but a slower first walk, or one that stops at the measured need plus more than 1 ms, would avoid it.
+- **The reference** (cable B's loopback, carrying only the keep-alive's silence): 171 short takes after the first 5 s, in
+  three bursts (about 66 by 19 min, 113 by 23.5 min, 175 by 26 min) and 2 jumps (one before 19 min, one at 26 min). Each
+  jump makes AEC3 reconverge for 5-10 s. Cable B's loopback hiccupping, as in #10's traces; real speakers to compare.
+- **Unexplained:** the output drift reading climbed from about 0 to +98 ppm over the last 30 s of the run, with the latency
+  unchanged. Check in the next soak whether it's real (VB-CABLE changing rate) or the reading.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.
