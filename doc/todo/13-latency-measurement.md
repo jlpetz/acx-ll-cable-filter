@@ -397,6 +397,22 @@ each lowering goes at once. The end point is the same, a window later: in the so
   in a longer run) an underrun would show what ran dry. The cost to check against: 7 ms more latency for minutes 2 to 4
   than the single stage had.
 
+## Soak 2 (2026-11-02, the engine fixes, b53a965)
+The same command and conditions as the first soak; the log is `Downloads\nf-scratch\soak-2.txt`. Exit 6.
+- **The new first walk works:** the target held at 14 ms in its trial until about 344 s, walked to 6.9 by about 390 s,
+  and nothing underran during or after it.
+- **The exclusive mic was perfectly steady:** 180,100 wakes of one block each, none of two or more.
+- **One output underrun anyway, at about 110 s, at the fixed 14 ms target** (before any lowering): a hiccup bigger than
+  the fixed target covers. The first soak's underrun was at about 122 s, 9 s into its first walk, so it may have been the
+  same kind of event rather than the walk. Two soaks, both near the two-minute mark: suspicious, not yet explained.
+  (Times are from the count of status lines, which skips a second now and then: 1734 lines for 1801 s.)
+- **The reference had 1,109 short takes** (the first soak 171), mostly from about 92 s to 595 s and again at about
+  1234-1251 s, and 2 jumps: cable B's loopback, carrying only the keep-alive's silence, misbehaving for minutes at a time.
+- **Latency:** readout 20.1 ms median, p95 20.6; app path 40.3 ms with AEC3 and RNNoise. 0 real-time heap allocations.
+- **The output drift reading** again read high at the end (+69.6 ppm; the first soak +97.9), with the latency steady.
+- **Next:** a flight recorder (the last seconds of per-block facts kept in memory and written out when an underrun or a
+  reference jump happens), so a soak or a user's run shows what ran dry.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.
