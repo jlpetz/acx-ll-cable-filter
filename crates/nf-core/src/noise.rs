@@ -23,9 +23,10 @@
 //! (hop > 480).
 //!
 //! **Reset:** when something was processed since the last one, the model, the re-blocker and `NoisePost`, in that order;
-//! otherwise nothing (so the chain's resets don't spend RNNoise's spare state). Everything is sized in [`NoiseStage::new`],
-//! so `activate` again never clears state. The one allocation on the audio thread is a model's: RNNoise's second real
-//! reset before the next `activate` rebuilds its state in place (ten allocations, [`NoiseModel::reset`]).
+//! otherwise nothing (so the chain's resets don't spend RNNoise's spare states). Everything is sized in [`NoiseStage::new`],
+//! so `activate` again never clears state, and a reset allocates nothing: RNNoise swaps in a spare state that its own
+//! thread built (`nf_stages::RnnoiseModel`), but for the one known exception, a third real reset within 100 ms of two
+//! others, which rebuilds in place ([`NoiseModel::reset`]).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -85,12 +86,14 @@ pub trait NoiseModel: Send {
     fn info(&self) -> &ModelInfo;
 
     /// Gets ready to process: called by [`NoiseStage`]'s `activate`, on the processing thread. May allocate (a warm-up, a
-    /// spare state).
+    /// spare state's maker).
     fn prepare(&mut self) -> Result<(), StageError>;
 
-    /// Back to a fresh state. On the audio thread, so no locks or system calls, and no allocation, with one exception: a
-    /// model that keeps a spare state (RNNoise) swaps it in at the first reset, and may rebuild in place at any further
-    /// one until the next `prepare` (RNNoise: ten allocations, which the engine's real-time pool serves).
+    /// Back to a fresh state. On the audio thread, so no locks or system calls, and no allocation but one known exception. A
+    /// model whose fresh state costs allocations keeps spares built off the audio thread and swaps one in (RNNoise: two,
+    /// replaced by a thread of its own within 100 ms); the exception is a reset that finds them all spent, which rebuilds in
+    /// place (RNNoise: a third real reset within 100 ms of two others, ten allocations, which the engine's real-time pool
+    /// serves; counted, `RnnoiseModel::rebuilds`).
     fn reset(&mut self);
 
     /// Denoises one hop: `input` and `output` are each `hop` samples, at full scale ±1. The input is finite and within
@@ -255,7 +258,7 @@ impl Stage for NoiseStage {
         &MONO_IN_OUT
     }
 
-    /// Checks the format, then prepares the model on the calling thread (RNNoise: rebuilds a used spare, warms up easyfft).
+    /// Checks the format, then prepares the model on the calling thread (RNNoise: starts its spare maker, warms up easyfft).
     fn activate(&mut self, activation: &Activation) -> Result<(), StageError> {
         activation.require_host(&DESCRIPTOR.name)?;
         self.model.prepare()
@@ -282,7 +285,7 @@ impl Stage for NoiseStage {
 
     fn reset(&mut self) {
         if !self.dirty {
-            return; // already fresh: keep RNNoise's spare
+            return; // already fresh: keep RNNoise's spares
         }
         self.dirty = false;
         self.model.reset();

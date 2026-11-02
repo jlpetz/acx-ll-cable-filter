@@ -17,16 +17,32 @@
 //!   thread, the first block allocates. The engine also calls [`crate::warm_up_fft_thread`] before it enters its real-time
 //!   scope, so the leaked state lives on the system heap rather than the locked pool, and each start gives the pool back in
 //!   full (review RT-1, `tests/rt_pool.rs`).
-//! - **Reset:** nnnoiseless has none, and a fresh state costs ten allocations (`DenoiseState::new`). So a pristine spare is
-//!   kept, built off the audio path. `reset` swaps it in: no allocation, no free. The used state stays parked in the
-//!   spare's slot until `prepare` rebuilds the spare. A second `reset` before then replaces the state in place: ten
-//!   allocations and frees on the audio thread, the one exception to its no-allocation rule (`NoiseModel::reset`), which
-//!   the engine's real-time pool serves (each passthrough end and each noise toggle after the first, until the next
-//!   start). The noise stage resets the model only when it processed something since its last reset, so the chain's
-//!   resets don't spend the spare. Feeding silence instead isn't a reset: RNNoise's input high-pass (pole radius
-//!   0.998) rings on from old audio for tens of ms, and silent frames don't touch the RNN state at all.
+//! - **Reset:** nnnoiseless has none, and a fresh state costs ten allocations (`DenoiseState::new`). So pristine spares are
+//!   kept, built off the audio thread, and `reset` swaps one in: no allocation, no free, no lock, no system call. A thread of
+//!   the model's own, the spare maker (started at the first `prepare`, the stage's `activate`), keeps [`SPARES`] of them on a
+//!   lock-free ring and frees the states that `reset` retired, on a second: it looks every [`MAKER_POLL`] (100 ms), and
+//!   `prepare` fills the ring before it starts it, so the first resets after an `activate` find their spares there. Only a
+//!   third real reset within 100 ms of two others could find none (no control toggles that fast): the one known exception
+//!   to the reset rule (`nf_core::noise::NoiseModel::reset`), it rebuilds the state in place, ten allocations that the
+//!   engine's real-time pool serves, as every reset after the first did before the maker (TODO 4), and counts it
+//!   ([`RnnoiseModel::rebuilds`]); the used state is retired as at any reset, so nothing is freed on the audio thread. A
+//!   model that was never prepared (no maker) has its first [`SPARES`] resets free and rebuilds after them. The maker polls
+//!   rather than being woken: waking it (`Thread::unpark`) would be a system call in `reset`, which the stage rule keeps
+//!   free of them, and a thread that looks at two rings ten times a second costs nothing beside the audio thread's hundreds
+//!   of wakes. The states built with the model and at `prepare` come from the real-time pool (the engine builds the chain
+//!   in its real-time scope), and the maker frees them when they're retired: nf-mem's pool takes frees from any thread
+//!   (by address, under its spin lock, which the audio thread takes only when it allocates: at a start, and in the
+//!   exception above). The noise stage resets the model only
+//!   when it processed something since its last reset, so the chain's resets don't spend a spare. Dropping the model stops
+//!   and joins the maker, so every state is freed by the time the drop returns (the engine's real-time pool comes back in
+//!   full at each start: review RT-1). Feeding silence instead isn't a reset: RNNoise's input high-pass (pole radius 0.998)
+//!   rings on from old audio for tens of ms, and silent frames don't touch the RNN state at all.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use nf_core::chain::MAX_STAGE_LATENCY;
 use nf_core::controls::ChainControls;
@@ -34,6 +50,7 @@ use nf_core::noise::{ModelInfo, NoiseModel, NoiseStage};
 use nf_core::stage::{StageError, text};
 use nf_core::{BLOCK, Block};
 use nnnoiseless::DenoiseState;
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 /// The stream offset: one block (see the module notes).
 pub const RNNOISE_LATENCY: u32 = 480;
@@ -55,12 +72,87 @@ pub fn rnnoise_stage(controls: Arc<ChainControls>) -> Result<NoiseStage, StageEr
     NoiseStage::new(controls, Box::new(RnnoiseModel::new()))
 }
 
+/// Pristine spare states kept for `reset` (the module notes): two, so two real resets within the maker's poll find one each.
+pub const SPARES: usize = 2;
+/// How often the spare maker looks for spent spares to replace (it needs no wake-up from the audio thread).
+pub const MAKER_POLL: Duration = Duration::from_millis(100);
+/// The retired states' ring: room for every state the audio thread can retire between two of the maker's passes, and more.
+const RETIRED: usize = 2 * SPARES + 2;
+
+type State = Box<DenoiseState<'static>>;
+
+/// The maker's side of the spares: pristine states go out on `fresh`, retired ones come back on `retired` to be freed.
+struct Shelf {
+    fresh: Producer<State>,
+    retired: Consumer<State>,
+}
+
+impl Shelf {
+    /// Frees what was retired and fills `fresh` with pristine states (not real-time: it allocates and frees). It frees before
+    /// each state it builds, so resets that take each new spare as it comes can't fill the retired ring meanwhile.
+    fn top_up(&mut self, stop: Option<&AtomicBool>) {
+        loop {
+            while let Ok(used) = self.retired.pop() {
+                drop(used);
+            }
+            if self.fresh.slots() == 0 || stop.is_some_and(|s| s.load(Acquire)) || self.fresh.push(DenoiseState::new()).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// The spare maker's thread and its stop flag. Dropping it stops and joins the thread, which hands its shelf back, so what
+/// the shelf holds is freed by whoever drops the model, as the states it built at the start were allocated there.
+struct Maker {
+    thread: Option<JoinHandle<Shelf>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Maker {
+    /// Starts the maker on `shelf`; `None` if no thread could be had (the shelf is gone with it, and the model rebuilds in
+    /// place once its spares are spent).
+    fn start(mut shelf: Shelf) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("nf-rnnoise-spares".into())
+            .spawn(move || {
+                while !flag.load(Acquire) {
+                    shelf.top_up(Some(&flag));
+                    std::thread::park_timeout(MAKER_POLL);
+                }
+                shelf
+            })
+            .ok()?;
+        Some(Self { thread: Some(thread), stop })
+    }
+}
+
+impl Drop for Maker {
+    fn drop(&mut self) {
+        self.stop.store(true, Release);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            drop(t.join());
+        }
+    }
+}
+
 /// RNNoise as a [`NoiseModel`].
 pub struct RnnoiseModel {
-    state: Box<DenoiseState<'static>>,
-    /// Pristine while `spare_fresh`; otherwise the state the last `reset` retired.
-    spare: Box<DenoiseState<'static>>,
-    spare_fresh: bool,
+    state: State,
+    /// The audio thread's side of the spares: pristine ones come in on `fresh`, retired ones go out on `retired` (the module
+    /// notes).
+    fresh: Consumer<State>,
+    retired: Producer<State>,
+    /// A retired state the ring had no room for, retired again at the next reset.
+    parked: Option<State>,
+    /// The maker's side, until the first `prepare` starts the maker with it.
+    shelf: Option<Shelf>,
+    maker: Option<Maker>,
+    /// Resets that found no spare and rebuilt the state in place (the module notes).
+    rebuilds: u64,
     // Blocks inline rather than boxed, and the loops in kernels taking each block as its own argument: then LLVM knows
     // nothing overlaps and vectorises without run-time overlap checks.
     /// The hop's input in i16 units.
@@ -70,9 +162,57 @@ pub struct RnnoiseModel {
 }
 
 impl RnnoiseModel {
-    /// Two model states, the live one and the spare (allocates).
+    /// The live state and [`SPARES`] pristine ones (allocates). The spare maker starts at the first `prepare`.
     pub fn new() -> Self {
-        Self { state: DenoiseState::new(), spare: DenoiseState::new(), spare_fresh: true, rnn_in: [0.0; BLOCK], rnn_out: [0.0; BLOCK] }
+        let (fresh_tx, fresh) = RingBuffer::new(SPARES);
+        let (retired, retired_rx) = RingBuffer::new(RETIRED);
+        let mut shelf = Shelf { fresh: fresh_tx, retired: retired_rx };
+        shelf.top_up(None);
+        Self {
+            state: DenoiseState::new(),
+            fresh,
+            retired,
+            parked: None,
+            shelf: Some(shelf),
+            maker: None,
+            rebuilds: 0,
+            rnn_in: [0.0; BLOCK],
+            rnn_out: [0.0; BLOCK],
+        }
+    }
+
+    /// Pristine spares ready for the next resets.
+    pub fn spares(&self) -> usize {
+        self.fresh.slots()
+    }
+
+    /// The spare maker runs (from the first `prepare`).
+    pub fn has_maker(&self) -> bool {
+        self.maker.is_some()
+    }
+
+    /// Resets that found no spare and rebuilt the state in place, ten allocations each: with the maker, only a third real
+    /// reset within its poll of two others (the module notes).
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
+    /// Hands a retired state over to be freed off this thread: the parked one first, then this one; one the ring has no room
+    /// for waits in `parked`. Real-time, but for one case the ring's size rules out while the maker runs: the ring and the
+    /// parking place both full (only a model never prepared, on a thread that isn't real-time) frees it here.
+    fn retire(&mut self, used: State) {
+        if let Some(p) = self.parked.take()
+            && let Err(PushError::Full(p)) = self.retired.push(p)
+        {
+            self.parked = Some(p);
+        }
+        if let Err(PushError::Full(u)) = self.retired.push(used) {
+            if self.parked.is_none() {
+                self.parked = Some(u);
+            } else {
+                drop(u);
+            }
+        }
     }
 }
 
@@ -87,23 +227,26 @@ impl NoiseModel for RnnoiseModel {
         &RNNOISE_INFO
     }
 
-    /// Rebuilds a used spare and warms up easyfft on the calling thread (see the module notes).
+    /// Starts the spare maker the first time, its spares filled first, and warms up easyfft on the calling thread (see the
+    /// module notes).
     fn prepare(&mut self) -> Result<(), StageError> {
-        if !self.spare_fresh {
-            self.spare = DenoiseState::new();
-            self.spare_fresh = true;
+        if let Some(mut shelf) = self.shelf.take() {
+            shelf.top_up(None);
+            self.maker = Maker::start(shelf);
         }
         warm_up_thread();
         Ok(())
     }
 
+    /// Swaps in a pristine spare and retires the used state to the maker; with none left (the module notes), builds the
+    /// fresh state here (ten allocations, counted) and retires the used one all the same.
     fn reset(&mut self) {
-        if self.spare_fresh {
-            std::mem::swap(&mut self.state, &mut self.spare);
-            self.spare_fresh = false;
-        } else {
-            self.state = DenoiseState::new();
-        }
+        let fresh = self.fresh.pop().unwrap_or_else(|_| {
+            self.rebuilds = self.rebuilds.saturating_add(1);
+            DenoiseState::new()
+        });
+        let used = std::mem::replace(&mut self.state, fresh);
+        self.retire(used);
     }
 
     fn process_hop(&mut self, input: &[f32], output: &mut [f32]) -> f32 {
@@ -290,22 +433,52 @@ mod tests {
         assert_eq!(run(&mut s, &input), fresh);
     }
 
+    /// Waits (up to 5 s) until the maker has put back every spare.
+    fn until_spares_are_back(m: &RnnoiseModel) {
+        let start = std::time::Instant::now();
+        while m.spares() < SPARES {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the maker didn't replace a spare: {}", m.spares());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The spares: two built with the model; the first `prepare` starts their maker, which replaces each one a reset takes
+    /// (within its 100 ms poll), so every reset swaps in a pristine state. Without the maker (a model never prepared) the
+    /// first two resets take the spares and the rest rebuild in place: pristine either way.
     #[test]
-    fn the_model_spends_its_spare_then_rebuilds() {
-        let mut m = RnnoiseModel::new();
-        assert!(m.spare_fresh);
-        m.reset();
-        assert!(!m.spare_fresh, "the first reset swaps the spare in");
-        m.reset();
-        assert!(!m.spare_fresh, "the second rebuilds in place");
-        m.prepare().unwrap();
-        assert!(m.spare_fresh, "prepare rebuilds the spare");
-        // A pristine model either way.
+    fn the_maker_replaces_each_spare_a_reset_takes() {
         let x = noise(6 * BLOCK, 4, 0.2);
         let fresh = run_model(&mut RnnoiseModel::new(), &x);
-        run_model(&mut m, &noise(3 * BLOCK, 9, 0.3));
+        let mut m = RnnoiseModel::new();
+        assert_eq!((m.spares(), m.has_maker()), (SPARES, false));
+        m.prepare().unwrap();
+        assert!(m.has_maker(), "prepare starts the maker");
+        for round in 0..6 {
+            run_model(&mut m, &noise(3 * BLOCK, 9 + round, 0.3));
+            m.reset();
+            assert_eq!(m.spares(), SPARES - 1, "round {round}: the reset took a spare");
+            assert_eq!(run_model(&mut m, &x), fresh, "round {round}: pristine");
+            until_spares_are_back(&m);
+        }
+        // Two resets in a row take both; the maker replaces both.
         m.reset();
-        assert_eq!(run_model(&mut m, &x), fresh);
+        m.reset();
+        assert_eq!(m.spares(), 0);
+        until_spares_are_back(&m);
+        assert_eq!(m.rebuilds(), 0, "every reset found a spare");
+        // A second prepare keeps the maker it has.
+        m.prepare().unwrap();
+        assert!(m.has_maker() && m.spares() == SPARES);
+        drop(m);
+        // Without the maker the spares run out, and each reset after them rebuilds in place, counted.
+        let mut never = RnnoiseModel::new();
+        for round in 0..4 {
+            run_model(&mut never, &noise(3 * BLOCK, 20 + round, 0.3));
+            never.reset();
+            assert_eq!(never.spares(), SPARES.saturating_sub(round as usize + 1), "round {round}");
+            assert_eq!(never.rebuilds(), (round as u64 + 1).saturating_sub(SPARES as u64), "round {round}");
+            assert_eq!(run_model(&mut never, &x), fresh, "round {round}: without the maker, pristine all the same");
+        }
     }
 
     #[test]

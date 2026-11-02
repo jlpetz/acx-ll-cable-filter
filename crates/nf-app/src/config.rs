@@ -17,15 +17,24 @@ pub fn load(path: &Path) -> Result<EngineConfig, Failure> {
 
 /// The window's settings file (`{"engine": {...}, "ui": {...}}`) or a bare `EngineConfig`. Missing
 /// fields take their defaults and unknown ones are ignored, as the window loads it; a UTF-8 BOM is
-/// fine.
+/// fine. The window's file is brought up to date by its version, as the window does
+/// (`nf_gui::upgrade_saved_engine`); a bare config (`quality --save`'s `chain_config.json`) is taken
+/// as it is.
 pub fn parse(text: &str) -> Result<EngineConfig, String> {
     let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
-    let engine = match value {
-        serde_json::Value::Object(mut map) if map.contains_key("engine") => map.remove("engine").unwrap_or_default(),
-        serde_json::Value::Object(map) => serde_json::Value::Object(map),
+    let (engine, version) = match value {
+        serde_json::Value::Object(mut map) if map.contains_key("engine") => {
+            let version = map.get("version").and_then(serde_json::Value::as_u64).map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX));
+            (map.remove("engine").unwrap_or_default(), Some(version))
+        }
+        serde_json::Value::Object(map) => (serde_json::Value::Object(map), None),
         _ => return Err("expected a JSON object".into()),
     };
-    serde_json::from_value(engine).map_err(|e| e.to_string())
+    let mut cfg: EngineConfig = serde_json::from_value(engine).map_err(|e| e.to_string())?;
+    if let Some(v) = version {
+        nf_gui::upgrade_saved_engine(v, &mut cfg);
+    }
+    Ok(cfg)
 }
 
 impl Processing {
@@ -187,6 +196,12 @@ mod tests {
         assert!(parse("[1, 2]").is_err());
         assert!(parse("{\"processing\": {\"floor_db\": \"loud\"}}").is_err());
         assert!(parse("not json").is_err());
+        // The window's file is brought up to date by its version (an older one's saved depth of 2 was the default then:
+        // automatic now); a bare config keeps its depth, as `quality --save` wrote what ran.
+        let depth = |json: &str| parse(json).unwrap().processing.model_depth;
+        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 2}}, "ui": {}}"#), nf_engine::AUTO_MODEL_DEPTH);
+        assert_eq!(depth(r#"{"version": 1, "engine": {"processing": {"model_depth": 2}}}"#), 2);
+        assert_eq!(depth(r#"{"processing": {"model_depth": 2}}"#), 2);
     }
 
     #[test]
@@ -203,7 +218,10 @@ mod tests {
         assert_eq!((p.gate.mode, p.gate.threshold_db), (GateMode::Auto, -40.0));
         assert_eq!((p.noise_model.as_str(), p.high_band), ("rnnoise", nf_engine::HighBand::Model), "kept unless given");
         Processing { model: Some("ulunas".into()), high_band: Some(nf_engine::HighBand::Pass), ..Default::default() }.apply(&mut p);
-        assert_eq!((p.noise_model.as_str(), p.high_band, p.model_depth), ("ulunas", nf_engine::HighBand::Pass, 2));
+        assert_eq!(
+            (p.noise_model.as_str(), p.high_band, p.model_depth),
+            ("ulunas", nf_engine::HighBand::Pass, nf_engine::AUTO_MODEL_DEPTH)
+        );
         Processing { model_depth: Some(1), ..Default::default() }.apply(&mut p);
         assert_eq!(p.model_depth, 1);
     }

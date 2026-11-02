@@ -69,9 +69,10 @@ third-party plugins come later.
   runs on the audio thread inside its real-time scope (a deviation from CLAP's main thread, for easyfft).
   `Chain::activate` first checks each stage against the host profile and its slot (`check_host_profile`).
 - **`process(ProcessIo { inputs, output })`** and **`reset()`** are real-time: no allocation, locks,
-  syscalls or logging. A reset with nothing processed since the last one is a no-op. One known exception:
-  RNNoise's second real reset before the next activate rebuilds its state in place (ten allocations from the
-  engine's real-time pool).
+  syscalls or logging. A reset with nothing processed since the last one is a no-op. RNNoise's reset swaps in
+  a pristine state that a thread of its own built (two kept, replaced within 100 ms; TODO 4). One known
+  exception: a third real reset within 100 ms of two others finds none and rebuilds the state in place (ten
+  allocations from the engine's real-time pool; counted).
 - **`latency()`** follows CLAP semantics: the samples by which output lags input in the stream (the
   stream offset, *not* the algorithmic latency, which is the offset plus one hop). The chain caches it at
   activate. RNNoise is 480. AEC3 is 430 (8.96 ms), measured with an impulse (`nf_stages::AEC3_LATENCY`),

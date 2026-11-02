@@ -130,34 +130,56 @@ fn the_rnnoise_chain_does_not_allocate_after_warm_up() {
     assert_eq!(total, 0, "allocations in the RNNoise chain: {:?}", counts.iter().enumerate().filter(|c| *c.1 > 0).collect::<Vec<_>>());
 }
 
+/// Gives RNNoise's spare maker time to replace a spare: it looks every 100 ms, and a reset never waits for it.
+fn let_the_maker_run() {
+    std::thread::sleep(nf_stages::MAKER_POLL + std::time::Duration::from_millis(50));
+}
+
 #[test]
-fn rnnoise_resets_allocate_only_once_the_spare_is_used() {
-    // Switching the noise stage on resets it (the pristine spare: no allocation). Leaving
-    // passthrough resets it again; with the spare used, that builds a fresh state.
+fn rnnoise_resets_never_allocate() {
+    // Switching the noise stage on resets it, and so does leaving passthrough: each swaps in a pristine spare that the
+    // spare maker built off this thread, and the maker frees the used state there too. Twelve resets, then two back to
+    // back (two spares), and a re-activate: none allocates on the processing thread.
     let s = signals(4);
     let c = controls(ProcessingConfig::default());
     let mut chain = build_chain(c.clone(), false).expect("chain");
-    let counts = per_block(&mut chain, &s, 0..120, |b| match b {
-        10 => c.noise.enabled.store(false, Relaxed),
-        20 => c.noise.enabled.store(true, Relaxed), // reset 1: swaps the spare in
-        40 => c.passthrough.store(true, Relaxed),
-        50 => c.passthrough.store(false, Relaxed), // reset 2: no spare left
-        70 => c.passthrough.store(true, Relaxed),
-        80 => c.passthrough.store(false, Relaxed), // reset 3
+    // Every 30 blocks from block 10: off (the noise stage, or passthrough on, in turn), and back on 10 blocks later: a reset
+    // at blocks 20, 50, ..., 350.
+    let counts = per_block(&mut chain, &s, 0..370, |b| match b % 30 {
+        10 if b < 360 => {
+            let_the_maker_run();
+            if b / 30 % 2 == 0 {
+                c.noise.enabled.store(false, Relaxed);
+            } else {
+                c.passthrough.store(true, Relaxed);
+            }
+        }
+        20 if b < 360 => {
+            c.noise.enabled.store(true, Relaxed);
+            c.passthrough.store(false, Relaxed);
+        }
         _ => {}
     });
-    eprintln!("allocations in reset blocks: 20: {}, 50: {}, 80: {}", counts[20], counts[50], counts[80]);
-    assert_eq!(counts[20], 0, "the first reset swaps in the pre-built spare");
-    for b in [50, 80] {
-        assert!((1..=12).contains(&counts[b]), "block {b}: {} allocations (one DenoiseState::new is 10)", counts[b]);
-    }
-    let others: usize = counts.iter().enumerate().filter(|(b, _)| ![50, 80].contains(b)).map(|(_, &n)| n).sum();
-    assert_eq!(others, 0, "only the later reset blocks allocate: {counts:?}");
-    // activate rebuilds the spare (off the audio path), and the next reset is free again.
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        0,
+        "allocations at blocks {:?}",
+        counts.iter().enumerate().filter(|c| *c.1 > 0).collect::<Vec<_>>()
+    );
+    // Two real resets in a row, the maker given no time between them: two spares.
+    let_the_maker_run();
+    let counts = per_block(&mut chain, &s, 370..410, |b| match b {
+        375 | 385 => c.passthrough.store(true, Relaxed),
+        380 | 390 => c.passthrough.store(false, Relaxed),
+        _ => {}
+    });
+    assert_eq!(counts.iter().sum::<usize>(), 0, "{counts:?}");
+    // activate keeps the maker; the next reset is free again.
+    let_the_maker_run();
     chain.activate().expect("re-activate");
-    let counts = per_block(&mut chain, &s, 120..140, |b| match b {
-        125 => c.noise.enabled.store(false, Relaxed),
-        130 => c.noise.enabled.store(true, Relaxed),
+    let counts = per_block(&mut chain, &s, 410..430, |b| match b {
+        415 => c.noise.enabled.store(false, Relaxed),
+        420 => c.noise.enabled.store(true, Relaxed),
         _ => {}
     });
     assert_eq!(counts.iter().sum::<usize>(), 0, "{counts:?}");
@@ -253,8 +275,8 @@ fn resetting_an_unused_noise_stage_keeps_its_spare() {
     });
     process(&mut stage, 0);
     let first = allocations_in(|| stage.reset());
+    let_the_maker_run();
     process(&mut stage, 1);
     let second = allocations_in(|| stage.reset());
-    assert_eq!((unused, first), (0, 0), "unused resets, then the spare");
-    assert!((1..=12).contains(&second), "the second real reset builds a fresh state: {second} allocations");
+    assert_eq!((unused, first, second), (0, 0, 0), "unused resets, then a spare each (the maker replaced the first)");
 }

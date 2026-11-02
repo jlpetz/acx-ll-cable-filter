@@ -53,10 +53,11 @@ restart the first run's, its counters up to its last whole second, with a warnin
 - **Echo reference** (after its start-up: 250 blocks and 10 more from its alignment, or the start-up's last restart): the
   share of blocks the loopback was stale (no delivery for two periods and 5 ms) or short (zeros owed), its lead and target,
   the start-up's raise of the target and any raise after it, whether the stamps timed it and how far the readings scatter
-  about the loop's lead, slips and jumps. In the start-up the target rises to the delivery's need by design; with the
-  exclusive mic (the default) that need includes up to a loopback period of its own (each mic block is processed before
-  the loopback, on its own period, has delivered as recent a reference: 12 to 18.3 ms on the cables, #10's detail file), so
-  only a raise past that, or any raise after the start-up, reads as bursts.
+  about the loop's lead, slips (said as the drift loop's, routine) and jumps (a raise's own jump is said with the raise,
+  not counted as one). In the start-up the target rises to the delivery's need by design; with the exclusive mic (the
+  default) that need includes up to a loopback period of its own (each mic block is processed before the loopback, on its
+  own period, has delivered as recent a reference: 12 to 18.3 ms on the cables, #10's detail file), so only the part of
+  the whole rise (in the start-up and after it) past that reads as bursts; with the shared mic, a rise of 3 ms or more.
 - **Each clock's drift** against the mic's, fitted over the blocks after the first second (`nf_engine::clock_drift`,
   `clock_fit.rs`): each clock is a line of time against its sample index, the mic's from its index and capture stamps (or
   its delivery, without them), the output's from the device's clock readings (`OutputFacts::clock_pos`, an exclusive
@@ -75,9 +76,39 @@ restart the first run's, its counters up to its last whole second, with a warnin
 - **Thresholds (provisional, ours):** from the cables, the only data (bursty: about half their blocks two to a wake, a block
   10-21 ms old, 16 on average; steady in the simulations: a block a wake, 10.7 ms old). In bursts: 5% of blocks two or more
   to a wake, or a 3 ms swing (p95 less median); late: a mean 3 ms past the packet; the loopback late at 2% stale, in bursts at
-  1% owed, its target raised 3 ms after its start-up (or in it, 3 ms past the exclusive mic's own need), or without trusted
-  stamps; slow to play: a render side 10 ms past half its period (the cables' shared output: about 20; exclusive: 2);
+  1% owed, its target risen 3 ms over its start in all (with the exclusive mic, 3 ms past that mic's own need of a loopback
+  period), or without trusted stamps; slow to play: a render side 10 ms past half its period (the cables' shared output: about 20; exclusive: 2);
   drifting: 300 ppm, as printed (rounded), from a fit within ±50 ppm. Real hardware's figures are to set them.
+
+## Fixes after the first live checks (2026-11-02, ours)
+- **The exclusive mic's own raise, called bursts.** A live check on the cables (the exclusive mic, CABLE-B's loopback)
+  reported the reference "in bursts", "needed 6.0 ms more lead than steady delivery does": its target had gone from 12 to
+  18 ms, the exclusive mic's own need, but all of it just after the check's start-up (block 260 from the alignment), and
+  the allowance applied to the start-up's raise alone. Why it can land there: the need is set by where the mic's blocks
+  fall against the loopback's packets, and in the start-up the target follows a need only once three wakes have reached
+  it; after the start-up it rises only once short takes persist (0.6 s of them, `reference.rs`), so a need that first shows
+  near the start-up's end, or after it, raises the target past block 260 (the cables' chain recordings with the exclusive
+  mic have it at blocks 5-35). Now the allowance is the whole rise's: the rise over the start target (in the start-up and
+  after) less a loopback period, 3 ms or more of that is bursts.
+  - **Inferred, not observed:** the report wasn't kept (the log holds no report text). Under the old rule only 12, 12, 18
+    with the exclusive mic gives exactly 6.0, but the old rule would then also have counted the raise's own jump: the
+    reference "in bursts, glitched", "its timeline jumped 1 times". If the report said only "in bursts", the other
+    reading fits: the check didn't see the mic as exclusive (a shared or refused mic, own need 0, a 12 to 18 rise in the
+    start-up also gives 6.0), which this change doesn't touch and which is then a different fault. To confirm live: rerun
+    `devices --check` with the defaults and read the Mic line ("exclusive 16-bit") and whether the reference says "In its
+    start-up ... rose" or "After its start-up ... rose". Tested with the live figures (`health.rs`,
+  `the_exclusive_mics_own_raise_is_steady_wherever_it_lands`: 12, 12, 18 is steady, as are 12, 18, 18 and 12, 14, 18;
+  shared, the same is bursts of 6 ms; 12, 20, 27 exclusive is bursts of 5) and from blocks
+  (`a_raise_just_after_the_start_up_is_the_exclusive_mic_s_own`: a retarget at block 300, the raise's jump, three slips).
+  With the shared mic the rule moves a little: a rise of 3 ms or more in all, where it was 3 in the start-up or 3 after.
+- **Wording.** The loopback's freshness read as lateness ("had delivered ... at 100% of the blocks"): now "the loopback
+  was delivering at 100% of the blocks (its last packet no more than two periods and 5 ms old), and 0% of them were short
+  of samples", and its verdict for staleness is "stale at times" (was "late (stale)"). Slips, routine drift corrections,
+  read like faults next to the jumps: now said apart, as the drift's ("as it should: they hold the echo path where it
+  is"), and a jump finding only when there were jumps. A raise after the start-up says it's a jump of the echo path. The
+  output's "Ran short or over" is "Ran short or overfilled". The exclusive mic's allowance first ended "so this is
+  steady", which a stream bursty or stale for another reason (1% owed, 2% stale, untrusted stamps) contradicted next to
+  its verdict; it now says of the rise alone "so the rise itself is no sign of bursts" (tested both ways).
 
 ## Open
 - Thresholds for "bursty" and "late", from real devices (the cables are the only data so far; #8's detail file). The first

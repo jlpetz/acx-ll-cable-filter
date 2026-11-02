@@ -414,6 +414,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self
     }
 
+    /// [`Self::with_adaptive_target`] with the old single-stage lowering (out_target.rs), for the simulations that compare it
+    /// or that start where the target has come down.
+    #[cfg(test)]
+    pub(crate) fn with_single_stage_target(mut self) -> Self {
+        self.adaptive = Some(AdaptiveTarget::new(self.out_period + self.out_margin, self.out_target).single_stage());
+        self
+    }
+
     /// The output target now, in samples.
     pub(crate) fn out_target(&self) -> usize {
         self.out_target
@@ -1003,6 +1011,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.set_out_target(t);
         }
         tel.output_target_ms.store(self.out_target as f32 * (1000.0 / SAMPLE_RATE as f32));
+        tel.output_target_on_trial.store(self.adaptive.as_ref().is_some_and(AdaptiveTarget::on_trial), Relaxed);
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
         if self.has_reference {

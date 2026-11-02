@@ -20,6 +20,23 @@
 //!   (0.1 ms in the model of the loop). A goal set in one step drove the fill 1.4 ms under it for 10 s: the PI loop runs
 //!   at its 1500 ppm limit, winds its integral up as it nears the goal and carries the fill past, at the moment the new
 //!   target is least proven. A steady walk overshoots too when it stops (0.8 ms at 0.25 ms/s).
+//! - **Two windows before the first lowering:** until proven, a window that would lower the target starts a **trial**
+//!   instead ([`AdaptiveTarget::on_trial`]): the target holds where it is (at the start, the fixed target) for a second
+//!   window. If that window passes without an underrun and allows a lowering too, the target is proven and comes down on
+//!   that window's need, as any lowering does; if its need doesn't allow one, the trial has failed, and the next window
+//!   that allows one starts another. Proven, every later lowering goes at once. A strike unproves it (the next lowering
+//!   is trialled again), and any underrun ends a trial. Why: a window is what has seen the delivery, and the first has seen
+//!   the least. The 30-minute soak on the cables (TODO 13's detail, "Soak") walked from 14 to 9.9 ms in 9 s on its first
+//!   window's need (heading for 6.8) and ran the device dry there at about 122 s, its queue at 10.6 ms: a block 8 ms or
+//!   more later than the rest (the queue less the period the device holds; about 10 in the simulations), a missed wake.
+//!   A first stop short of the fixed target doesn't cover that: in the soak's conditions one halfway (10.1-10.4 ms) or at
+//!   a period + a block (12 ms) ran short with a block 10 ms late while it held (a block more than a block late, with the
+//!   fill under a period, is a deficit), where the fixed target rode out blocks up to 13.5 ms late. Held at the fixed
+//!   target, the trial rides out what the fixed target does, and a hiccup in it fails the trial rather than costing a
+//!   strike (a wake 15 ms late every 150 s never lets the target down, where the single stage struck three times). The
+//!   end point is the same, a window later: settled by [`SETTLE_MAX_S`] (`pipeline/tests/exclusive.rs`,
+//!   `the_first_lowering_waits_for_a_second_window`). The price is the fixed target's latency for minutes 2 to 4 of a run
+//!   (ours, 2026-11-02).
 //! - **Raised at once:** an underrun (the device ran dry, or a deficit) puts it back to the fixed target, and the
 //!   pipeline's zeros fill the device to it at that block, as they fill it to any target. An underrun under the fixed
 //!   target is a **strike** (the fixed target might have covered it: a missed wake of 10-15 ms is what its spare block is
@@ -57,6 +74,10 @@ pub(crate) const RAMP_MAX_STEP: usize = 24;
 const RAMP_FRACTION: usize = 10;
 /// The longest walk, in seconds: from the fixed target to the floor + the headroom (a block less the headroom: 9 ms).
 pub(crate) const RAMP_MAX_S: usize = ramp_seconds(BLOCK - HEADROOM);
+/// The longest a run's target takes to settle, in seconds, when nothing strikes and the need holds still: the window, the
+/// trial's window, and the walk down (at most [`RAMP_MAX_S`]). A need that falls between windows (a dip leaving the window),
+/// or a trial that fails, moves it later.
+pub(crate) const SETTLE_MAX_S: usize = 2 * WINDOW_S + RAMP_MAX_S;
 /// The mean's time constant.
 const MEAN_TAU_S: f64 = 1.0;
 
@@ -112,6 +133,12 @@ pub(crate) struct AdaptiveTarget {
     strikes: u32,
     strike_need: f32,
     strike_left_s: usize,
+    /// A trial has passed since the start or the last strike, so every lowering goes at once; and a trial is on (the target
+    /// holds for a window).
+    proven: bool,
+    trial: bool,
+    /// Trials before the first lowering (always, but in the simulations that compare the old single stage).
+    trials: bool,
 }
 
 impl AdaptiveTarget {
@@ -136,7 +163,24 @@ impl AdaptiveTarget {
             strikes: 0,
             strike_need: 0.0,
             strike_left_s: 0,
+            proven: false,
+            trial: false,
+            trials: true,
         }
+    }
+
+    /// The old single-stage lowering (every lowering at once, on its window alone, the first and after a strike too), for
+    /// the simulations that compare the two.
+    #[cfg(test)]
+    pub(crate) fn single_stage(mut self) -> Self {
+        self.trials = false;
+        self
+    }
+
+    /// The target holds for the trial's window, which proves it: the lowering is still to come (`latency --settle` and
+    /// `quality --settle` wait for it).
+    pub(crate) fn on_trial(&self) -> bool {
+        self.trial
     }
 
     #[cfg(test)]
@@ -218,11 +262,15 @@ impl AdaptiveTarget {
         self.reseed();
         self.since_move_s = 0;
         self.goal = self.fixed;
+        // A trial is over: only a whole window without an underrun passes one.
+        self.trial = false;
         if self.target >= self.fixed {
             // What the fixed target gets anyway: no strike.
             return None;
         }
         self.strikes = self.strikes.saturating_add(1);
+        // The next lowering is unproven again: a trial first.
+        self.proven = false;
         // At least as far under the fixed target as it ran: the next lowering stops a headroom short of where this one ran
         // dry.
         let need = dip.max(self.target.saturating_sub(self.floor) as f32);
@@ -233,7 +281,8 @@ impl AdaptiveTarget {
     }
 
     /// Once a second: the second's largest dip into the window; a new goal when a whole window since the last move says
-    /// the target can come down; and a step of the walk to the goal. Returns the target when it moved.
+    /// the target can come down (until proven, a trial first, and the goal at its end: the module notes); and a step of the
+    /// walk to the goal. Returns the target when it moved.
     pub(crate) fn second(&mut self) -> Option<usize> {
         if let Some(slot) = self.maxima.get_mut(self.next) {
             *slot = self.second_max;
@@ -251,8 +300,20 @@ impl AdaptiveTarget {
         if self.strikes < MAX_STRIKES && self.since_move_s >= WINDOW_S {
             let need = self.need().max(self.strike_need).max(0.0).ceil() as usize;
             let wanted = (self.floor + need + HEADROOM).min(self.fixed);
-            if wanted + HYSTERESIS <= self.goal {
-                self.goal = wanted;
+            let lower = wanted + HYSTERESIS <= self.goal;
+            if self.trial {
+                // The trial's window has passed without an underrun (one would have ended it). Passed if it allows a lowering
+                // too, on its own need as any lowering is; failed if not, and the next window that allows one starts another.
+                self.trial = false;
+                if lower {
+                    (self.goal, self.proven, self.since_move_s) = (wanted, true, 0);
+                }
+            } else if lower {
+                if self.proven || !self.trials {
+                    self.goal = wanted;
+                } else {
+                    self.trial = true;
+                }
                 self.since_move_s = 0;
             }
         }
@@ -269,6 +330,10 @@ mod tests {
 
     const FLOOR: usize = 480 + 96;
     const FIXED: usize = 480 + 480 + 96;
+
+    fn target() -> AdaptiveTarget {
+        AdaptiveTarget::new(FLOOR, FIXED)
+    }
 
     /// `seconds` of blocks whose fill (by the clock) is 5000 plus `offset(k)`; the targets it moved to.
     fn blocks(a: &mut AdaptiveTarget, seconds: usize, offset: impl Fn(usize) -> f64) -> Vec<usize> {
@@ -288,26 +353,33 @@ mod tests {
         a.abs_diff(b) <= tol
     }
 
-    /// The walk: a tenth of the way, 1 to 24 samples a second, never past the goal; the longest (9 ms) takes under a minute.
+    /// The walk: a tenth of the way, 1 to 24 samples a second, never past the goal; the longest (9 ms) takes under a minute,
+    /// and a run settles within five minutes of its start when nothing strikes.
     #[test]
     fn the_walk_slows_to_its_end() {
         let steps = [432, 240, 239, 35, 9, 1, 0].map(ramp_step);
         assert_eq!(steps, [24, 24, 23, 3, 1, 1, 0]);
         assert_eq!(RAMP_MAX_S, 53, "9 ms in 53 s");
+        assert_eq!(SETTLE_MAX_S, 2 * WINDOW_S + RAMP_MAX_S, "two windows, and the walk down in at most 53 s");
     }
 
-    /// Steady delivery: nothing moves for a window, then the target walks down to the floor + the largest dip + the
-    /// headroom, never faster than the walk's limit and slowing to its end, and stays.
+    /// Steady delivery: nothing moves for a window; then a trial holds the target at the fixed one for a second window;
+    /// then it walks down to the floor + the largest dip + the headroom, never faster than the walk's limit and slowing to
+    /// its end, and stays.
     #[test]
-    fn steady_delivery_lowers_the_target_after_a_window() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
+    fn steady_delivery_lowers_the_target_after_a_trial() {
+        let mut a = target();
         assert_eq!(a.target(), FIXED, "starts at the fixed target");
         // 1 ms of jitter around the fill's mean.
         let jitter = |k: usize| if k % 7 == 0 { -48.0 } else { 8.0 };
         let early = blocks(&mut a, WINDOW_S - 1, jitter);
-        assert!(early.is_empty(), "{early:?}");
-        let moves = blocks(&mut a, 3 * WINDOW_S, jitter);
-        assert!(near(a.goal(), FLOOR + 48 + HEADROOM, 1), "to the floor + the dip + the headroom: {}", a.goal());
+        assert!(early.is_empty() && !a.on_trial(), "{early:?}");
+        let held = blocks(&mut a, WINDOW_S, jitter);
+        assert!(held.is_empty() && a.on_trial() && a.goal() == FIXED, "a trial, at the fixed target: {held:?}");
+        let end = FLOOR + 48 + HEADROOM;
+        let moves = blocks(&mut a, WINDOW_S, jitter);
+        assert!(!a.on_trial());
+        assert!(near(a.goal(), end, 1), "to the floor + the dip + the headroom: {}", a.goal());
         assert_eq!(moves.last().copied(), Some(a.goal()), "walked all the way");
         assert!(moves.len() > 30 && moves.len() <= RAMP_MAX_S, "a walk: {moves:?}");
         let path: Vec<usize> = std::iter::once(FIXED).chain(moves.iter().copied()).collect();
@@ -315,6 +387,31 @@ mod tests {
         assert!(steps.iter().all(|&s| (1..=RAMP_MAX_STEP).contains(&s)), "{steps:?}");
         assert!(steps.windows(2).all(|w| w[1] <= w[0]), "slowing: {steps:?}");
         assert!(a.need() > 47.0 && a.need() < 48.5, "{}", a.need());
+        assert!(blocks(&mut a, 2 * WINDOW_S, jitter).is_empty(), "and stays");
+        // A passed trial lowers on its own window's need, as any lowering does: a dip of 4 ms in the first window (at 60 s)
+        // is past, and the target comes down to the end point; one in the trial's window (at 130 s) holds it 4 ms up, and
+        // once the dip has left the window it comes the rest of the way at once (proven).
+        let mut b = target();
+        blocks(&mut b, 2 * WINDOW_S + RAMP_MAX_S, |k| if k == 6000 { -200.0 } else { 0.0 });
+        assert_eq!((b.target(), b.on_trial()), (FLOOR + HEADROOM, false), "dip at 60 s");
+        let mut b = target();
+        blocks(&mut b, 2 * WINDOW_S + RAMP_MAX_S, |k| if k == 13_000 { -200.0 } else { 0.0 });
+        assert!(near(b.target(), FLOOR + 200 + HEADROOM, 4) && !b.on_trial(), "dip at 130 s: {}", b.target());
+        blocks(&mut b, WINDOW_S + RAMP_MAX_S, |_| 0.0);
+        assert_eq!(b.target(), FLOOR + HEADROOM, "dip at 130 s, then at once");
+        // A trial whose own window doesn't allow a lowering fails (a block 9 ms late at 130 s: the target stays fixed), and the
+        // next window that allows one, once the dip has left it, starts another; a window later the target comes down.
+        let mut f = target();
+        let moves = blocks(&mut f, 2 * WINDOW_S + 5, |k| if k == 13_000 { -440.0 } else { 0.0 });
+        assert!(moves.is_empty() && !f.on_trial(), "failed: {moves:?}");
+        blocks(&mut f, 10, |_| 0.0);
+        assert!(f.on_trial(), "another trial once the dip has left the window");
+        blocks(&mut f, WINDOW_S + RAMP_MAX_S, |_| 0.0);
+        assert_eq!((f.target(), f.on_trial()), (FLOOR + HEADROOM, false));
+        // The old single stage, for comparison: down after the first window.
+        let mut c = target().single_stage();
+        blocks(&mut c, WINDOW_S + RAMP_MAX_S, jitter);
+        assert!(near(c.target(), end, 1) && !c.on_trial(), "{}", c.target());
     }
 
     /// The cables' bursts (blocks 10 ms late every other one) need 5 ms: lowered to the floor + 5 ms + the headroom, half
@@ -322,36 +419,39 @@ mod tests {
     /// first fill is far off the mean doesn't count (the mean's warm-up).
     #[test]
     fn bursts_hold_the_target_up_by_their_lateness() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
-        blocks(&mut a, 2 * WINDOW_S, |k| if k % 2 == 0 { 240.0 } else { -240.0 });
+        let settled = 2 * WINDOW_S + RAMP_MAX_S;
+        let mut a = target();
+        blocks(&mut a, settled, |k| if k % 2 == 0 { 240.0 } else { -240.0 });
         assert!(near(a.target(), FLOOR + 240 + HEADROOM, 2), "{}", a.target());
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
-        blocks(&mut a, 2 * WINDOW_S, |k| if k % 5 == 0 { -384.0 } else { 96.0 });
+        let mut a = target();
+        blocks(&mut a, settled, |k| if k % 5 == 0 { -384.0 } else { 96.0 });
         assert!(near(a.target(), FLOOR + 384 + HEADROOM, 4), "{}", a.target());
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
-        blocks(&mut a, WINDOW_S + RAMP_MAX_S, |k| if k == 0 { 2000.0 } else { 0.0 });
+        let mut a = target();
+        blocks(&mut a, settled, |k| if k == 0 { 2000.0 } else { 0.0 });
         assert!(near(a.target(), FLOOR + HEADROOM, 8), "{}: a first fill 40 ms off moves the warm-up's mean by 0.1 ms", a.target());
     }
 
-    /// An underrun under the fixed target is a strike: back to the fixed target at once, and its need holds the target up
-    /// for 10 minutes (a window later it comes down only as far as that need allows), then it's forgotten. A second strike
-    /// holds for 20 minutes, and the third keeps the target fixed for the run. An underrun at the fixed target isn't one.
+    /// An underrun under the fixed target is a strike: back to the fixed target at once, unproven again (a window later a
+    /// trial, and a window after that down to what the strike's need allows, no further), and its need holds the target
+    /// up for 10 minutes, then it's forgotten. A second strike holds for 20 minutes, and the third keeps the target fixed
+    /// for the run. An underrun at the fixed target isn't one; on trial, it ends the trial.
     #[test]
     fn strikes_hold_the_target_up_for_longer_each_time() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
-        blocks(&mut a, WINDOW_S + RAMP_MAX_S, |_| 0.0);
+        let mut a = target();
+        blocks(&mut a, 2 * WINDOW_S + RAMP_MAX_S, |_| 0.0);
         assert_eq!(a.target(), FLOOR + HEADROOM);
         // A block 6 ms later than the others.
         assert_eq!(a.underrun(5000.0 - 288.0, true), Some(FIXED), "back to the fixed target");
         assert_eq!(a.strikes(), 1);
-        let moves = blocks(&mut a, WINDOW_S - 1, |_| 0.0);
-        assert!(moves.is_empty(), "{moves:?}");
-        // A window on, down to what the strike's dip needs, and no further while its hold lasts.
-        blocks(&mut a, RAMP_MAX_S, |_| 0.0);
-        assert!(near(a.target(), FLOOR + 288 + HEADROOM, 3), "{}", a.target());
-        blocks(&mut a, STRIKE_HOLD_S - WINDOW_S - RAMP_MAX_S - 1, |_| 0.0);
-        assert!(near(a.target(), FLOOR + 288 + HEADROOM, 3), "held for 10 minutes: {}", a.target());
-        blocks(&mut a, WINDOW_S + RAMP_MAX_S, |_| 0.0);
+        let moves = blocks(&mut a, 2 * WINDOW_S - 1, |_| 0.0);
+        assert!(moves.is_empty() && a.on_trial(), "a window, then a trial: {moves:?}");
+        let held = FLOOR + 288 + HEADROOM;
+        blocks(&mut a, 1 + RAMP_MAX_S, |_| 0.0);
+        assert!(near(a.target(), held, 3) && !a.on_trial(), "{}", a.target());
+        blocks(&mut a, STRIKE_HOLD_S - 2 * WINDOW_S - RAMP_MAX_S - 1, |_| 0.0);
+        assert!(near(a.target(), held, 3), "held for 10 minutes: {}", a.target());
+        // Proven by then: the next lowering goes at once.
+        blocks(&mut a, RAMP_MAX_S + 1, |_| 0.0);
         assert_eq!(a.target(), FLOOR + HEADROOM, "then forgotten");
         // The second strike holds for 20 minutes; a third keeps it fixed.
         assert_eq!(a.underrun(5000.0 - 100.0, true), Some(FIXED));
@@ -364,34 +464,37 @@ mod tests {
         assert_eq!(blocks(&mut a, 3 * STRIKE_HOLD_S, |_| 0.0), Vec::<usize>::new(), "fixed for the run");
         // A block later than a whole block, at the fixed target: no strike; it stays there, and a window passes before it
         // can come down, then only as far as the dip allows (here not at all) until the dip leaves the window.
-        let mut b = AdaptiveTarget::new(FLOOR, FIXED);
+        let mut b = target();
         blocks(&mut b, 4, |_| 0.0);
         assert_eq!(b.underrun(5000.0 - 700.0, true), None, "at the fixed target already");
         assert_eq!(b.underrun(f64::NAN, true), None);
         assert_eq!((b.target(), b.strikes()), (FIXED, 0));
         assert_eq!(blocks(&mut b, WINDOW_S, |_| 0.0), Vec::<usize>::new(), "the dip holds it");
-        blocks(&mut b, WINDOW_S + RAMP_MAX_S, |_| 0.0);
+        blocks(&mut b, 2 * WINDOW_S + RAMP_MAX_S, |_| 0.0);
         assert_eq!(b.target(), FLOOR + HEADROOM, "and then it's gone");
         // An underrun at the fixed target just before the window ends puts the lowering off for another window.
-        let mut c = AdaptiveTarget::new(FLOOR, FIXED);
+        let mut c = target();
         blocks(&mut c, WINDOW_S - 1, |_| 0.0);
         assert_eq!(c.underrun(5000.0 - 100.0, true), None);
         assert_eq!(blocks(&mut c, 2, |_| 0.0), Vec::<usize>::new(), "no walk");
-        assert_eq!((c.goal(), c.strikes()), (FIXED, 0));
+        assert_eq!((c.goal(), c.strikes(), c.on_trial()), (FIXED, 0, false));
+        // An underrun on trial (at the fixed target, so no strike) ends the trial, and a window on another starts.
+        let mut t = target();
+        blocks(&mut t, WINDOW_S + 30, |_| 0.0);
+        assert!(t.on_trial());
+        assert_eq!(t.underrun(5000.0 - 100.0, true), None);
+        assert!(!t.on_trial() && t.strikes() == 0);
+        assert_eq!(blocks(&mut t, WINDOW_S, |_| 0.0), Vec::<usize>::new(), "a window on, another trial");
+        assert!(t.on_trial());
     }
 
-    /// A hiccup that comes back less often than the window (a dip of 15 ms every 150 s, which the fixed target covers):
-    /// the first after the target has come down underruns, and its need holds the target at the fixed one through the
-    /// next hiccups for its hold; each time the hold runs out between hiccups the next strikes again, and the run's
-    /// strikes stop at [`MAX_STRIKES`].
-    #[test]
-    fn rare_hiccups_strike_at_most_max_strikes_times() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
+    /// A dip of 15 ms (which the fixed target covers; anything under it doesn't) every `every_s` seconds for two hours: the
+    /// underruns, the strikes and the target at the end.
+    fn hiccups(mut a: AdaptiveTarget, every_s: usize) -> (u32, u32, usize) {
         let mut underruns = 0;
         for s in 0..7200 {
             for b in 0..100 {
-                if s % 150 == 149 && b == 50 {
-                    // The fixed target covers it; anything under it doesn't.
+                if s % every_s == every_s - 1 && b == 50 {
                     if a.target() < FIXED {
                         underruns += 1;
                         a.underrun(5000.0 - 720.0, true);
@@ -404,14 +507,25 @@ mod tests {
             }
             a.second();
         }
-        assert_eq!((underruns, a.strikes()), (MAX_STRIKES, MAX_STRIKES));
-        assert_eq!(a.target(), FIXED);
+        (underruns, a.strikes(), a.target())
+    }
+
+    /// Hiccups that come back less often than the window. Every 150 s, one lands in each trial's window and fails it, so the
+    /// target never comes down and nothing underruns; the old single stage, lowered on each clean window, struck three times.
+    /// Every 300 s (rarer than the two windows), the first after the target has come down underruns, and its need holds the
+    /// target at the fixed one through the next hiccups for its hold; each time the hold runs out between hiccups the next
+    /// strikes again, and the run's strikes stop at [`MAX_STRIKES`].
+    #[test]
+    fn rare_hiccups_strike_at_most_max_strikes_times() {
+        assert_eq!(hiccups(target(), 150), (0, 0, FIXED), "every 150 s: no trial passes");
+        assert_eq!(hiccups(target().single_stage(), 150), (MAX_STRIKES, MAX_STRIKES, FIXED), "the single stage");
+        assert_eq!(hiccups(target(), 300), (MAX_STRIKES, MAX_STRIKES, FIXED), "every 300 s");
     }
 
     /// A switch between the clock's fill and the padding starts the mean again: the step between them isn't a dip.
     #[test]
     fn a_change_of_measure_starts_the_mean_again() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
+        let mut a = target();
         blocks(&mut a, 10, |_| 0.0);
         for _ in 0..100 {
             a.observe(4000.0, false);
@@ -422,7 +536,7 @@ mod tests {
     /// The per-block work allocates nothing.
     #[test]
     fn it_never_allocates() {
-        let mut a = AdaptiveTarget::new(FLOOR, FIXED);
+        let mut a = target();
         let ((), allocs, frees) = crate::test_alloc::count(|| {
             for k in 0..60_000usize {
                 a.observe(FIXED as f64 + (k % 13) as f64, k % 5000 != 0);

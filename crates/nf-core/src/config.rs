@@ -41,9 +41,10 @@ pub struct ProcessingConfig {
     /// What a band-limited model's output does above its band (a 16 kHz model's 8 kHz): applied live.
     pub high_band: HighBand,
     /// How many blocks behind the audio thread a model pack's inference worker runs (1 to [`MAX_MODEL_DEPTH`]; TODO 6,
-    /// `noise::Pipelined`). Each block adds 10 ms of latency; a wake that processes more blocks than this back to back (a
-    /// 20 ms device period, a cable's burst, a late wake) costs a block of the unfiltered mic for each one over. RNNoise
-    /// ignores it. Changing it, with a pack in use, is an engine restart.
+    /// `noise::Pipelined`), or [`AUTO_MODEL_DEPTH`] (the default): the engine picks it at each start from how the mic
+    /// delivers ([`ProcessingConfig::model_depth_for`]). Each block adds 10 ms of latency; a wake that processes more blocks
+    /// than this back to back (a 20 ms device period, a cable's burst, a late wake) costs a block of the unfiltered mic for
+    /// each one over. RNNoise ignores it. Changing it, with a pack in use, is an engine restart.
     pub model_depth: u32,
     /// Maximum attenuation the noise stage may apply, in dB (negative). -60 is effectively unlimited.
     pub floor_db: f32,
@@ -61,7 +62,7 @@ impl Default for ProcessingConfig {
             noise_enabled: true,
             noise_model: DEFAULT_NOISE_MODEL.to_owned(),
             high_band: HighBand::default(),
-            model_depth: DEFAULT_MODEL_DEPTH,
+            model_depth: AUTO_MODEL_DEPTH,
             floor_db: -60.0,
             gate: GateConfig::default(),
             meters_enabled: true,
@@ -72,9 +73,58 @@ impl Default for ProcessingConfig {
 
 /// The built-in default noise model.
 pub const DEFAULT_NOISE_MODEL: &str = "rnnoise";
-/// [`ProcessingConfig::model_depth`]'s default and its limit (`noise::DEFAULT_DEPTH`, `noise::MAX_DEPTH`).
-pub const DEFAULT_MODEL_DEPTH: u32 = crate::noise::DEFAULT_DEPTH;
+/// [`ProcessingConfig::model_depth`]'s default: the engine picks the depth at each start (TODO 5).
+pub const AUTO_MODEL_DEPTH: u32 = 0;
+/// The depths it picks: one block for a mic that delivers a block a wake, two (`noise::DEFAULT_DEPTH`) for one that bursts
+/// or hasn't been measured, and offline. And the limit (`noise::MAX_DEPTH`).
+pub const STEADY_MODEL_DEPTH: u32 = 1;
+pub const BURSTY_MODEL_DEPTH: u32 = crate::noise::DEFAULT_DEPTH;
 pub const MAX_MODEL_DEPTH: u32 = crate::noise::MAX_DEPTH;
+
+/// How a run's mic delivers its blocks, for the automatic model depth ([`ProcessingConfig::model_depth_for`]; TODO 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicDelivery {
+    /// A block a wake: as the last run on this mic, opened the same way, measured it (`telemetry::WakeBlocks::delivery`), or
+    /// unmeasured, the exclusive mic at a period of a block or less (its 3.33 ms packets make a block at every third).
+    OneAtATime,
+    /// Wakes of two or more blocks often enough that a worker one block behind would miss (the cables' shared mic: a fifth
+    /// to a third of its wakes).
+    Bursts,
+    /// Not measured: a mic's first run in the process opened this way (but the exclusive mic's at a period of a block or
+    /// less), or offline.
+    Unknown,
+}
+
+impl MicDelivery {
+    /// As the status says it: "the mic delivers a block at a time", "the mic delivers in bursts", "the mic's delivery isn't
+    /// measured yet".
+    pub fn text(self) -> &'static str {
+        match self {
+            MicDelivery::OneAtATime => "the mic delivers a block at a time",
+            MicDelivery::Bursts => "the mic delivers in bursts",
+            MicDelivery::Unknown => "the mic's delivery isn't measured yet",
+        }
+    }
+}
+
+impl ProcessingConfig {
+    /// The model depth a start uses: [`ProcessingConfig::model_depth`] when it's set (clamped to 1..=[`MAX_MODEL_DEPTH`]);
+    /// automatic, [`STEADY_MODEL_DEPTH`] for a mic that delivers a block at a time and [`BURSTY_MODEL_DEPTH`] otherwise
+    /// (bursts, or not measured: the safe choice). The engine decides at each start and never mid-stream: the depth is the
+    /// noise stage's latency, so changing it moves the output by a block (a click), and a start is where the chain is built.
+    pub fn model_depth_for(&self, delivery: MicDelivery) -> u32 {
+        match (self.model_depth, delivery) {
+            (AUTO_MODEL_DEPTH, MicDelivery::OneAtATime) => STEADY_MODEL_DEPTH,
+            (AUTO_MODEL_DEPTH, _) => BURSTY_MODEL_DEPTH,
+            (d, _) => d.clamp(1, MAX_MODEL_DEPTH),
+        }
+    }
+
+    /// The model depth is automatic ([`AUTO_MODEL_DEPTH`]).
+    pub fn model_depth_auto(&self) -> bool {
+        self.model_depth == AUTO_MODEL_DEPTH
+    }
+}
 
 /// A model id: a model pack's id rule (`[a-z0-9][a-z0-9-]{0,63}`, `doc/spec/model-pack-v0.md`), which `"rnnoise"` follows too.
 /// A pack's folder is named by it, so it can't hold a path.
@@ -216,7 +266,7 @@ pub struct IoConfig {
     /// note. While the filter runs no other app can record from that mic directly: they use the filtered mic (the cable).
     /// On by default (the owner, 2026-11-02); off for someone who records the raw mic in another app as well.
     pub mic_exclusive: bool,
-    /// Let the output's fill target follow the delivery it sees: down, slowly (after two minutes), to one period + the
+    /// Let the output's fill target follow the delivery it sees: down, slowly (after four minutes), to one period + the
     /// margin + the largest lateness measured; up at once after an underrun, which can cost up to three glitches a run
     /// that the fixed target (one period + one block + the margin) would have ridden out. On by default (the owner,
     /// 2026-11-02); off for a recording that must have none.
@@ -241,6 +291,25 @@ impl Default for IoConfig {
 mod tests {
     use super::*;
 
+    /// The automatic depth (TODO 5): one block for a mic that delivers a block at a time, two for one that bursts or hasn't
+    /// been measured; a depth that's set is used whatever the delivery, within its limits.
+    #[test]
+    fn the_automatic_depth_follows_the_mic_s_delivery() {
+        let auto = ProcessingConfig::default();
+        assert!(auto.model_depth_auto());
+        let picks = [MicDelivery::OneAtATime, MicDelivery::Bursts, MicDelivery::Unknown].map(|d| auto.model_depth_for(d));
+        assert_eq!(picks, [1, 2, 2]);
+        for (set, used) in [(1, 1), (2, 2), (3, 3), (4, 4), (9, MAX_MODEL_DEPTH)] {
+            let p = ProcessingConfig { model_depth: set, ..ProcessingConfig::default() };
+            assert!(!p.model_depth_auto());
+            for d in [MicDelivery::OneAtATime, MicDelivery::Bursts, MicDelivery::Unknown] {
+                assert_eq!(p.model_depth_for(d), used, "{set} with {d:?}");
+            }
+        }
+        let saved: ProcessingConfig = serde_json::from_str(r#"{"model_depth": 1}"#).unwrap();
+        assert_eq!(saved.model_depth_for(MicDelivery::Bursts), 1, "a depth a settings file sets is kept");
+    }
+
     /// The owner's decision (2026-11-02): the lowest-latency I/O by default, exclusive output and mic and the adaptive
     /// output target; the rest as before.
     #[test]
@@ -255,9 +324,9 @@ mod tests {
     #[test]
     fn rnnoise_is_the_default_model_and_ids_follow_the_pack_rule() {
         let p = ProcessingConfig::default();
-        assert_eq!((p.noise_model.as_str(), p.high_band, p.model_depth), ("rnnoise", HighBand::Model, 2));
+        assert_eq!((p.noise_model.as_str(), p.high_band, p.model_depth), ("rnnoise", HighBand::Model, AUTO_MODEL_DEPTH));
         let old: ProcessingConfig = serde_json::from_str(r#"{"noise_model": "ulunas"}"#).unwrap();
-        assert_eq!(old.model_depth, DEFAULT_MODEL_DEPTH, "an older settings file gets the default depth");
+        assert_eq!(old.model_depth, AUTO_MODEL_DEPTH, "an older settings file gets the automatic depth");
         for good in ["rnnoise", "ulunas", "a", "fast-enhancer-48k", &"x".repeat(64)] {
             assert!(is_model_id(good), "{good}");
         }

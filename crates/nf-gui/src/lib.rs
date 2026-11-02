@@ -63,6 +63,12 @@ pub fn run(engine: Arc<Engine>, settings_path: PathBuf) -> Result<(), String> {
     shown
 }
 
+/// Brings the engine config of a settings file of `version` (its top-level `"version"`, 0 without one) up to this version's
+/// meaning, as the window does when it loads one: for the CLI's `--config`, which reads the window's file too.
+pub fn upgrade_saved_engine(version: u32, engine: &mut nf_engine::EngineConfig) {
+    settings::upgrade_engine(version, engine);
+}
+
 /// The settings file's usual place: `%APPDATA%\noise-filter\settings.json`. `None` if `APPDATA`
 /// isn't set.
 pub fn default_settings_path() -> Option<PathBuf> {

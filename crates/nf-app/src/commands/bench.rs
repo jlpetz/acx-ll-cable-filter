@@ -112,7 +112,7 @@ fn bench_model(args: &BenchArgs, id: &str) -> Result<(), Failure> {
          thread. The audio side of the worker row makes neither: ONNX Runtime's per-run heap calls are the worker's (TODO 6)."
     );
     say!("The worker fed as bursty wakes deliver, at real time (a wake of k blocks costs about k - depth misses):");
-    for depth in [1, nf_engine::DEFAULT_MODEL_DEPTH] {
+    for depth in [nf_engine::STEADY_MODEL_DEPTH, nf_engine::BURSTY_MODEL_DEPTH] {
         for burst in [1, 2, 3] {
             let worker = Arc::new(nf_engine::models::EngineHooks::default());
             let row = nf_ort::bench::bursts(&pack, &signals.noisy, worker, depth, burst, 300).map_err(Failure::error)?;

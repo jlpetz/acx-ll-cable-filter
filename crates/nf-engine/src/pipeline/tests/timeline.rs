@@ -1045,3 +1045,69 @@ fn aec3_converges_on_the_traces() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+/// The traces' mic delivery (the cables' shared mic, each trace looped to 330 s) against the adaptive output target on a
+/// shared 10 ms device, with the trial and in the old single stage (out_target.rs): where each goes and whether either runs
+/// dry. Prints; ignored (it needs the traces); `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn traces_and_the_adaptive_target() {
+    let all = traces();
+    if all.is_empty() {
+        eprintln!("no traces in {:?}", trace_dir());
+    }
+    for (name, rows) in all {
+        let mic: Vec<&Row> = rows.iter().filter(|r| r.kind == 0).collect();
+        let (Some(first), Some(last)) = (mic.first(), mic.last()) else { continue };
+        let pos0 = first.pos;
+        let frames = last.pos + last.frames as u64 - pos0;
+        let span = frames as f64 * 1e7 / 48_000.0;
+        for single in [false, true] {
+            let c = PipelineConfig { out_period: 480, out_margin: 96, ref_period: None, max_packet: 4800 };
+            let p = Pipeline::new(c, DriftController::new(c.out_target() as f32), SlipResampler::new(), SlipResampler::new());
+            let mut p = if single { p.with_single_stage_target() } else { p.with_adaptive_target() };
+            let mut sink = VSink::new(480, 0.0, 0.37, T0);
+            p.prefill(&mut sink).unwrap();
+            let tel = Telemetry::new();
+            let mut capture = FakeCapture::default();
+            let mut ticks = FakeTicks(0);
+            let mut targets = Vec::new();
+            'run: for k in 0u64.. {
+                let shift = k as f64 * span;
+                let mut i = 0;
+                while i < mic.len() {
+                    let now = mic[i].now;
+                    while let Some(r) = mic.get(i).filter(|r| r.now == now) {
+                        let q = (r.qpc != NO_STAMP).then_some((T0 + r.qpc + shift) as u64);
+                        capture.push(r.pos - pos0 + k * frames, q, vec![0.1; r.frames]);
+                        i += 1;
+                    }
+                    let t = T0 + now - first.now + shift;
+                    if t - T0 > 330e7 {
+                        break 'run;
+                    }
+                    sink.advance_to(t);
+                    p.drain_mic(&mut capture, t).unwrap();
+                    while p.process_block(&mut CopyChain, &mut sink, &mut ticks, &tel, false).unwrap() {
+                        if p.second_due() {
+                            p.publish_second(&tel, &CopyChain, 0, 0, 0);
+                            targets.push(p.out_target());
+                        }
+                    }
+                }
+            }
+            let at = |s: usize| targets.get(s).map_or(0.0, |&t| t as f64 / 48.0);
+            eprintln!(
+                "{name} {}: target {:.1} ms at 119 s, {:.1} at 180, {:.1} at 239, {:.1} at 300, {:.1} at 329; {} underruns, need {:.1} ms",
+                if single { "single stage" } else { "with a trial" },
+                at(119),
+                at(180),
+                at(239),
+                at(300),
+                at(329),
+                p.counters.render_underruns,
+                p.adaptive.as_ref().map_or(0.0, |a| f64::from(a.need()) / 48.0)
+            );
+        }
+    }
+}

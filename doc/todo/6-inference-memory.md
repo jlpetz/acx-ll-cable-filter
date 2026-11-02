@@ -270,7 +270,8 @@ second (after them: no flush-to-zero, the catch-all counter in); the allocation 
   they cost a fifth to a half of the blocks, which an A/B by ear would hear as unfiltered noise and blame on the model.
   `--model-depth 1-4` (the config's `model_depth`) sets it; the soak summary's "wakes" line counts the wakes of 1, 2, 3 and
   4+ blocks and says what depths 1, 2 and 3 would have missed, and the status line counts the bursty wakes with a model,
-  so the owner can pick 1 where bursts prove rare.
+  so the owner can pick 1 where bursts prove rare. Since superseded (2026-11-02, ours): the depth is automatic by default,
+  1 when the mic delivers a block a wake, from those same wake counts (TODO 5's detail, "The automatic depth").
 
 ## Open
 - Whether the operator-new shim works with pyke's static ORT.

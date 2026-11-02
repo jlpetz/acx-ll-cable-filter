@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use nf_core::chain::Chain;
-use nf_core::config::EngineConfig;
+use nf_core::config::{EngineConfig, MicDelivery};
 use nf_core::controls::ChainControls;
 use nf_core::dsp::drift::DriftController;
 use nf_core::dsp::slip::SlipResampler;
@@ -27,7 +27,7 @@ use wasapi::{DeviceEnumerator, Direction, Role};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::WaitForMultipleObjects;
 
-use crate::api::{BufferTargets, StreamInfo};
+use crate::api::{BufferTargets, ModelDepth, StreamInfo};
 use crate::devices::resolve;
 use crate::errors::{Fault, StartFailure, StreamRole, Warning, is_virtual_cable};
 use crate::exclusive::ExclusiveRefusal;
@@ -89,6 +89,8 @@ pub(crate) struct Opened {
     pub(crate) aec_built: bool,
     pub(crate) warnings: Vec<Warning>,
     pub(crate) targets: BufferTargets,
+    /// The model pack's depth this run chose (`None`: RNNoise).
+    pub(crate) model_depth: Option<ModelDepth>,
 }
 
 /// Everything the audio thread is started with.
@@ -100,6 +102,9 @@ pub(crate) struct AudioArgs {
     pub(crate) tap: TapEnd,
     /// The chain recorder's hand-over (recorder.rs); one armed before the start is in its command ring already.
     pub(crate) recorder: End<ChainTx>,
+    /// The mic an earlier run in this process measured, as it opened then, and how it delivered (the control side's
+    /// memory, for the automatic model depth: `choose_model_depth`).
+    pub(crate) mic_delivery: Option<(MicOpening, MicDelivery)>,
     /// The one-shot "running" (or the failure) for `start()`.
     pub(crate) ready: SyncSender<Result<Opened, StartFailure>>,
     /// Dropped when the thread ends: the control thread waits on it to join with a timeout.
@@ -171,7 +176,7 @@ fn worker_main(jobs: Receiver<AudioArgs>) {
 }
 
 fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
-    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, ready, done } = args;
+    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mic_delivery, ready, done } = args;
     // Declared first, so dropped last: both signal "gone" after every stream is released.
     let _done = done;
     let _exit = ExitFlag(shared.clone());
@@ -179,7 +184,7 @@ fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
         Some(code) => {
             let _ = ready.send(Err(StartFailure::Com(code)));
         }
-        None => run(Run { config, telemetry, controls, shared, tap, recorder: &mut recorder, ready, mmcss }),
+        None => run(Run { config, telemetry, controls, shared, tap, recorder: &mut recorder, mic_delivery, ready, mmcss }),
     }
     // A chain recorder the run never took (the start failed, or it stopped before its next wake) goes back, so a failed
     // start's caller can keep it for the next start (recorder::run_failed). Before `_done`: the caller has it once joined.
@@ -193,6 +198,7 @@ struct Run<'a> {
     shared: Arc<AudioShared>,
     tap: TapEnd,
     recorder: &'a mut End<ChainTx>,
+    mic_delivery: Option<(MicOpening, MicDelivery)>,
     ready: SyncSender<Result<Opened, StartFailure>>,
     mmcss: &'a Mmcss,
 }
@@ -207,6 +213,8 @@ struct Session {
     chain: Chain,
     /// The noise model's inference worker's stats, when a model pack runs on one (TODO 6).
     inference: Option<Arc<InferenceStats>>,
+    /// Its depth, and how it was chosen.
+    model_depth: Option<ModelDepth>,
 }
 
 impl Drop for Session {
@@ -237,12 +245,12 @@ impl Ticks for QpcTicks {
 }
 
 fn run(r: Run<'_>) {
-    let Run { config, telemetry, controls, shared, mut tap, recorder, ready, mmcss } = r;
+    let Run { config, telemetry, controls, shared, mut tap, recorder, mic_delivery, ready, mmcss } = r;
     let mut warnings = Vec::new();
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
     }
-    let (mut session, ids) = match open_session(&config, &controls, &shared, &mut warnings) {
+    let (mut session, ids) = match open_session(&config, &controls, &shared, mic_delivery.as_ref(), &mut warnings) {
         Ok(s) => s,
         Err(f) => {
             let _ = ready.send(Err(f));
@@ -322,6 +330,7 @@ fn run(r: Run<'_>) {
         aec_built: config.processing.aec_enabled,
         warnings,
         targets,
+        model_depth: session.model_depth,
     };
     if ready.send(Ok(opened)).is_err() {
         // start() gave up waiting; it has already reported a timeout.
@@ -344,12 +353,14 @@ struct Ids {
     output_default: bool,
 }
 
-/// Resolves the endpoints, builds the stages and the chain (inside the caller's `RtScope`) and
-/// opens every stream. The reference and keep-alive are optional: failing them is a warning.
-/// Devices come first: resolving is cheap, so a start that can't run (a retry waiting for a device)
-/// fails before building the stages.
+/// Resolves the endpoints, opens every stream and builds the stages and the chain (inside the
+/// caller's `RtScope`). The reference and keep-alive are optional: failing them is a warning.
+/// Devices come first: resolving and opening are cheap, so a start that can't run (a retry waiting
+/// for a device, a device in use) fails before building the stages. `mic_delivery`: what an earlier
+/// run measured of the mic, for the automatic model depth.
 fn open_session(
-    config: &EngineConfig, controls: &Arc<ChainControls>, run_shared: &Arc<AudioShared>, warnings: &mut Vec<Warning>,
+    config: &EngineConfig, controls: &Arc<ChainControls>, run_shared: &Arc<AudioShared>, mic_delivery: Option<&(MicOpening, MicDelivery)>,
+    warnings: &mut Vec<Warning>,
 ) -> Result<(Session, Ids), StartFailure> {
     let aec_wanted = config.processing.aec_enabled;
     let en = DeviceEnumerator::new().map_err(|e| StartFailure::Enumerator(hr_of(&e)))?;
@@ -385,19 +396,6 @@ fn open_session(
         }
     }
 
-    // Built and activated here, inside the thread's real-time scope, by the one constructor the offline tools use too, so a
-    // chain recording reruns offline exactly (engine.md, "The chain recorder"). A model pack loads and starts on its
-    // inference worker meanwhile (TODO 6), this thread waiting for it at most 3 s and giving up when the start is stopped (a
-    // start timeout or a stop: the command leaves CMD_RUN); a pack that fails to load fails the start.
-    let stopped = run_shared.clone();
-    let give_up: crate::models::GiveUp = Arc::new(move || stopped.command.load(Relaxed) != CMD_RUN);
-    let thread = crate::models::ModelThread::Worker { give_up: Some(give_up) };
-    let crate::models::BuiltChain { chain, inference } =
-        crate::models::build_chain(controls.clone(), &config.processing, aec_wanted, thread).map_err(|e| StartFailure::Stage(e.0))?;
-    if let Some(code) = inference.as_ref().and_then(|s| s.snapshot().worker_sched_refused) {
-        warnings.push(Warning::InferenceMmcss(code));
-    }
-
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
     // Exclusive mode where asked (the default; engine.md, "Exclusive mode"): a device that refuses it runs shared, with a
     // note (`Warning::is_note`). Never the output on the default playback device: the output check's warning says so.
@@ -427,7 +425,85 @@ fn open_session(
         }
     }
     let ids = Ids { mic: mic_dev.get_id().ok(), output: ids_out, reference: ref_id, output_default: out_default };
-    Ok((Session { mic, out, lb, ka, chain, inference }, ids))
+
+    // The chain, once the streams are open (so the model's depth can follow how the mic opened: `choose_model_depth`).
+    // Built and activated here, inside the thread's real-time scope, by the one constructor the offline tools use too, so a
+    // chain recording reruns offline exactly (engine.md, "The chain recorder"; the status gives the depth it ran at). A
+    // model pack loads and starts on its inference worker meanwhile (TODO 6), this thread waiting for it at most 3 s and
+    // giving up when the start is stopped (a start timeout or a stop: the command leaves CMD_RUN); a pack that fails to load
+    // fails the start (the streams, opened but not started, are released).
+    let model_depth = choose_model_depth(&config.processing, &MicOpening::of(ids.mic.as_deref(), &mic.info.stream_info()), mic_delivery);
+    let processing = nf_core::config::ProcessingConfig {
+        model_depth: model_depth.map_or(config.processing.model_depth, |d| d.depth),
+        ..config.processing.clone()
+    };
+    let stopped = run_shared.clone();
+    let give_up: crate::models::GiveUp = Arc::new(move || stopped.command.load(Relaxed) != CMD_RUN);
+    let thread = crate::models::ModelThread::Worker { give_up: Some(give_up) };
+    let crate::models::BuiltChain { chain, inference } =
+        crate::models::build_chain(controls.clone(), &processing, aec_wanted, thread).map_err(|e| StartFailure::Stage(e.0))?;
+    if let Some(code) = inference.as_ref().and_then(|s| s.snapshot().worker_sched_refused) {
+        warnings.push(Warning::InferenceMmcss(code));
+    }
+    Ok((Session { mic, out, lb, ka, chain, inference, model_depth }, ids))
+}
+
+/// How a run opened its mic, which is what sets how it delivers: its endpoint, exclusive or shared, its period (frames at
+/// 48 kHz), IAudioClient3's small period and RAW mode. The automatic model depth's memory is keyed by it (`remembered` in
+/// [`choose_model_depth`]): a measurement holds only for a mic opened the same way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MicOpening {
+    pub(crate) id: Option<String>,
+    pub(crate) exclusive: bool,
+    pub(crate) period_frames: u32,
+    pub(crate) low_latency: bool,
+    pub(crate) raw: bool,
+}
+
+impl MicOpening {
+    pub(crate) fn of(id: Option<&str>, info: &StreamInfo) -> Self {
+        Self {
+            id: id.map(str::to_owned),
+            exclusive: info.exclusive.is_some(),
+            period_frames: (info.period_ms.max(0.0) * nf_core::SAMPLE_RATE as f32 / 1000.0).round() as u32,
+            low_latency: info.low_latency,
+            raw: info.raw,
+        }
+    }
+
+    /// The same endpoint opened the same way (an endpoint without an id matches nothing).
+    pub(crate) fn same(&self, other: &MicOpening) -> bool {
+        self.id.is_some() && self == other
+    }
+
+    /// A block a wake by construction: the exclusive mic at a period of a block or less (each of its events brings at most
+    /// one block's last sample; `exclusive::exclusive_period` tiles the block where the device allows). A longer exclusive
+    /// period (a device whose minimum is over 10 ms) brings two blocks in some wakes, and a shared mic's delivery is the
+    /// audio engine's and the driver's: those need a measurement.
+    pub(crate) fn one_at_a_time(&self) -> bool {
+        self.exclusive && self.period_frames > 0 && self.period_frames as usize <= nf_core::BLOCK
+    }
+}
+
+/// The depth a run's model pack runs at (TODO 5): the config's when it sets one; automatic (the default), one block for a mic
+/// that delivers a block at a time, else two (bursts, or not measured). How it delivers: as an earlier run in this process
+/// measured it (`remembered`: the mic as it opened then, and its delivery), when it opened the same way; else a block at a
+/// time for the exclusive mic at a period of a block or less ([`MicOpening::one_at_a_time`]: its 3.33 ms packets); else not
+/// known. Chosen at the start, before the chain is built, and never changed mid-stream: the depth is the noise stage's
+/// latency, so a change would move the output by a block, a click. A mic first measured in this run gets its depth at the
+/// next start (any restart: a settings or device change, a model change). `None` for RNNoise, which has no worker.
+pub(crate) fn choose_model_depth(
+    p: &nf_core::config::ProcessingConfig, mic: &MicOpening, remembered: Option<&(MicOpening, MicDelivery)>,
+) -> Option<ModelDepth> {
+    if p.noise_model == nf_core::config::DEFAULT_NOISE_MODEL {
+        return None;
+    }
+    let delivery = match remembered.filter(|(then, _)| then.same(mic)) {
+        Some((_, measured)) => *measured,
+        None if mic.one_at_a_time() => MicDelivery::OneAtATime,
+        None => MicDelivery::Unknown,
+    };
+    Some(ModelDepth { depth: p.model_depth_for(delivery), auto: p.model_depth_auto().then_some(delivery) })
 }
 
 /// The interface friendly name two endpoints share ("VB-Audio Virtual Cable" for both sides of a
@@ -855,12 +931,22 @@ mod tests {
 
     /// RT-1: once a thread has built easyfft's per-thread state (what the audio thread now does
     /// before entering its real-time scope), building, activating and dropping the noise stage
-    /// gives back everything it took, so restarts don't leak the locked pool.
+    /// gives back everything it took, so restarts don't leak the locked pool. Its activate starts
+    /// RNNoise's spare maker, a thread, and a thread frees a few of the allocations its spawn made
+    /// here (its boxed start-up) as it ends, which this thread's count can't see: they're what a
+    /// bare spawn and join leaves, counted the same way. (nf-stages' `tests/rt_pool.rs` checks the
+    /// pool itself, process-wide: back in full after each start, resets and all.)
     #[test]
     fn a_warmed_thread_builds_the_noise_stage_without_leaking() {
         std::thread::spawn(|| {
             let _scope = prepare_rt_thread();
             let controls = Arc::new(ChainControls::new(&nf_core::config::ProcessingConfig::default()));
+            let ((), spawn_allocs, spawn_frees) = crate::test_alloc::count(|| {
+                if let Ok(t) = std::thread::Builder::new().name("nf-test-spawn".into()).spawn(|| ()) {
+                    let _ = t.join();
+                }
+            });
+            let elsewhere = spawn_allocs - spawn_frees;
             for _ in 0..3 {
                 let ((), allocs, frees) = crate::test_alloc::count(|| {
                     use nf_core::stage::{Activation, Stage};
@@ -869,7 +955,7 @@ mod tests {
                     drop(s);
                 });
                 assert!(allocs > 0);
-                assert_eq!(allocs, frees, "a start's stage set-up leaks nothing on a warmed thread");
+                assert_eq!(allocs, frees + elsewhere, "a start's stage set-up leaks nothing on a warmed thread");
             }
         })
         .join()

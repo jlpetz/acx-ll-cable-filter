@@ -139,8 +139,8 @@ its latency as the stream offset plus the re-blocking delay:
 | UL-UNAS, bin-mapped (1536/768 STFT) | 768 | 1536 | 1440 |
 
 A model run on a worker thread (TODO 6) adds `depth` × 480 to `L`, its result used `depth` blocks later (amended
-2026-11-02: the v0 host runs every pack on one, `nf_core::noise::Pipelined`, at depth 2 by default, the host's setting, not a
-pack field): UL-UNAS bin-mapped is 2400 (1920 at depth 1).
+2026-11-02: the v0 host runs every pack on one, `nf_core::noise::Pipelined`, at the host's depth, not a pack field: automatic,
+1 when the mic delivers a block a wake and 2 otherwise, or as set): UL-UNAS bin-mapped is 2400 (1920 at depth 1).
 
 ### Spectral packs at 48 kHz, made concrete (amended 2026-11-02)
 With `r = 48000 / sample_rate`:

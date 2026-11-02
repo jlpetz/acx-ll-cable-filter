@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 nf-core.workspace = true
 nnnoiseless.workspace = true
+# RNNoise's spare states, between the audio thread and their maker (rnnoise.rs). Pure Rust, no allocation after construction.
+rtrb.workspace = true
 sonora.workspace = true
 hound.workspace = true
 # synth::convolve (test signals only, never on the audio path).

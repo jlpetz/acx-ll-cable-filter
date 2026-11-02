@@ -525,10 +525,11 @@ impl Summary {
 }
 
 /// Before `latency` or `quality` measures: with the adaptive output target (the default) it measures the delivery at the
-/// fixed target for a run's first two minutes before it can come down, and then walks down to where it's going (a tenth of
-/// the way a second, up to a minute). With `settle` (`--settle`) this waits for it to settle (up to [`ADAPTIVE_WAIT_S`]), so
-/// the test measures where it settled; without, it says the test measures at the fixed start, and returns at once (the
-/// owner, 2026-11-02: the lab commands measure what the product does by default, and needn't wait three minutes for it).
+/// fixed target for a run's first two minutes before it can come down, holds there for two more to confirm it (a trial),
+/// and then walks down to where it's going, a tenth of the way a second (`nf_engine::ADAPTIVE_OUTPUT_SETTLE_S` in all).
+/// With `settle` (`--settle`) this waits for it to settle (up to [`ADAPTIVE_WAIT_S`]), so the test measures where it
+/// settled; without, it says the test measures at the fixed start, and returns at once (the owner, 2026-11-02: the lab
+/// commands measure what the product does by default, and needn't wait three minutes for it).
 /// Returns true when Ctrl+C cancelled the wait.
 pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig, settle: bool) -> bool {
     let from = engine.telemetry().output_target_ms;
@@ -545,10 +546,10 @@ pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig, 
         TargetWait::Settle => {}
     }
     say!(
-        "The adaptive output target measures the delivery for {} s before it can come down, and then walks down for up to {} s: \
-         waiting for it to settle (up to {ADAPTIVE_WAIT_S} s; Ctrl+C cancels).",
+        "The adaptive output target measures the delivery for {} s before it can come down, holds for another {} s to \
+         confirm it, and then walks down: waiting for it to settle (up to {ADAPTIVE_WAIT_S} s; Ctrl+C cancels).",
         nf_engine::ADAPTIVE_OUTPUT_WINDOW_S,
-        nf_engine::ADAPTIVE_OUTPUT_WALK_S
+        nf_engine::ADAPTIVE_OUTPUT_WINDOW_S
     );
     let start = Instant::now();
     let mut watch = TargetWatch::new(from);
@@ -556,7 +557,8 @@ pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig, 
         if console::sleep_unless_stopped(Duration::from_secs(1)) {
             return true;
         }
-        if let Some(now) = watch.see(engine.telemetry().output_target_ms) {
+        let t = engine.telemetry();
+        if let Some(now) = watch.see(t.output_target_ms, t.output_target_on_trial) {
             let secs = start.elapsed().as_secs();
             if now < from - 0.5 {
                 say!("The output target came down from {} to {} ms ({secs} s).", fixed(f64::from(from), 1), fixed(f64::from(now), 1));
@@ -613,7 +615,7 @@ fn at_fixed_start(ms: f32) -> String {
         "The adaptive output target is at its fixed start ({} ms) and can come down only after {} s of running: measuring now, \
          at the fixed start. --settle waits for it first (up to {ADAPTIVE_WAIT_S} s).",
         fixed(f64::from(ms), 1),
-        nf_engine::ADAPTIVE_OUTPUT_WINDOW_S
+        nf_engine::ADAPTIVE_OUTPUT_FIRST_S
     )
 }
 
@@ -622,7 +624,8 @@ fn at_fixed_start(ms: f32) -> String {
 const TARGET_STILL_S: u32 = 3;
 
 /// Watches the published output target, a reading a second: settled once it has moved and then held still for
-/// [`TARGET_STILL_S`].
+/// [`TARGET_STILL_S`], but not while it holds for a trial (`on_trial`: its lowering is still to come; after a strike's raise,
+/// the next lowering is trialled again).
 #[derive(Clone, Copy, Debug)]
 struct TargetWatch {
     last: f32,
@@ -635,8 +638,8 @@ impl TargetWatch {
         Self { last: from, moved: false, still: 0 }
     }
 
-    /// This second's target (ms); the target once it has settled.
-    fn see(&mut self, ms: f32) -> Option<f32> {
+    /// This second's target (ms) and whether it is on trial; the target once it has settled.
+    fn see(&mut self, ms: f32, on_trial: bool) -> Option<f32> {
         if ms.is_nan() || ms <= 0.0 {
             // Stopped, or restarting: nothing to watch.
             return None;
@@ -646,7 +649,7 @@ impl TargetWatch {
             return None;
         }
         self.still += 1;
-        (self.moved && self.still >= TARGET_STILL_S).then_some(ms)
+        (self.moved && !on_trial && self.still >= TARGET_STILL_S).then_some(ms)
     }
 }
 
@@ -823,8 +826,10 @@ pub fn describe_status(s: &EngineStatus) -> String {
     if s.reference.is_some() {
         lines.push(stream_line("Reference", s.reference.as_ref()));
     }
+    // A model pack's worker depth, and why (TODO 5: automatic by default).
+    let depth = s.model_depth.map_or(String::new(), |d| format!("; model {}", d.text()));
     lines.push(format!(
-        "{:<10} {}; MMCSS {}; chain {} ms",
+        "{:<10} {}; MMCSS {}; chain {} ms{depth}",
         "Engine",
         if s.memory.is_empty() { "memory unknown" } else { &s.memory },
         if s.mmcss { "Pro Audio" } else { "unavailable" },
@@ -883,17 +888,33 @@ mod tests {
         assert_eq!(waits, [false, false, false, true]);
         assert_eq!(
             super::at_fixed_start(14.0),
-            "The adaptive output target is at its fixed start (14.0 ms) and can come down only after 120 s of running: measuring \
-             now, at the fixed start. --settle waits for it first (up to 188 s)."
+            "The adaptive output target is at its fixed start (14.0 ms) and can come down only after 240 s of running: measuring \
+             now, at the fixed start. --settle waits for it first (up to 308 s)."
         );
     }
 
     /// The adaptive target's wait: nothing until it has moved, then settled once it holds still for 3 s; a walk's steps
-    /// (every second) keep it waiting, and a stopped engine's 0 doesn't count.
+    /// (every second) keep it waiting, and so does a trial (its lowering is still to come); a stopped engine's 0 doesn't
+    /// count.
     #[test]
     fn the_adaptive_wait_settles_after_the_walk() {
+        // The run's trial holds the target at the fixed one: not moved, not settled; then the walk, and 3 s still.
         let mut w = super::TargetWatch::new(22.0);
-        let seen: Vec<Option<f32>> = [22.0, 22.0, 22.0, 21.5, 21.0, 20.6, 0.0, 20.6, 20.6, 20.6, 20.6].iter().map(|&t| w.see(t)).collect();
+        let trial = [false, true, true, true, true, true, false, false, false, false, false, false, false];
+        let at = [22.0, 22.0, 22.0, 22.0, 0.0, 22.0, 21.5, 21.0, 20.6, 20.6, 20.6, 20.6, 20.6];
+        let seen: Vec<Option<f32>> = at.iter().zip(trial).map(|(&t, on)| w.see(t, on)).collect();
+        assert_eq!(seen[..11], [None; 11], "the trial, then the walk");
+        assert_eq!(seen[11..], [Some(20.6), Some(20.6)]);
+        // A target that has moved and is on trial (as after a strike's raise) isn't settled either.
+        let mut w = super::TargetWatch::new(22.0);
+        let trial = [false, false, false, true, true, true, true, true, true, true, true, true, false, false, false, false];
+        let at = [22.0, 22.0, 22.0, 21.5, 21.0, 20.6, 20.6, 20.6, 20.6, 20.6, 0.0, 20.6, 20.0, 20.0, 20.0, 20.0];
+        let seen: Vec<Option<f32>> = at.iter().zip(trial).map(|(&t, on)| w.see(t, on)).collect();
+        assert_eq!(seen[..14], [None; 14], "held on trial for longer than 3 s isn't the end");
+        assert_eq!(seen[14..], [None, Some(20.0)]);
+        let mut w = super::TargetWatch::new(22.0);
+        let seen: Vec<Option<f32>> =
+            [22.0, 22.0, 22.0, 21.5, 21.0, 20.6, 0.0, 20.6, 20.6, 20.6, 20.6].iter().map(|&t| w.see(t, false)).collect();
         assert_eq!(seen, [None, None, None, None, None, None, None, None, None, Some(20.6), Some(20.6)]);
     }
 
@@ -1210,5 +1231,15 @@ mod tests {
              Engine     large pages (32 MiB); MMCSS Pro Audio; chain 10.00 ms\nnote: the reference couldn't be opened\n\
              warning: the mic is the output cable's own recording side\nnote: The microphone (Mic) runs in shared mode: ..."
         );
+        // A model pack's depth, and how it was chosen (TODO 5).
+        let auto = nf_engine::ModelDepth { depth: 1, auto: Some(nf_engine::MicDelivery::OneAtATime) };
+        let pack = EngineStatus { model_depth: Some(auto), chain_latency_ms: 40.0, ..s.clone() };
+        assert!(
+            describe_status(&pack).contains("chain 40.00 ms; model depth 1 (auto: the mic delivers a block at a time)\n"),
+            "{}",
+            describe_status(&pack)
+        );
+        let set = EngineStatus { model_depth: Some(nf_engine::ModelDepth { depth: 3, auto: None }), ..pack };
+        assert!(describe_status(&set).contains("; model depth 3 (set)\n"), "{}", describe_status(&set));
     }
 }

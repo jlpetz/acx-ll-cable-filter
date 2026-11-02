@@ -407,6 +407,9 @@ pub struct Telemetry {
     pub output_exclusive: AtomicBool,
     /// The output's target adapts to the delivery (`IoConfig::adaptive_output`): `output_target_ms` moves.
     pub output_adaptive: AtomicBool,
+    /// The adaptive target holds for a trial, the window that proves the delivery before it first comes down: its lowering is
+    /// still to come (nf-engine `out_target.rs`; `--settle` waits past it). Published each second.
+    pub output_target_on_trial: AtomicBool,
     /// The noise model runs on an inference worker (a model pack, TODO 6): the `inference_*` counters below are its
     /// (`nf_core::noise::InferenceStats`), published once a second.
     pub inference_active: AtomicBool,
@@ -429,6 +432,11 @@ pub struct Telemetry {
     pub wake_blocks: [AtomicU64; 4],
 }
 
+/// [`WakeBlocks::delivery`]'s thresholds: the wakes it needs (10 s of a block a wake), and the blocks per miss at depth 1
+/// that still count as a block at a time.
+pub const DELIVERY_MIN_WAKES: u64 = 1_000;
+pub const DELIVERY_STEADY_BLOCKS: u64 = 500;
+
 /// How many wakes processed 1, 2, 3, and 4 or more blocks ([`Telemetry::wake_blocks`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WakeBlocks(pub [u64; 4]);
@@ -443,6 +451,31 @@ impl WakeBlocks {
     /// Wakes that processed more than one block.
     pub fn bursts(&self) -> u64 {
         self.0[1..].iter().sum()
+    }
+
+    /// The wakes counted, and the blocks they processed (a wake of 4 or more counted as 4).
+    pub fn wakes(&self) -> u64 {
+        self.0.iter().sum()
+    }
+
+    pub fn blocks(&self) -> u64 {
+        self.0.iter().enumerate().map(|(i, &n)| n * (i as u64 + 1)).sum()
+    }
+
+    /// How the mic delivered, for the automatic model depth (TODO 5; `config::ProcessingConfig::model_depth_for`): unknown
+    /// before [`DELIVERY_MIN_WAKES`] wakes; a block at a time when a worker one block behind would have missed at most one
+    /// block in [`DELIVERY_STEADY_BLOCKS`] (each miss plays a block of the unfiltered mic: one every 5 s at most); else in
+    /// bursts. The cables' shared mic, a fifth to a third of its wakes two blocks, is bursts by far; the exclusive mic, and
+    /// steady delivery, have none but a stall's.
+    pub fn delivery(&self) -> crate::config::MicDelivery {
+        use crate::config::MicDelivery;
+        if self.wakes() < DELIVERY_MIN_WAKES {
+            MicDelivery::Unknown
+        } else if self.misses_at(1).saturating_mul(DELIVERY_STEADY_BLOCKS) <= self.blocks() {
+            MicDelivery::OneAtATime
+        } else {
+            MicDelivery::Bursts
+        }
     }
 
     /// From `earlier` to these (each count's growth).
@@ -513,6 +546,7 @@ pub struct TelemetrySnapshot {
     pub mic_exclusive: bool,
     pub output_exclusive: bool,
     pub output_adaptive: bool,
+    pub output_target_on_trial: bool,
     pub inference_active: bool,
     pub inference_runs: u64,
     pub inference_misses: u64,
@@ -642,6 +676,7 @@ impl Telemetry {
             mic_exclusive: self.mic_exclusive.load(Relaxed),
             output_exclusive: self.output_exclusive.load(Relaxed),
             output_adaptive: self.output_adaptive.load(Relaxed),
+            output_target_on_trial: self.output_target_on_trial.load(Relaxed),
             inference_active: self.inference_active.load(Relaxed),
             inference_runs: self.inference_runs.load(Relaxed),
             inference_misses: self.inference_misses.load(Relaxed),
@@ -680,6 +715,20 @@ mod tests {
         assert_eq!(sum, WakeBlocks([1, 2, 1, 1]));
         sum.add(&WakeBlocks([1, 1, 1, 1]));
         assert_eq!(sum, WakeBlocks([2, 3, 2, 2]));
+        assert_eq!((w.wakes(), w.blocks()), (6, 2 + 4 + 3 + 4));
+    }
+
+    /// The automatic depth's reading of the wakes (TODO 5): too few is unknown; a block a wake with a rare stall's pair is a
+    /// block at a time; the cables' shared bursts (a pair every third wake) and one pair in a hundred are bursts.
+    #[test]
+    fn the_wakes_say_how_the_mic_delivers() {
+        use crate::config::MicDelivery;
+        assert_eq!(WakeBlocks([999, 0, 0, 0]).delivery(), MicDelivery::Unknown);
+        assert_eq!(WakeBlocks([1_000, 0, 0, 0]).delivery(), MicDelivery::OneAtATime);
+        assert_eq!(WakeBlocks([30_000, 30, 2, 1]).delivery(), MicDelivery::OneAtATime, "a pair every 10 s or so");
+        assert_eq!(WakeBlocks([20_000, 10_000, 0, 0]).delivery(), MicDelivery::Bursts, "the cables' shared mic");
+        assert_eq!(WakeBlocks([9_900, 100, 0, 0]).delivery(), MicDelivery::Bursts, "a pair every 100 wakes");
+        assert_eq!(WakeBlocks([0, 1_000, 0, 0]).delivery(), MicDelivery::Bursts, "a 20 ms period: two blocks every wake");
     }
 
     /// The readout is the four parts on the sample's way; the chain's offset comes on top of it.

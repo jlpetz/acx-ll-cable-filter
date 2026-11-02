@@ -7,7 +7,9 @@
 //!   feature (nf-ort; ONNX Runtime). Without it: "noise model 'X' needs a build with --features onnx". A missing pack says
 //!   how to fetch it. A pack that fails to load fails the start: there's no silent fallback to RNNoise, since the user asked
 //!   for that model.
-//! - A pack's model runs on an inference worker live (`nf_core::noise::Pipelined`, TODO 6), `cfg.model_depth` blocks behind,
+//! - A pack's model runs on an inference worker live (`nf_core::noise::Pipelined`, TODO 6), `cfg.model_depth` blocks behind
+//!   (automatic by default: the engine picks it at the start from how the mic delivers, `audio::choose_model_depth`, and
+//!   builds with that; offline, where nothing delivers, automatic is the bursty depth, 2, as before: `MicDelivery::Unknown`),
 //!   entered with [`EngineHooks`]: MMCSS "Pro Audio" at normal priority (its fallback, HIGHEST, under the audio thread's;
 //!   a refusal is a start-up warning), then, once the pack is loaded, hashed and its session built and warmed up on the
 //!   worker, nf-mem's real-time scope, so whatever its steady state allocates in Rust comes from the locked pool and is
@@ -93,7 +95,7 @@ pub fn noise_stage(controls: Arc<ChainControls>, cfg: &ProcessingConfig, thread:
     if !is_model_id(id) {
         return Err(StageError(format!("'{id}' isn't a noise model id ([a-z0-9][a-z0-9-]{{0,63}})")));
     }
-    pack_stage(controls, id, cfg.model_depth, thread)
+    pack_stage(controls, id, cfg.model_depth_for(nf_core::config::MicDelivery::Unknown), thread)
 }
 
 #[cfg(feature = "onnx")]

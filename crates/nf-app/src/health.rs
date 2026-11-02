@@ -34,8 +34,10 @@ pub const LATE_MS: f32 = 3.0;
 pub const REF_STALE_SHARE: f32 = 0.02;
 pub const REF_OWED_SHARE: f32 = 0.01;
 /// The loopback's lead target this far (ms) over what steady delivery needs: its delivery needed that much more (the cables'
-/// rose from 12 to 13.5-23.4 ms with the shared mic). After the start-up any raise counts; in it, with the exclusive mic, a
-/// loopback period of it is that mic's own need (doc/todo/10-aec.md: the lead rose to 18.3 ms on the cables).
+/// rose from 12 to 13.5-23.4 ms with the shared mic). It's the whole rise over the target's start, in the start-up and after
+/// it; with the exclusive mic up to a loopback period of it is that mic's own need, wherever it lands (doc/todo/10-aec.md:
+/// the lead rose to 18.3 ms on the cables; a live check, 2026-11-02, called a rise of 12 to 18 bursts of 6.0 ms, which the
+/// old rule gives only for a rise after the start-up: inferred, as its report wasn't kept).
 pub const REF_RAISE_MS: f32 = 3.0;
 /// The lead's readings scattering this far (ms RMS) from the loop's low-passed lead: the stamps, or the delivery that times it,
 /// are noisy (the cables' stamps: within 1 ms).
@@ -164,7 +166,8 @@ pub struct ReferenceFigures {
     pub settled_target_ms: f32,
     /// Its clock against the mic's, fitted over the check (`None`: not measured, without stamps or too short a run).
     pub drift: Option<DriftFit>,
-    /// Slips and jumps after the start-up, and the gaps (blocks served zeros owed) over the check.
+    /// Slips and jumps after the start-up (the jumps other than a raise of the target: a break undone, a step of the count, a
+    /// centring), and the gaps (blocks served zeros owed) over the check.
     pub slips: u64,
     pub jumps: u64,
     pub gaps: u64,
@@ -276,7 +279,11 @@ pub fn measure(blocks: &[ChainBlock], counters: &TelemetrySnapshot, status: &Eng
             settled_target_ms: settled.first().map_or(last.target_ms, |r| r.target_ms),
             drift: drift.reference,
             slips: settled.iter().filter(|r| r.consumed != 480 && r.consumed != 0).count() as u64,
-            jumps: settled.iter().filter(|r| r.jumped != 0).count() as u64,
+            // A raise of the target is a jump too, said with the raise (it's the need's); these are the timeline's others.
+            jumps: settled
+                .iter()
+                .filter(|r| r.jumped != 0 && r.events & (ReferenceFacts::BROKEN | ReferenceFacts::STEPPED | ReferenceFacts::CENTRED) != 0)
+                .count() as u64,
             gaps: counters.reference_gaps,
         })
     });
@@ -311,7 +318,7 @@ pub struct Health {
     /// Delivers in bursts (the mic, the loopback), or is slow to play (the output: holds the audio long after taking it).
     pub bursty: bool,
     pub slow: bool,
-    /// Late: steady, but past its packet (the mic), or stale (the loopback).
+    /// Late: steady, but past its packet (the mic), or stale at times (the loopback: no delivery for two periods and 5 ms).
     pub late: bool,
     pub drifting: bool,
     pub glitched: bool,
@@ -341,8 +348,8 @@ impl Health {
         }
     }
 
-    /// "steady", "steady by its wakes (not timed)", or what's wrong: "delivered nothing", "in bursts", "late", "slow to play",
-    /// "drifting", "glitched", joined.
+    /// "steady", "steady by its wakes (not timed)", or what's wrong: "delivered nothing", "in bursts", "late" (the loopback:
+    /// "stale at times"), "slow to play", "drifting", "glitched", joined.
     pub fn verdict(&self) -> String {
         let mut v = Vec::new();
         if self.silent {
@@ -352,7 +359,7 @@ impl Health {
             v.push("in bursts");
         }
         if self.late {
-            v.push(if self.kind == Kind::Reference { "late (stale)" } else { "late" });
+            v.push(if self.kind == Kind::Reference { "stale at times" } else { "late" });
         }
         if self.slow {
             v.push("slow to play");
@@ -525,7 +532,7 @@ fn output_health(o: &OutputFigures) -> Health {
     let e = &o.events;
     h.glitched = e.underruns > 0 || e.coarse_drops > 0;
     let what = e.text();
-    h.findings.push(if h.glitched { format!("Ran short or over: {what}.") } else { format!("Took every block in time: {what}.") });
+    h.findings.push(if h.glitched { format!("Ran short or overfilled: {what}.") } else { format!("Took every block in time: {what}.") });
     if let Some(r) = o.render {
         let queue = o
             .queue
@@ -571,22 +578,29 @@ fn output_health(o: &OutputFigures) -> Health {
     h
 }
 
-/// The loopback; `mic_exclusive`: the mic ran in exclusive mode, whose blocks need a loopback period more lead.
+/// The loopback; `mic_exclusive`: the mic ran in exclusive mode, whose blocks need up to a loopback period more lead.
 fn reference_health(r: &ReferenceFigures, mic_exclusive: bool) -> Health {
     let mut h = Health::new(Kind::Reference, &r.stream);
     let settled = r.blocks > 0;
     h.late = settled && r.stale >= REF_STALE_SHARE;
-    // Raised in the start-up beyond what the exclusive mic needs by itself, and after it at all.
+    // The target's rise over its start: in the start-up (it follows the need up) and after it. With the exclusive mic up to a
+    // loopback period of it is that mic's own need, wherever it lands: where the mic's blocks fall against the loopback's
+    // packets sets it, and a need that first shows near the start-up's end, or after it, raises the target only once the
+    // takes have come up short for 0.6 s (reference.rs), past the start-up. So the allowance is the whole rise's, not the
+    // start-up's alone (a live check called a rise of 12 to 18 ms bursts of 6.0 ms, which the start-up-only allowance gives
+    // only for a rise after it: inferred, doc/todo/21-device-health.md).
     let startup_raise = r.settled_target_ms - r.start_target_ms;
-    let own_need = if mic_exclusive { if r.stream.known() { r.stream.period_ms } else { 10.0 } } else { 0.0 };
-    let startup_excess = startup_raise - own_need;
     let raised = r.target_ms - r.settled_target_ms;
-    let raised_for_bursts = startup_excess >= REF_RAISE_MS || raised >= REF_RAISE_MS;
+    let rise = startup_raise.max(0.0) + raised.max(0.0);
+    let own_need = if mic_exclusive { if r.stream.known() { r.stream.period_ms } else { 10.0 } } else { 0.0 };
+    let excess = rise - own_need;
+    let raised_for_bursts = excess >= REF_RAISE_MS;
     h.bursty = (settled && r.owed >= REF_OWED_SHARE) || raised_for_bursts;
     if settled {
         h.findings.push(format!(
-            "After its start-up the loopback had delivered within two periods at {} of the blocks, and {} were short of samples \
-             (zeros served for ones still to come); its lead {} ms, against a target of {} ms.",
+            "After its start-up the loopback was delivering at {} of the blocks (its last packet no more than two periods and 5 \
+             ms old), and {} of them were short of samples (zeros served for ones still to come); at the end its lead was {} ms, \
+             against a target of {} ms.",
             percent(1.0 - r.stale),
             percent(r.owed),
             ms(r.lead_ms),
@@ -601,31 +615,35 @@ fn reference_health(r: &ReferenceFigures, mic_exclusive: bool) -> Health {
         ));
     }
     if startup_raise >= 0.5 {
-        let why = if mic_exclusive {
-            format!(
-                "; with the exclusive mic up to a loopback period ({} ms) of that is expected: each mic block is processed before \
-                 the loopback, on its own period, has delivered as recent a reference",
-                ms(own_need)
-            )
-        } else {
-            String::new()
-        };
         h.findings.push(format!(
-            "In its start-up its lead target rose from {} to {} ms, to what its delivery needed{why}.",
+            "In its start-up its lead target rose from {} to {} ms, to what its delivery needed.",
             ms(r.start_target_ms),
             ms(r.settled_target_ms)
         ));
     }
     if raised >= 0.5 {
-        h.findings.push(format!("After its start-up its target rose another {} ms: its takes kept coming up short.", ms(raised)));
+        h.findings.push(format!(
+            "After its start-up its target rose {} ms more, to {} ms: its takes kept coming up short (each raise is a jump of the \
+             echo path, which the canceller takes 5-10 s to follow).",
+            ms(raised),
+            ms(r.target_ms)
+        ));
+    }
+    if mic_exclusive && rise >= 0.5 {
+        // Of the rise alone: the verdict may be bursts or staleness for its own reasons (the shares above, the stamps below).
+        h.findings.push(format!(
+            "With the exclusive mic up to a loopback period ({} ms) of that rise is expected, in the start-up or after it: each \
+             mic block is processed before the loopback, on its own period, has delivered as recent a reference{}.",
+            ms(own_need),
+            if raised_for_bursts { "" } else { "; so the rise itself is no sign of bursts" }
+        ));
     }
     if raised_for_bursts {
-        let extra = startup_excess.max(0.0) + raised.max(0.0);
-        h.costs_ms = Some(extra);
+        h.costs_ms = Some(excess);
         h.findings.push(format!(
             "Its delivery needed about {} ms more lead than steady delivery does: the echo has to reach the mic that much later \
              after the speakers' mix for the canceller to catch it.",
-            ms(extra)
+            ms(excess)
         ));
     }
     if r.stamped {
@@ -644,11 +662,20 @@ fn reference_health(r: &ReferenceFigures, mic_exclusive: bool) -> Health {
                 .to_owned(),
         );
     }
-    if r.jumps > 0 || r.slips > 0 {
+    if r.jumps > 0 {
         h.findings.push(format!(
-            "After its start-up it slipped {} times and its timeline jumped {} times (each jump moves the echo path, and the \
-             canceller takes 5-10 s to follow).",
-            r.slips, r.jumps
+            "After its start-up its timeline jumped {} {} (each jump moves the echo path, and the canceller takes 5-10 s to \
+             follow).",
+            r.jumps,
+            if r.jumps == 1 { "time" } else { "times" }
+        ));
+    }
+    if r.slips > 0 {
+        // The drift loop's one-sample slips are how it should follow the clocks: said only so they aren't taken for jumps.
+        h.findings.push(format!(
+            "It followed the clocks' drift in {} one-sample slips after its start-up, as it should: they hold the echo path \
+             where it is.",
+            r.slips
         ));
     }
     h.glitched = r.jumps > 0;
@@ -848,7 +875,7 @@ mod tests {
         );
         assert!(text.contains("Its clock runs 12 ppm fast against the mic's (±1, fitted over 14 s; the filter corrects it)."), "{text}");
         assert!(text.contains("Its clock runs 4 ppm slow against the mic's"), "{text}");
-        assert!(text.contains("After its start-up the loopback had delivered within two periods at 100% of the blocks"), "{text}");
+        assert!(text.contains("After its start-up the loopback was delivering at 100% of the blocks (its last packet no more"), "{text}");
         assert!(text.ends_with("Overall: every stream is steady."), "{text}");
     }
 
@@ -941,7 +968,7 @@ mod tests {
         let out = &all[1];
         assert!(out.glitched && out.drifting, "{out:?}");
         assert_eq!(out.verdict(), "drifting, glitched");
-        assert!(out.findings[0].starts_with("Ran short or over: 1 underrun, 1 deficit (10.0 ms of zeros)"), "{out:?}");
+        assert!(out.findings[0].starts_with("Ran short or overfilled: 1 underrun, 1 deficit (10.0 ms of zeros)"), "{out:?}");
         assert!(out.findings.iter().any(|l| l.starts_with("Its clock runs 450 ppm slow against the mic's")), "{out:?}");
         assert!(
             out.tries.iter().any(|t| t.contains("--no-adaptive-output")) && out.tries.iter().any(|t| t.contains("--no-exclusive-output"))
@@ -996,15 +1023,16 @@ mod tests {
         r.jumps = 1;
         let h = &assess(&f)[2];
         assert!(h.late && h.bursty && h.glitched, "{h:?}");
-        assert_eq!(h.verdict(), "in bursts, late (stale), glitched");
+        assert_eq!(h.verdict(), "in bursts, stale at times, glitched");
         // The shared mic needs no raise: 2 ms in the start-up and 9.4 after it.
         assert!((h.costs_ms.unwrap() - 11.4).abs() < 1e-4, "{h:?}");
         assert!(
             h.findings[0]
-                .starts_with("After its start-up the loopback had delivered within two periods at 95% of the blocks, and 2% were short"),
+                .starts_with("After its start-up the loopback was delivering at 95% of the blocks (its last packet no more than two"),
             "{h:?}"
         );
-        assert!(h.findings.iter().any(|l| l.starts_with("After its start-up its target rose another 9.4 ms")), "{h:?}");
+        assert!(h.findings.iter().any(|l| l.starts_with("After its start-up its target rose 9.4 ms more, to 23.4 ms")), "{h:?}");
+        assert!(h.findings[0].contains("and 2% of them were short of samples"), "{h:?}");
         let mut f = steady();
         f.reference.as_mut().unwrap().stamped = false;
         assert!(assess(&f)[2].bursty);
@@ -1017,35 +1045,135 @@ mod tests {
         assert_eq!(assess(&f).len(), 2, "no reference without echo cancelling");
     }
 
-    /// With the exclusive mic the loopback's target rises a period in its start-up by design (12 to 18 ms on the cables): that
-    /// is steady, and said; with a shared mic the same raise is the delivery's need, a burst. A raise past the exclusive mic's
-    /// period is a burst too.
+    /// With the exclusive mic the loopback's target rises up to a period by design (12 to 18 ms on the cables): that is
+    /// steady, and said, whether the rise comes in the start-up or after it (the live check of 2026-11-02 called a 12 to 18
+    /// rise bursts "needing 6.0 ms more lead", which the old rule gives only for all of it after the start-up), or some of
+    /// each; with a shared mic the same rise is the delivery's need, a burst. A rise past the exclusive mic's period is a
+    /// burst too, by what's past it. The rise's own clause speaks of the rise alone: a stream bursty or stale for another
+    /// reason isn't called steady by it.
     #[test]
-    fn the_exclusive_mics_startup_raise_is_steady() {
-        let mut f = steady();
-        f.mic.stream = stream("Mic", 3.33, true);
-        f.mic.delivery = spread(0.6, 0.8, 1.0, 1.2, 0.8);
-        let r = f.reference.as_mut().unwrap();
-        (r.settled_target_ms, r.target_ms, r.lead_ms) = (18.0, 18.0, 18.0);
+    fn the_exclusive_mics_own_raise_is_steady_wherever_it_lands() {
+        let exclusive = |settled: f32, end: f32| {
+            let mut f = steady();
+            f.mic.stream = stream("CABLE-A Output (VB-Audio Virtual Cable A)", 3.33, true);
+            f.mic.delivery = spread(0.6, 0.8, 1.0, 1.2, 0.8);
+            let r = f.reference.as_mut().unwrap();
+            r.stream = stream("CABLE-B Input (VB-Audio Virtual Cable B)", 10.0, false);
+            (r.settled_target_ms, r.target_ms, r.lead_ms) = (settled, end, end);
+            f
+        };
+        // The live check's figures: 12 at the start and at the start-up's end, 18 at the end.
+        for (settled, end) in [(12.0, 18.0), (18.0, 18.0), (14.0, 18.0)] {
+            let f = exclusive(settled, end);
+            let all = assess(&f);
+            let h = &all[2];
+            assert_eq!(h.verdict(), "steady", "{settled} then {end}: {h:?}");
+            assert!(h.costs_ms.is_none() && h.tries.is_empty(), "{settled} then {end}: {h:?}");
+            assert!(!h.findings.iter().any(|l| l.contains("more lead than steady delivery")), "{settled} then {end}: {h:?}");
+            assert!(
+                h.findings.iter().any(|l| l.starts_with(
+                    "With the exclusive mic up to a loopback period (10.0 ms) of that rise is \
+                                                         expected, in the start-up or after it"
+                ) && l.ends_with("; so the rise itself is no sign of bursts.")),
+                "{settled} then {end}: {h:?}"
+            );
+            assert!(format(&f, &all).ends_with("Overall: every stream is steady."), "{settled} then {end}");
+        }
+        // Bursty or stale for another reason (2% owed, 5% stale), the rise's clause speaks of the rise alone and says
+        // nothing of the stream as steady.
+        for (owed, stale, verdict) in [(0.02, 0.0, "in bursts"), (0.0, 0.05, "stale at times")] {
+            let mut f = exclusive(12.0, 18.0);
+            let r = f.reference.as_mut().unwrap();
+            (r.owed, r.stale) = (owed, stale);
+            let h = &assess(&f)[2];
+            assert_eq!(h.verdict(), verdict, "{h:?}");
+            assert!(h.costs_ms.is_none() && !h.findings.iter().any(|l| l.contains("steady")), "{h:?}");
+            assert!(h.findings.iter().any(|l| l.ends_with("; so the rise itself is no sign of bursts.")), "{h:?}");
+        }
+        let h = &assess(&exclusive(12.0, 18.0))[2];
+        assert!(
+            h.findings.iter().any(|l| l
+                == "After its start-up its target rose 6.0 ms more, to 18.0 ms: its takes kept coming up \
+                                            short (each raise is a jump of the echo path, which the canceller takes 5-10 s to \
+                                            follow)."),
+            "{h:?}"
+        );
+        assert!(!h.findings.iter().any(|l| l.starts_with("In its start-up")), "no rise in the start-up: {h:?}");
+        let h = &assess(&exclusive(18.0, 18.0))[2];
+        assert!(h.findings.iter().any(|l| l == "In its start-up its lead target rose from 12.0 to 18.0 ms, to what its delivery needed."));
+        // The shared mic: the same rise is a burst, 6 ms, in the start-up or after it.
+        for (settled, end) in [(12.0, 18.0), (18.0, 18.0)] {
+            let mut f = exclusive(settled, end);
+            f.mic = steady().mic;
+            let h = &assess(&f)[2];
+            assert!(h.bursty && (h.costs_ms.unwrap() - 6.0).abs() < 1e-4, "{h:?}");
+            assert!(!h.findings.iter().any(|l| l.starts_with("With the exclusive mic")), "{h:?}");
+        }
+        // The exclusive mic, risen 15 ms (some in the start-up, the rest after): 5 ms past its own need.
+        let h = &assess(&exclusive(20.0, 27.0))[2];
+        assert!(h.bursty && (h.costs_ms.unwrap() - 5.0).abs() < 1e-4, "{h:?}");
+        assert!(h.findings.iter().any(|l| l.starts_with("Its delivery needed about 5.0 ms more lead")), "{h:?}");
+        assert!(h.findings.iter().any(|l| l.starts_with("With the exclusive mic") && l.ends_with("a reference.")), "{h:?}");
+    }
+
+    /// The live check's case from the blocks: the exclusive mic, the loopback aligned at block 2 and its target raised from 12
+    /// to 18 ms at block 300, after the check's start-up (block 262), as the engine raises it once the takes have come up
+    /// short for 0.6 s. Measured, the start-up leaves it at 12 and the rise is after it; assessed, it's steady. One-sample
+    /// slips are said as the drift's, not as trouble.
+    #[test]
+    fn a_raise_just_after_the_start_up_is_the_exclusive_mic_s_own() {
+        let mut blocks: Vec<ChainBlock> = (0..1500u64).map(|i| block(i, 10.0 * i as f64, 0.8)).collect();
+        for (i, b) in blocks.iter_mut().enumerate() {
+            let target_ms = if i < 300 { 12.0 } else { 18.0 };
+            b.reference = Some(ReferenceFacts {
+                fresh: true,
+                consumed: if i % 400 == 399 { 479 } else { 480 },
+                // The raise moves the read position 6 ms back, a jump of the timeline, as the engine's does.
+                read_index: i as i64 * 480 - 576 - if i >= 300 { 288 } else { 0 },
+                jumped: if i == 300 { -288 } else { 0 },
+                lead_reading_ms: target_ms,
+                lead_ms: target_ms,
+                target_ms,
+                stamped: true,
+                events: match i {
+                    2 => ReferenceFacts::ALIGNED,
+                    300 => ReferenceFacts::RETARGETED,
+                    _ => 0,
+                },
+                ..Default::default()
+            });
+        }
+        let info = |name: &str, period_ms: f32, exclusive: Option<&'static str>| StreamInfo {
+            device_name: name.into(),
+            sample_rate: 48_000,
+            channels: 2,
+            period_ms,
+            low_latency: false,
+            autoconvert: false,
+            raw: false,
+            exclusive,
+            exclusive_refused: None,
+        };
+        let status = EngineStatus {
+            mic: Some(info("CABLE-A Output (VB-Audio Virtual Cable A)", 3.33, Some("16-bit"))),
+            output: Some(info("CABLE Input (VB-Audio Virtual Cable)", 2.0, Some("16-bit"))),
+            reference: Some(info("CABLE-B Input (VB-Audio Virtual Cable B)", 10.0, None)),
+            ..Default::default()
+        };
+        let f = measure(&blocks, &TelemetrySnapshot::default(), &status, 15.0, false);
+        let r = f.reference.as_ref().unwrap();
+        assert_eq!((r.start_target_ms, r.settled_target_ms, r.target_ms), (12.0, 12.0, 18.0), "{r:?}");
+        assert_eq!((r.blocks, r.slips, r.jumps), (1500 - 262, 3, 0), "{r:?}");
         let all = assess(&f);
         let h = &all[2];
         assert_eq!(h.verdict(), "steady", "{h:?}");
         assert!(
-            h.findings.iter().any(|l| l.starts_with("In its start-up its lead target rose from 12.0 to 18.0 ms")
-                && l.contains("with the exclusive mic up to a loopback period (10.0 ms) of that is expected")),
+            h.findings.iter().any(|l| l
+                == "It followed the clocks' drift in 3 one-sample slips after its start-up, as it should: \
+                                            they hold the echo path where it is."),
             "{h:?}"
         );
-        assert!(format(&f, &all).ends_with("Overall: every stream is steady."));
-        // The shared mic: the same raise is a burst, 6 ms.
-        f.mic = steady().mic;
-        let h = &assess(&f)[2];
-        assert!(h.bursty && (h.costs_ms.unwrap() - 6.0).abs() < 1e-4, "{h:?}");
-        // The exclusive mic, raised 15 ms: 5 ms past its own need.
-        f.mic.stream = stream("Mic", 3.33, true);
-        let r = f.reference.as_mut().unwrap();
-        (r.settled_target_ms, r.target_ms) = (27.0, 27.0);
-        let h = &assess(&f)[2];
-        assert!(h.bursty && (h.costs_ms.unwrap() - 5.0).abs() < 1e-4, "{h:?}");
+        assert!(!h.findings.iter().any(|l| l.contains("jumped")), "{h:?}");
     }
 
     /// A stream the engine didn't describe (its status gone at the end) gets no period-based verdict, nor USB advice for it.

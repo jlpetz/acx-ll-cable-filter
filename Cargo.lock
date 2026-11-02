@@ -414,6 +414,7 @@ dependencies = [
  "nf-mem",
  "nnnoiseless",
  "realfft",
+ "rtrb",
  "sonora",
 ]
 
