@@ -17,7 +17,9 @@ pub enum Command {
     Help,
     Version,
     Devices,
-    Run(EngineArgs),
+    /// `devices --check`: a short passive run on the chosen devices, then a health report per stream (TODO 21).
+    DeviceCheck(CheckArgs),
+    Run(RunArgs),
     Latency(LatencyArgs),
     Quality(QualityArgs),
     Process(ProcessArgs),
@@ -37,7 +39,7 @@ impl Command {
     /// lock-pages privilege and the working-set minimum before any engine thread exists.
     pub fn needs_memory(&self) -> bool {
         match self {
-            Command::Gui | Command::Run(_) | Command::Quality(_) | Command::Bench(_) => true,
+            Command::Gui | Command::Run(_) | Command::DeviceCheck(_) | Command::Quality(_) | Command::Bench(_) => true,
             // The cable-only test runs no engine
             Command::Latency(l) => !l.cable_only,
             _ => false,
@@ -78,6 +80,22 @@ pub struct EngineArgs {
     pub reference: Option<String>,
     pub processing: Processing,
     pub io: IoOptions,
+}
+
+/// `run`: the engine's options, and how long to run (a soak: stop after that many seconds and print the summary).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunArgs {
+    pub engine: EngineArgs,
+    /// `--seconds N`: stop after N seconds; `None` runs until Ctrl+C.
+    pub seconds: Option<u32>,
+}
+
+/// `devices --check`: `run`'s options (the devices to check; echo cancelling on unless `--no-aec`, so the speakers' loopback is
+/// checked too) and how long to listen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckArgs {
+    pub engine: EngineArgs,
+    pub seconds: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +160,13 @@ pub struct BenchArgs {
     pub aec: bool,
 }
 
+/// `run --seconds` at most: a day.
+pub const MAX_RUN_SECONDS: u32 = 86_400;
+/// `devices --check`'s default listening time and its range. The check keeps the chain recorder's per-block facts for the whole
+/// time (about 0.6 MB a second).
+pub const DEFAULT_CHECK_SECONDS: u32 = 15;
+pub const MIN_CHECK_SECONDS: u32 = 5;
+pub const MAX_CHECK_SECONDS: u32 = 120;
 /// The latency test's default repetitions (the engine's `LatencyTestRequest` default).
 pub const DEFAULT_REPETITIONS: u32 = 5;
 /// The longest `--settle` waits for the adaptive output target: its window, its longest walk down, and 15 s.
@@ -194,7 +219,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         // `help run` too: there's one help text
         "help" => return Ok(Command::Help),
         "--version" | "-V" | "version" => Command::Version,
-        "devices" => Command::Devices,
+        "devices" => return parse_devices(&mut p),
         "run" => return parse_run(&mut p).map(Command::Run),
         "latency" => return parse_latency(&mut p).map(Command::Latency),
         "quality" => return parse_quality(&mut p).map(Command::Quality),
@@ -353,19 +378,56 @@ fn check_settle(settle: bool, engine: &EngineArgs) -> Result<(), UsageError> {
     Ok(())
 }
 
-fn parse_run(p: &mut Parser<'_>) -> Result<EngineArgs, UsageError> {
-    let mut e = EngineArgs::default();
+/// A whole number of seconds from `lo` to `hi`.
+fn seconds(flag: &str, v: &str, lo: u32, hi: u32) -> Result<u32, UsageError> {
+    match v.trim().parse::<u32>() {
+        Ok(n) if (lo..=hi).contains(&n) => Ok(n),
+        _ => Err(usage(format!("{flag} takes a whole number of seconds from {lo} to {hi}, not '{v}'"))),
+    }
+}
+
+fn parse_run(p: &mut Parser<'_>) -> Result<RunArgs, UsageError> {
+    let mut r = RunArgs::default();
     while let Some(arg) = p.next() {
         match arg {
+            Arg::Flag("--seconds", inline) => r.seconds = Some(seconds("--seconds", p.value("--seconds", inline)?, 1, MAX_RUN_SECONDS)?),
             Arg::Flag(flag, inline) => {
-                if !e.take(p, flag, inline)? {
+                if !r.engine.take(p, flag, inline)? {
                     return Err(p.unknown(flag));
                 }
             }
             Arg::Positional(a) => return Err(usage(format!("'run' takes no argument '{a}'"))),
         }
     }
-    Ok(e)
+    Ok(r)
+}
+
+/// `devices` alone lists them; `devices --check` checks them, and takes `--seconds` and `run`'s options.
+fn parse_devices(p: &mut Parser<'_>) -> Result<Command, UsageError> {
+    let (mut check, mut secs, mut engine) = (false, None, EngineArgs::default());
+    // The first option given that only the check uses
+    let mut check_option: Option<&str> = None;
+    while let Some(arg) = p.next() {
+        match arg {
+            Arg::Flag("--check", inline) => check = switch("--check", inline)?,
+            Arg::Flag("--seconds", inline) => {
+                secs = Some(seconds("--seconds", p.value("--seconds", inline)?, MIN_CHECK_SECONDS, MAX_CHECK_SECONDS)?);
+                check_option.get_or_insert("--seconds");
+            }
+            Arg::Flag(flag, inline) => {
+                if !engine.take(p, flag, inline)? {
+                    return Err(p.unknown(flag));
+                }
+                check_option.get_or_insert(flag);
+            }
+            Arg::Positional(a) => return Err(usage(format!("'devices' takes no argument '{a}'"))),
+        }
+    }
+    match (check, check_option) {
+        (true, _) => Ok(Command::DeviceCheck(CheckArgs { engine, seconds: secs.unwrap_or(DEFAULT_CHECK_SECONDS) })),
+        (false, None) => Ok(Command::Devices),
+        (false, Some(flag)) => Err(usage(format!("{flag} is for 'devices --check': add --check, or drop it"))),
+    }
 }
 
 fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
@@ -586,7 +648,16 @@ pub fn help_text() -> String {
 Usage:
   noise-filter [gui]             Open the settings window (the default)
   noise-filter devices           List the recording and playback devices
-  noise-filter run [OPTIONS]     Run the filter without the window; Ctrl+C stops it
+  noise-filter devices --check [--seconds N] [OPTIONS]
+                                 Run the filter quietly for N s (default {check_s}, {check_lo}-{check_hi}) and say
+                                 how each stream delivers: steady, in bursts or late, its drift and
+                                 glitches, and what to try. Echo cancelling is on (so the speakers'
+                                 loopback is checked too) unless --no-aec. The thresholds are
+                                 provisional: they come from virtual cables, not real hardware yet
+  noise-filter run [--seconds N] [OPTIONS]
+                                 Run the filter without the window; Ctrl+C stops it. --seconds stops
+                                 it after N s (a soak, up to a day; its exit code says whether it was
+                                 clean). Either way it ends with a summary (dropouts, latency, drift)
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
                        [--through-model] [--settle] [OPTIONS]
                                  Measure the latency with sweeps and print the report
@@ -675,9 +746,12 @@ QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records th
                      and what the chain got and gave live (chain_*.wav, chain_blocks.csv)
 
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no result (latency: no
-valid repetition; quality: the recording didn't line up with the scene; either: cancelled),
-4 the large-page helper started without elevation, 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2,
-FMA), which noise-filter is built for.
+valid repetition; quality: the recording didn't line up with the scene; latency, quality,
+run --seconds or devices --check: cancelled), 4 the large-page helper started without
+elevation, 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2, FMA), which noise-filter is built for,
+6 run --seconds: the soak wasn't clean (mic glitches or stalls, output underruns or coarse
+drops, a fault that stopped it, or real-time heap allocations; the summary says which). A
+run without --seconds exits 0.
 
 In a terminal, run commands through noise-filter-cli, which sits next to noise-filter.exe:
   noise-filter-cli run --output \"CABLE Input\"
@@ -691,6 +765,9 @@ Log: %LOCALAPPDATA%\\noise-filter\\noise-filter.log",
         version = env!("CARGO_PKG_VERSION"),
         echo_floor = EXCLUSIVE_MIC_ECHO_FLOOR_MS,
         settle_s = ADAPTIVE_WAIT_S,
+        check_s = DEFAULT_CHECK_SECONDS,
+        check_lo = MIN_CHECK_SECONDS,
+        check_hi = MAX_CHECK_SECONDS,
     )
 }
 
@@ -754,24 +831,27 @@ mod tests {
         ]);
         assert_eq!(
             c,
-            Ok(Command::Run(EngineArgs {
-                config: Some("s.json".into()),
-                mic: Some("Headset Mic".into()),
-                output: Some("CABLE Input".into()),
-                reference: Some("Speakers".into()),
-                processing: Processing {
-                    aec: Some(true),
-                    noise: Some(false),
-                    floor_db: Some(-20.0),
-                    gate: Some(GateMode::Auto),
-                    threshold_db: Some(-45.5),
+            Ok(Command::Run(RunArgs {
+                engine: EngineArgs {
+                    config: Some("s.json".into()),
+                    mic: Some("Headset Mic".into()),
+                    output: Some("CABLE Input".into()),
+                    reference: Some("Speakers".into()),
+                    processing: Processing {
+                        aec: Some(true),
+                        noise: Some(false),
+                        floor_db: Some(-20.0),
+                        gate: Some(GateMode::Auto),
+                        threshold_db: Some(-45.5),
+                    },
+                    io: IoOptions::default(),
                 },
-                io: IoOptions::default(),
+                seconds: None,
             }))
         );
-        assert_eq!(p(&["run"]), Ok(Command::Run(EngineArgs::default())));
+        assert_eq!(p(&["run"]), Ok(Command::Run(RunArgs::default())));
         // The last of a pair wins
-        let Ok(Command::Run(e)) = p(&["run", "--aec", "--no-aec", "--no-ns", "--ns"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--aec", "--no-aec", "--no-ns", "--ns"]) else { panic!() };
         assert_eq!((e.processing.aec, e.processing.noise), (Some(false), Some(true)));
     }
 
@@ -781,13 +861,20 @@ mod tests {
     /// (no devices) doesn't take them.
     #[test]
     fn the_latency_options_turn_exclusive_mode_and_the_adaptive_target_off_and_on() {
-        let Ok(Command::Run(e)) = p(&["run"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run"]) else { panic!() };
         assert_eq!(e.io, IoOptions::default(), "nothing given: the config's (or the defaults)");
-        let Ok(Command::Run(e)) = p(&["run", "--no-exclusive-output", "--no-exclusive-mic", "--no-adaptive-output"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) =
+            p(&["run", "--no-exclusive-output", "--no-exclusive-mic", "--no-adaptive-output"])
+        else {
+            panic!()
+        };
         assert_eq!(e.io, IoOptions { output_exclusive: Some(false), mic_exclusive: Some(false), adaptive_output: Some(false) });
-        let Ok(Command::Run(e)) = p(&["run", "--exclusive-output", "--exclusive-mic", "--adaptive-output"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--exclusive-output", "--exclusive-mic", "--adaptive-output"]) else {
+            panic!()
+        };
         assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: Some(true) });
-        let Ok(Command::Run(e)) = p(&["run", "--no-exclusive-output", "--exclusive-output", "--adaptive-output", "--no-adaptive-output"])
+        let Ok(Command::Run(RunArgs { engine: e, .. })) =
+            p(&["run", "--no-exclusive-output", "--exclusive-output", "--adaptive-output", "--no-adaptive-output"])
         else {
             panic!()
         };
@@ -860,9 +947,9 @@ mod tests {
         assert_eq!(err(&["run", "--mic", ""]), "--mic needs a value");
         assert_eq!(err(&["run", "--output="]), "--output needs a value");
         // A value may look like an option
-        let Ok(Command::Run(e)) = p(&["run", "--output", "--weird name"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--output", "--weird name"]) else { panic!() };
         assert_eq!(e.output.as_deref(), Some("--weird name"));
-        let Ok(Command::Run(e)) = p(&["run", "--floor", "0"]) else { panic!() };
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--floor", "0"]) else { panic!() };
         assert_eq!(e.processing.floor_db, Some(0.0));
     }
 
@@ -1072,6 +1159,41 @@ mod tests {
         assert_eq!(err(&["setup-large-pages", "now"]), "'setup-large-pages' takes no argument 'now'");
     }
 
+    /// `run --seconds N` stops after N seconds (a soak); without it, it runs until Ctrl+C.
+    #[test]
+    fn run_takes_seconds_for_a_soak() {
+        let Ok(Command::Run(r)) = p(&["run", "--seconds", "3600", "--output", "CABLE Input"]) else { panic!() };
+        assert_eq!((r.seconds, r.engine.output.as_deref()), (Some(3600), Some("CABLE Input")));
+        assert_eq!(p(&["run", "--seconds=1"]), Ok(Command::Run(RunArgs { seconds: Some(1), ..Default::default() })));
+        for bad in ["0", "86401", "1.5", "an hour"] {
+            assert_eq!(
+                err(&["run", "--seconds", bad]),
+                format!("--seconds takes a whole number of seconds from 1 to 86400, not '{bad}'"),
+                "{bad}"
+            );
+        }
+        assert_eq!(err(&["run", "--seconds"]), "--seconds needs a value");
+    }
+
+    /// `devices` lists; `devices --check` takes `--seconds` (5-120, 15 by default) and `run`'s options, which the list refuses.
+    #[test]
+    fn devices_check_takes_seconds_and_runs_options() {
+        assert_eq!(p(&["devices"]), Ok(Command::Devices));
+        assert_eq!(p(&["devices", "--check"]), Ok(Command::DeviceCheck(CheckArgs { engine: EngineArgs::default(), seconds: 15 })));
+        let Ok(Command::DeviceCheck(c)) = p(&["devices", "--mic", "USB", "--check", "--seconds", "30", "--no-aec", "--no-exclusive-mic"])
+        else {
+            panic!()
+        };
+        assert_eq!((c.seconds, c.engine.mic.as_deref(), c.engine.processing.aec), (30, Some("USB"), Some(false)));
+        assert_eq!(c.engine.io.mic_exclusive, Some(false));
+        assert_eq!(err(&["devices", "--seconds", "30"]), "--seconds is for 'devices --check': add --check, or drop it");
+        assert_eq!(err(&["devices", "--mic", "USB"]), "--mic is for 'devices --check': add --check, or drop it");
+        assert_eq!(err(&["devices", "--check", "--seconds", "4"]), "--seconds takes a whole number of seconds from 5 to 120, not '4'");
+        assert_eq!(err(&["devices", "--check", "x"]), "'devices' takes no argument 'x'");
+        assert_eq!(err(&["devices", "--check=yes"]), "--check takes no value");
+        assert!(help_text().contains("devices --check") && help_text().contains("run [--seconds N]"));
+    }
+
     #[test]
     fn only_engine_commands_want_the_pool() {
         let wants = |args: &[&str]| p(args).map(|c| c.needs_memory()).unwrap_or(false);
@@ -1080,6 +1202,7 @@ mod tests {
         // The cable-only test runs no engine
         assert!(!wants(&["latency", "--cable-only", "--probe", "a", "--capture", "b"]));
         assert!(!wants(&["devices"]) && !wants(&["--help"]) && !wants(&["--version"]) && !wants(&["setup-large-pages"]));
+        assert!(wants(&["devices", "--check"]), "the check runs the engine");
         assert!(!wants(&["process", "a.wav", "b.wav"]));
     }
 }

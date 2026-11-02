@@ -3,8 +3,8 @@
 //! The audio thread writes with relaxed stores (one block of skew between fields is harmless), and
 //! the UI takes a [`TelemetrySnapshot`] about 20 times a second.
 
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
 
 use crate::atomic::{AtomicF32, AtomicF64};
 
@@ -148,6 +148,114 @@ impl BudgetTotals {
     }
 }
 
+/// The output side's events (TODO 9): what the engine's drift loop and coarse corrections did to the stream it played, and the
+/// silence an exclusive output's device played where our ring ran short, so that a move of the output path's delay can be told
+/// from the devices' own (a cable that inserts silence after taking our samples moves the delay too, and none of these count
+/// it). Counted from a run's first block; [`Self::between`] gives a span's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputEvents {
+    /// Underruns (`render_underruns`): the device found dry, a deficit, or an exclusive output's ring short of a period at an
+    /// event; once a block at most.
+    pub underruns: u64,
+    /// Silence an exclusive output's device played in our stream where its ring ran short at an event, or for the periods an
+    /// event answered late (`output_silence_frames`). Each frame plays every later sample a frame later, until the drift loop
+    /// slips it back out. 0 for a shared output, whose device engine plays its own silence outside our stream.
+    pub silence_frames: u64,
+    /// Deficits: blocks at which zeros were written to top the device up to the target (each counts as an underrun too), and
+    /// the zeros written. Each zero lengthens the output path by a sample until the drift loop slips it back out.
+    pub deficits: u64,
+    pub zero_frames: u64,
+    /// Coarse drops (`output_coarse_drops`): whole blocks dropped to pull an overfull buffer back to its target (one per event),
+    /// and pending samples that overflowed; and the samples dropped. Each shortens the path by a sample.
+    pub coarse_drops: u64,
+    pub dropped_frames: u64,
+    /// The drift loop's slips (one sample a block at most), and their net: samples inserted less samples dropped.
+    pub slips: u64,
+    pub slip_net: i64,
+    /// Times the fill's calibration to the device's padding started over from the next readings (the device ran dry, or its
+    /// clock jumped): the drift loop holds the fill it then measures.
+    pub reanchors: u64,
+}
+
+impl OutputEvents {
+    /// The run's so far, as a snapshot has them.
+    pub fn of(t: &TelemetrySnapshot) -> Self {
+        Self {
+            underruns: t.render_underruns,
+            silence_frames: t.output_silence_frames,
+            deficits: t.output_deficits,
+            zero_frames: t.output_zero_frames,
+            coarse_drops: t.output_coarse_drops,
+            dropped_frames: t.output_dropped_frames,
+            slips: t.output_slips,
+            slip_net: t.output_slip_net,
+            reanchors: t.output_reanchors,
+        }
+    }
+
+    /// The events between two snapshots. A restart between them starts the counts again: then those since it.
+    pub fn between(before: &TelemetrySnapshot, after: &TelemetrySnapshot) -> Self {
+        let (b, a) = (Self::of(before), Self::of(after));
+        if after.blocks < before.blocks {
+            return a;
+        }
+        Self {
+            underruns: a.underruns.saturating_sub(b.underruns),
+            silence_frames: a.silence_frames.saturating_sub(b.silence_frames),
+            deficits: a.deficits.saturating_sub(b.deficits),
+            zero_frames: a.zero_frames.saturating_sub(b.zero_frames),
+            coarse_drops: a.coarse_drops.saturating_sub(b.coarse_drops),
+            dropped_frames: a.dropped_frames.saturating_sub(b.dropped_frames),
+            slips: a.slips.saturating_sub(b.slips),
+            slip_net: a.slip_net.wrapping_sub(b.slip_net),
+            reanchors: a.reanchors.saturating_sub(b.reanchors),
+        }
+    }
+
+    /// Samples the engine's own corrections and an exclusive device's silence added to the output path (zeros, silence and
+    /// inserted slips, less what it dropped): the path moved by this much, until the drift loop slipped it back.
+    pub fn net_frames(&self) -> i64 {
+        (self.zero_frames as i64)
+            .wrapping_add(self.silence_frames as i64)
+            .wrapping_sub(self.dropped_frames as i64)
+            .wrapping_add(self.slip_net)
+    }
+
+    /// Anything but slips: an underrun, silence, zeros, a drop or a re-anchor.
+    pub fn any_correction(&self) -> bool {
+        self.underruns > 0 || self.silence_frames > 0 || self.deficits > 0 || self.coarse_drops > 0 || self.reanchors > 0
+    }
+    /// In one phrase: "no underruns, zeros, drops or re-anchors; 37 slips (net -5 samples)", or the ones there were: "1 underrun
+    /// (2.0 ms of silence played), 1 deficit (12.0 ms of zeros), 1 coarse drop (10.0 ms dropped), 1 re-anchor; 37 slips (net -5
+    /// samples)". The silence an exclusive device played and the zeros lengthen the output path and the drops shorten it, until
+    /// the drift loop slips it back; a move of the path these don't show is the devices' own.
+    pub fn text(&self) -> String {
+        let ms = |frames: u64| format!("{:.1}", frames as f64 * 1000.0 / f64::from(crate::SAMPLE_RATE));
+        let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        match (self.underruns, self.silence_frames) {
+            (0, 0) => {}
+            (n, 0) => parts.push(plural(n, "underrun", "underruns")),
+            (n, f) => parts.push(format!("{} ({} ms of silence played)", plural(n, "underrun", "underruns"), ms(f))),
+        }
+        if self.deficits > 0 {
+            parts.push(format!("{} ({} ms of zeros)", plural(self.deficits, "deficit", "deficits"), ms(self.zero_frames)));
+        }
+        if self.coarse_drops > 0 || self.dropped_frames > 0 {
+            parts.push(format!("{} ({} ms dropped)", plural(self.coarse_drops, "coarse drop", "coarse drops"), ms(self.dropped_frames)));
+        }
+        if self.reanchors > 0 {
+            parts.push(plural(self.reanchors, "re-anchor", "re-anchors"));
+        }
+        let corrections = if parts.is_empty() { "no underruns, zeros, drops or re-anchors".to_owned() } else { parts.join(", ") };
+        let slips = match self.slips {
+            0 => "no slips".to_owned(),
+            n => format!("{} (net {:+} samples)", plural(n, "slip", "slips"), self.slip_net),
+        };
+        format!("{corrections}; {slips}")
+    }
+}
+
 /// A [`LatencyBudget`]'s atomics.
 #[derive(Debug, Default)]
 pub struct BudgetCell {
@@ -215,6 +323,9 @@ pub struct Telemetry {
     pub state: AtomicU8,
     /// Blocks processed since start.
     pub blocks: AtomicU64,
+    /// The once-a-second publications since start (stored last, with `Release`): a reader that waits for it to move gets
+    /// counters that include everything up to then ([`Telemetry::publishes`]).
+    pub publishes: AtomicU64,
     pub input: MeterCell,
     pub output: MeterCell,
     /// Latched when the raw input clips; cleared by [`Telemetry::reset_clip`].
@@ -270,6 +381,15 @@ pub struct Telemetry {
     /// target, or without stamps a step of the count put back).
     pub output_coarse_drops: AtomicU64,
     pub reference_coarse_drops: AtomicU64,
+    /// The output's other events ([`OutputEvents`]): deficits and their zeros, the samples coarse drops took, the slips' net
+    /// (inserted less dropped), and the fill calibration's re-anchors.
+    pub output_deficits: AtomicU64,
+    pub output_zero_frames: AtomicU64,
+    pub output_dropped_frames: AtomicU64,
+    pub output_slip_net: AtomicI64,
+    pub output_reanchors: AtomicU64,
+    /// Silence an exclusive output's device played in our stream where its ring ran short ([`OutputEvents::silence_frames`]).
+    pub output_silence_frames: AtomicU64,
     /// Latency-test tap blocks lost because the tap ring was full.
     pub tap_overflows: AtomicU64,
     /// The targets the drift loops hold, in ms (0 while stopped or without a reference): the output's
@@ -294,6 +414,9 @@ pub struct Telemetry {
 pub struct TelemetrySnapshot {
     pub state: EngineState,
     pub blocks: u64,
+    /// The once-a-second publications since start: a snapshot whose count moved past an earlier one's has a later second's
+    /// counters ([`Telemetry::publishes`]).
+    pub publishes: u64,
     pub input: MeterSnapshot,
     pub output: MeterSnapshot,
     pub clip_latched: bool,
@@ -327,6 +450,12 @@ pub struct TelemetrySnapshot {
     pub stalls: u64,
     pub output_coarse_drops: u64,
     pub reference_coarse_drops: u64,
+    pub output_deficits: u64,
+    pub output_zero_frames: u64,
+    pub output_dropped_frames: u64,
+    pub output_slip_net: i64,
+    pub output_reanchors: u64,
+    pub output_silence_frames: u64,
     pub tap_overflows: u64,
     pub output_target_ms: f32,
     pub reference_target_ms: f32,
@@ -356,10 +485,30 @@ impl Telemetry {
         self.clip_latched.store(false, Relaxed);
     }
 
+    /// Whether the raw input clipped since the latch was last cleared, clearing it: a reader that shows the latch (`run`'s
+    /// status line, once a second) loses no clip between its readings.
+    pub fn take_clip(&self) -> bool {
+        self.clip_latched.swap(false, Relaxed)
+    }
+
+    /// The once-a-second publications so far, read with `Acquire`: once it has moved past an earlier reading, a snapshot taken
+    /// after this has every counter as of that publication.
+    pub fn publishes(&self) -> u64 {
+        self.publishes.load(Acquire)
+    }
+
+    /// Marks a publication done: after every counter of it is stored (the audio thread, once a second).
+    pub fn published(&self) {
+        self.publishes.fetch_add(1, Release);
+    }
+
     pub fn snapshot(&self) -> TelemetrySnapshot {
+        // First, with `Acquire`: the counters read after it are at least that publication's.
+        let publishes = self.publishes();
         TelemetrySnapshot {
             state: self.state(),
             blocks: self.blocks.load(Relaxed),
+            publishes,
             input: self.input.load(),
             output: self.output.load(),
             clip_latched: self.clip_latched.load(Relaxed),
@@ -393,6 +542,12 @@ impl Telemetry {
             stalls: self.stalls.load(Relaxed),
             output_coarse_drops: self.output_coarse_drops.load(Relaxed),
             reference_coarse_drops: self.reference_coarse_drops.load(Relaxed),
+            output_deficits: self.output_deficits.load(Relaxed),
+            output_zero_frames: self.output_zero_frames.load(Relaxed),
+            output_dropped_frames: self.output_dropped_frames.load(Relaxed),
+            output_slip_net: self.output_slip_net.load(Relaxed),
+            output_reanchors: self.output_reanchors.load(Relaxed),
+            output_silence_frames: self.output_silence_frames.load(Relaxed),
             tap_overflows: self.tap_overflows.load(Relaxed),
             output_target_ms: self.output_target_ms.load(),
             reference_target_ms: self.reference_target_ms.load(),
@@ -443,5 +598,81 @@ mod tests {
         tel.budget_mean.store(&budget(1.0, 2.0, 3.0, 4.0, 5.0));
         let s = tel.snapshot();
         assert_eq!((s.budget_totals, s.budget_mean), (t, budget(1.0, 2.0, 3.0, 4.0, 5.0)));
+    }
+
+    /// The output's events between two snapshots, the samples they moved the path by, and a restart between the snapshots.
+    #[test]
+    fn output_events_between_two_snapshots() {
+        let tel = Telemetry::new();
+        tel.blocks.store(100, Relaxed);
+        tel.output_slips.store(10, Relaxed);
+        tel.output_slip_net.store(-4, Relaxed);
+        let before = tel.snapshot();
+        assert!(!OutputEvents::of(&before).any_correction());
+        tel.blocks.store(200, Relaxed);
+        tel.render_underruns.store(1, Relaxed);
+        tel.output_deficits.store(1, Relaxed);
+        tel.output_zero_frames.store(576, Relaxed);
+        tel.output_coarse_drops.store(1, Relaxed);
+        tel.output_dropped_frames.store(480, Relaxed);
+        tel.output_slips.store(13, Relaxed);
+        tel.output_slip_net.store(-7, Relaxed);
+        tel.output_reanchors.store(1, Relaxed);
+        tel.output_silence_frames.store(96, Relaxed);
+        let after = tel.snapshot();
+        let e = OutputEvents::between(&before, &after);
+        let expected = OutputEvents {
+            underruns: 1,
+            silence_frames: 96,
+            deficits: 1,
+            zero_frames: 576,
+            coarse_drops: 1,
+            dropped_frames: 480,
+            slips: 3,
+            slip_net: -3,
+            reanchors: 1,
+        };
+        assert_eq!(e, expected);
+        assert_eq!(e.net_frames(), 576 + 96 - 480 - 3);
+        assert!(e.any_correction());
+        // A restart between them: the counts since it.
+        let restarted = TelemetrySnapshot { blocks: 50, output_slips: 2, ..TelemetrySnapshot::default() };
+        assert_eq!(OutputEvents::between(&after, &restarted).slips, 2);
+    }
+
+    #[test]
+    fn output_events_read_as_what_happened() {
+        let none = OutputEvents { slips: 37, slip_net: -5, ..Default::default() };
+        assert_eq!(none.text(), "no underruns, zeros, drops or re-anchors; 37 slips (net -5 samples)");
+        assert_eq!(OutputEvents::default().text(), "no underruns, zeros, drops or re-anchors; no slips");
+        let some = OutputEvents {
+            underruns: 1,
+            silence_frames: 96,
+            deficits: 1,
+            zero_frames: 576,
+            coarse_drops: 2,
+            dropped_frames: 960,
+            slips: 1,
+            slip_net: 1,
+            reanchors: 1,
+        };
+        assert_eq!(
+            some.text(),
+            "1 underrun (2.0 ms of silence played), 1 deficit (12.0 ms of zeros), 2 coarse drops (20.0 ms dropped), 1 re-anchor; \
+             1 slip (net +1 samples)"
+        );
+        let two = OutputEvents { underruns: 2, ..Default::default() };
+        assert_eq!(two.text(), "2 underruns; no slips");
+    }
+
+    /// Taking the clip latch clears it, so the next reading shows only a new clip.
+    #[test]
+    fn taking_the_clip_latch_clears_it() {
+        let tel = Telemetry::new();
+        assert!(!tel.take_clip());
+        tel.clip_latched.store(true, Relaxed);
+        assert!(tel.snapshot().clip_latched);
+        assert!(tel.take_clip());
+        assert!(!tel.take_clip() && !tel.snapshot().clip_latched);
     }
 }

@@ -585,3 +585,100 @@ fn an_underrun_raises_the_adaptive_target_at_once() {
     assert_eq!(o.p.out_target(), fixed_target, "held");
     assert_eq!(o.p.adaptive.as_ref().map(|a| a.strikes()), Some(1));
 }
+
+/// The output's facts per block (`OutputFacts`, TODO 9) follow the device stream exactly: block to block its index moves by
+/// the last block's length (480 and its slip, or nothing when it was dropped whole) plus this block's zeros less the pending
+/// samples it dropped, and the facts add up to the run's counters (the output's events), through bursts, a device that runs
+/// dry, a mic stall's dry spell and its overfull burst, a device period other than a block, and a lagging clock.
+#[test]
+fn the_output_facts_follow_the_stream_block_for_block() {
+    #[rustfmt::skip]
+    let cases: [(&str, Sim); 6] = [
+        ("steady", BASE),
+        ("bursty", Sim { late: bursty, ..BASE }),
+        ("a wake 35 ms late: the device runs dry", Sim { late_wake: Some((30.0, 35.0)), ..BASE }),
+        ("a mic stall: dry, then overfull", Sim { late: mic_stall, seconds: 70.0, ..BASE }),
+        ("a 1024-frame device", Sim { out_period: 1024, ..BASE }),
+        ("a lagging clock", Sim { lag: 700.0, ..BASE }),
+    ];
+    for (what, sim) in cases {
+        let o = run(sim);
+        assert_eq!(o.recorded.len(), o.blocks, "{what}");
+        for w in o.recorded.windows(2) {
+            let (a, b) = (&w[0].output, &w[1].output);
+            let len = if a.skipped { 0 } else { 480 + i64::from(a.slip) };
+            let expect = a.index as i64 + len + i64::from(b.zeros) - i64::from(b.dropped);
+            assert_eq!(b.index as i64, expect, "{what}: block {} after {a:?}: {b:?}", w[1].index);
+        }
+        let facts = o.recorded.iter().map(|b| b.output);
+        let (mut zeros, mut deficits, mut dropped, mut slip_net, mut underruns, mut reanchors) = (0u64, 0u64, 0u64, 0i64, 0u64, 0u64);
+        for f in facts {
+            zeros += u64::from(f.zeros);
+            deficits += u64::from(f.zeros > 0);
+            dropped += u64::from(f.dropped) + if f.skipped { 480 } else { 0 };
+            slip_net += i64::from(f.slip);
+            underruns += u64::from(f.underrun);
+            reanchors += u64::from(f.reanchored);
+            assert_eq!(f.target as usize, o.p.out_target(), "{what}: the fixed target");
+        }
+        let c = &o.p.counters;
+        assert_eq!(
+            (zeros, deficits, dropped, slip_net, underruns, reanchors),
+            (c.output_zero_frames, c.output_deficits, c.output_dropped_frames, c.output_slip_net, c.render_underruns, c.output_reanchors),
+            "{what}: {c:?}"
+        );
+        let corrected = c.output_deficits + c.output_drops + c.render_underruns + c.output_reanchors;
+        match what {
+            "steady" | "bursty" | "a 1024-frame device" | "a lagging clock" => assert_eq!(corrected, 0, "{what}: {c:?}"),
+            _ => assert!(corrected > 0, "{what}: {c:?}"),
+        }
+    }
+}
+
+/// The cables' bursts (0 and 960 frames a wake in turn) move the output path's delay by nothing but the drift loop's slips:
+/// over two minutes at 300 ppm no zeros, drops, underruns or re-anchors after the start, and the readout's 1 s means hold
+/// within a millisecond once the calibration has settled. So the engine's output side can't make the 9-12 ms steps the
+/// quality takes saw (TODO 9: they were silence inserted after the filter's output, the cable's or our test recorder's, which the readout,
+/// timed by the output's own clock, doesn't see).
+#[test]
+fn the_cables_bursts_move_the_output_path_by_its_slips_alone() {
+    let o = run(Sim { late: bursty, seconds: 120.0, ..BASE });
+    let c = &o.p.counters;
+    assert_eq!((c.output_deficits, c.output_drops, c.render_underruns, c.output_reanchors), (0, 0, 0, 0), "{c:?}");
+    assert!(c.output_slips > 0, "300 ppm needs slips: {c:?}");
+    let mut means = Vec::new();
+    for s in (SETTLED_S as usize)..120 {
+        let r: Vec<f64> = o.rows.iter().filter(|r| r.t_s >= s as f64 && r.t_s < (s + 1) as f64).map(|r| f64::from(r.readout)).collect();
+        means.push(r.iter().sum::<f64>() / r.len() as f64);
+    }
+    let (lo, hi) = means.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &m| (lo.min(m), hi.max(m)));
+    assert!(hi - lo < 1.0, "the readout's 1 s means moved {:.2} ms: {means:?}", hi - lo);
+}
+
+/// `devices --check`'s drift (TODO 21): fitted over a 15 s check's blocks after its first second (`clock_drift`), it comes
+/// within a few ppm of the device's true drift, steady or with the cables' bursts and wakes up to 3 ms late, where the drift
+/// loop's own estimate is still far off at 15 s (here, at 0 ppm with the bursts, -196; at +100, -289 on the loop's sign: its
+/// integral settles in 30-60 s, and bursts give it a start-up transient of hundreds of ppm). Without the mic's stamps its
+/// delivery times it, less precisely.
+#[test]
+fn a_short_check_measures_the_drift() {
+    for (late, jitter_ms, name) in [(steady as Late, 0.0, "steady"), (bursty as Late, 3.0, "bursty, jittered")] {
+        for ppm in [0.0, 100.0, -100.0, 300.0, -300.0] {
+            let o = run(Sim { late, jitter_ms, ppm, seconds: 16.0, ..BASE });
+            let blocks = &o.recorded[100..];
+            let d = crate::api::clock_drift(blocks);
+            assert_eq!(d.mic, Some(crate::api::MicTiming::Stamps), "{name}, {ppm}");
+            let fit = d.output.unwrap_or_else(|| panic!("{name}, {ppm}: no fit"));
+            assert!((fit.ppm - ppm).abs() < 5.0 && fit.uncertainty_ppm < 10.0, "{name}, {ppm} ppm: {fit:?}");
+            assert!(fit.seconds > 14.0, "{fit:?}");
+            assert_eq!(d.reference, None, "no reference here");
+            // Without the stamps: by the mic's delivery.
+            let unstamped: Vec<ChainBlock> =
+                blocks.iter().map(|b| ChainBlock { mic_stamped: false, capture_qpc_hns: f64::NAN, ..*b }).collect();
+            let d = crate::api::clock_drift(&unstamped);
+            let fit = d.output.unwrap();
+            assert_eq!(d.mic, Some(crate::api::MicTiming::Delivery));
+            assert!((fit.ppm - ppm).abs() < 30.0 && fit.uncertainty_ppm < 100.0, "{name}, {ppm} ppm, by delivery: {fit:?}");
+        }
+    }
+}

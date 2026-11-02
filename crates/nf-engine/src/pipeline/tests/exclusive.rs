@@ -337,6 +337,7 @@ fn a_late_first_answer_leaves_the_readout_right() {
         assert_eq!((late.sink.device().stale, late.sink.counts().1), (2, 1), "{ppm} ppm: two stale periods, one late answer");
         assert_eq!(late.start_silence, 2 * 96, "{ppm} ppm");
         assert_eq!(late.p.counters.render_underruns, 0, "{ppm} ppm: {:?}", late.p.counters);
+        assert_eq!(late.p.counters.output_silence_frames, 0, "{ppm} ppm: nor is its silence counted");
         let ((cb, cr), (lb, lr)) = (means(&clean.rows, SETTLED_S), means(&late.rows, SETTLED_S));
         assert!((lr - cr).abs() < 0.3 && near(lb.render_ms, cb.render_ms, 0.3), "{ppm} ppm: {lb:?} {lr} against {cb:?} {cr}");
         assert!(lb.render_ms > 1.9, "{ppm} ppm: {lb:?}");
@@ -344,7 +345,8 @@ fn a_late_first_answer_leaves_the_readout_right() {
 }
 
 /// A mic stall (40 ms without packets, then all of them at once): the ring runs short at a dozen device events, which is
-/// one underrun, counted at the block after as the shared path counts its dry spell (not one an event). The silence is
+/// one underrun, counted at the block after as the shared path counts its dry spell (not one an event), and its silence counted
+/// in the output's events. The silence is
 /// out of the stream's indices, so the readout comes back to where it was once the burst's excess is dropped.
 #[test]
 fn a_dry_spell_is_one_underrun() {
@@ -353,6 +355,8 @@ fn a_dry_spell_is_one_underrun() {
         let silence = o.sink.counts().0 - o.start_silence;
         assert!(silence > 10 * 96, "{ppm} ppm: {silence} frames of silence");
         assert_eq!(o.p.counters.render_underruns, 1, "{ppm} ppm: {:?}", o.p.counters);
+        // The output's events count the device's silence, every frame of it (TODO 9).
+        assert_eq!(o.p.counters.output_silence_frames, silence, "{ppm} ppm: {:?}", o.p.counters);
         assert!(o.p.counters.output_drops <= 1, "{ppm} ppm: {:?}", o.p.counters);
         let rows = |from: f64, to: f64| o.rows.iter().filter(|r| r.t_s >= from && r.t_s < to).copied().collect::<Vec<_>>();
         let ((_, before), (after_b, after)) = (means(&rows(20.0, 30.0), 0.0), means(&rows(36.0, 40.0), 0.0));

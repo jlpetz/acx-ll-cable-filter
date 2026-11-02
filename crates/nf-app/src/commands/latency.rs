@@ -177,6 +177,10 @@ pub fn format_report(r: &LatencyReport) -> String {
     if let Some(b) = &r.budget {
         let _ = write!(s, "\n  latency budget      {}, means over the test", budget_text(b));
     }
+    if let Some(e) = &r.output {
+        // A spread between the sweeps that these don't explain is the devices' own (TODO 9).
+        let _ = write!(s, "\n  output events       {} over the test", e.text());
+    }
     let _ = write!(s, "\n  chain offset        {}", ms(f64::from(r.chain_ms)));
     if !r.conditions.is_empty() {
         let _ = write!(s, "\n  conditions: {}", r.conditions);
@@ -203,6 +207,7 @@ mod tests {
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.0),
             budget: Some(nf_engine::LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
+            output: Some(nf_engine::OutputEvents { slips: 3, slip_net: 1, ..Default::default() }),
             chain_ms: 10.0,
             confidence_db_min: 31.26,
             conditions: "mic 10 ms".into(),
@@ -216,6 +221,7 @@ mod tests {
              live readout        12.00 ms median\n  \
              latency budget      mic delivery 10.5 + wait 0.0 + output queue 22.0 + render side 5.0 = readout 37.5 ms; the chain's \
              10.0 ms on top: 47.5 ms, means over the test\n  \
+             output events       no underruns, zeros, drops or re-anchors; 3 slips (net +1 samples) over the test\n  \
              chain offset        10.00 ms\n  \
              conditions: mic 10 ms\n  \
              warning: one repetition was weak"

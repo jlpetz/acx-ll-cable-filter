@@ -259,7 +259,7 @@ impl Choices {
 /// How a finished test ended.
 #[derive(Clone, Debug, PartialEq)]
 enum TestOutcome {
-    Done(LatencyReport),
+    Done(Box<LatencyReport>),
     Failed(String),
     Cancelled,
 }
@@ -1217,9 +1217,9 @@ mod tests {
         panel.progress(0, LatencyProgress::Cancelled);
         assert!(panel.running.is_some() && panel.outcome.is_none(), "an earlier test's end is ignored");
         let report = LatencyReport { repetitions: 5, valid: 5, ..LatencyReport::default() };
-        panel.progress(1, LatencyProgress::Done(report.clone()));
+        panel.progress(1, LatencyProgress::Done(Box::new(report.clone())));
         assert!(!panel.busy());
-        assert_eq!(panel.outcome, Some(TestOutcome::Done(report)));
+        assert_eq!(panel.outcome, Some(TestOutcome::Done(Box::new(report))));
         panel.progress(1, LatencyProgress::Failed("late".to_owned()));
         assert!(matches!(panel.outcome, Some(TestOutcome::Done(_))), "nothing after the end");
 

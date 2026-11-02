@@ -16,6 +16,9 @@ pub enum Exit {
     /// This CPU lacks a feature of x86-64-v3, which noise-filter is built for (cpu_check.rs). The
     /// launcher exits with it too.
     UnsupportedCpu = 5,
+    /// `run --seconds`: the soak wasn't clean (mic glitches or stalls, output underruns or coarse drops, a fault that stopped
+    /// it, or real-time heap allocations), so it reads as one code. A `run` without `--seconds` exits [`Exit::Ok`].
+    Glitched = 6,
 }
 
 impl Exit {
@@ -52,6 +55,10 @@ impl Failure {
     pub fn not_elevated(message: impl Into<String>) -> Self {
         Self { exit: Exit::NotElevated, message: message.into() }
     }
+
+    pub fn glitched(message: impl Into<String>) -> Self {
+        Self { exit: Exit::Glitched, message: message.into() }
+    }
 }
 
 #[cfg(test)]
@@ -60,8 +67,9 @@ mod tests {
 
     #[test]
     fn the_codes_are_app_mds() {
-        let all = [Exit::Ok, Exit::Usage, Exit::Error, Exit::NoResult, Exit::NotElevated, Exit::UnsupportedCpu];
-        assert_eq!(all.map(Exit::code), [0, 1, 2, 3, 4, 5]);
+        let all = [Exit::Ok, Exit::Usage, Exit::Error, Exit::NoResult, Exit::NotElevated, Exit::UnsupportedCpu, Exit::Glitched];
+        assert_eq!(all.map(Exit::code), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(Failure::glitched("g").exit, Exit::Glitched);
         assert_eq!(Failure::usage("u").exit, Exit::Usage);
         assert_eq!(Failure::error("e").exit, Exit::Error);
         assert_eq!(Failure::no_result("n").exit, Exit::NoResult);

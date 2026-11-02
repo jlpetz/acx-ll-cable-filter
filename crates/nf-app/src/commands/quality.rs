@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_engine::{
     ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, EngineStatus, Flow, LatePart, LateStart,
-    LatencyBudget, MAX_CHAIN_RECORDING_S, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot,
-    TrackRole,
+    LatencyBudget, MAX_CHAIN_RECORDING_S, OutputEvents, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS,
+    TelemetrySnapshot, TrackRole,
 };
 
 use super::run::stream_text;
@@ -515,6 +515,9 @@ pub struct EngineReadings {
     pub reference_jumps: u64,
     pub aec_delay_ms: f32,
     pub aec_erle_db: f32,
+    /// What the output side did over the take (TODO 9): a move of the output path's delay that these don't show happened in
+    /// the devices, after the filter's output took the samples.
+    pub output: OutputEvents,
 }
 
 impl EngineReadings {
@@ -531,7 +534,13 @@ impl EngineReadings {
             reference_jumps: t.reference_coarse_drops.saturating_sub(before.reference_coarse_drops),
             aec_delay_ms: t.aec_delay_ms,
             aec_erle_db: t.aec_erle_db,
+            output: OutputEvents::between(before, t),
         }
+    }
+
+    /// "output events              no underruns, zeros, drops or re-anchors; 37 slips (net -5 samples) over the take".
+    fn output_line(&self) -> String {
+        format!("{:<26} {} over the take", "output events", self.output.text())
     }
 
     /// "output drift +1.2 ppm, reference drift -0.4 ppm, lead 23.4 ms (target 23.4), 2 slips and 0 jumps over the take;
@@ -630,14 +639,23 @@ const CHAIN_FILES: [&str; 5] = ["chain_mic.wav", "chain_ref.wav", "chain_out.wav
 /// (samples its FIFO discarded, device position it skipped unfilled); the reference's take (`ReferenceFacts`; empty without a
 /// reference), with `path`, the mic's index less the reference's, the echo path as the engine holds it (it moves by
 /// `mic_discarded` on the mic's side, and on the reference's by a slip, `consumed` other than 480, and a jump, `jumped`);
-/// AEC3's own estimates; 1 where the chain's settings changed from the block before; and the latency readout's budget
+/// AEC3's own estimates; 1 where the chain's settings changed from the block before; the latency readout's budget
 /// (`nf_engine::LatencyBudget`; empty without one): mic delivery, wait, the chain's offset, the output queue and the render
-/// side in ms, and the readout, which is mic delivery + wait + queue + render side (the chain's offset isn't in it). Times are
-/// QPC in 100 ns units; a number that's unknown is empty.
+/// side in ms, and the readout, which is mic delivery + wait + queue + render side (the chain's offset isn't in it); and what
+/// the output side did (`nf_engine::OutputFacts`, TODO 9): the device-stream index the block's first sample went to (block to
+/// block it moves by the last block's 480 and its slip, or nothing when that one was skipped, plus this block's zeros less its
+/// dropped samples), the device's padding and our pending samples when it was written, the fill the drift loop read and its
+/// target (samples), the slip (-1, 0, +1), the zeros written (a deficit), the pending samples dropped, 1 where the block itself
+/// was dropped (skipped), an underrun, a re-anchor of the fill's calibration, the silence an exclusive device played since the
+/// block before (samples), and the device's clock as the block read it (its position in our stream's frames, and the QPC time
+/// it belongs to: `nf_engine::clock_drift` fits the drift from those). Times are QPC in 100 ns units; a number that's unknown
+/// is empty.
 const CHAIN_COLUMNS: &str = "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,\
                              ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,\
                              consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed,\
-                             mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms";
+                             mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,\
+                             out_index,out_padding,out_pending,out_fill,out_target,out_slip,out_zeros,out_dropped,out_skipped,\
+                             out_underrun,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns";
 const CHAIN_BUDGET_COLUMNS: usize = 6;
 const CHAIN_REFERENCE_COLUMNS: usize = 15;
 
@@ -713,6 +731,25 @@ fn chain_csv(chain: &ChainRecording) -> String {
             }
             None => s.push_str(&",".repeat(CHAIN_BUDGET_COLUMNS)),
         }
+        let o = &b.output;
+        let _ = write!(
+            s,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            o.index,
+            o.padding,
+            o.pending,
+            num(f64::from(o.fill), 1),
+            o.target,
+            o.slip,
+            o.zeros,
+            o.dropped,
+            u8::from(o.skipped),
+            u8::from(o.underrun),
+            u8::from(o.reanchored),
+            o.silence,
+            num(o.clock_pos, 1),
+            num(o.clock_qpc_hns, 1)
+        );
         s.push('\n');
         last = Some(b);
     }
@@ -822,6 +859,7 @@ pub fn format_report(test: QualityTest, result: &Result<Analysis, AlignmentFailu
         }
     }
     let _ = write!(s, "\n  {}", take.engine.line());
+    let _ = write!(s, "\n  {}", take.engine.output_line());
     if let Some(echo) = &take.echo {
         for line in echo.lines() {
             let _ = write!(s, "\n  {line}");
@@ -939,7 +977,7 @@ fn difference(a: f32, b: f32, signed: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nf_engine::{ChainParams, DeviceSelection, ReferenceFacts, StreamInfo};
+    use nf_engine::{ChainParams, DeviceSelection, OutputFacts, ReferenceFacts, StreamInfo};
 
     use super::*;
     use crate::cli::Processing;
@@ -1119,7 +1157,13 @@ mod tests {
             steady_pauses: levels(4.2, -30.0, -52.5),
             speech: speech(8.1, -18.52, -18.9, -18.94, -52.04),
         };
-        let ok = Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics, warnings: vec!["a short region".into()] });
+        let ok = Ok(Analysis {
+            alignment: ALIGNMENT,
+            aligned: Vec::new(),
+            metrics,
+            delay_steps: Vec::new(),
+            warnings: vec!["a short region".into()],
+        });
         let readings = EngineReadings { noise_filter: true, output_drift_ppm: 1.24, ..Default::default() };
         assert_eq!(
             format_report(QualityTest::Noise, &ok, &take(&["CABLE-A Input"], readings)),
@@ -1132,6 +1176,7 @@ mod tests {
              \x20 200 ms from speech       input -30.0 dBFS, output -52.5 dBFS: change -22.5 dB over 4.2 s\n  \
              speech in its cores        clean -18.5 dBFS, output -18.9 dBFS (speech -18.9, rest -52.0): change -0.4 dB over 8.1 s\n  \
              engine                     output drift +1.2 ppm\n  \
+             output events              no underruns, zeros, drops or re-anchors; no slips over the take\n  \
              dropouts                   filter: mic glitches 2, output underruns 0, reference gaps 0, stalls 0; test streams: \
              capture gaps 1 (480 frames), playback underruns 0\n  \
              played on CABLE-A Input (48000 Hz, 2 ch, period 10.00 ms); recorded from CABLE Output (48000 Hz, 2 ch, period 10.00 ms)\n  \
@@ -1149,7 +1194,13 @@ mod tests {
             double_talk: speech(1.4, -18.4, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
             both_talking: speech(0.4, -18.2, -21.0, -21.3, -32.6),
         };
-        let echo = Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics: metrics.clone(), warnings: Vec::new() });
+        let echo = Ok(Analysis {
+            alignment: ALIGNMENT,
+            aligned: Vec::new(),
+            metrics: metrics.clone(),
+            delay_steps: Vec::new(),
+            warnings: Vec::new(),
+        });
         let aec = EngineReadings {
             aec: true,
             noise_filter: false,
@@ -1162,6 +1213,7 @@ mod tests {
             reference_jumps: 0,
             aec_delay_ms: 40.0,
             aec_erle_db: 31.25,
+            output: OutputEvents { slips: 7, slip_net: -1, ..Default::default() },
         };
         let report = format_report(QualityTest::Echo, &echo, &take(&["CABLE-A Input", "CABLE-B Input"], aec));
         for line in [
@@ -1194,7 +1246,8 @@ mod tests {
             double_talk,
             both_talking,
         };
-        let echo = Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics: silent, warnings: Vec::new() });
+        let echo =
+            Ok(Analysis { alignment: ALIGNMENT, aligned: Vec::new(), metrics: silent, delay_steps: Vec::new(), warnings: Vec::new() });
         let report = format_report(QualityTest::Echo, &echo, &take(&["A", "B"], aec));
         assert!(report.contains("output -inf dBFS: ERLE over 95.5 dB over 4.0 s"), "{report}");
 
@@ -1222,6 +1275,7 @@ mod tests {
         assert!(
             report.contains(
                 "\n  engine                     output drift +1.2 ppm\n  \
+                 output events              no underruns, zeros, drops or re-anchors; no slips over the take\n  \
                  latency budget             mic delivery 16.2 + wait 0.1 + output queue 22.0 + render side 23.4 = readout 61.8 ms; \
                  the chain's 10.0 ms on top: 71.8 ms, means over the take\n  dropouts"
             ),
@@ -1366,8 +1420,12 @@ mod tests {
     fn the_engine_readings_come_from_the_config_and_the_telemetry() {
         let mut cfg = EngineConfig::default();
         cfg.processing.aec_enabled = true;
-        let before = TelemetrySnapshot { reference_slips: 10, reference_coarse_drops: 1, ..Default::default() };
+        let before = TelemetrySnapshot { reference_slips: 10, reference_coarse_drops: 1, output_slips: 4, ..Default::default() };
         let t = TelemetrySnapshot {
+            output_slips: 9,
+            output_slip_net: 3,
+            output_coarse_drops: 1,
+            output_dropped_frames: 480,
             output_drift_ppm: 3.0,
             reference_drift_ppm: -1.0,
             reference_fill_ms: 12.5,
@@ -1391,8 +1449,10 @@ mod tests {
             reference_slips: 3,
             reference_jumps: 1,
             aec_delay_ms: 52.0,
-            aec_erle_db: 12.0
+            aec_erle_db: 12.0,
+            output: OutputEvents { coarse_drops: 1, dropped_frames: 480, slips: 5, slip_net: 3, ..Default::default() },
         });
+        assert_eq!(r.output_line(), "output events              1 coarse drop (10.0 ms dropped); 5 slips (net +3 samples) over the take");
         assert!(r.line().contains("lead 12.5 ms by delivery (target 12.0), 3 slips and 1 jumps over the take"), "{}", r.line());
         let off = EngineReadings { output_drift_ppm: f32::NAN, ..Default::default() };
         assert_eq!(off.line(), format!("{:<26} output drift -- ppm", "engine"));
@@ -1540,6 +1600,22 @@ mod tests {
                 queue_ms: 21.25,
                 render_ms: 22.0,
             }),
+            output: OutputFacts {
+                index: 1056 + index * 480,
+                padding: 960,
+                pending: 0,
+                fill: 1019.75,
+                target: 1056,
+                slip: if index == 1 { -1 } else { 0 },
+                zeros: if index == 1 { 96 } else { 0 },
+                dropped: 0,
+                skipped: false,
+                underrun: index == 1,
+                reanchored: false,
+                silence: if index == 1 { 46 } else { 0 },
+                clock_pos: if index == 0 { 96.0 } else { f64::NAN },
+                clock_qpc_hns: if index == 0 { 10_000_180_000.0 } else { f64::NAN },
+            },
         }
     }
 
@@ -1590,9 +1666,12 @@ mod tests {
         assert_eq!(
             lines[1],
             "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,,3.25,0,\
-             19.500,0.125,10.000,21.250,22.000,62.875"
+             19.500,0.125,10.000,21.250,22.000,62.875,1056,960,0,1019.8,1056,0,0,0,0,0,0,0,96.0,10000180000.0"
         );
-        assert_eq!(lines[2], "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1,,,,,,");
+        assert_eq!(
+            lines[2],
+            "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1,,,,,,,1536,960,0,1019.8,1056,-1,96,0,0,1,0,46,,"
+        );
         let back = crate::config::load(&dir.join("chain_config.json")).unwrap();
         assert_eq!(back, cfg, "process --config reads it");
         let _ = std::fs::remove_dir_all(dir);

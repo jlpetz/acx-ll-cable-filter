@@ -646,10 +646,12 @@ fn reset_telemetry(t: &Telemetry) {
     t.reference_fill_ms.store(0.0);
     for c in [
         &t.output_slips, &t.reference_slips, &t.capture_glitches, &t.render_underruns, &t.reference_gaps, &t.stalls,
-        &t.output_coarse_drops, &t.reference_coarse_drops, &t.tap_overflows,
+        &t.output_coarse_drops, &t.reference_coarse_drops, &t.tap_overflows, &t.output_deficits, &t.output_zero_frames,
+        &t.output_dropped_frames, &t.output_reanchors, &t.output_silence_frames, &t.publishes,
     ] {
         c.store(0, Relaxed);
     }
+    t.output_slip_net.store(0, Relaxed);
     for f in [&t.block_us_p50, &t.block_us_p99, &t.block_us_max, &t.aec_us_p99, &t.noise_us_p99, &t.aec_delay_ms, &t.aec_erle_db] {
         f.store(0.0);
     }
