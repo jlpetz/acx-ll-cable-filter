@@ -30,7 +30,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Runs the same chain the live app runs (AEC → noise stage with its floor/gate), through the same stage interface (#17), on WAV files, faster than real time, with no audio devices. It's the base for #3's conformance test, #13 layer 0 and #14's batch scoring.
 - Checks: the measured stream offset equals each model's declared `latency_samples − hop` to the sample (the hop of buffering only shows live, #13); output matches each model's reference; CPU per frame (p50/p99/max).
 - Runs under `cargo test`, which the project rules allow on the dev box. `cargo bench` isn't on that list: ask the owner, or time frames in an ignored test.
-**Next**: a reusable check a new stage or pack can call, then the ONNX models (#5) through it; recorded mic+reference pairs for the echo canceller.
+- `harness::check_stage` (2026-11-02, e374c2c): the profile, the offset at 4 block phases, finite output after hostile input and a parity hook, in one call; RNNoise, AEC3 and UL-UNAS use it.
+**Next**: recorded mic+reference pairs for the echo canceller (offline AEC scoring with #14).
 **Detail**: `doc/todo/2-offline-harness.md`
 
 ---
@@ -50,7 +51,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High (phase 0) | **Status**: chosen as the baseline (owner, 2026-10-26); the noise stage's first model, through the harness (2026-11-02): offset 480 to the sample, bit-equal to nnnoiseless; on the fetched speech-in-cafe takes the noise falls 11.7-34.1 dB in pauses.
 - Pure Rust, BSD-3 code and weights, 48 kHz, 10 ms frames (matches AEC3 and WASAPI), 20 ms algorithmic latency, ~0.4% of a core. Weakest quality, so it's the bring-up model and later the eco mode. Its VAD output can drive the gate (#11).
 - Gotchas: `default-features = false`; warm up the state before streaming (first-call and reset allocations); dev-profile `opt-level` for dependencies. It can't load RNNoise 0.2 models.
-**Next**: build the spare state off the audio thread (a second reset allocates, served by the real-time pool); the Lab's scores against the ONNX models (#5, #14).
+- Resets never allocate since 2026-11-02 (b53a965): spare states are refilled off the audio thread. In the Lab's 357 clips UL-UNAS beat it (#5).
+**Next**: the baseline the next models are scored against (#5, #14).
 **Detail**: `doc/todo/4-rnnoise-baseline.md`; `doc/research-2026-10.md` (Noise models)
 
 ---
@@ -62,7 +64,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - DeepFilterNet3: standard weights plausibly open; _ll is a bigger model (9.7M params) with weaker evidence. Opt-in only.
 - Open (owner): does dropping GTCRN over its patent filings also cover UL-UNAS, which probably shares the family? Until answered, UL-UNAS stays the next integration.
 - RNNoise (#4) is the fallback. Choose by #13 and #14 on the owner's own mic, not by paper scores.
-**Next**: the owner's patent answer for UL-UNAS; a live A/B against RNNoise on the cables and by ear (#14), with the high-band fold; FastEnhancer when its weights or our retrain allow.
+- Live A/B on the cables (8cb6913): 8-19 dB more noise cut in pauses, speech alike, app path 64.5 ms at depth 1 (auto with the exclusive mic, b53a965) against RNNoise's 34.4. The Lab (357 clips, e374c2c): DNSMOS OVRL +0.26 [+0.12, +0.41], SIGMOS OVRL +0.68 [+0.54, +0.82].
+**Next**: the owner's patent answer and a listen (WAVs in the VM's `Downloads\nf-quality\ab-*`); a lower-latency candidate (FastEnhancer, or our 10 ms-hop retrain, #7).
 **Detail**: `doc/todo/5-candidate-models.md`; `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
 
 ---
@@ -148,18 +151,19 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
 - Latency options (2026-11-01), the defaults since 2026-11-02 (owner: the lowest latency by default, with switches to turn each off, e.g. for recording the raw mic): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
-**Next**: longer soak runs for glitches; IAudioClient3 small periods on the output and the speakers' keep-alive (shorter loopback packets, a shorter reference lead, #10), to verify on real hardware; layer 3 in phase 2.
+- 30-minute soak (878b029): readout 20.4 ms, 1 output underrun in the adaptive target's first walk; since b53a965 the first lowering waits for a second clean window.
+**Next**: a soak with the fixed first walk; IAudioClient3 small periods on the output and the speakers' keep-alive (shorter loopback packets, a shorter reference lead, #10), to verify on real hardware; layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---
 
 ### 14. [lab] Quality analyser: the Lab mode (MOS)
-**Priority**: Medium (phase 0 batch, later GUI) | **Status**: designed (owner: in the app, not a companion); metric licences fact-checked 2026-10-26. Phase 0's live half, `noise-filter quality` (level metrics over the virtual cables), built and first run 2026-11-01: the noise test works (-27 dB noise, -0.6 dB speech); the echo test found #10's reference gaps.
+**Priority**: Medium (phase 0 batch, later GUI) | **Status**: in the app (owner). Phase 0 built: `quality` live over the cables (2026-11-01) and `noise-filter lab` offline (2026-11-02, e374c2c): a deterministic playlist from the test audio, every model, DNSMOS P.835 and SIGMOS (packs, licences rechecked 2026-11-02) and the level measures, paired differences with cluster-robust 95% CIs. The echo test flags rig slips and sets their turns apart.
 - Record once, process many: the same input (WAV playlist, or a saved raw take plus loopback) through every model. Also score the live output, to catch real-time glitches.
 - Metrics (Lab download): DNSMOS P.835/P.808 (MIT + CC BY 4.0, 16 kHz only), SIGMOS (MIT, full band, no published accuracy), AECMOS (MIT, mode B). Optional: ScoreQ. Left out: NISQA, SQUIM subjective (non-commercial), UTMOS.
 - Test audio (2026-11-01): `python -I tools/fetch_test_audio.py` fetches a licence-checked starter set (19 takes: speech, noise, music, an AEC pair) into `%LOCALAPPDATA%\noise-filter\test-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-catalogue-2026-11-01.md`.
 - Statistics over distinct clips (~50 paired), paired differences with 95% CIs. Final say: blind A/B or CCR, loudness-matched (BS.1770); ABX only for "is there a difference?".
-**Next**: flag rig slips in the echo test (the far track slipped 70 ms in a take, 2026-11-02; the detail file). Phase 0: the batch CLI with #2 (the echo test's live half is done: #10), playlist, DNSMOS/SIGMOS feature parity. Phase 1: live capture saving raw take and loopback (the chain recorder, `quality --save`, is its first part). Phase 2: AECMOS. Later: the Lab page (#15).
+**Next**: a cleaner speech set for pause figures at high SNR (VCTK's own room noise masks half the clips); the owner's listening A/B. Phase 1: live capture saving raw take and loopback (the chain recorder, `quality --save`, is its first part). Phase 2: AECMOS. Later: the Lab page (#15).
 **Detail**: `doc/todo/14-quality-lab.md`
 
 ---
@@ -222,5 +226,5 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Owner: tell the user when a device or driver delivers in bursts or late, so they can fix it; and a calibration that sizes the buffers to the devices, not too big or small.
 - Proposed: a health readout per stream (steady or bursty, how late, drift, glitches, with a plain verdict and what to try), and a calibration (passive: measure delivery and set the starting targets; active with speakers: time the echo path and check it against the reference's lead, #10).
 - Most of the measures exist: the latency budget (#13), the reference's facts (#10), the counters, the live probe.
-**Next**: real-hardware runs to set the thresholds; fix two wordings seen live (a false 'in bursts' for the exclusive mic's normal lead; 'delivered lately'); then the GUI's readout and the calibration.
+**Next**: real-hardware runs to set the thresholds (the two live wording bugs fixed 2026-11-02, b53a965); then the GUI's readout and the calibration.
 **Detail**: `doc/todo/21-device-health.md`
