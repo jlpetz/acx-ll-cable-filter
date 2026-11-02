@@ -15,12 +15,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 1. [project] Repo, workspace and crate layout
 **Priority**: High (phase 0) | **Status**: own git repo at `C:\Users\Administrator\Downloads\noise-filter`, copied out of the TMR workspace 2026-10-26; v0 built (crates `nf-core`, `nf-mem`, `nf-stages`, `nf-engine`, `nf-gui`, `nf-app`); first commit 2026-10-28 (f9b0d35, the owner's OK).
-- Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile (#17; the AEC and noise filter in the same format is our proposal, awaiting the owner); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
+- Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile, and the AEC and noise filter in the same format (#17; the owner's OK, 2026-11-02); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
 - Owner's wish (tentative, 'should probably publish the spec'): a standard stage interface, published so others can add stages such as a voice changer (#3, #17).
 - Decided (owner, 2026-10-28): the x86-64-v3 CPU baseline, like TMR; both exes check the CPU first and refuse others (exit 5). TMR's commit rules, rustfmt settings and fmt-then-clippy routine (`CLAUDE.md`).
 - Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `sonora =0.2.0` (from crates.io again: the vendored `mul_add` patch went with the v3 baseline, #10), later `ort =2.0.0-rc.15`.
-- The old copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` is stale (edited before the move; no `CLAUDE.md`). Removing it waits for the owner's OK.
-**Next**: retire the old copy (owner's OK, #20); start future sessions in the new folder.
+- The old pre-move copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` was deleted 2026-11-02 (the owner's OK; it held only a TODO.md, `doc/` and `todo_check.py` from 2026-10-26).
+**Next**: start future sessions in this folder; keep the crate layout as the stage interface (#17) and model stages (#5) land.
 **Detail**: this entry; project rules in `CLAUDE.md`
 
 ---
@@ -211,16 +211,6 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 with the C++ workload, the Spectre libraries and the WDK extension; WDK 10.0.28000.2526 and SDK 10.0.28000.2705 (ACX 1.0/1.1, KMDF up to 1.35, inf2cat, stampinf, infverif, signtool). VB-CABLE 3.3.1.7 loads on Server 2025.
 **Next**: when the owner un-pauses the spike: an EBS snapshot, `bcdedit /set testsigning on` and a reboot; then the spike's seven checks.
 **Detail**: `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`
-
----
-### 20. [chore] Clean up the review's build caches and scratch data
-**Priority**: Low | **Status**: kept for now (owner, 2026-10-28: they may be wanted again; keep them a little while).
-- `target/` (41 GB on 2026-10-26), mostly the workflow agents' own build folders (`agent-*`, `review-*`, `fix-*`, `fix-verify-*`, `v3-asm`, `v3-review`); since the v3 switch `target/v3` is the one in use, and `target/main` is the old v2 build.
-- A stray `crates/nf-stages/target/` (an agent's build; ignored by git since the initial commit).
-- Scratch in `%TEMP%` (`C:\Users\Administrator\AppData\Local\Temp` and its `2` subfolder): `nf-verify-*`, `nf-review-*`, `nf-gate-scratch`, `nf-fix-app`, `nf-dsp6`, `nf-core-edit`, `nfscan`, `nf-review-asm`, `nfscripts`, and `nf-*.txt`/`.md`/`.log` reports. The verifiers' event sims are now in the repo (`crates/nf-engine/src/pipeline/tests/events.rs`).
-- The stale pre-move copy `C:\Users\Administrator\Downloads\TMR\noise-filter` (awaiting the owner's OK).
-**Next**: delete them once v0's live tests are done, asking first.
-**Detail**: none (this entry is the list).
 
 ---
 
