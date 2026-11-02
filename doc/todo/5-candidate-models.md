@@ -149,3 +149,19 @@ Mean noise cut in the pauses (dB, the noise as mixed against the output a latenc
   about 50 dB) to 241 taps (2.5 ms, about 80 dB), so the delay is a whole sample at both rates.
 - A VAD from the mask; the chain recorder logging misses, so offline reruns stay exact; pack zips; caching conformance
   results; freezing the spec; the `.clap` export.
+
+## Live A/B on the cables (2026-11-02)
+`quality --test noise --seconds 30 --model rnnoise|ulunas` on the dev VM's cables, the defaults (exclusive mic and output),
+the onnx release build (88d1caa). WAVs in the VM's `Downloads\nf-quality\ab-*` for listening.
+
+| Scene | RNNoise: noise in pauses (200 ms clear) | UL-UNAS | Speech kept |
+|---|---|---|---|
+| Synthetic voice, pink noise 10 dB under | -26.5 dB (-27.3) | -34.5 dB (-46.1) | -0.3 dB both |
+| VCTK p226, keyboard (Freesound 448209) 10 dB under | -24.5 dB (-28.5) | -32.9 dB (-34.6) | -0.4 dB both |
+
+- **Latency:** the app path (readout + chain) 34.4 ms with RNNoise, 74.6 ms with UL-UNAS at depth 2 (the chain 50 ms), 64.5
+  ms at depth 1 (the chain 40 ms). Depth 1 ran clean here (no dropouts, the same noise cut) because the exclusive mic
+  delivers a block at a time; with the shared mic's bursts it would miss (the fix pass's table). Proposal: pick the depth
+  from the mic's delivery (1 when steady), not a fixed 2.
+- So UL-UNAS cuts 8-19 dB more noise in pauses for the same speech level, at 30-40 ms more latency. Latency is the owner's
+  first criterion: RNNoise stays the default; UL-UNAS (if the patent question allows) as a stronger mode.
