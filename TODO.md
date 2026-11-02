@@ -179,12 +179,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ---
 
-### 17. [plugins] Stage format: CLAP for effects (owner); AEC and noise filter too (proposed)
-**Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26). The owner asked whether the noise filter and AEC should use it too; proposal yes (below), awaiting the owner's OK.
+### 17. [plugins] Stage format: CLAP for effects, the AEC and the noise filter (owner)
+**Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26); the AEC and the noise filter are CLAP-shaped stages too (owner, 2026-11-02: "the best and most modern alt to VST3"). Stage interface being built (phase 0).
 - Every stage is CLAP-shaped. The AEC takes the mic on its main input and the speaker reference on a second input port (CLAP allows one main input plus non-main ones, the sidechain convention). The noise filter is a stage that loads model packs (#3), with the floor and gate inside it and a namespaced extension publishing its speech probability. Effects (a voice changer) come after.
 - Our own stages run in-process through the same Rust interface (no FFI). They can also be exported as `.clap` files (and VST3 via clap-wrapper) for other hosts. Third-party plugins run in an fx-host process (shared memory, a watchdog that passes clean audio through on a miss, editors as its own windows).
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
-**Next**: the owner's OK; then the stage interface in phase 0 (#2 runs stages through it).
+**Next**: the stage interface in phase 0, with #2 running stages through it.
 **Detail**: `doc/todo/17-post-effects.md`
 
 ---
