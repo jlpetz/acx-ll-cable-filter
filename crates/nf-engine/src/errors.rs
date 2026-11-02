@@ -102,7 +102,7 @@ pub(crate) enum StartFailure {
     Spawn,
 }
 
-/// A non-fatal start-up condition.
+/// A non-fatal start-up condition: a warning in the status, or a note ([`Warning::is_note`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Warning {
     /// MMCSS registration failed with this Win32 error; the thread runs at a raised normal priority.
@@ -116,12 +116,14 @@ pub(crate) enum Warning {
     MicSharesOutputDevice(String),
     /// The output is the default playback device and doesn't look like a virtual cable (this
     /// endpoint name): the cleaned mic plays out of the speakers instead of reaching other apps.
-    OutputIsSpeakers(String),
+    /// `exclusive_withheld`: it was asked for in exclusive mode and runs shared, as the default
+    /// playback device always does (`audio::output_check`).
+    OutputIsSpeakers { name: String, exclusive_withheld: bool },
     /// The output cable is also the default playback device (this endpoint name), so every app's
-    /// sound goes into the filtered mic.
-    CableIsDefaultPlayback(String),
+    /// sound goes into the filtered mic. `exclusive_withheld` as above.
+    CableIsDefaultPlayback { name: String, exclusive_withheld: bool },
     /// The mic or the output was asked for in exclusive mode and runs in shared mode: the device (this endpoint name)
-    /// refused it.
+    /// refused it. A note, not a warning: exclusive mode is the default, so a refusal is ordinary.
     ExclusiveUnavailable { role: StreamRole, device: String, why: ExclusiveRefusal },
 }
 
@@ -224,8 +226,28 @@ pub(crate) fn describe_hr(role: StreamRole, code: i32) -> String {
             format!("{noun} was disconnected or disabled.")
         }
         hr::E_NOTFOUND => format!("{noun} wasn't found. It may be unplugged or disabled; pick it again in the settings."),
-        hr::AUDCLNT_E_DEVICE_IN_USE | hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => format!(
-            "{noun} is in use by another app in exclusive mode. Close that app, or turn off \"Allow applications to take exclusive control\" for the device in Sound settings."
+        // A shared open (every open that can fail the start: an exclusive one falls back to shared first) is refused this
+        // only while another app holds the endpoint in exclusive mode. With exclusive mode the default, the mic or the output
+        // is most often held by another copy of the filter on the same device; the filter takes no other stream exclusive.
+        hr::AUDCLNT_E_DEVICE_IN_USE => {
+            let (holder, cost) = match role {
+                StreamRole::Mic | StreamRole::Output => (
+                    "Another copy of the filter counts (the window, or a run, latency or quality command on the same device): \
+                     close that app, or stop its filter.",
+                    ", the filter's own streams then shared too, with more latency",
+                ),
+                _ => ("Close that app.", ""),
+            };
+            format!(
+                "{noun} is held in exclusive mode by another app, so the filter can't open it. {holder} Unticking \"Allow \
+                 applications to take exclusive control of this device\" for the device (Sound control panel, its Properties > \
+                 Advanced) keeps every app from holding it{cost}."
+            )
+        }
+        // Only an exclusive open is refused this, and the streams that can fail the start open shared: worded for a stray one.
+        hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => format!(
+            "{noun} doesn't allow exclusive mode: \"Allow applications to take exclusive control of this device\" is unticked \
+             for it (Sound control panel, its Properties > Advanced)."
         ),
         hr::AUDCLNT_E_SERVICE_NOT_RUNNING => {
             "The Windows Audio service isn't running. Start it (or restart the PC) and try again.".to_owned()
@@ -298,30 +320,86 @@ pub(crate) fn describe_warning(w: &Warning) -> String {
         Warning::MicSharesOutputDevice(adapter) => format!(
             "The microphone is on the same device as the output ({adapter}). If it is the output cable's recording side, the filter only hears its own output and your apps get silence. Pick your real microphone."
         ),
-        Warning::OutputIsSpeakers(name) => format!(
-            "The output is your default playback device ({name}), which doesn't look like a virtual cable: the cleaned microphone plays out loud instead of reaching your other apps. Pick the virtual cable as the output."
+        Warning::OutputIsSpeakers { name, exclusive_withheld } => format!(
+            "The output is your default playback device ({name}), which doesn't look like a virtual cable: the cleaned \
+             microphone plays out loud instead of reaching your other apps. Pick the virtual cable as the output.{}",
+            withheld_text(*exclusive_withheld)
         ),
-        Warning::CableIsDefaultPlayback(name) => format!(
-            "The output cable ({name}) is also Windows' default playback device, so every app's sound goes into your filtered microphone. Make your speakers or headphones the default playback device in Sound settings."
+        Warning::CableIsDefaultPlayback { name, exclusive_withheld } => format!(
+            "The output cable ({name}) is also Windows' default playback device, so every app's sound goes into your filtered \
+             microphone. Make your speakers or headphones the default playback device in Sound settings.{}",
+            withheld_text(*exclusive_withheld)
         ),
-        Warning::ExclusiveUnavailable { role, device, why } => format!(
-            "{} ({device}) couldn't be opened in exclusive mode: {}. It runs in shared mode, without exclusive mode's lower latency.",
-            role.noun(),
-            describe_refusal(*why)
-        ),
+        Warning::ExclusiveUnavailable { role, device, why } => describe_exclusive_fallback(*role, device, *why),
     }
 }
 
-/// Why exclusive mode was refused, as a clause.
+/// The output warnings' last sentence when the output was asked for in exclusive mode: the default playback device runs
+/// shared (`audio::output_check`), and the change of default restarts the streams (`control::device_event_needs_restart`).
+fn withheld_text(exclusive_withheld: bool) -> &'static str {
+    if exclusive_withheld {
+        " Until then it runs in shared mode, with more latency: in exclusive mode the filter would have it to itself, and no \
+         other app could play sound on it."
+    } else {
+        ""
+    }
+}
+
+impl Warning {
+    /// A note rather than a warning: how the engine runs, which needs nothing done (`EngineStatus::notes`). Exclusive mode is
+    /// the default (the owner, 2026-11-02), so a device that refuses it is ordinary: the stream runs shared, as it did before.
+    pub(crate) fn is_note(&self) -> bool {
+        matches!(self, Warning::ExclusiveUnavailable { .. })
+    }
+}
+
+/// The note for a stream asked for in exclusive mode that runs shared: which, why, what it costs (the A/B on the dev VM's
+/// VB-CABLE cables, TODO 13: shared output 21-30 ms more, shared mic 10-19, depending on the other stream's mode), and what
+/// the user can do: fix the cause where there is one, or turn that stream's option off to stop it trying (the window's
+/// switch and the CLI's flag both named: the engine doesn't know which front end shows it).
+fn describe_exclusive_fallback(role: StreamRole, device: &str, why: ExclusiveRefusal) -> String {
+    let cost = match role {
+        StreamRole::Output => "about 20-30 ms more on VB-CABLE",
+        StreamRole::Mic => "about 10-20 ms more on VB-CABLE",
+        _ => "a little more",
+    };
+    let fix = match why {
+        ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE) => Some(
+            "To get exclusive mode, close the app that holds it and restart the filter (or start the filter before that app \
+             next time).",
+        ),
+        ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) => Some(
+            "To get exclusive mode, tick \"Allow applications to take exclusive control of this device\" in the Sound control \
+             panel (Settings > System > Sound > More sound settings), under the device's Properties > Advanced, and restart \
+             the filter.",
+        ),
+        _ => None,
+    };
+    let stop = match role {
+        StreamRole::Output => " To stop trying, turn off Exclusive output (the window's Diagnostics > Latency, or --no-exclusive-output).",
+        StreamRole::Mic => " To stop trying, turn off Exclusive microphone (the window's Diagnostics > Latency, or --no-exclusive-mic).",
+        _ => "",
+    };
+    format!(
+        "{} ({device}) runs in shared mode: {}. It works as usual, with more latency ({cost}).{}{stop}",
+        role.noun(),
+        describe_refusal(why),
+        fix.map(|f| format!(" {f}")).unwrap_or_default()
+    )
+}
+
+/// Why exclusive mode was refused, as a clause: the note's, and the stream's in the status and the reports' conditions.
 pub(crate) fn describe_refusal(why: ExclusiveRefusal) -> String {
     match why {
         ExclusiveRefusal::NoFormat | ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT) => {
-            "it takes none of the formats the filter can use there (48 kHz in 32-bit float, 24-bit or 16-bit)".to_owned()
+            "it takes none of the formats the filter can use in exclusive mode (48 kHz in 32-bit float, 24-bit or 16-bit)".to_owned()
         }
         ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE) => {
-            "another app is using it, and exclusive mode needs it to itself (close that app, or start the filter first)".to_owned()
+            "another app is using it, and exclusive mode needs it to itself".to_owned()
         }
-        ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) => "Windows doesn't allow it (turn on \"Allow applications to take exclusive control of this device\" in Sound settings > the device > Advanced)".to_owned(),
+        ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) => {
+            "exclusive control of it is turned off in Windows' sound settings".to_owned()
+        }
         ExclusiveRefusal::Refused(
             code @ (hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED | hr::AUDCLNT_E_INVALID_DEVICE_PERIOD | hr::AUDCLNT_E_BUFFER_SIZE_ERROR),
         ) => format!("it refused the short period (error 0x{:08X})", code as u32),
@@ -334,6 +412,9 @@ pub(crate) fn describe_refusal(why: ExclusiveRefusal) -> String {
                 format!("every period tried, {} to {}", ms(shortest_hns), ms(longest_hns))
             };
             format!("it refused {tried} (error 0x{:08X})", code as u32)
+        }
+        ExclusiveRefusal::DefaultPlayback => {
+            "it is Windows' default playback device, and in exclusive mode no other app could play sound on it".to_owned()
         }
     }
 }
@@ -416,7 +497,9 @@ mod tests {
         let m = describe_hr(StreamRole::Mic, hr::E_ACCESSDENIED);
         assert!(m.starts_with("Windows blocked access to the microphone.") && m.contains("Privacy"), "{m}");
         let m = describe_hr(StreamRole::Output, hr::AUDCLNT_E_DEVICE_IN_USE);
-        assert!(m.starts_with("The output device is in use"), "{m}");
+        assert!(m.starts_with("The output device is held in exclusive mode by another app"), "{m}");
+        let m = describe_hr(StreamRole::Mic, hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED);
+        assert!(m.starts_with("The microphone doesn't allow exclusive mode") && !m.contains("another app"), "{m}");
         let m = describe_hr(StreamRole::Output, 0x8889_0099_u32 as i32);
         assert_eq!(m, "The output device couldn't be used (error 0x88890099).");
         assert!(describe_start_failure(&StartFailure::NotFound(StreamRole::Output)).contains("pick it again"));
@@ -435,25 +518,109 @@ mod tests {
         assert!(m.contains("default microphone") && m.contains("VB-Audio Virtual Cable"), "{m}");
         let r = describe_reference_lost(Fault::Stream { role: StreamRole::Reference, hr: hr::AUDCLNT_E_DEVICE_INVALIDATED });
         assert!(r.starts_with("Echo cancellation lost its reference:") && r.contains("keeps running"), "{r}");
-        assert!(describe_warning(&Warning::OutputIsSpeakers("Speakers (Realtek(R) Audio)".into())).contains("plays out loud"));
-        assert!(describe_warning(&Warning::CableIsDefaultPlayback("CABLE Input".into())).contains("default playback"));
-        let excl = |why| describe_warning(&Warning::ExclusiveUnavailable { role: StreamRole::Output, device: "CABLE Input".into(), why });
-        let w = excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED));
-        assert!(w.starts_with("The output device (CABLE Input) couldn't be opened in exclusive mode: Windows doesn't allow it"), "{w}");
-        assert!(w.ends_with("It runs in shared mode, without exclusive mode's lower latency."), "{w}");
-        assert!(excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)).contains("short period (error 0x88890019)"));
-        assert!(excl(ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT)).contains("32-bit float, 24-bit or 16-bit"));
-        assert!(excl(ExclusiveRefusal::Refused(hr::E_FAIL)).contains(": error 0x80004005."));
-        let periods = ExclusiveRefusal::Periods { hr: hr::AUDCLNT_E_INVALID_DEVICE_PERIOD, shortest_hns: 30_000, longest_hns: 100_000 };
-        assert!(excl(periods).contains(": it refused every period tried, 3.00 ms to 10.00 ms (error 0x88890020)."), "{}", excl(periods));
-        let one = ExclusiveRefusal::Periods { hr: hr::E_INVALIDARG, shortest_hns: 20_000, longest_hns: 20_000 };
-        assert!(excl(one).contains(": it refused the 2.00 ms period (error 0x80070057)."), "{}", excl(one));
         assert!(describe_hr(StreamRole::Mic, hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED).contains("disconnected"));
         assert!(describe_hr(StreamRole::FarEnd, hr::AUDCLNT_E_DEVICE_INVALIDATED).starts_with("The far-end device was disconnected"));
         assert_eq!(StreamRole::from_u8(StreamRole::FarEnd as u8), StreamRole::FarEnd);
         // A UI thread's COM: said plainly; anything else keeps its code
         assert!(describe_com_failure(hr::RPC_E_CHANGED_MODE).contains("worker thread"));
         assert_eq!(describe_com_failure(hr::E_FAIL), "Windows audio couldn't be initialised (error 0x80004005).");
+    }
+
+    /// Exclusive mode is the default (the owner, 2026-11-02), so a refusal is ordinary: a note, not a warning, that says which
+    /// stream runs shared and why, what that costs, and what to do: the fix where there is one (the app holding the device, or
+    /// Windows' "Allow applications to take exclusive control" box), and how to stop it trying.
+    #[test]
+    fn an_exclusive_refusal_is_a_note_with_its_cost_and_its_fix() {
+        let note = |role, device: &str, why| {
+            let w = Warning::ExclusiveUnavailable { role, device: device.into(), why };
+            assert!(w.is_note());
+            describe_warning(&w)
+        };
+        let out = |why| note(StreamRole::Output, "CABLE Input", why);
+        let w = out(ExclusiveRefusal::Refused(hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED));
+        assert_eq!(
+            w,
+            "The output device (CABLE Input) runs in shared mode: exclusive control of it is turned off in Windows' sound settings. \
+             It works as usual, with more latency (about 20-30 ms more on VB-CABLE). To get exclusive mode, tick \"Allow \
+             applications to take exclusive control of this device\" in the Sound control panel (Settings > System > Sound > More \
+             sound settings), under the device's Properties > Advanced, and restart the filter. To stop trying, turn off \
+             Exclusive output (the window's Diagnostics > Latency, or --no-exclusive-output)."
+        );
+        let w = note(StreamRole::Mic, "Mic (USB)", ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE));
+        assert_eq!(
+            w,
+            "The microphone (Mic (USB)) runs in shared mode: another app is using it, and exclusive mode needs it to itself. It \
+             works as usual, with more latency (about 10-20 ms more on VB-CABLE). To get exclusive mode, close the app that holds \
+             it and restart the filter (or start the filter before that app next time). To stop trying, turn off Exclusive \
+             microphone (the window's Diagnostics > Latency, or --no-exclusive-mic)."
+        );
+        // Nothing to fix: only how to stop it trying.
+        let w = out(ExclusiveRefusal::NoFormat);
+        assert!(w.contains(": it takes none of the formats the filter can use in exclusive mode (48 kHz in 32-bit float"), "{w}");
+        let stop = "To stop trying, turn off Exclusive output (the window's Diagnostics > Latency, or --no-exclusive-output).";
+        assert!(w.ends_with(&format!("more on VB-CABLE). {stop}")), "{w}");
+        assert_eq!(out(ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT)), w, "as no format");
+        assert!(
+            out(ExclusiveRefusal::Refused(hr::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED))
+                .contains(": it refused the short period (error 0x88890019).")
+        );
+        assert!(out(ExclusiveRefusal::Refused(hr::E_FAIL)).contains("shared mode: error 0x80004005. It works"));
+        let periods = ExclusiveRefusal::Periods { hr: hr::AUDCLNT_E_INVALID_DEVICE_PERIOD, shortest_hns: 30_000, longest_hns: 100_000 };
+        assert!(out(periods).contains(": it refused every period tried, 3.00 ms to 10.00 ms (error 0x88890020). It"), "{}", out(periods));
+        let one = ExclusiveRefusal::Periods { hr: hr::E_INVALIDARG, shortest_hns: 20_000, longest_hns: 20_000 };
+        assert!(out(one).contains(": it refused the 2.00 ms period (error 0x80070057)."), "{}", out(one));
+        // The stream's own clause (the status, the reports' conditions) is the short why, without the fix.
+        assert_eq!(
+            describe_refusal(ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE)),
+            "another app is using it, and exclusive mode needs it to itself"
+        );
+        // Every other start-up condition stays a warning.
+        for w in
+            [Warning::Mmcss(1), Warning::KeepAliveUnavailable(0), Warning::OutputIsSpeakers { name: "x".into(), exclusive_withheld: true }]
+        {
+            assert!(!w.is_note(), "{w:?}");
+        }
+    }
+
+    /// The output on Windows' default playback device: the speakers, or a cable that then carries every app's sound. Either
+    /// way it needs fixing, so a warning; asked for in exclusive mode, it also says the output runs shared until then, as
+    /// exclusive mode there would keep every other app from playing sound (and the stream's own clause says why).
+    #[test]
+    fn the_default_playback_output_warns_and_says_it_runs_shared() {
+        let speakers = |exclusive_withheld| {
+            describe_warning(&Warning::OutputIsSpeakers { name: "Speakers (Realtek(R) Audio)".into(), exclusive_withheld })
+        };
+        let cable =
+            |exclusive_withheld| describe_warning(&Warning::CableIsDefaultPlayback { name: "CABLE Input".into(), exclusive_withheld });
+        let withheld = " Until then it runs in shared mode, with more latency: in exclusive mode the filter would have it to itself, \
+                        and no other app could play sound on it.";
+        assert!(speakers(false).contains("plays out loud") && speakers(false).ends_with("Pick the virtual cable as the output."));
+        assert_eq!(speakers(true), format!("{}{withheld}", speakers(false)));
+        assert!(cable(false).contains("every app's sound goes into your filtered microphone"), "{}", cable(false));
+        assert!(cable(false).ends_with("the default playback device in Sound settings."), "{}", cable(false));
+        assert_eq!(cable(true), format!("{}{withheld}", cable(false)));
+        assert_eq!(
+            describe_refusal(ExclusiveRefusal::DefaultPlayback),
+            "it is Windows' default playback device, and in exclusive mode no other app could play sound on it"
+        );
+    }
+
+    /// A start that fails on a device held in exclusive mode (with exclusive mode the default, most often another copy of the
+    /// filter: the window and a CLI command on the same cable or mic) says so, and what unticking Windows' box would cost.
+    #[test]
+    fn a_device_held_by_another_app_names_the_filter_itself() {
+        let m = describe_start_failure(&StartFailure::Open { role: StreamRole::Mic, hr: hr::AUDCLNT_E_DEVICE_IN_USE });
+        assert!(m.starts_with("The microphone is held in exclusive mode by another app, so the filter can't open it."), "{m}");
+        assert!(m.contains("Another copy of the filter counts (the window, or a run, latency or quality command"), "{m}");
+        assert!(m.contains("close that app, or stop its filter"), "{m}");
+        assert!(m.contains("the filter's own streams then shared too, with more latency"), "{m}");
+        let f = describe_fault(Fault::Stream { role: StreamRole::Output, hr: hr::AUDCLNT_E_DEVICE_IN_USE });
+        assert!(f.starts_with("The output device is held in exclusive mode") && f.ends_with("The filter restarts when it's back."), "{f}");
+        // Streams the filter never takes exclusive (the reference, the lab's probe and capture): just another app, and
+        // unticking the box costs the filter nothing there.
+        let r = describe_hr(StreamRole::Reference, hr::AUDCLNT_E_DEVICE_IN_USE);
+        assert!(r.contains("so the filter can't open it. Close that app. Unticking") && !r.contains("copy of the filter"), "{r}");
+        assert!(r.ends_with("keeps every app from holding it."), "{r}");
     }
 
     /// The owner's ask (2026-10-31): a mic that Windows' privacy settings block offers a way to the setting;

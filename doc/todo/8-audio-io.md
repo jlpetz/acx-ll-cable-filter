@@ -5,8 +5,8 @@ Facts and sources: `doc/research-2026-10.md` (Windows audio I/O).
 ## Streams
 | Stream | Endpoint | Mode | Notes |
 |---|---|---|---|
-| Mic capture | chosen mic | event-driven shared mode; IAudioClient3 minimum period if the driver allows, else 10 ms; exclusive mode as an option (`--exclusive-mic`, below) | RAW mode where `RawProcessingSupported`; not the Communications category |
-| Cable render | chosen virtual cable input (e.g. CABLE Input) | polled shared mode, written at the mic's wakes; event-driven exclusive mode as an option (`--exclusive-output`, below) | `SetDuckingPreference(TRUE)`; small period or RATEADJUST, not both |
+| Mic capture | chosen mic | event-driven exclusive mode by default (`--no-exclusive-mic` turns it off, below); in shared mode, IAudioClient3 minimum period if the driver allows, else 10 ms | RAW mode where `RawProcessingSupported` (shared mode); not the Communications category |
+| Cable render | chosen virtual cable input (e.g. CABLE Input) | event-driven exclusive mode by default (`--no-exclusive-output`, below); polled shared mode, written at the mic's wakes, when off or refused | `SetDuckingPreference(TRUE)`; small period or RATEADJUST, not both |
 | Reference capture | loopback of the chosen speakers | shared mode only | zero-fill through silence (no packets arrive); pre-volume; honour `flags.silent`; QPC timestamps |
 | Keep-alive (optional) | the chosen speakers | silent render at the default period | keeps loopback packets flowing; never a small period (that would switch every app on the endpoint) |
 
@@ -50,10 +50,12 @@ Facts and sources: `doc/research-2026-10.md` (Windows audio I/O).
 - 10 ms-hop models (RNNoise, DFN3) align with 10 ms periods.
 - UL-UNAS (16 ms hop) and FastEnhancer-48k (512-sample hop) pay up to ~8-9 ms unless the period divides the hop.
 
-## Exclusive mode (built 2026-11-01, opt-in; engine.md, "Exclusive mode")
+## Exclusive mode (built 2026-11-01; the default since 2026-11-02; engine.md, "Exclusive mode")
 A probe on the dev VM (2026-11-01, not in the tree) found every VB-CABLE endpoint takes exclusive mode, 16-bit only (32-bit
 float and 24-in-32 refused), event-driven at periods down to 2 ms (render) and 3 ms (capture), 10 ms by default. The options
-`io.output_exclusive` (`--exclusive-output`) and `io.mic_exclusive` (`--exclusive-mic`) use it; neither is on by default.
+`io.output_exclusive` and `io.mic_exclusive` use it, both on by default (the owner, 2026-11-02: the lowest latency by
+default; `--no-exclusive-output`, `--no-exclusive-mic` and the window's switches turn them off, e.g. to record the raw mic
+in another app). The cable's recording side, which the apps read, stays shared either way.
 - **Why:** shared mode puts the audio engine's pass between the app and the driver on each side. On the cables the render
   side (our buffer to the output's play-out) was 26 ms and the mic's delivery 16, against a block's 10. Exclusive mode
   reaches the driver directly, at its own small period.
@@ -76,10 +78,26 @@ float and 24-in-32 refused), event-driven at periods down to 2 ms (render) and 3
 - **Trade-offs:**
   - Exclusive mode locks the endpoint. The output cable only has the filter playing into it, so locking its input side
     costs nothing (the apps read its other side). The mic is another matter: **no other app can record from that mic while
-    the filter runs**; they should use the filtered mic (the cable) anyway. The help and the status say so.
+    the filter runs**; they should use the filtered mic (the cable) anyway. The help and the window's switch say so, and
+    say to turn it off to record the raw mic in another app too.
+  - **Never on the default playback device:** an output that is Windows' default playback device (the speakers picked by
+    mistake, or VB-CABLE's installer leaving CABLE Input the default) is opened shared even when exclusive is asked:
+    held exclusively, no other app could play sound at all (the call's own sound included). Its warning says so, and a
+    change of default to or from the output restarts the streams, so fixing the default brings exclusive mode back.
+  - **Two copies of the filter:** with both exclusive by default, the window and a CLI `run`/`latency`/`quality` on the
+    same mic or cable can't both run: the second's shared open fails on the first's exclusive stream
+    (`AUDCLNT_E_DEVICE_IN_USE`), and its start error names another copy of the filter as the likeliest holder. The lab
+    commands want the window's filter stopped first.
   - No Windows effects on an exclusive stream (no APOs, so RAW has nothing to do), and no IAudioClient3.
+  - **Volume (unverified):** an exclusive stream bypasses the audio engine, so the endpoint's volume slider (CABLE Input's
+    playback level, the mic's Levels slider) should apply only where the device has a hardware volume control; on a
+    device whose volume is the engine's software one, it would stop applying. Unchecked on VB-CABLE and on a real mic;
+    the next live run should check it before the help and the window's lines say so.
   - A device in use by another app, with exclusive control turned off in its properties, or refusing every period tried,
-    falls back to shared mode with a warning that says which (the periods tried, for those).
+    falls back to shared mode with a note (not a warning: a refusal is ordinary now that exclusive is the default) that
+    says which stream, why (the periods tried, for those), what shared mode costs, how to fix it and where to turn the
+    option off (the window's switch, the CLI's flag). When the format check takes nothing, the initialise is tried anyway,
+    so "in use" and "not allowed" come back as themselves.
   - **The output's deadline:** a late answer (the thread held off for over a period, 2 ms) lets the device replay a stale
     buffer: a glitch, counted as an underrun (once a block, as a dry spell is). How the driver's stream position treats it
     is unverified on VB-CABLE: the engine assumes the stream moved on. The first answer, after the start's other work, is

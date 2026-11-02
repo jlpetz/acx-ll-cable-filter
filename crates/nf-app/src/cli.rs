@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use nf_engine::{GateMode, LatencyMode};
 
 use crate::quality::QualityTest;
-use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, MAX_ECHO_DELAY_MS};
+use crate::quality::echo_delay::{DEFAULT_ECHO_DELAY_MS, EXCLUSIVE_MIC_ECHO_FLOOR_MS, MAX_ECHO_DELAY_MS};
 
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,14 +56,15 @@ pub struct Processing {
 }
 
 /// The streams' options (`IoConfig`'s latency options), shared by `run`, `latency` and `quality`. `None` keeps the config's
-/// value.
+/// value (on by default: the owner, 2026-11-02). The `--no-...` flags turn one off, as `--no-aec` does; the plain ones turn it
+/// back on over a `--config` file that has it off. The last of a pair wins.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IoOptions {
-    /// `--exclusive-output`: the output in WASAPI exclusive mode.
+    /// `--exclusive-output`, `--no-exclusive-output`: the output in WASAPI exclusive mode.
     pub output_exclusive: Option<bool>,
-    /// `--exclusive-mic`: the mic in WASAPI exclusive mode.
+    /// `--exclusive-mic`, `--no-exclusive-mic`: the mic in WASAPI exclusive mode.
     pub mic_exclusive: Option<bool>,
-    /// `--adaptive-output`: the output's target follows the delivery.
+    /// `--adaptive-output`, `--no-adaptive-output`: the output's target follows the delivery.
     pub adaptive_output: Option<bool>,
 }
 
@@ -90,6 +91,9 @@ pub struct LatencyArgs {
     /// `--cable-only`: the sweeps from the probe to the capture with no engine, so `engine`, `mode` and `through_model` are
     /// unused (the parser refuses them).
     pub cable_only: bool,
+    /// `--settle`: wait for the adaptive output target to come down before the sweeps (up to `run::ADAPTIVE_WAIT_S`). Without
+    /// it the test runs at once, at the target's fixed start.
+    pub settle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +116,8 @@ pub struct QualityArgs {
     pub far_speech: Option<PathBuf>,
     /// Where to write the scene, the recording and the aligned recording as WAVs, and what the chain got and gave live.
     pub save: Option<PathBuf>,
+    /// `--settle`: wait for the adaptive output target to come down before the scene, as `latency --settle` does.
+    pub settle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,6 +144,8 @@ pub struct BenchArgs {
 
 /// The latency test's default repetitions (the engine's `LatencyTestRequest` default).
 pub const DEFAULT_REPETITIONS: u32 = 5;
+/// The longest `--settle` waits for the adaptive output target: its window, its longest walk down, and 15 s.
+pub const ADAPTIVE_WAIT_S: u64 = nf_engine::ADAPTIVE_OUTPUT_WINDOW_S + nf_engine::ADAPTIVE_OUTPUT_WALK_S + 15;
 /// `quality`'s default scene length, and its range. The echo scene is one FFT convolution over its whole length, as `bench`'s
 /// is, hence the same cap.
 pub const DEFAULT_QUALITY_SECONDS: f32 = 30.0;
@@ -336,6 +344,15 @@ impl EngineArgs {
     }
 }
 
+/// `--settle` waits for the adaptive output target: refused with `--no-adaptive-output`, which fixes it (a config file that
+/// does is told at the start instead).
+fn check_settle(settle: bool, engine: &EngineArgs) -> Result<(), UsageError> {
+    if settle && engine.io.adaptive_output == Some(false) {
+        return Err(usage("--settle waits for the adaptive output target, which --no-adaptive-output keeps fixed: drop one"));
+    }
+    Ok(())
+}
+
 fn parse_run(p: &mut Parser<'_>) -> Result<EngineArgs, UsageError> {
     let mut e = EngineArgs::default();
     while let Some(arg) = p.next() {
@@ -353,8 +370,8 @@ fn parse_run(p: &mut Parser<'_>) -> Result<EngineArgs, UsageError> {
 
 fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     let mut engine = EngineArgs::default();
-    let (mut probe, mut capture, mut mode, mut reps, mut through_model, mut cable_only) =
-        (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false, false);
+    let (mut probe, mut capture, mut mode, mut reps, mut through_model, mut cable_only, mut settle) =
+        (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false, false, false);
     // The first option given that only the test through the filter uses
     let mut filter_option: Option<&str> = None;
     while let Some(arg) = p.next() {
@@ -382,6 +399,10 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
                     filter_option.get_or_insert(flag);
                 }
                 "--cable-only" => cable_only = switch(flag, inline)?,
+                "--settle" => {
+                    settle = switch(flag, inline)?;
+                    filter_option.get_or_insert(flag);
+                }
                 _ => {
                     if !engine.take(p, flag, inline)? {
                         return Err(p.unknown(flag));
@@ -396,6 +417,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     if cable_only && let Some(flag) = filter_option {
         return Err(usage(format!("'latency --cable-only' times the probe-to-capture path alone, without the filter: drop {flag}")));
     }
+    check_settle(settle, &engine)?;
     let probe = probe.ok_or_else(|| usage("'latency' needs --probe DEV: the playback device the sweeps are played on"))?;
     let capture = capture.ok_or_else(|| {
         usage(if cable_only {
@@ -404,7 +426,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
             "'latency' needs --capture DEV: the recording device that carries the filter's output"
         })
     })?;
-    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only })
+    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only, settle })
 }
 
 fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
@@ -421,6 +443,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
         noise: None,
         far_speech: None,
         save: None,
+        settle: false,
     };
     let (mut probe, mut capture, mut echo_delay) = (None, None, false);
     let path = |flag: &str, v: &str| text(flag, v).map(PathBuf::from);
@@ -455,6 +478,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
                 "--noise" => q.noise = Some(path(flag, p.value(flag, inline)?)?),
                 "--far-speech" => q.far_speech = Some(path(flag, p.value(flag, inline)?)?),
                 "--save" => q.save = Some(path(flag, p.value(flag, inline)?)?),
+                "--settle" => q.settle = switch(flag, inline)?,
                 _ => {
                     if !q.engine.take(p, flag, inline)? {
                         return Err(p.unknown(flag));
@@ -464,6 +488,7 @@ fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
             Arg::Positional(a) => return Err(usage(format!("'quality' takes no argument '{a}'"))),
         }
     }
+    check_settle(q.settle, &q.engine)?;
     q.probe = probe
         .ok_or_else(|| usage("'quality' needs --probe DEV: the playback device that feeds the filter's mic (e.g. \"CABLE-A Input\")"))?;
     q.capture = capture.ok_or_else(|| {
@@ -563,12 +588,12 @@ Usage:
   noise-filter devices           List the recording and playback devices
   noise-filter run [OPTIONS]     Run the filter without the window; Ctrl+C stops it
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
-                       [--through-model] [OPTIONS]
+                       [--through-model] [--settle] [OPTIONS]
                                  Measure the latency with sweeps and print the report
   noise-filter latency --cable-only --probe DEV --capture DEV [--reps N]
                                  The same sweeps through one cable alone, without the filter
   noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
-                       [OPTIONS]
+                       [--settle] [OPTIONS]
                                  Play a test scene through the filter and measure what it did
   noise-filter process IN.wav OUT.wav [--ref REF.wav] [--align] [--warm-up] [--config FILE]
                        [PROCESSING]
@@ -588,24 +613,42 @@ OPTIONS (run, latency, quality):
   --reference DEV    Speakers whose sound AEC removes (default: the default playback device)
   DEV is a device id or part of its name (exact name first, then the first match, any case).
 
-LATENCY OPTIONS (run, latency, quality; each off by default, --no-... turns one off):
-  --exclusive-output Open the output in exclusive mode at the device's smallest period (2 ms
-                     on VB-CABLE), past Windows' audio engine. Nothing else can play into
-                     that device while the filter runs: fine for the output cable, which only
-                     the filter plays into. If the device refuses, the output runs in shared
-                     mode and a warning says why
-  --exclusive-mic    Open the microphone in exclusive mode at its smallest period. No other app
-                     can record from that microphone while the filter runs: they should use
-                     the filtered mic (the cable). Windows' effects on it don't run. Its
-                     buffer is one period (3.3 ms on VB-CABLE, against shared mode's 40 ms),
-                     so a filter thread held up longer than that loses mic audio (a mic
-                     glitch). If it refuses, shared mode, with a warning
-  --adaptive-output  Let the output's buffer target follow the delivery: after two minutes it
-                     walks down to a period + the margin + the lateness measured (up to a
-                     minute). An underrun puts it back to the fixed one (a period + a block +
-                     the margin) and holds it there for 10 minutes, 20 after a second; after
-                     a third it stays fixed. So a rare hiccup the fixed target would ride out
-                     can cost a glitch, up to three in a run
+LATENCY OPTIONS (run, latency, quality): the lowest latency is the default; each --no-...
+turns one off, and the plain flag (--exclusive-output, --exclusive-mic, --adaptive-output)
+turns it back on over a --config file that has it off. Your apps record the output cable's
+other side, which stays shared whatever these say.
+  --no-exclusive-output
+                     Play into the output in shared mode, through Windows' audio engine.
+                     Exclusive mode plays into the device's driver directly at its smallest
+                     period (2 ms on VB-CABLE: 20-30 ms less latency there), and nothing else
+                     can play into that device while the filter runs: fine for the output
+                     cable, which only the filter plays into. Never while it is Windows'
+                     default playback device (no other app could play sound): that runs
+                     shared, with a warning. Turn it off if the output device misbehaves in
+                     exclusive mode
+  --no-exclusive-mic Record the microphone in shared mode. Exclusive mode (10-20 ms less latency
+                     on VB-CABLE) keeps every other app from recording that microphone while
+                     the filter runs: they use the filtered mic (the cable). Turn it off to
+                     record the raw microphone in another app too (OBS, a DAW), or if it
+                     misbehaves in exclusive mode. Exclusive, its buffer is one period (3.3 ms
+                     on VB-CABLE, against shared mode's 40 ms): a filter thread held up longer
+                     than that loses mic audio (a glitch). With echo cancellation on it
+                     lengthens the reference's lead, so the canceller needs the echo to reach
+                     the mic {echo_floor} ms or more after the speakers' sound is mixed (14 shared)
+  --no-adaptive-output
+                     Keep the output's buffer target fixed at a period + a block + the margin.
+                     Adaptive, it walks down after two minutes to a period + the margin + the
+                     lateness measured (about 7 ms less on VB-CABLE). An underrun puts it back
+                     to the fixed one and holds it there for 10 minutes, 20 after a second;
+                     after a third it stays fixed. So a rare hiccup the fixed target would
+                     ride out can cost a glitch, up to three in a run: turn it off for a
+                     recording that must have none
+  A device that refuses exclusive mode runs in shared mode, with a note saying why, what it
+  costs and how to fix it.
+  --settle           (latency, quality) Wait for the adaptive output target to come down
+                     before measuring: it can after two minutes of running, then walks for up
+                     to a minute ({settle_s} s at most). Without it they measure at once, at its
+                     fixed start, and the report's conditions say so
 
 PROCESSING (run, latency, quality, process):
   --aec, --no-aec    Echo cancellation on or off (default off; on in quality's echo test)
@@ -620,9 +663,10 @@ QUALITY (the probe feeds the mic, e.g. \"CABLE-A Input\"; the capture records th
                      echo reference, e.g. \"CABLE-B Input\"
   --echo-delay MS    The echo test's echo path: its echo reaches the mic this long after
                      the far end's loopback taps the far voice, as a speaker's output
-                     latency and the air would: 0 to 300 ms (default 25). Each take first
-                     times its devices' own offset with a short sweep on both, and reports
-                     the delay it got
+                     latency and the air would: 0 to 300 ms (default 25, over the {echo_floor} ms
+                     the exclusive mic leaves the canceller). Each take first times its
+                     devices' own offset with a short sweep on both, and reports the delay
+                     it got
   --seconds N        The scene's length, 5 to 300 s (default 30; the echo test needs 12)
   --snr DB           The noise under the speech's level, 0 to 60 dB (default 10; echo test 60)
   --speech FILE, --noise FILE, --far-speech FILE
@@ -644,7 +688,9 @@ noise-filter-cli.exe to noise-filter.com in the same folder, a plain `noise-filt
 terminal runs it (PATHEXT puts .COM before .EXE), and a double-click still opens the window.
 Without it, use `start /wait noise-filter ...` in cmd, or pipe it in PowerShell (`| Out-Host`).
 Log: %LOCALAPPDATA%\\noise-filter\\noise-filter.log",
-        version = env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        echo_floor = EXCLUSIVE_MIC_ECHO_FLOOR_MS,
+        settle_s = ADAPTIVE_WAIT_S,
     )
 }
 
@@ -729,31 +775,76 @@ mod tests {
         assert_eq!((e.processing.aec, e.processing.noise), (Some(false), Some(true)));
     }
 
-    /// The latency options: each on, off, or (unless given) the config's; `latency` and `quality` take them too, and
-    /// `latency --cable-only` refuses them like the filter's other options.
+    /// The latency options, on by default (the owner, 2026-11-02): each turned off by its `--no-...` flag, back on by the
+    /// plain one (over a config file that has it off), or (unless given) the config's; the last of a pair wins. `latency`
+    /// and `quality` take them too, `latency --cable-only` refuses them like the filter's other options, and `process`
+    /// (no devices) doesn't take them.
     #[test]
-    fn the_latency_options_turn_exclusive_mode_and_the_adaptive_target_on_and_off() {
+    fn the_latency_options_turn_exclusive_mode_and_the_adaptive_target_off_and_on() {
+        let Ok(Command::Run(e)) = p(&["run"]) else { panic!() };
+        assert_eq!(e.io, IoOptions::default(), "nothing given: the config's (or the defaults)");
+        let Ok(Command::Run(e)) = p(&["run", "--no-exclusive-output", "--no-exclusive-mic", "--no-adaptive-output"]) else { panic!() };
+        assert_eq!(e.io, IoOptions { output_exclusive: Some(false), mic_exclusive: Some(false), adaptive_output: Some(false) });
         let Ok(Command::Run(e)) = p(&["run", "--exclusive-output", "--exclusive-mic", "--adaptive-output"]) else { panic!() };
         assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: Some(true) });
-        let Ok(Command::Run(e)) = p(&["run", "--exclusive-output", "--no-exclusive-output", "--no-adaptive-output"]) else { panic!() };
-        assert_eq!(e.io, IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) });
-        assert_eq!(err(&["run", "--exclusive-mic=yes"]), "--exclusive-mic takes no value");
-        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--exclusive-output"]) else { panic!() };
-        assert_eq!(l.engine.io.output_exclusive, Some(true));
-        let Ok(Command::Quality(q)) = p(&["quality", "--probe", "a", "--capture", "b", "--adaptive-output", "--exclusive-mic"]) else {
+        let Ok(Command::Run(e)) = p(&["run", "--no-exclusive-output", "--exclusive-output", "--adaptive-output", "--no-adaptive-output"])
+        else {
             panic!()
         };
-        assert_eq!((q.engine.io.adaptive_output, q.engine.io.mic_exclusive), (Some(true), Some(true)));
-        assert!(
-            err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--exclusive-output"]).ends_with("drop --exclusive-output")
-        );
-        assert_eq!(err(&["process", "a.wav", "b.wav", "--exclusive-output"]), "'process' has no option '--exclusive-output'");
+        assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: None, adaptive_output: Some(false) }, "the last wins");
+        assert_eq!(err(&["run", "--exclusive-mic=yes"]), "--exclusive-mic takes no value");
+        assert_eq!(err(&["run", "--no-exclusive-mic=1"]), "--no-exclusive-mic takes no value");
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--no-exclusive-output"]) else { panic!() };
+        assert_eq!(l.engine.io.output_exclusive, Some(false));
+        let Ok(Command::Quality(q)) = p(&["quality", "--probe", "a", "--capture", "b", "--no-adaptive-output", "--no-exclusive-mic"])
+        else {
+            panic!()
+        };
+        assert_eq!((q.engine.io.adaptive_output, q.engine.io.mic_exclusive), (Some(false), Some(false)));
+        for flag in ["--exclusive-output", "--no-exclusive-mic", "--no-adaptive-output"] {
+            let e = err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", flag]);
+            assert!(e.ends_with(&format!("drop {flag}")), "{e}");
+        }
+        assert_eq!(err(&["process", "a.wav", "b.wav", "--no-exclusive-output"]), "'process' has no option '--no-exclusive-output'");
         let help = help_text();
-        for flag in ["--exclusive-output", "--exclusive-mic", "--adaptive-output"] {
+        for flag in [
+            "--exclusive-output", "--exclusive-mic", "--adaptive-output", "--no-exclusive-output", "--no-exclusive-mic",
+            "--no-adaptive-output",
+        ] {
             assert!(help.contains(flag), "{flag}");
         }
-        assert!(help.contains("Nothing else can play into") && help.contains("No other app") && help.contains("filtered mic"));
-        assert!(help.contains("loses mic audio") && help.contains("up to three in a run"));
+        // Each says what it costs and when to turn it off.
+        assert!(help.contains("the lowest latency is the default") && help.contains("other side, which stays shared"));
+        assert!(help.contains("nothing else") && help.contains("misbehaves in exclusive mode"));
+        assert!(help.contains("filtered mic") && help.contains("record the raw microphone in another app"));
+        assert!(help.contains("loses mic audio") && help.contains("up to three in a run") && help.contains("must have none"));
+        assert!(help.contains("a note saying why, what it") && help.contains("20 ms or more after"));
+    }
+
+    /// `--settle` (latency, quality) waits for the adaptive target before measuring; off unless given. It needs the adaptive
+    /// target, so `--no-adaptive-output` refuses it, and `latency --cable-only` refuses it with the filter's options.
+    #[test]
+    fn settle_waits_for_the_adaptive_target_when_asked() {
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert!(!l.settle, "off unless asked for: the test measures at once");
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--settle"]) else { panic!() };
+        assert!(l.settle);
+        let Ok(Command::Quality(q)) = p(&["quality", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert!(!q.settle);
+        let Ok(Command::Quality(q)) = p(&["quality", "--settle", "--probe", "a", "--capture", "b", "--adaptive-output"]) else { panic!() };
+        assert!(q.settle);
+        let refused = "--settle waits for the adaptive output target, which --no-adaptive-output keeps fixed: drop one";
+        assert_eq!(err(&["latency", "--probe", "a", "--capture", "b", "--settle", "--no-adaptive-output"]), refused);
+        assert_eq!(err(&["quality", "--probe", "a", "--capture", "b", "--no-adaptive-output", "--settle"]), refused);
+        assert_eq!(
+            err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--settle"]).rsplit(": ").next(),
+            Some("drop --settle")
+        );
+        assert_eq!(err(&["run", "--settle"]), "'run' has no option '--settle'");
+        assert_eq!(err(&["quality", "--probe", "a", "--capture", "b", "--settle=1"]), "--settle takes no value");
+        let help = help_text();
+        assert!(help.contains("[--through-model] [--settle] [OPTIONS]") && help.contains("[--settle] [OPTIONS]"));
+        assert!(help.contains(&format!("({ADAPTIVE_WAIT_S} s at most)")) && help.contains("measure at once"));
     }
 
     #[test]
@@ -808,7 +899,7 @@ mod tests {
         };
         assert!(l.cable_only);
         assert_eq!((l.probe.as_str(), l.capture.as_str(), l.repetitions), ("CABLE-A Input", "CABLE-A Output", 3));
-        assert_eq!((l.engine, l.mode, l.through_model), (EngineArgs::default(), LatencyMode::VirtualLoop, false));
+        assert_eq!((l.engine, l.mode, l.through_model, l.settle), (EngineArgs::default(), LatencyMode::VirtualLoop, false, false));
         let Ok(Command::Latency(l)) = p(&["latency", "--cable-only", "--probe", "a", "--capture", "b"]) else { panic!() };
         assert_eq!(l.repetitions, DEFAULT_REPETITIONS);
         let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b"]) else { panic!() };
@@ -860,6 +951,7 @@ mod tests {
             noise: None,
             far_speech: None,
             save: None,
+            settle: false,
         };
         assert_eq!(q, expected);
         let Ok(Command::Quality(q)) = p(&[

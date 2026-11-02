@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nf_engine::{EngineConfig, LatencyMode};
+use nf_engine::{EngineConfig, IoConfig, LatencyMode};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
@@ -70,6 +70,87 @@ pub(crate) const HOLD_MS: Span = Span { min: 0.0, max: 500.0, step: 10.0 };
 pub(crate) const RANGE_DB: Span = Span { min: -80.0, max: 0.0, step: 1.0 };
 /// Extra fill kept on the output cable.
 pub(crate) const OUTPUT_MARGIN_MS: Span = Span { min: 0.0, max: 20.0, step: 0.5 };
+
+/// The I/O switches: `IoConfig`'s booleans, each a ToggleSwitch in the diagnostics section (gui.md section 7). The latency
+/// options come first, each with a line on what it does and costs; changing any restarts the streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IoSwitch {
+    ExclusiveOutput,
+    ExclusiveMic,
+    AdaptiveOutput,
+    LowLatency,
+    RawMic,
+    KeepAlive,
+}
+
+impl IoSwitch {
+    /// The latency options (on by default: the owner, 2026-11-02), in the order shown.
+    pub const LATENCY: [Self; 3] = [Self::ExclusiveOutput, Self::ExclusiveMic, Self::AdaptiveOutput];
+    /// The streams' other switches, in the order shown.
+    pub const STREAMS: [Self; 3] = [Self::LowLatency, Self::RawMic, Self::KeepAlive];
+
+    pub fn get(self, io: &IoConfig) -> bool {
+        match self {
+            Self::ExclusiveOutput => io.output_exclusive,
+            Self::ExclusiveMic => io.mic_exclusive,
+            Self::AdaptiveOutput => io.adaptive_output,
+            Self::LowLatency => io.low_latency_periods,
+            Self::RawMic => io.raw_mic,
+            Self::KeepAlive => io.keep_alive_reference,
+        }
+    }
+
+    pub fn set(self, io: &mut IoConfig, on: bool) {
+        let field = match self {
+            Self::ExclusiveOutput => &mut io.output_exclusive,
+            Self::ExclusiveMic => &mut io.mic_exclusive,
+            Self::AdaptiveOutput => &mut io.adaptive_output,
+            Self::LowLatency => &mut io.low_latency_periods,
+            Self::RawMic => &mut io.raw_mic,
+            Self::KeepAlive => &mut io.keep_alive_reference,
+        };
+        *field = on;
+    }
+
+    /// The switch's header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExclusiveOutput => "Exclusive output",
+            Self::ExclusiveMic => "Exclusive microphone",
+            Self::AdaptiveOutput => "Adaptive output buffer",
+            Self::LowLatency => "Low-latency periods (IAudioClient3)",
+            Self::RawMic => "RAW mic",
+            Self::KeepAlive => "Keep reference alive",
+        }
+    }
+
+    /// The line under it, in plain words: what it does, what it costs, and when to turn it off. The figures are the dev
+    /// VM's VB-CABLE A/B (TODO 13).
+    pub fn description(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ExclusiveOutput => {
+                "Lowest latency (20-30 ms less on VB-CABLE): the filter plays straight into the cable's driver. Only the filter \
+                 plays into the cable, and your apps still record its other side as usual. Turn off if the cable misbehaves."
+            }
+            Self::ExclusiveMic => {
+                "Lowest latency. While the filter runs, other apps can't open your microphone directly; they use the filtered \
+                 mic. Turn off if you record your raw microphone in another app. With echo cancelling on, if echo gets through \
+                 or your voice crackles, try turning this off."
+            }
+            Self::AdaptiveOutput => {
+                "Trims the output buffer to what your PC needs after two minutes of running (about 7 ms less on VB-CABLE). A \
+                 rare hiccup can then cost a short glitch, three a run at most. Turn off for a recording that must have none."
+            }
+            // The mic's shared-mode options: the exclusive mic has its own small period and no Windows effects.
+            Self::LowLatency | Self::RawMic => "For the microphone in shared mode (with the exclusive microphone off, or refused).",
+            Self::KeepAlive => return None,
+        })
+    }
+}
+
+/// Under the latency options: what a refusal does.
+pub(crate) const EXCLUSIVE_FALLBACK: &str =
+    "A device that refuses exclusive mode runs in shared mode, and a note at the top says why and how to fix it.";
 
 /// Everything the settings file holds.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -492,6 +573,54 @@ mod tests {
         let json = serde_json::to_vec_pretty(&s).unwrap();
         assert_eq!(parse(&json).unwrap(), s);
         assert_eq!(parse(&serde_json::to_vec(&Settings::default()).unwrap()).unwrap(), Settings::default());
+    }
+
+    /// The I/O switches: each reads and writes its own field, the latency options are on by default (the owner, 2026-11-02),
+    /// and a change goes through the settings file and back.
+    #[test]
+    fn the_io_switches_round_trip_through_the_settings_file() {
+        let all: Vec<IoSwitch> = IoSwitch::LATENCY.iter().chain(&IoSwitch::STREAMS).copied().collect();
+        let defaults = IoConfig::default();
+        for s in IoSwitch::LATENCY {
+            assert!(s.get(&defaults), "{s:?} on by default");
+            assert!(s.description().is_some_and(|d| d.contains("Turn off")), "{s:?} says when to turn it off");
+        }
+        for s in &all {
+            for on in [false, true] {
+                let mut settings = Settings::default();
+                s.set(&mut settings.engine.io, on);
+                assert_eq!(s.get(&settings.engine.io), on, "{s:?}");
+                // Only its own field
+                for other in all.iter().filter(|o| *o != s) {
+                    assert_eq!(other.get(&settings.engine.io), other.get(&defaults), "{s:?} moved {other:?}");
+                }
+                let back = parse(&serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+                assert_eq!(back, settings, "{s:?} = {on}");
+            }
+        }
+        let labels: Vec<&str> = all.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), labels.iter().collect::<std::collections::HashSet<_>>().len(), "one label each");
+        let mic = IoSwitch::ExclusiveMic.description().unwrap();
+        assert!(mic.starts_with("Lowest latency. While the filter runs, other apps can't open your microphone directly"));
+        assert!(mic.contains("raw microphone"));
+        // Its two other costs (the longer echo floor, and the one-period buffer's glitches) as what to try.
+        assert!(mic.ends_with("With echo cancelling on, if echo gets through or your voice crackles, try turning this off."));
+    }
+
+    /// The latency options came in with off as their default (e074ff7) and went on (the owner, 2026-11-02): a file that
+    /// doesn't name them gets them on, and one that saved them off keeps them off.
+    #[test]
+    fn older_files_get_the_latency_options_on_and_a_saved_off_stays_off() {
+        let old = br#"{"engine": {"devices": {"output": "cable"}, "io": {"raw_mic": false, "output_margin_ms": 3.0}}, "ui": {}}"#;
+        let io = parse(old).unwrap().engine.io;
+        assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output);
+        assert!(!io.raw_mic && io.output_margin_ms == 3.0);
+        let off = br#"{"engine": {"io": {"output_exclusive": false, "mic_exclusive": false, "adaptive_output": false}}}"#;
+        let io = parse(off).unwrap().engine.io;
+        assert!(!io.output_exclusive && !io.mic_exclusive && !io.adaptive_output);
+        let some = br#"{"engine": {"io": {"mic_exclusive": false}}}"#;
+        let io = parse(some).unwrap().engine.io;
+        assert!(io.output_exclusive && !io.mic_exclusive && io.adaptive_output);
     }
 
     #[test]

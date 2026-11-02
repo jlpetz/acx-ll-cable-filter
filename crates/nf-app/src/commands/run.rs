@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use nf_engine::{EngineConfig, EngineState, EngineStatus, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot};
 
 use super::{db, fixed, list_devices};
-use crate::cli::EngineArgs;
+use crate::cli::{ADAPTIVE_WAIT_S, EngineArgs};
 use crate::exit::Failure;
 use crate::{config, console};
 
@@ -15,7 +15,7 @@ pub fn run(args: &EngineArgs) -> Result<(), Failure> {
     let engine = start(&cfg)?;
     say!("{LEGEND}");
     let first = engine.status();
-    let (mut last_message, mut last_warnings) = (first.message, first.warnings);
+    let (mut last_message, mut last_warnings, mut last_notes) = (first.message, first.warnings, first.notes);
     let mut ctrl_c = console::CtrlCWatch::default();
     while !console::sleep_unless_stopped(Duration::from_secs(1)) {
         let status = engine.status();
@@ -26,10 +26,16 @@ pub fn run(args: &EngineArgs) -> Result<(), Failure> {
             last_message = status.message;
         }
         if status.warnings != last_warnings {
-            for line in warning_changes(&last_warnings, &status.warnings) {
+            for line in changes("warning", &last_warnings, &status.warnings) {
                 say!("{line}");
             }
             last_warnings = status.warnings;
+        }
+        if status.notes != last_notes {
+            for line in changes("note", &last_notes, &status.notes) {
+                say!("{line}");
+            }
+            last_notes = status.notes;
         }
         if let Some(w) = ctrl_c.check() {
             say!("{w}");
@@ -42,17 +48,26 @@ pub fn run(args: &EngineArgs) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The longest [`wait_for_adaptive_target`] waits: the adaptive target's window, its longest walk down, and 15 s.
-pub const ADAPTIVE_WAIT_S: u64 = nf_engine::ADAPTIVE_OUTPUT_WINDOW_S + nf_engine::ADAPTIVE_OUTPUT_WALK_S + 15;
-
-/// With `--adaptive-output` a run measures at the fixed output target for its first two minutes before the target can come
-/// down, and then walks down to where it's going (a tenth of the way a second, up to a minute), so `latency` and `quality`
-/// wait for it to settle (up to [`ADAPTIVE_WAIT_S`]) and measure where it settled. Returns true when Ctrl+C cancelled the wait.
-pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig) -> bool {
-    if !cfg.io.adaptive_output {
-        return false;
-    }
+/// Before `latency` or `quality` measures: with the adaptive output target (the default) it measures the delivery at the
+/// fixed target for a run's first two minutes before it can come down, and then walks down to where it's going (a tenth of
+/// the way a second, up to a minute). With `settle` (`--settle`) this waits for it to settle (up to [`ADAPTIVE_WAIT_S`]), so
+/// the test measures where it settled; without, it says the test measures at the fixed start, and returns at once (the
+/// owner, 2026-11-02: the lab commands measure what the product does by default, and needn't wait three minutes for it).
+/// Returns true when Ctrl+C cancelled the wait.
+pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig, settle: bool) -> bool {
     let from = engine.telemetry().output_target_ms;
+    match target_wait(cfg, settle) {
+        TargetWait::Fixed => return false,
+        TargetWait::NothingToSettle => {
+            say!("--settle: the output target is fixed (the config turns the adaptive target off), so there's nothing to wait for.");
+            return false;
+        }
+        TargetWait::AtFixedStart => {
+            say!("{}", at_fixed_start(from));
+            return false;
+        }
+        TargetWait::Settle => {}
+    }
     say!(
         "The adaptive output target measures the delivery for {} s before it can come down, and then walks down for up to {} s: \
          waiting for it to settle (up to {ADAPTIVE_WAIT_S} s; Ctrl+C cancels).",
@@ -84,6 +99,46 @@ pub fn wait_for_adaptive_target(engine: &nf_engine::Engine, cfg: &EngineConfig) 
         fixed(f64::from(from), 1)
     );
     false
+}
+
+/// What a lab test does about the output target before it measures ([`target_wait`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetWait {
+    /// Fixed (`--no-adaptive-output`, or a config): nothing to say or wait for.
+    Fixed,
+    /// Fixed, and `--settle` given: say there's nothing to wait for.
+    NothingToSettle,
+    /// Adaptive, no `--settle`: measure at once, at the target's fixed start, and say so.
+    AtFixedStart,
+    /// Adaptive with `--settle`: wait for it to come down (up to [`ADAPTIVE_WAIT_S`]).
+    Settle,
+}
+
+impl TargetWait {
+    /// Whether the test waits for the target (the chain recorder's limit allows for the wait).
+    pub fn waits(self) -> bool {
+        self == TargetWait::Settle
+    }
+}
+
+/// What `latency` or `quality` does about the output target with `cfg` and `--settle`.
+pub fn target_wait(cfg: &EngineConfig, settle: bool) -> TargetWait {
+    match (cfg.io.adaptive_output, settle) {
+        (false, false) => TargetWait::Fixed,
+        (false, true) => TargetWait::NothingToSettle,
+        (true, false) => TargetWait::AtFixedStart,
+        (true, true) => TargetWait::Settle,
+    }
+}
+
+/// What a test that doesn't wait for the adaptive output target measures: the target at its fixed start, `ms`.
+fn at_fixed_start(ms: f32) -> String {
+    format!(
+        "The adaptive output target is at its fixed start ({} ms) and can come down only after {} s of running: measuring now, \
+         at the fixed start. --settle waits for it first (up to {ADAPTIVE_WAIT_S} s).",
+        fixed(f64::from(ms), 1),
+        nf_engine::ADAPTIVE_OUTPUT_WINDOW_S
+    )
 }
 
 /// Seconds the adaptive target must hold still, after it has moved, to count as settled: its walk moves it every second
@@ -119,9 +174,10 @@ impl TargetWatch {
     }
 }
 
-/// What changed in the engine's standing warnings: each new one, then each one that has cleared.
-pub fn warning_changes(old: &[String], new: &[String]) -> Vec<String> {
-    let added = new.iter().filter(|w| !old.contains(w)).map(|w| format!("warning: {w}"));
+/// What changed in the engine's standing warnings or notes (`kind`: "warning" or "note"): each new one, then each one that
+/// has cleared.
+pub fn changes(kind: &str, old: &[String], new: &[String]) -> Vec<String> {
+    let added = new.iter().filter(|w| !old.contains(w)).map(|w| format!("{kind}: {w}"));
     let cleared = old.iter().filter(|w| !new.contains(w)).map(|w| format!("cleared: {w}"));
     added.chain(cleared).collect()
 }
@@ -149,12 +205,12 @@ pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig) -> Result<()
 /// What the status line's columns are.
 pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS; latency median/p95 (mic capture to cable play-out), \
      then its budget's means in ms [mic delivery+wait+output queue+render side] (the chain's offset, given at the start, \
-     isn't in it), and with --adaptive-output the output queue's target now; CPU p99 per block; drift output/reference; \
-     with an echo reference, its lead/target in ms (how long before the mic block it was tapped; 'by delivery' without \
-     trusted stamps, 'high' over 30 ms, which a speaker's echo path may not cover); dropouts mic/output/reference, then, \
-     once there are any, mic stalls (100 ms with no packet) and coarse corrections, output/reference (whole blocks dropped \
-     to catch up; on the reference, jumps of its timeline); 'excl', then the streams in WASAPI exclusive mode (out, mic); \
-     real-time heap allocations (pool allocations per second). Ctrl+C stops.";
+     isn't in it), and with the adaptive output target (unless --no-adaptive-output) the output queue's target now; CPU \
+     p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic block \
+     it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not cover); \
+     dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse corrections, \
+     output/reference (whole blocks dropped to catch up; on the reference, jumps of its timeline); 'excl', then the streams \
+     in WASAPI exclusive mode (out, mic); real-time heap allocations (pool allocations per second). Ctrl+C stops.";
 
 /// One line of live telemetry. `retrying`: stopped by a fault, with the engine set to restart by
 /// itself (`EngineStatus::retrying`).
@@ -216,7 +272,8 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool) -> String {
         }
     }
     format!(
-        "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}{target}  cpu {} µs  drift {}/{} ppm{reference}  drops {}/{}/{}{rare}{modes}  rt {} ({}/s)",
+        "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}{target}  cpu {} µs  drift {}/{} ppm{reference}  \
+         drops {}/{}/{}{rare}{modes}  rt {} ({}/s)",
         db(t.input.peak_dbfs),
         db(t.input.rms_dbfs),
         db(t.output.peak_dbfs),
@@ -253,13 +310,13 @@ pub fn describe_config(cfg: &EngineConfig) -> String {
         nf_engine::GateMode::Auto => format!("auto, {} dB over the noise floor", fixed(f64::from(p.gate.auto_margin_db), 1)),
     };
     let io = &cfg.io;
-    let asked: Vec<&str> =
-        [(io.output_exclusive, "exclusive output"), (io.mic_exclusive, "exclusive mic"), (io.adaptive_output, "adaptive output target")]
-            .iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, what)| *what)
-            .collect();
-    let latency = if asked.is_empty() { String::new() } else { format!("; {}", asked.join(", ")) };
+    let mode = |exclusive: bool| if exclusive { "exclusive" } else { "shared" };
+    let latency = format!(
+        "; {} output, {} mic, {} output target",
+        mode(io.output_exclusive),
+        mode(io.mic_exclusive),
+        if io.adaptive_output { "adaptive" } else { "fixed" }
+    );
     format!(
         "Starting: mic {}, output {}{}; noise filter {}, floor {} dB, gate {gate}{latency}",
         or_default(&cfg.devices.mic),
@@ -286,7 +343,8 @@ pub fn describe_status(s: &EngineStatus) -> String {
     if let Some(m) = &s.message {
         lines.push(format!("note: {m}"));
     }
-    lines.extend(warning_changes(&[], &s.warnings));
+    lines.extend(changes("warning", &[], &s.warnings));
+    lines.extend(changes("note", &[], &s.notes));
     lines.join("\n")
 }
 
@@ -316,6 +374,30 @@ pub fn stream_text(s: &StreamInfo) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The lab tests measure what the product does by default, at once: the adaptive target at its fixed start, which they
+    /// say; `--settle` waits for it (and only then does the chain recorder allow for the wait); a fixed target has nothing
+    /// to wait for.
+    #[test]
+    fn the_lab_tests_wait_for_the_adaptive_target_only_with_settle() {
+        use super::{TargetWait, target_wait};
+        let mut cfg = super::EngineConfig::default();
+        assert_eq!(target_wait(&cfg, false), TargetWait::AtFixedStart, "the default: adaptive, measured at once");
+        assert_eq!(target_wait(&cfg, true), TargetWait::Settle);
+        cfg.io.adaptive_output = false;
+        assert_eq!(target_wait(&cfg, false), TargetWait::Fixed);
+        assert_eq!(target_wait(&cfg, true), TargetWait::NothingToSettle);
+        let waits: Vec<bool> = [TargetWait::Fixed, TargetWait::NothingToSettle, TargetWait::AtFixedStart, TargetWait::Settle]
+            .iter()
+            .map(|w| w.waits())
+            .collect();
+        assert_eq!(waits, [false, false, false, true]);
+        assert_eq!(
+            super::at_fixed_start(14.0),
+            "The adaptive output target is at its fixed start (14.0 ms) and can come down only after 120 s of running: measuring \
+             now, at the fixed start. --settle waits for it first (up to 188 s)."
+        );
+    }
+
     /// The adaptive target's wait: nothing until it has moved, then settled once it holds still for 3 s; a walk's steps
     /// (every second) keep it waiting, and a stopped engine's 0 doesn't count.
     #[test]
@@ -418,33 +500,41 @@ mod tests {
         let line = status_line(&shared, false);
         assert!(line.contains("[10.3+0.0+5.0+3.0]  cpu") && line.contains("drops 0/0/0  excl mic  rt"), "{line}");
         assert!(!status_line(&TelemetrySnapshot { mic_exclusive: false, ..shared }, false).contains("excl"));
-        assert!(LEGEND.contains("--adaptive-output") && LEGEND.contains("'excl'"));
+        assert!(LEGEND.contains("--no-adaptive-output") && LEGEND.contains("'excl'"));
     }
 
     #[test]
     fn warnings_are_printed_when_they_change() {
         let s = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
-        assert!(warning_changes(&s(&["a"]), &s(&["a"])).is_empty());
-        assert_eq!(warning_changes(&[], &s(&["the echo reference was lost"])), ["warning: the echo reference was lost"]);
-        assert_eq!(warning_changes(&s(&["a", "b"]), &s(&["b", "c"])), ["warning: c", "cleared: a"]);
-        assert_eq!(warning_changes(&s(&["a"]), &[]), ["cleared: a"]);
+        assert!(changes("warning", &s(&["a"]), &s(&["a"])).is_empty());
+        assert_eq!(changes("warning", &[], &s(&["the echo reference was lost"])), ["warning: the echo reference was lost"]);
+        assert_eq!(changes("warning", &s(&["a", "b"]), &s(&["b", "c"])), ["warning: c", "cleared: a"]);
+        assert_eq!(changes("warning", &s(&["a"]), &[]), ["cleared: a"]);
+        // The notes (a stream that runs shared, not exclusive) the same way, as "note:"
+        assert_eq!(changes("note", &[], &s(&["The microphone runs in shared mode"])), ["note: The microphone runs in shared mode"]);
     }
 
     #[test]
     fn the_start_lines_say_what_runs() {
         let mut cfg = EngineConfig::default();
         cfg.devices.output = Some("{cable}".into());
-        assert_eq!(describe_config(&cfg), "Starting: mic the default, output {cable}; noise filter on, floor -60 dB, gate off");
+        assert_eq!(
+            describe_config(&cfg),
+            "Starting: mic the default, output {cable}; noise filter on, floor -60 dB, gate off; exclusive output, exclusive mic, \
+             adaptive output target"
+        );
         cfg.processing = ProcessingConfig { aec_enabled: true, noise_enabled: false, floor_db: -20.0, ..Default::default() };
         cfg.processing.gate.mode = GateMode::Static;
         cfg.processing.gate.threshold_db = -45.0;
+        cfg.io.mic_exclusive = false;
+        cfg.io.adaptive_output = false;
         assert_eq!(
             describe_config(&cfg),
-            "Starting: mic the default, output {cable}, echo cancel on (reference the default); noise filter off, floor -20 dB, gate static at -45.0 dBFS"
+            "Starting: mic the default, output {cable}, echo cancel on (reference the default); noise filter off, floor -20 dB, gate \
+             static at -45.0 dBFS; exclusive output, shared mic, fixed output target"
         );
-        cfg.io.output_exclusive = true;
-        cfg.io.adaptive_output = true;
-        assert!(describe_config(&cfg).ends_with("gate static at -45.0 dBFS; exclusive output, adaptive output target"));
+        cfg.io.output_exclusive = false;
+        assert!(describe_config(&cfg).ends_with("gate static at -45.0 dBFS; shared output, shared mic, fixed output target"));
         let out = StreamInfo {
             device_name: "CABLE Input".into(),
             sample_rate: 48_000,
@@ -477,13 +567,14 @@ mod tests {
             chain_latency_ms: 10.0,
             message: Some("the reference couldn't be opened".into()),
             warnings: vec!["the mic is the output cable's own recording side".into()],
+            notes: vec!["The microphone (Mic) runs in shared mode: ...".into()],
             ..Default::default()
         };
         assert_eq!(
             describe_status(&s),
             "Mic        Mic (48000 Hz, 2 ch, period 3.33 ms, low-latency period, RAW)\nOutput     --\n\
              Engine     large pages (32 MiB); MMCSS Pro Audio; chain 10.00 ms\nnote: the reference couldn't be opened\n\
-             warning: the mic is the output cable's own recording side"
+             warning: the mic is the output cable's own recording side\nnote: The microphone (Mic) runs in shared mode: ..."
         );
     }
 }

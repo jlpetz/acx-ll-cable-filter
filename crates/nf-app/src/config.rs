@@ -193,24 +193,43 @@ mod tests {
         assert_eq!((p.gate.mode, p.gate.threshold_db), (GateMode::Auto, -40.0));
     }
 
-    /// The latency options go over the config's: given ones win, the rest keep the file's (or the defaults: all off).
+    /// The latency options go over the config's: given ones win, the rest keep the file's, or the defaults (all on: the
+    /// owner, 2026-11-02).
     #[test]
     fn the_latency_options_override_the_config() {
         let mut io = nf_engine::IoConfig::default();
-        assert!(!io.output_exclusive && !io.mic_exclusive && !io.adaptive_output, "off by default");
-        IoOptions { output_exclusive: Some(true), mic_exclusive: None, adaptive_output: Some(true) }.apply(&mut io);
-        assert!(io.output_exclusive && !io.mic_exclusive && io.adaptive_output);
-        IoOptions { output_exclusive: Some(false), ..Default::default() }.apply(&mut io);
-        assert!(!io.output_exclusive && io.adaptive_output);
-        let c = parse(r#"{"io": {"mic_exclusive": true}}"#).unwrap();
-        assert!(c.io.mic_exclusive && !c.io.output_exclusive, "from a settings file");
-        let args = EngineArgs {
-            output: Some("{ren-3}".into()),
-            io: IoOptions { output_exclusive: Some(true), ..Default::default() },
-            ..Default::default()
+        assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output, "on by default");
+        IoOptions::default().apply(&mut io);
+        assert_eq!(io, nf_engine::IoConfig::default(), "nothing given changes nothing");
+        IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) }.apply(&mut io);
+        assert!(!io.output_exclusive && io.mic_exclusive && !io.adaptive_output);
+        IoOptions { output_exclusive: Some(true), ..Default::default() }.apply(&mut io);
+        assert!(io.output_exclusive && !io.adaptive_output);
+        let with = |file: &str, io: IoOptions| {
+            let dir = crate::test_dir("config-io");
+            let path = dir.join("settings.json");
+            std::fs::write(&path, file).unwrap();
+            let args = EngineArgs { config: Some(path), output: Some("{ren-3}".into()), io, ..Default::default() };
+            let c = engine_config(&args, || Ok(devices())).unwrap().io;
+            let _ = std::fs::remove_dir_all(dir);
+            (c.output_exclusive, c.mic_exclusive, c.adaptive_output)
         };
+        // The defaults, through a file that names none of them (an older settings file or engine config) and with no flag
+        assert_eq!(with(r#"{"engine": {"io": {"raw_mic": false}}}"#, IoOptions::default()), (true, true, true));
+        assert_eq!(with("{}", IoOptions::default()), (true, true, true));
+        // A file's false stays false, and a flag goes over the file either way
+        let off = r#"{"engine": {"io": {"output_exclusive": false, "mic_exclusive": false, "adaptive_output": false}}}"#;
+        assert_eq!(with(off, IoOptions::default()), (false, false, false));
+        let on = IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: None };
+        assert_eq!(with(off, on), (true, true, false));
+        let bare = r#"{"io": {"mic_exclusive": false}}"#;
+        assert_eq!(with(bare, IoOptions::default()), (true, false, true), "a bare engine config");
+        let no = IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) };
+        assert_eq!(with(bare, no.clone()), (false, false, false));
+        // Without a file, the flags over the defaults
+        let args = EngineArgs { output: Some("{ren-3}".into()), io: no, ..Default::default() };
         let c = engine_config(&args, || Ok(devices())).unwrap();
-        assert!(c.io.output_exclusive && !c.io.adaptive_output);
+        assert!(!c.io.output_exclusive && c.io.mic_exclusive && !c.io.adaptive_output);
     }
 
     #[test]

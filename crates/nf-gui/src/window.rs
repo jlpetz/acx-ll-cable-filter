@@ -27,11 +27,12 @@ use windows_reactor::*;
 use crate::devices::{self, DeviceChoices, Picker};
 use crate::live::{Live, LiveInput};
 use crate::settings::{
-    ATTACK_MS, FLOOR_DB, HOLD_MS, MARGIN_DB, MAX_REPETITIONS, MIN_HEIGHT, MIN_REPETITIONS, MIN_WIDTH, OUTPUT_MARGIN_MS, RANGE_DB,
-    RELEASE_MS, SaverHandle, Settings, THRESHOLD_DB, TestMode,
+    ATTACK_MS, EXCLUSIVE_FALLBACK, FLOOR_DB, HOLD_MS, IoSwitch, MARGIN_DB, MAX_REPETITIONS, MIN_HEIGHT, MIN_REPETITIONS, MIN_WIDTH,
+    OUTPUT_MARGIN_MS, RANGE_DB, RELEASE_MS, SaverHandle, Settings, THRESHOLD_DB, TestMode,
 };
 use crate::widgets::{
-    MAX_CONTENT, PAGE_MARGIN, SECTION_SPACING, card, combo, device_combo, secondary, selectable, slider, switch, track_width,
+    MAX_CONTENT, PAGE_MARGIN, SECTION_SPACING, card, combo, described_switch, device_combo, secondary, selectable, slider, switch,
+    track_width,
 };
 use crate::{SharedEngine, format, screen, waiting};
 
@@ -123,9 +124,8 @@ pub(crate) enum Msg {
     /// Run, or cancel the running test.
     RunTest,
     // Diagnostics
-    LowLatency(bool),
-    RawMic(bool),
-    KeepAlive(bool),
+    /// One of the I/O switches (the latency options, and the streams' others).
+    Io(IoSwitch, bool),
     OutputMargin(f64),
     EnableLargePages,
     // Window
@@ -201,29 +201,34 @@ impl FaultWatch {
     }
 }
 
-/// The warnings InfoBar: the engine's warnings while it runs ([`format::warnings`]). Closing it
-/// hides that list of warnings; a changed list shows again, and so does the same one in a later
+/// The warnings InfoBar: the engine's warnings and notes while it runs ([`format::warnings`]).
+/// Closing it hides that list; a changed list shows again, and so does the same one in a later
 /// run.
 #[derive(Debug, Default)]
 struct WarningsBar {
-    /// The list the user closed the bar on.
+    /// The list the user closed the bar on: the warnings, then the notes.
     dismissed: Vec<String>,
+}
+
+/// The engine's standing warnings, then its notes.
+fn standing(status: &EngineStatus) -> Vec<String> {
+    [status.warnings.as_slice(), status.notes.as_slice()].concat()
 }
 
 impl WarningsBar {
     fn observe(&mut self, status: &EngineStatus) {
-        if status.state != EngineState::Running || status.warnings.is_empty() {
+        if status.state != EngineState::Running || (status.warnings.is_empty() && status.notes.is_empty()) {
             self.dismissed.clear();
         }
     }
 
     fn dismiss(&mut self, status: &EngineStatus) {
-        self.dismissed.clone_from(&status.warnings);
+        self.dismissed = standing(status);
     }
 
-    /// The bar's title and text, when it's open.
-    fn shown(&self, status: &EngineStatus) -> Option<(&'static str, String)> {
-        format::warnings(status).filter(|_| status.warnings != self.dismissed)
+    /// The bar's tone, title and text, when it's open.
+    fn shown(&self, status: &EngineStatus) -> Option<(format::Tone, &'static str, String)> {
+        format::warnings(status).filter(|_| standing(status) != self.dismissed)
     }
 }
 
@@ -771,9 +776,7 @@ impl Component for Window {
             }
             Msg::Repetitions(_) => {}
             Msg::RunTest => self.run_or_cancel_test(context),
-            Msg::LowLatency(on) => self.configure(|c| c.io.low_latency_periods = on),
-            Msg::RawMic(on) => self.configure(|c| c.io.raw_mic = on),
-            Msg::KeepAlive(on) => self.configure(|c| c.io.keep_alive_reference = on),
+            Msg::Io(switch, on) => self.configure(|c| switch.set(&mut c.io, on)),
             Msg::OutputMargin(v) => self.configure(|c| c.io.output_margin_ms = OUTPUT_MARGIN_MS.clamp(v as f32, c.io.output_margin_ms)),
             Msg::EnableLargePages => self.enable_large_pages(context),
             // InfoBar.IsOpen has no feedback: clear it, so the next notice is a change Reactor applies
@@ -873,13 +876,18 @@ impl Window {
         ))
     }
 
-    /// The engine's warnings while it runs; closed when they clear (or the user closes it).
+    /// The engine's warnings and notes while it runs; closed when they clear (or the user closes it). Notes alone (a stream
+    /// that runs shared, not exclusive) are informational.
     fn warnings_bar(&self, context: &ViewContext<Self>) -> View {
         let shown = self.warnings.shown(&self.status);
         let open = shown.is_some();
-        let (title, message) = shown.unwrap_or_default();
+        let (tone, title, message) = shown.unwrap_or((format::Tone::Warning, "", String::new()));
+        let severity = match tone {
+            format::Tone::Warning => InfoBarSeverity::Warning,
+            format::Tone::Note => InfoBarSeverity::Informational,
+        };
         InfoBar::new()
-            .severity(InfoBarSeverity::Warning)
+            .severity(severity)
             .title(title)
             .message(message)
             .is_open(open)
@@ -1088,11 +1096,24 @@ impl Window {
         let io = &self.settings.engine.io;
         let facts = format::diagnostics(&self.status).into_iter().enumerate().map(|(i, line)| (i, selectable(line)));
         let note: View = if self.large_pages_set_up { secondary("Sign out and back in to apply.").into() } else { View::empty() };
+        // Each switch keyed by itself, with its line under it where it has one
+        let io_switch = |s: IoSwitch| {
+            let view = match s.description() {
+                Some(d) => described_switch(s.label(), d, s.get(io), io_callback(context, s)),
+                None => switch(s.label(), s.get(io), io_callback(context, s)),
+            };
+            (s as usize, view)
+        };
+        let (latency, streams) = (IoSwitch::LATENCY.map(io_switch), IoSwitch::STREAMS.map(io_switch));
+        let heading =
+            |text: &'static str| TextBlock::new().text(text).font_weight(FontWeight::SEMI_BOLD).margin(Thickness::new(0.0, 6.0, 0.0, 0.0));
         let body = StackPanel::new().spacing(12.0).children((
             StackPanel::new().spacing(2.0).keyed_children(facts),
-            switch("Low-latency periods (IAudioClient3)", io.low_latency_periods, context.callback(Msg::LowLatency)),
-            switch("RAW mic", io.raw_mic, context.callback(Msg::RawMic)),
-            switch("Keep reference alive", io.keep_alive_reference, context.callback(Msg::KeepAlive)),
+            heading("Latency"),
+            StackPanel::new().spacing(12.0).keyed_children(latency),
+            secondary(EXCLUSIVE_FALLBACK),
+            heading("Streams"),
+            StackPanel::new().spacing(12.0).keyed_children(streams),
             slider(
                 format::labelled("Output margin (ms)", io.output_margin_ms, 1, ""),
                 OUTPUT_MARGIN_MS,
@@ -1113,6 +1134,19 @@ impl Window {
         Expander::new()
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .slots([SlotView::new(ExpanderSlot::Header, "Diagnostics"), SlotView::new(ExpanderSlot::Content, body)])
+    }
+}
+
+/// A switch's callback. Each arm's mapper captures nothing, so it keeps its identity across renders (Reactor's
+/// `callback`: a capturing closure's would change at each one).
+fn io_callback(context: &ViewContext<Window>, switch: IoSwitch) -> Callback<bool> {
+    match switch {
+        IoSwitch::ExclusiveOutput => context.callback(|on| Msg::Io(IoSwitch::ExclusiveOutput, on)),
+        IoSwitch::ExclusiveMic => context.callback(|on| Msg::Io(IoSwitch::ExclusiveMic, on)),
+        IoSwitch::AdaptiveOutput => context.callback(|on| Msg::Io(IoSwitch::AdaptiveOutput, on)),
+        IoSwitch::LowLatency => context.callback(|on| Msg::Io(IoSwitch::LowLatency, on)),
+        IoSwitch::RawMic => context.callback(|on| Msg::Io(IoSwitch::RawMic, on)),
+        IoSwitch::KeepAlive => context.callback(|on| Msg::Io(IoSwitch::KeepAlive, on)),
     }
 }
 
@@ -1297,7 +1331,7 @@ mod tests {
         let lost = "The echo reference was lost".to_owned();
         let mut status = EngineStatus { state: S::Running, warnings: vec![lost.clone()], ..EngineStatus::default() };
         bar.observe(&status);
-        assert_eq!(bar.shown(&status), Some(("Running with a warning", lost.clone())));
+        assert_eq!(bar.shown(&status), Some((format::Tone::Warning, "Running with a warning", lost.clone())));
 
         // Closed by the user: hidden while the same list holds, shown again when it changes
         bar.dismiss(&status);
@@ -1305,7 +1339,7 @@ mod tests {
         assert_eq!(bar.shown(&status), None);
         status.warnings.push("MMCSS isn't available".to_owned());
         bar.observe(&status);
-        assert_eq!(bar.shown(&status).map(|(title, _)| title), Some("Running with warnings"));
+        assert_eq!(bar.shown(&status).map(|(_, title, _)| title), Some("Running with warnings"));
 
         // They clear: the bar closes, and the same warning coming back later shows again
         bar.dismiss(&status);
@@ -1315,6 +1349,18 @@ mod tests {
         status.warnings = vec![lost];
         bar.observe(&status);
         assert!(bar.shown(&status).is_some());
+
+        // A note (a stream that runs shared, not exclusive) alone: informational; closed, it stays closed until the list
+        // changes, as the warnings do
+        status.warnings.clear();
+        status.notes = vec!["The microphone (Mic) runs in shared mode: ...".to_owned()];
+        bar.observe(&status);
+        assert_eq!(bar.shown(&status).map(|(tone, title, _)| (tone, title)), Some((format::Tone::Note, "Running with a note")));
+        bar.dismiss(&status);
+        bar.observe(&status);
+        assert_eq!(bar.shown(&status), None);
+        status.warnings = vec!["MMCSS isn't available".to_owned()];
+        assert!(bar.shown(&status).is_some_and(|(tone, _, text)| tone == format::Tone::Warning && text.ends_with("shared mode: ...")));
 
         // Only while running
         status.state = S::Stopped;

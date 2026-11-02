@@ -76,6 +76,9 @@ pub(crate) enum ExclusiveRefusal {
     /// Every period tried ([`exclusive_periods`], from the shortest to the longest, 100 ns) was refused, the last with
     /// this HRESULT.
     Periods { hr: Hr, shortest_hns: i64, longest_hns: i64 },
+    /// Not tried: the output is Windows' default playback device, which the filter never takes to itself, as no other app
+    /// could play sound then (`audio::output_check`'s warning says so).
+    DefaultPlayback,
 }
 
 /// What a refused exclusive initialise leaves to try ([`first_exclusive`]).
@@ -150,6 +153,17 @@ pub(crate) fn first_exclusive<F, T>(
     })
 }
 
+/// The formats to initialise, best first: those `IsFormatSupported` took (each in the form it took), or every candidate as
+/// built when it took none. The check can't say why it refuses (wasapi's quirks retry folds every failure into "unsupported",
+/// and Microsoft documents no other answer for it), but the initialise refuses a device that another app holds, or that
+/// Windows keeps from exclusive control, with its own code (`AUDCLNT_E_DEVICE_IN_USE`, `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`):
+/// the note can then say which, where "it takes none of the formats" would send the user looking at the wrong thing. A device
+/// that takes none refuses each initialise with `AUDCLNT_E_UNSUPPORTED_FORMAT` ([`first_exclusive`] goes on to the next
+/// format): three initialises more, at the start.
+pub(crate) fn formats_to_try<F>(accepted: Vec<F>, candidates: impl FnOnce() -> Vec<F>) -> Vec<F> {
+    if accepted.is_empty() { candidates() } else { accepted }
+}
+
 /// The exclusive period, in frames at 48 kHz, for a device whose default and minimum periods (`GetDevicePeriod`, 100 ns)
 /// are these: the smallest period from the minimum (and from [`MIN_PERIOD_FRAMES`]) that divides the block and isn't
 /// past the default, else that lower bound itself. A period that tiles the block makes the mic's packets end where its
@@ -169,7 +183,8 @@ pub(crate) fn exclusive_period(default_hns: i64, min_hns: i64) -> usize {
 }
 
 /// Opens a stream exclusive-first: `exclusive` when `want` (and it works), else `shared`. A refused exclusive open falls
-/// back to shared mode with the warning that says why; a failed shared open is the start's failure, as without the option.
+/// back to shared mode with the note that says why (`Warning::ExclusiveUnavailable`, a note: `Warning::is_note`); a failed
+/// shared open is the start's failure, as without the option.
 pub(crate) fn exclusive_or_shared<T, E>(
     want: bool, role: StreamRole, device: &str, exclusive: impl FnOnce() -> Result<T, ExclusiveRefusal>,
     shared: impl FnOnce() -> Result<T, E>,
@@ -459,6 +474,30 @@ mod tests {
         assert_eq!(first_exclusive(&none, &periods, |_, _| Ok(())), Err(ExclusiveRefusal::NoFormat));
     }
 
+    /// A format check that took nothing leaves the initialise to say why: in use and not allowed come back as themselves
+    /// (each ends the tries at once), and a device that takes no format still reads as one.
+    #[test]
+    fn a_check_that_takes_no_format_leaves_the_initialise_to_say_why() {
+        assert_eq!(formats_to_try(vec!["16-bit"], || panic!("the check took one")), ["16-bit"]);
+        let all = || vec!["f32", "24-bit", "16-bit"];
+        assert_eq!(formats_to_try(Vec::new(), all), all());
+        let periods = [20_000, 100_000];
+        for code in [hr::AUDCLNT_E_DEVICE_IN_USE, hr::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED] {
+            let mut n = 0;
+            let r = first_exclusive(&formats_to_try(Vec::new(), all), &periods, |_, _| -> Result<(), Hr> {
+                n += 1;
+                Err(code)
+            });
+            assert_eq!((r, n), (Err(ExclusiveRefusal::Refused(code)), 1));
+        }
+        let mut n = 0;
+        let r = first_exclusive(&formats_to_try(Vec::new(), all), &periods, |_, _| -> Result<(), Hr> {
+            n += 1;
+            Err(hr::AUDCLNT_E_UNSUPPORTED_FORMAT)
+        });
+        assert_eq!((r, n), (Err(ExclusiveRefusal::Refused(hr::AUDCLNT_E_UNSUPPORTED_FORMAT)), 3), "one try a format");
+    }
+
     #[test]
     fn formats_are_tried_best_first() {
         assert_eq!(ExclusiveFormat::ALL, [ExclusiveFormat::F32, ExclusiveFormat::I24In32, ExclusiveFormat::I16]);
@@ -466,11 +505,11 @@ mod tests {
         assert_eq!(ExclusiveFormat::I16.label(), "16-bit");
     }
 
-    /// A refused exclusive open gives the shared stream and a warning that names the device and why; one that works, or
-    /// isn't asked for, no warning; and a shared open that fails after a refusal fails the start, as it would without the
+    /// A refused exclusive open gives the shared stream and a note that names the device and why; one that works, or
+    /// isn't asked for, none; and a shared open that fails after a refusal fails the start, as it would without the
     /// option.
     #[test]
-    fn a_refused_exclusive_open_falls_back_to_shared_with_a_warning() {
+    fn a_refused_exclusive_open_falls_back_to_shared_with_a_note() {
         let shared = || Ok::<_, Hr>("shared");
         let granted = || Ok::<_, ExclusiveRefusal>("exclusive");
         let in_use = || Err::<&str, _>(ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE));
@@ -485,11 +524,10 @@ mod tests {
             why: ExclusiveRefusal::Refused(hr::AUDCLNT_E_DEVICE_IN_USE)
         });
         let text = describe_warning(&w);
-        assert!(text.starts_with("The output device (CABLE Input) couldn't be opened in exclusive mode"), "{text}");
-        assert!(text.contains("another app") && text.contains("shared mode"), "{text}");
+        assert!(text.starts_with("The output device (CABLE Input) runs in shared mode: another app is using it"), "{text}");
         let (_, w) = exclusive_or_shared(true, StreamRole::Mic, "Mic", || Err::<&str, _>(ExclusiveRefusal::NoFormat), shared).unwrap();
         let text = describe_warning(&w.unwrap());
-        assert!(text.starts_with("The microphone (Mic) couldn't be opened in exclusive mode") && text.contains("16-bit"), "{text}");
+        assert!(text.starts_with("The microphone (Mic) runs in shared mode") && text.contains("16-bit"), "{text}");
         let failed = exclusive_or_shared(true, StreamRole::Output, "x", in_use, || Err::<&str, Hr>(hr::AUDCLNT_E_DEVICE_INVALIDATED));
         assert_eq!(failed, Err(hr::AUDCLNT_E_DEVICE_INVALIDATED));
     }

@@ -83,6 +83,11 @@ pub(crate) fn switch(header: &'static str, on: bool, on_toggled: Callback<bool>)
     ToggleSwitch::new().is_on(on).on_toggled(on_toggled).slot(ToggleSwitchSlot::Header, header)
 }
 
+/// A ToggleSwitch with its header above and, under it, a dimmed line saying what it does and costs.
+pub(crate) fn described_switch(header: &'static str, description: &'static str, on: bool, on_toggled: Callback<bool>) -> View {
+    StackPanel::new().spacing(2.0).children((switch(header, on, on_toggled), secondary(description)))
+}
+
 /// A slider over `span`, with its value in the header. `value` is clamped into the span first, so
 /// a stray value can't make WinUI coerce it (and echo the coerced value back).
 pub(crate) fn slider(header: String, span: Span, value: f32, enabled: bool, on_change: Callback<f64>) -> View {
@@ -156,5 +161,6 @@ mod tests {
         let bad = DeviceChoices { labels: vec!["a".to_owned()], ids: vec![None], selected: Some(3), key: 1 };
         let _ = device_combo("x", &bad, "p", true, pick());
         let _ = card("t", Some(show_switch("s", true, Callback::new(|_: bool| {}))), secondary("x"));
+        let _ = described_switch("h", "d", false, Callback::new(|_: bool| {}));
     }
 }

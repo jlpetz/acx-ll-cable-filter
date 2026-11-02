@@ -33,7 +33,8 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
 - `control`: `Inner` (telemetry, status, the command channel, the audio-thread handle),
   `start/stop/apply/status`, and status messages worded for the user. The control thread owns:
   - a device-change listener (`DeviceEventCallbacks`) that restarts on removal, a followed default's
-    change, an explicit reference's arrival, or a property change of a lost reference;
+    change, the default playback device moving to or from the output, an explicit reference's
+    arrival, or a property change of a lost reference;
   - a timed retry with backoff (0.5 s doubling to 10 s) after a fault or a failed start with a
     transient cause. The backoff starts over only after a run has stayed up 30 s, so a mic that
     opens but sends nothing backs off instead of restarting every 2.5 s;
@@ -143,10 +144,10 @@ Never allocate, lock, log or make blocking calls inside the loop:
 
 **Targets:**
 - Output render target = one render period + one block + `io.output_margin_ms`, measured before
-  each block's write: 22 ms at a shared 10 ms period, 14 ms at an exclusive 2 ms one. (Whether one period + the margin
-  is enough is to be measured on a real cable: it would take a block, 10 ms, off the latency. In the event simulation
-  it is for steady delivery and isn't for a bursty mic's missed wakes: TODO 13's detail, "Budget".) With
-  `io.adaptive_output` it moves: "The output target" below.
+  each block's write: 22 ms at a shared 10 ms period, 14 ms at an exclusive 2 ms one (the default). (Whether one
+  period + the margin is enough is to be measured on a real cable: it would take a block, 10 ms, off the latency. In the
+  event simulation it is for steady delivery and isn't for a bursty mic's missed wakes: TODO 13's detail, "Budget".)
+  With `io.adaptive_output` (the default) it moves: "The output target" below.
 - Reference lead target: one loopback period + 2 ms to start with; it can rise in the first 2.5 s
   and when underflows persist, up to 50 ms, and comes back down after five minutes under ("The
   reference" below).
@@ -158,7 +159,10 @@ in reverse order and the thread goes back to waiting. MMCSS and COM stay with th
 engine is dropped.
 
 ## Exclusive mode (`exclusive.rs`, `stream.rs`; TODO 13)
-Opt-in, each side on its own: `io.output_exclusive` (`--exclusive-output`) and `io.mic_exclusive` (`--exclusive-mic`).
+Each side on its own, both **on by default** (the owner, 2026-11-02: "by default apply the lowest processing default ...
+some users may want to toggle it off for recording streams etc. Though as long as the final output is not exclusive that
+shouldn't be a problem most of the time"; the final output, the cable's recording side that the apps read, stays shared):
+`io.output_exclusive` (`--no-exclusive-output` turns it off) and `io.mic_exclusive` (`--no-exclusive-mic`).
 The aim is the render side and the mic's delivery: in shared mode the audio engine's pass sits between us and the device
 on each side (the cables' render side read 26 ms, the mic 16), and exclusive mode reaches the driver directly.
 - **Opening:** the first of 32-bit float, 24 bits in 32, 16-bit that the device takes at 48 kHz and its mix's channel
@@ -170,11 +174,35 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
   `AUDCLNT_E_BUFFER_SIZE_ERROR`, `E_INVALIDARG`) tries the device's minimum next (VB-CABLE's capture side: the 3 ms the
   probe saw it take, should it refuse 3.33) and then its default; a format `IsFormatSupported` took and the initialise
   refused tries the next format (`exclusive::first_exclusive`). Each try is on a fresh client, and a driver that wants its
-  buffer aligned (`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`) is retried once at the size its failed client gives.
+  buffer aligned (`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`) is retried once at the size its failed client gives. When the check
+  takes no format at all, every format is tried at the initialise anyway (`exclusive::formats_to_try`): the check can't say
+  why it refuses (wasapi's quirks retry folds it into "unsupported", and Microsoft documents no other answer), while the
+  initialise refuses a device another app holds, or one Windows keeps from exclusive control, with its own code, so the
+  note names the real cause rather than "no format" (three initialises more for a device that really takes none).
 - **Falling back:** a refusal (no format, the device in use, exclusive control not allowed, every period tried) opens the
-  stream in shared mode as without the option, with `Warning::ExclusiveUnavailable` saying which and why in the status
-  (the window's warnings, `run`'s "warning:" line; for the periods, "it refused every period tried, 2.00 ms to 10.00 ms
-  (error ...)"). A shared open that fails then is the start's failure, as before.
+  stream in shared mode as without the option, with `Warning::ExclusiveUnavailable`, which is a **note**
+  (`Warning::is_note`, `EngineStatus::notes`), not a warning: with exclusive mode the default, a refusal is ordinary. It
+  says which stream, why (`describe_refusal`: another app holds it, `AUDCLNT_E_DEVICE_IN_USE`; exclusive control turned
+  off for the device, `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`; no format, `AUDCLNT_E_UNSUPPORTED_FORMAT`; the short period,
+  `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`, `AUDCLNT_E_INVALID_DEVICE_PERIOD`, `AUDCLNT_E_BUFFER_SIZE_ERROR`; for the periods,
+  "it refused every period tried, 2.00 ms to 10.00 ms (error ...)"; anything else by its code), that it works as usual with
+  more latency (the A/B on the cables: 20-30 ms for the output, 10-20 for the mic, depending on the other stream's mode),
+  and what to do: to get exclusive mode, close the app that holds it and restart the filter (or start the filter before
+  that app next time), or tick "Allow applications to take exclusive control of this device" (Sound control panel, the
+  device's Properties > Advanced) and restart; to stop it trying, turn the stream's option off (the window's Diagnostics >
+  Latency switch, or `--no-exclusive-output` / `--no-exclusive-mic`: the engine doesn't know which front end shows it, so
+  it names both). The window shows notes informational, `run` as "note:" lines. A shared open that fails then is the
+  start's failure, as before: `AUDCLNT_E_DEVICE_IN_USE` there means another app holds the endpoint exclusively, most
+  often now another copy of the filter (the window and a CLI command on the same device), and its message says so, with
+  what unticking "Allow applications to take exclusive control" would cost (the filter's own streams shared too).
+  `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` has its own wording (only an exclusive open should get it).
+- **Never on the default playback device** (`audio::output_exclusive`): an output that is Windows' default playback
+  device opens shared even when exclusive is asked, as it did before exclusive was the default. Held exclusively, no other
+  app could play sound at all (the call's own sound included), where shared it at least plays (into the mic, for a cable,
+  which the warning is about). Its warning (`OutputIsSpeakers`, `CableIsDefaultPlayback`, with `exclusive_withheld`) adds
+  that it runs shared until the default is fixed, and the stream's readout says why (`ExclusiveRefusal::DefaultPlayback`).
+  A change of default to or from the output restarts the streams (`device_event_needs_restart`, `RunView::output_default`),
+  so fixing the default brings exclusive mode back, and an exclusive output made the default gives it up.
 - **The output is event-driven** (`EventRender`): WASAPI gives it two buffers of one period, and at each device event the
   client hands over a whole period while the device plays the other. The pipeline writes into a ring (100 ms) as it
   writes into a shared stream's buffer, and each event moves a period from the ring to the device. The ring is the
@@ -219,18 +247,28 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
   float to a 16-bit cable without one too, the rounding error (-101 dBFS RMS) is under any mic's own noise, and a dither
   would put a -96 dBFS hiss on the gate's silence.
 - **What it costs others:** an exclusive stream has the endpoint to itself. On the output cable that's nothing (only the
-  filter plays into it, and the apps read the cable's other side); on the mic, no other app can record from that mic while
-  the filter runs, so they should use the filtered mic. A start whose device is held by another app (exclusive or
-  shared) falls back, and the next start tries again. The options' help says both, and the mic's deadline.
+  filter plays into it, and the apps read the cable's other side, which stays shared); on the mic, no other app can record
+  from that mic while the filter runs, so they should use the filtered mic, and someone who records the raw mic in another
+  app too (OBS, a DAW) turns it off. A start whose device is held by another app (exclusive or shared) falls back, and the
+  next start tries again. The options' help and the window's switches say both, and `--help` and the window's mic line
+  the mic's deadline and the echo floor. Two copies of the filter on the same mic or cable (the window and a CLI command)
+  can't both run now: the second's shared open fails on the first's exclusive stream, and is retried.
+- **Volume (unverified):** an exclusive stream bypasses the audio engine, so the endpoint's volume (CABLE Input's playback
+  slider, the mic's Levels slider) should apply only where the device has a hardware volume control; where the volume is
+  the engine's software one it would stop applying. Unchecked on VB-CABLE and on a real mic (a live check is due before
+  the help and the window's lines say so).
+- **The echo floor:** the exclusive mic's blocks come fresher, so the reference's lead rose to 18.3 ms on the cables
+  (12-14 shared), and the shortest echo AEC3 can cancel to about 20 ms (TODO 10's detail). Speakers whose output latency
+  is under that echo through; `quality --test echo`'s default delay (25 ms) is over it.
 - Telemetry `mic_exclusive`, `output_exclusive` (set at the start, cleared at the stop); `StreamInfo::exclusive` names
   the format, and `StreamInfo::exclusive_refused` why a stream asked for in exclusive mode runs shared (the reports'
   conditions say it with the stream).
 
 ## The output target (`out_target.rs`, TODO 13)
-Fixed by default: one period + one block + `io.output_margin_ms`. The block is spare for steady delivery and is what
+The fixed target: one period + one block + `io.output_margin_ms`. The block is spare for steady delivery and is what
 bursts use: the drift loop holds the mean of the fills read before each write at the target, so a block that comes
-later than the others finds that much less queued. With `io.adaptive_output` (`--adaptive-output`) the target follows
-what the delivery needs:
+later than the others finds that much less queued. With `io.adaptive_output` (on by default, the owner, 2026-11-02;
+`--no-adaptive-output` keeps it fixed) the target follows what the delivery needs:
 - **Measured:** each ordinary block's dip, how far its fill (before the calibration to the padding: frames written less
   the device position now, or the padding without a clock) is under its 1 s mean; each second's largest, kept for 120 s.
   The need is the largest over that window: a high percentile would let the rarest bursts through, and each costs an
@@ -257,8 +295,13 @@ what the delivery needs:
   150 s underran 7 times in 1000 s where the fixed target never did).
 - The deficit and drop thresholds are on the target, so they follow it; `output_target_ms` is published each second,
   and `run`'s status line, the window's budget and fill lines and the reports' conditions show it.
-- In the first 120 s of a run it is the fixed target, and then it walks for up to a minute, so `latency` and `quality`
-  with `--adaptive-output` wait for it to settle (to move and then hold still for 3 s; up to 188 s) before they measure.
+- In the first 120 s of a run it is the fixed target, and then it walks for up to a minute. `latency` and `quality`
+  measure at once by default (at the fixed start, which they say before measuring), so a lab run doesn't wait three
+  minutes; `--settle` waits for it to settle (to move and then hold still for 3 s; up to 188 s) before they measure. Their
+  conditions give the target as a snapshot at the test's end (`output_target_text`): "6.8 ms at the end (adaptive, down
+  from 14.0 ms)", or, at the fixed one, the neutral "14.0 ms at the end (adaptive, at the fixed target: it comes down only
+  after 120 s of running, and goes back up to it after an underrun)", since a run's first two minutes, a strike, a
+  delivery that needs the whole target and a `--settle` that timed out all read the same there.
 
 In the event simulations, with the events at 200 s, after it has come down (`pipeline/tests/events.rs`,
 `the_adaptive_target_after_it_has_come_down`, and `budget.rs`'s scenes; `events.rs`'s ignored `adaptive_sweep` prints
@@ -423,7 +466,8 @@ or noisy; `NF_SEED` plays them with another seed.
   share a device name too, and that's fine.
 - The output being Windows' default playback device: a warning, worded for the speakers (it
   doesn't look like a cable: the cleaned mic plays out loud) or for a cable (every app's sound goes
-  into the filtered mic).
+  into the filtered mic), and shared mode even where exclusive is asked ("Exclusive mode", "Never
+  on the default playback device"). The default moving to or from the output restarts the streams.
 - The reference is only needed when AEC is enabled at start or later. Open the loopback whenever a
   reference device is set and AEC is enabled. If AEC is switched on later, rebuild the streams; a
   short restart is acceptable.

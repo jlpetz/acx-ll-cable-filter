@@ -96,19 +96,30 @@ pub(crate) fn fault(status: &EngineStatus) -> String {
     }
 }
 
-/// The warnings InfoBar's title and text: the engine's warnings while it runs, one per line.
-/// `None` when it isn't running or all is well.
-pub(crate) fn warnings(status: &EngineStatus) -> Option<(&'static str, String)> {
+/// How the warnings InfoBar reads: a warning (something worth fixing), or only notes (how it runs: a stream asked for in
+/// exclusive mode that runs shared, an ordinary thing now that exclusive mode is the default), shown calmer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Warning,
+    Note,
+}
+
+/// The warnings InfoBar's tone, title and text: the engine's warnings while it runs, then its notes, one per line. `None`
+/// when it isn't running or all is well.
+pub(crate) fn warnings(status: &EngineStatus) -> Option<(Tone, &'static str, String)> {
     if status.state != EngineState::Running {
         return None;
     }
-    let lines: Vec<&str> = status.warnings.iter().map(|w| w.trim()).filter(|w| !w.is_empty()).collect();
-    let title = match lines.len() {
-        0 => return None,
-        1 => "Running with a warning",
-        _ => "Running with warnings",
+    let lines = |v: &[String]| v.iter().map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()).collect::<Vec<_>>();
+    let (warnings, notes) = (lines(&status.warnings), lines(&status.notes));
+    let (tone, title) = match (warnings.len(), notes.len()) {
+        (0, 0) => return None,
+        (0, 1) => (Tone::Note, "Running with a note"),
+        (0, _) => (Tone::Note, "Running with notes"),
+        (1, _) => (Tone::Warning, "Running with a warning"),
+        _ => (Tone::Warning, "Running with warnings"),
     };
-    Some((title, lines.join("\n")))
+    Some((tone, title, [warnings, notes].concat().join("\n")))
 }
 
 /// A meter's numbers: "RMS -23.4 · peak -12.1 dBFS".
@@ -160,7 +171,8 @@ pub(crate) fn budget(t: &TelemetrySnapshot) -> String {
 
 /// The streams' modes, under the clocks: "Streams: mic shared, 10.0 ms period · output exclusive, 2.0 ms period · output
 /// target fixed". Exclusive is WASAPI exclusive mode, as asked for and granted (a refused one runs shared, with a
-/// warning); the target is fixed (a period + a block + the margin) or adaptive.
+/// note; an output on the default playback device runs shared, with that warning); the target is fixed (a period + a
+/// block + the margin) or adaptive.
 pub(crate) fn streams(t: &TelemetrySnapshot) -> String {
     let mode = |exclusive: bool| if exclusive { "exclusive" } else { "shared" };
     format!(
@@ -437,10 +449,18 @@ mod tests {
         let mut s = status(EngineState::Running, None);
         assert_eq!(warnings(&s), None, "all is well");
         s.warnings = vec!["The echo reference was lost".to_owned()];
-        assert_eq!(warnings(&s), Some(("Running with a warning", "The echo reference was lost".to_owned())));
+        assert_eq!(warnings(&s), Some((Tone::Warning, "Running with a warning", "The echo reference was lost".to_owned())));
         s.warnings.push(" ".to_owned());
         s.warnings.push("MMCSS isn't available".to_owned());
-        assert_eq!(warnings(&s), Some(("Running with warnings", "The echo reference was lost\nMMCSS isn't available".to_owned())));
+        let both = "The echo reference was lost\nMMCSS isn't available";
+        assert_eq!(warnings(&s), Some((Tone::Warning, "Running with warnings", both.to_owned())));
+        // The notes come after the warnings, and alone they're a note (an exclusive stream that runs shared)
+        s.notes = vec!["The microphone (Mic) runs in shared mode: ...".to_owned()];
+        assert_eq!(warnings(&s), Some((Tone::Warning, "Running with warnings", format!("{both}\n{}", s.notes[0]))));
+        s.warnings.clear();
+        assert_eq!(warnings(&s), Some((Tone::Note, "Running with a note", s.notes[0].clone())));
+        s.notes.push("The output device (CABLE Input) runs in shared mode: ...".to_owned());
+        assert!(matches!(warnings(&s), Some((Tone::Note, "Running with notes", _))));
         s.state = EngineState::Error;
         assert_eq!(warnings(&s), None, "only while running");
     }

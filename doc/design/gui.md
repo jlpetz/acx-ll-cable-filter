@@ -16,8 +16,12 @@ minimise for now; the tray comes later (TODO #15, #16).
        per fault with what happens next, the large-page setup's result, a settings file that
        couldn't be read);
      - **the warnings bar:** the engine's standing warnings while it runs, one per line (a mic on
-       the output cable, the output being the default playback device, a lost echo reference,
-       MMCSS). It closes by itself when they clear.
+       the output cable, the output being the default playback device, which also says it runs
+       shared until that's fixed, a lost echo reference, MMCSS), then its notes
+       (`EngineStatus::notes`: a stream asked for in exclusive mode that runs shared, with why, the
+       cost, the fix and where to turn the switch off). Notes alone make it informational ("Running
+       with a note"), not a warning: exclusive mode is the default, so a refusal is ordinary. It
+       closes by itself when they clear.
 2. **Devices** (each a ComboBox with a header):
    - **Microphone:** capture endpoints, plus "Default microphone".
    - **Output (virtual cable):** render endpoints; no default. The placeholder reads "Pick the
@@ -71,7 +75,28 @@ minimise for now; the tray comes later (TODO #15, #16).
 7. **Diagnostics** (collapsed by default):
    - memory (`status.memory`), MMCSS, RAW mic in effect;
    - each stream's format and period; chain latency;
-   - ToggleSwitches "Low-latency periods (IAudioClient3)", "RAW mic" and "Keep reference alive";
+   - **Latency** (the owner, 2026-11-02: on by default, the lowest latency; some will turn one
+     off): ToggleSwitches, each with a dimmed line on what it does, costs and when to turn it off
+     (`settings::IoSwitch`; changing one restarts the streams):
+     - "Exclusive output": "Lowest latency (20-30 ms less on VB-CABLE): the filter plays straight
+       into the cable's driver. Only the filter plays into the cable, and your apps still record
+       its other side as usual. Turn off if the cable misbehaves."
+     - "Exclusive microphone": "Lowest latency. While the filter runs, other apps can't open your
+       microphone directly; they use the filtered mic. Turn off if you record your raw microphone
+       in another app. With echo cancelling on, if echo gets through or your voice crackles, try
+       turning this off." (its other two costs, the longer echo floor and the one-period buffer,
+       as what to try.)
+     - "Adaptive output buffer": "Trims the output buffer to what your PC needs after two minutes
+       of running (about 7 ms less on VB-CABLE). A rare hiccup can then cost a short glitch, three
+       a run at most. Turn off for a recording that must have none."
+     - under them: "A device that refuses exclusive mode runs in shared mode, and a note at the top
+       says why and how to fix it." The stream lines above already say each stream's mode.
+     - With both exclusive by default, a CLI `run`, `latency` or `quality` on the window's mic or
+       cable can't open them while the window's filter runs (and the window's can't while one of
+       those runs): the start error says the device is held in exclusive mode, maybe by another
+       copy of the filter.
+   - **Streams:** ToggleSwitches "Low-latency periods (IAudioClient3)", "RAW mic" (both with "For the microphone in shared
+     mode (with the exclusive microphone off, or refused)." under them) and "Keep reference alive";
    - Slider "Output margin (ms)", 0..20;
    - a Button "Enable large pages…", which runs `noise-filter.exe setup-large-pages` elevated
      through `nf_mem::privilege::run_elevated` and then says "Sign out and back in to apply".

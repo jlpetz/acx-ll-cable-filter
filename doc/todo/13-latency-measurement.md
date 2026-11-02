@@ -237,8 +237,8 @@ first:
 3. **Mic delivery's 6 ms beyond a block:** VB-CABLE's bursts (#8's detail file); a device matter.
 The chain's 9-19 ms belongs to the algorithms (#5, #7).
 
-**The options, A/B live** (2026-11-01, the same day, `latency --mode virtual --reps 5`, passthrough; the options are
-opt-in: `--exclusive-output`, `--exclusive-mic`, `--adaptive-output`):
+**The options, A/B live** (2026-11-01, the same day, `latency --mode virtual --reps 5`, passthrough; the options were
+opt-in then: `--exclusive-output`, `--exclusive-mic`, `--adaptive-output`):
 
 | Options | Mic + wait | Queue | Render side | Readout | App path (+ chain 10) | App + output cable | Spread |
 |---|---|---|---|---|---|---|---|
@@ -260,8 +260,41 @@ opt-in: `--exclusive-output`, `--exclusive-mic`, `--adaptive-output`):
   ms with the exclusive mic against 12-14 shared), which raises the shortest echo AEC3 can cancel by about as much (#10).
   The adaptive target trades the spare block for at most three extra underruns a run on rare 10-15 ms hiccups.
 
-**The latency options** (built 2026-11-01, each opt-in so a live A/B can compare them; engine.md, "Exclusive mode" and
-"The output target"). What each should take off the cables' readout of 64 ms (mic 16.4 + wait 0 + queue 22.2 + render
+**Now the defaults** (the owner, 2026-11-02): "By default apply the lowest processing default (exclusives, adaptive queues)
+etc. We should however keep in mind that some users may want to toggle it off for recording streams etc. Though as long as
+the final output is not exclusive that shouldn't be a problem most of the time." The final output, the cable's recording
+side that Discord or OBS read, stays shared; only our render into the cable and our mic capture are exclusive. Built the
+same day:
+- `IoConfig`'s three default to on; a settings file or engine config without them gets them on, one that saved them off
+  keeps them off (e074ff7's window wrote all three as `false`, so a `settings.json` it saved keeps them off until the
+  window's switches turn them on). `--no-exclusive-output`, `--no-exclusive-mic`, `--no-adaptive-output` turn one off; the
+  plain flags turn one back on over a config; `--help` says what each costs and when to turn it off (recording the raw mic
+  in another app; a device that misbehaves in exclusive mode; a recording that must have no glitch).
+- The window: three switches in Diagnostics > Latency, each with a line on what it does and costs (gui.md, section 7).
+- A refusal is ordinary now: a note (`EngineStatus::notes`), informational in the window, `note:` in `run`, with the stream,
+  why, the cost (20-30 ms output, 10-20 mic, from the table above), the fix, and where to turn it off (the window's switch,
+  the CLI's flag; engine.md, "Exclusive mode"). A format check that takes nothing leaves the initialise to say why, so "in
+  use" and "not allowed" aren't reported as "no format".
+- Ours, not the owner's (a review's finding): never the output exclusive on Windows' default playback device (the speakers
+  picked by mistake, or CABLE Input left the default): held exclusively, no other app could play sound. It runs shared
+  there, its warning says so, and a change of default to or from the output restarts the streams.
+- Two copies on the same devices: the window and a CLI `run`/`latency`/`quality` on the same mic or cable can't both run
+  now (the second's shared open is refused, `AUDCLNT_E_DEVICE_IN_USE`; its start error names another copy of the filter as
+  the likely holder). Stop the window's filter before a lab run on its devices, and before `latency --cable-only` on a
+  cable the window holds.
+- `latency` and `quality` measure what the product does by default, at once: the adaptive target is then at its fixed
+  start (14 ms with the exclusive output), which they say before measuring; `--settle` waits for it (up to 188 s), as they
+  did with `--adaptive-output` before. Their conditions give the target at the test's end, neutrally ("at the fixed
+  target", or "down from" it), as a strike or a timed-out `--settle` reads the same as a run's first two minutes. The
+  18.1 ms row above is the settled one; an unsettled run should read about the "both exclusive" row's 24.8.
+- The echo test's default delay (25 ms) is over the exclusive mic's floor (about 20 ms, #10).
+- `latency --cable-only` times both ends in shared mode, while the product now renders into the output cable exclusively
+  (and the A/B shows exclusive mode changes the cable's own transit: app + output cable fell 52 ms against the readout's 30).
+  So cable-only compares the cables' shared paths; how a cable does as the product's output is the full `--mode virtual`
+  run's app + output cable with that cable as the output.
+
+**The latency options** (built 2026-11-01, each opt-in then so a live A/B could compare them; engine.md, "Exclusive mode"
+and "The output target"). What each should take off the cables' readout of 64 ms (mic 16.4 + wait 0 + queue 22.2 + render
 25.7), by the event simulations and the design; the live runs will say:
 
 | Option | Mic + wait | Output queue | Render side | Readout | What it cuts |
@@ -277,10 +310,10 @@ opt-in: `--exclusive-output`, `--exclusive-mic`, `--adaptive-output`):
   its clock; with the exclusive mic, mic delivery reads about 3.6 ms and the wait about 6.7 (a block's first sample comes
   with its 3.33 ms packet and waits for the other two).
 - The adaptive target takes two minutes to move and then walks down (a tenth of the way a second, at most 0.5 ms: a
-  step drove the queue 1.4 ms under the new target for 10 s, under the floor in exclusive mode), so `latency` and
-  `quality` with `--adaptive-output` wait for it to settle (up to 188 s) before they measure; in a shorter run it is the
-  fixed one. Its floor is a whole period + the margin (12 ms shared, 4 ms exclusive), the design's reasoning rather than
-  the simulation's half period, plus 1 ms of headroom over the largest dip in two minutes; it never goes over the fixed
+  step drove the queue 1.4 ms under the new target for 10 s, under the floor in exclusive mode), so `latency --settle`
+  and `quality --settle` wait for it to settle (up to 188 s) before they measure; in a shorter run it is the fixed one.
+  Its floor is a whole period + the margin (12 ms shared, 4 ms exclusive), the design's reasoning rather than the
+  simulation's half period, plus 1 ms of headroom over the largest dip in two minutes; it never goes over the fixed
   target.
 - **What the adaptive target costs:** below the fixed target, a rare hiccup of 10-15 ms that the spare block covered (a
   missed wake) runs the device dry: a glitch. In the event simulations, with the event after the target has come down,

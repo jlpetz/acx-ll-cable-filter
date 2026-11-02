@@ -281,8 +281,8 @@ pub struct Telemetry {
     pub reference_stamped: AtomicBool,
     pub mic_period_ms: AtomicF32,
     pub output_period_ms: AtomicF32,
-    /// The run's mic and output streams are in WASAPI exclusive mode (asked for in `IoConfig` and granted; a refused one
-    /// runs shared, with a warning), set at the start and cleared at the stop.
+    /// The run's mic and output streams are in WASAPI exclusive mode (asked for in `IoConfig`, the default, and granted; a
+    /// refused one runs shared, with a note), set at the start and cleared at the stop.
     pub mic_exclusive: AtomicBool,
     pub output_exclusive: AtomicBool,
     /// The output's target adapts to the delivery (`IoConfig::adaptive_output`): `output_target_ms` moves.

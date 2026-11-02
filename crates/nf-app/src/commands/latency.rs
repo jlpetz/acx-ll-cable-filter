@@ -39,7 +39,7 @@ pub fn latency(args: &LatencyArgs) -> Result<(), Failure> {
 fn measure(
     engine: &nf_engine::Engine, cfg: &nf_engine::EngineConfig, args: &LatencyArgs, probe: String, capture: String,
 ) -> Result<(), Failure> {
-    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg) {
+    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg, args.settle) {
         return Err(Failure::no_result("Cancelled before the test started."));
     }
     let request = LatencyTestRequest {

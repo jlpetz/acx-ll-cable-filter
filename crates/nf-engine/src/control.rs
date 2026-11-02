@@ -81,6 +81,8 @@ pub(crate) struct StatusInfo {
     pub(crate) message: Option<String>,
     /// Warnings that hold while running, worded.
     pub(crate) warnings: Vec<String>,
+    /// Notes that hold while running (`EngineStatus::notes`), worded.
+    pub(crate) notes: Vec<String>,
     pub(crate) mic: Option<StreamInfo>,
     pub(crate) output: Option<StreamInfo>,
     pub(crate) reference: Option<StreamInfo>,
@@ -88,6 +90,8 @@ pub(crate) struct StatusInfo {
     pub(crate) mic_id: Option<String>,
     pub(crate) output_id: Option<String>,
     pub(crate) reference_id: Option<String>,
+    /// The output was Windows' default playback device at the start (`Opened::output_default`).
+    pub(crate) output_default: bool,
     pub(crate) targets: BufferTargets,
     /// The live run lost its reference and carries on without it (wasapi/B).
     pub(crate) reference_lost: bool,
@@ -281,6 +285,7 @@ impl Inner {
             aec_built: d.aec_built,
             mic_id: st.mic_id.as_deref(),
             output_id: st.output_id.as_deref(),
+            output_default: st.output_default,
             reference_id: st.reference_id.as_deref(),
             lost_reference_id: st.lost_reference_id.as_deref(),
         };
@@ -428,6 +433,8 @@ pub(crate) struct RunView<'a> {
     pub(crate) aec_built: bool,
     pub(crate) mic_id: Option<&'a str>,
     pub(crate) output_id: Option<&'a str>,
+    /// The output was Windows' default playback device at the start.
+    pub(crate) output_default: bool,
     pub(crate) reference_id: Option<&'a str>,
     /// The reference the live run lost, if it did.
     pub(crate) lost_reference_id: Option<&'a str>,
@@ -439,7 +446,10 @@ pub(crate) struct RunView<'a> {
 /// wasapi/C), or a property of a lost reference changes (its format or enhancements were changed,
 /// which ends a loopback with no removal or arrival). Losing the reference alone doesn't restart:
 /// the audio thread drops it and the filter carries on (wasapi/B). While waiting after a fault, any
-/// arrival or default change is worth a retry.
+/// arrival or default change is worth a retry. Also when the output becomes Windows' default
+/// playback device or stops being it: the start's output check (its warning, and shared mode
+/// where exclusive was asked: `audio::output_exclusive`) no longer holds, and an exclusive output
+/// that became the default would keep every other app from playing sound.
 pub(crate) fn device_event_needs_restart(ev: &DevEvent, v: &RunView<'_>) -> bool {
     let Some(cfg) = v.wanted else { return false };
     if v.waiting && !v.running {
@@ -471,7 +481,10 @@ pub(crate) fn device_event_needs_restart(ev: &DevEvent, v: &RunView<'_>) -> bool
             }
             match dir {
                 Direction::Capture => cfg.devices.mic.is_none() && id.as_deref() != v.mic_id,
-                Direction::Render => v.aec_built && cfg.devices.reference.is_none() && id.as_deref() != v.reference_id,
+                Direction::Render => {
+                    let output_default_moved = v.output_id.is_some_and(|o| (id.as_deref() == Some(o)) != v.output_default);
+                    output_default_moved || (v.aec_built && cfg.devices.reference.is_none() && id.as_deref() != v.reference_id)
+                }
             }
         }
     }
@@ -864,10 +877,11 @@ fn resend(inner: &Inner, stale: bool, deferred: Vec<DevEvent>) {
 }
 
 fn status_from(o: Opened) -> StatusInfo {
-    let warnings: Vec<String> = o.warnings.iter().map(describe_warning).collect();
+    let (notes, warnings): (Vec<_>, Vec<_>) = o.warnings.iter().partition(|w| w.is_note());
     StatusInfo {
         message: None,
-        warnings,
+        warnings: warnings.into_iter().map(describe_warning).collect(),
+        notes: notes.into_iter().map(describe_warning).collect(),
         mic: Some(o.mic),
         output: Some(o.output),
         reference: o.reference,
@@ -875,6 +889,7 @@ fn status_from(o: Opened) -> StatusInfo {
         mic_id: o.mic_id,
         output_id: o.output_id,
         reference_id: o.reference_id,
+        output_default: o.output_default,
         targets: o.targets,
         reference_lost: false,
         lost_reference_id: None,
@@ -961,6 +976,7 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
         mmcss: st.mmcss,
         chain_latency_ms,
         warnings: st.warnings,
+        notes: st.notes,
         retrying: inner.armed(),
         remedy: st.remedy,
     }
@@ -1164,6 +1180,7 @@ mod tests {
             aec_built: c.processing.aec_enabled,
             mic_id: Some("mic1"),
             output_id: Some("cable"),
+            output_default: false,
             reference_id: c.processing.aec_enabled.then_some("spk1"),
             lost_reference_id: None,
         }
@@ -1197,6 +1214,16 @@ mod tests {
         let v = view(&explicit, true, false);
         assert!(!device_event_needs_restart(&def(Direction::Capture, Role::Console, "mic2"), &v));
         assert!(!device_event_needs_restart(&def(Direction::Render, Role::Console, "spk2"), &v));
+        // The output becoming Windows' default playback device, or ceasing to be it: the start's output check (its warning,
+        // and the shared mode exclusive mode gives way to there) no longer holds. Not on the console role: nothing.
+        assert!(device_event_needs_restart(&def(Direction::Render, Role::Console, "cable"), &v), "became the default");
+        assert!(!device_event_needs_restart(&def(Direction::Render, Role::Communications, "cable"), &v));
+        let on_default = RunView { output_default: true, ..v };
+        assert!(!device_event_needs_restart(&def(Direction::Render, Role::Console, "cable"), &on_default), "still the default");
+        assert!(device_event_needs_restart(&def(Direction::Render, Role::Console, "spk2"), &on_default), "no longer the default");
+        assert!(device_event_needs_restart(&DevEvent::Default(Direction::Render, Role::Console, None), &on_default));
+        let no_id = RunView { output_id: None, ..v };
+        assert!(!device_event_needs_restart(&DevEvent::Default(Direction::Render, Role::Console, None), &no_id), "unknown output");
     }
 
     #[test]
@@ -1227,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn status_lists_the_warnings_once() {
+    fn status_lists_the_warnings_and_the_notes_once() {
         let info = StreamInfo {
             device_name: "Mic".into(),
             sample_rate: 48_000,
@@ -1246,17 +1273,30 @@ mod tests {
             mic_id: Some("m".into()),
             output_id: Some("o".into()),
             reference_id: None,
+            output_default: true,
             mmcss: false,
             aec_built: false,
-            warnings: vec![crate::errors::Warning::Mmcss(1552), crate::errors::Warning::KeepAliveUnavailable(-1)],
+            warnings: vec![
+                crate::errors::Warning::Mmcss(1552),
+                crate::errors::Warning::ExclusiveUnavailable {
+                    role: StreamRole::Mic,
+                    device: "Mic".into(),
+                    why: crate::exclusive::ExclusiveRefusal::Refused(crate::errors::hr::AUDCLNT_E_DEVICE_IN_USE),
+                },
+                crate::errors::Warning::KeepAliveUnavailable(-1),
+            ],
             targets: BufferTargets { output_ms: 22.0, reference_ms: 0.0 },
         };
         let s = status_from(o);
         assert_eq!(s.warnings.len(), 2, "one entry per warning: {:?}", s.warnings);
         assert!(s.warnings[0].contains("Pro Audio") && s.warnings[1].contains("keep-alive"));
+        // An exclusive stream that runs shared is a note (exclusive mode is the default: a refusal is ordinary), listed once.
+        assert_eq!(s.notes.len(), 1, "{:?}", s.notes);
+        assert!(s.notes[0].starts_with("The microphone (Mic) runs in shared mode: another app is using it"), "{}", s.notes[0]);
         assert_eq!(s.message, None, "the warnings aren't repeated in the message");
         assert_eq!(s.targets.output_ms, 22.0);
         assert_eq!(s.mic_id.as_deref(), Some("m"));
+        assert!(s.output_default, "kept for the device events");
     }
 
     #[test]

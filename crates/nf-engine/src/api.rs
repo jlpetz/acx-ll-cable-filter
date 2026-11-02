@@ -61,11 +61,11 @@ pub struct StreamInfo {
     /// RAW mode is in effect (mic only).
     pub raw: bool,
     /// In WASAPI exclusive mode (`IoConfig::mic_exclusive`, `output_exclusive`, granted: a refused one runs shared, with a
-    /// warning), in this sample format: "32-bit float", "24-bit" or "16-bit". `None` in shared mode. The period is then
+    /// note), in this sample format: "32-bit float", "24-bit" or "16-bit". `None` in shared mode. The period is then
     /// the exclusive buffer's, and no Windows effects run.
     pub exclusive: Option<&'static str>,
     /// Asked for in exclusive mode and refused: why, as a clause ("another app is using it, ..."). It runs in shared mode;
-    /// the status's warnings say so too.
+    /// the status's notes say so too, with the cost and the fix.
     pub exclusive_refused: Option<String>,
 }
 
@@ -88,6 +88,10 @@ pub struct EngineStatus {
     /// Warnings that hold while running (e.g. the mic is the output cable's own recording side, the
     /// echo reference was lost), worded for the user. Empty when all is well.
     pub warnings: Vec<String>,
+    /// Notes that hold while running: how it runs where that isn't as asked but needs nothing done, worded for the user. Today
+    /// a stream asked for in exclusive mode (the default) that runs shared: which, why, what it costs and how to fix it or
+    /// stop it trying. Empty when all runs as asked. The window shows them calmer than the warnings, `run` as "note:".
+    pub notes: Vec<String>,
     /// Stopped by a fault but armed: the engine retries by itself (timed backoff and device events).
     pub retrying: bool,
     /// What the user can do about the error in `message`, when the app can take them there.
@@ -136,6 +140,32 @@ pub const ADAPTIVE_OUTPUT_WINDOW_S: u64 = crate::out_target::WINDOW_S as u64;
 /// The longest the adaptive output target's walk down takes once it has started, in seconds (it moves a tenth of the way a
 /// second, so the queue follows without overshooting).
 pub const ADAPTIVE_OUTPUT_WALK_S: u64 = crate::out_target::RAMP_MAX_S as u64;
+
+/// The output target as the reports' conditions name it, from the target at the test's end
+/// (`TelemetrySnapshot::output_target_ms`), whether it adapts, and the fixed one it starts at (`BufferTargets::output_ms`):
+/// "output target 22.0 ms (fixed)"; adaptive, either "6.8 ms at the end (adaptive, down from 14.0 ms)" or "14.0 ms at the end
+/// (adaptive, at the fixed target: it comes down only after 120 s of running, and goes back up to it after an underrun)". A
+/// snapshot, so "at the end": a long test may have run part of its time at another target. The second is the neutral
+/// reading of a target at the fixed one, which a run's first two minutes are (`latency` and `quality` measure at once
+/// unless `--settle` waits), but so is a run that went back after an underrun (out_target.rs's strikes), whose delivery
+/// needs the whole target, or whose `--settle` timed out. Empty without a target (stopped).
+pub fn output_target_text(target_ms: f32, adaptive: bool, fixed_ms: f32) -> String {
+    if target_ms.is_nan() || target_ms <= 0.0 {
+        return String::new();
+    }
+    if !adaptive {
+        return format!("output target {target_ms:.1} ms (fixed)");
+    }
+    let how = if fixed_ms > 0.0 && target_ms < fixed_ms - 0.05 {
+        format!("down from {fixed_ms:.1} ms")
+    } else {
+        format!(
+            "at the fixed target: it comes down only after {ADAPTIVE_OUTPUT_WINDOW_S} s of running, and goes back up to it after \
+             an underrun"
+        )
+    };
+    format!("output target {target_ms:.1} ms at the end (adaptive, {how})")
+}
 
 /// Which loop the latency test measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

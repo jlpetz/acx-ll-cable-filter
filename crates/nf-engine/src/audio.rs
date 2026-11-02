@@ -31,6 +31,7 @@ use windows::Win32::System::Threading::WaitForMultipleObjects;
 use crate::api::{BufferTargets, StreamInfo};
 use crate::devices::resolve;
 use crate::errors::{Fault, StartFailure, StreamRole, Warning, is_virtual_cable};
+use crate::exclusive::ExclusiveRefusal;
 use crate::handover::{self, End};
 use crate::latency_test::TapEnd;
 use crate::pipeline::{CaptureSource, DITHER, DriftControl, Hr, Pipeline, PipelineConfig, Resampler, TapItem, Ticks};
@@ -81,6 +82,9 @@ pub(crate) struct Opened {
     pub(crate) mic_id: Option<String>,
     pub(crate) output_id: Option<String>,
     pub(crate) reference_id: Option<String>,
+    /// The output was Windows' default playback device at the start (its warning, and shared mode where exclusive was
+    /// asked: `output_exclusive`), so a change of default that ends it restarts the streams.
+    pub(crate) output_default: bool,
     pub(crate) mmcss: bool,
     /// The AEC stage exists (AEC was on at start), so turning AEC on later needs no restart.
     pub(crate) aec_built: bool,
@@ -312,6 +316,7 @@ fn run(r: Run<'_>) {
         mic_id: ids.mic,
         output_id: ids.output,
         reference_id: session.lb.as_ref().and(ids.reference),
+        output_default: ids.output_default,
         mmcss: mmcss.registered(),
         aec_built: config.processing.aec_enabled,
         warnings,
@@ -334,6 +339,8 @@ struct Ids {
     mic: Option<String>,
     output: Option<String>,
     reference: Option<String>,
+    /// The output is Windows' default playback device.
+    output_default: bool,
 }
 
 /// Resolves the endpoints, builds the stages and the chain (inside the caller's `RtScope`) and
@@ -355,7 +362,8 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
     let out_name = out_dev.get_friendlyname().unwrap_or_default();
     let out_cable = is_virtual_cable(&out_name) || out_adapter.as_deref().is_some_and(is_virtual_cable);
     let default_out = en.get_default_device_for_role(&Direction::Render, &Role::Console).ok().and_then(|d| d.get_id().ok());
-    if let Some(w) = output_check(default_out.is_some() && default_out == ids_out, out_cable, out_name) {
+    let out_default = default_out.is_some() && default_out == ids_out;
+    if let Some(w) = output_check(out_default, out_cable, out_name, config.io.output_exclusive) {
         warnings.push(w);
     }
 
@@ -381,10 +389,16 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
     chain.activate().map_err(|e| StartFailure::Stage(e.0))?;
 
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
-    // Exclusive mode where asked (engine.md, "Exclusive mode"): a device that refuses it runs shared, with a warning.
+    // Exclusive mode where asked (the default; engine.md, "Exclusive mode"): a device that refuses it runs shared, with a
+    // note (`Warning::is_note`). Never the output on the default playback device: the output check's warning says so.
     let mic_options = MicOptions { low_latency: config.io.low_latency_periods, raw: config.io.raw_mic, exclusive: config.io.mic_exclusive };
     let (mic, mic_warning) = CaptureStream::open_mic(&mic_dev, mic_options).map_err(open(StreamRole::Mic))?;
-    let (out, out_warning) = Output::open(&out_dev, config.io.output_exclusive, RENDER_BUFFER_HNS).map_err(open(StreamRole::Output))?;
+    let out_exclusive = output_exclusive(config.io.output_exclusive, out_default);
+    let (mut out, out_warning) =
+        Output::open(&out_dev, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS).map_err(open(StreamRole::Output))?;
+    if let Err(why) = out_exclusive {
+        out.withheld(why);
+    }
     warnings.extend(mic_warning.into_iter().chain(out_warning));
     let (mut lb, mut ka, mut ref_id) = (None, None, None);
     if let Some((dev, id)) = reference {
@@ -402,7 +416,7 @@ fn open_session(config: &EngineConfig, controls: &Arc<ChainControls>, warnings: 
             Err(e) => warnings.push(Warning::ReferenceUnavailable(StartFailure::Open { role: StreamRole::Reference, hr: hr_of(&e) })),
         }
     }
-    let ids = Ids { mic: mic_dev.get_id().ok(), output: ids_out, reference: ref_id };
+    let ids = Ids { mic: mic_dev.get_id().ok(), output: ids_out, reference: ref_id, output_default: out_default };
     Ok((Session { mic, out, lb, ka, chain }, ids))
 }
 
@@ -436,13 +450,24 @@ pub(crate) fn adapter_check(following_default: bool, shared: Option<String>) -> 
 
 /// The output against Windows' default playback device (gui/F1): the default and not a cable is
 /// the speakers, so the cleaned mic plays out loud; the default and a cable means every app's
-/// sound goes into the filtered mic. Both run, with a warning.
-pub(crate) fn output_check(output_is_default: bool, output_is_cable: bool, name: String) -> Option<Warning> {
+/// sound goes into the filtered mic. Both run, with a warning, and in shared mode: the warning
+/// says so where exclusive mode was asked for (`exclusive_asked`; [`output_exclusive`]).
+pub(crate) fn output_check(output_is_default: bool, output_is_cable: bool, name: String, exclusive_asked: bool) -> Option<Warning> {
+    let exclusive_withheld = exclusive_asked;
     match (output_is_default, output_is_cable) {
-        (true, false) => Some(Warning::OutputIsSpeakers(name)),
-        (true, true) => Some(Warning::CableIsDefaultPlayback(name)),
+        (true, false) => Some(Warning::OutputIsSpeakers { name, exclusive_withheld }),
+        (true, true) => Some(Warning::CableIsDefaultPlayback { name, exclusive_withheld }),
         (false, _) => None,
     }
+}
+
+/// Whether to open the output in exclusive mode: as asked (`IoConfig::output_exclusive`), but never while it is Windows'
+/// default playback device, where the filter would have it to itself and no other app could play sound (the call's own
+/// sound included). There it runs shared, as it did before exclusive mode was the default, with the output check's
+/// warning; `Err` says why, for the stream's readout. A change of default that ends it restarts the streams
+/// (`control::device_event_needs_restart`), so fixing the default brings exclusive mode back.
+pub(crate) fn output_exclusive(asked: bool, output_is_default: bool) -> Result<bool, ExclusiveRefusal> {
+    if asked && output_is_default { Err(ExclusiveRefusal::DefaultPlayback) } else { Ok(asked) }
 }
 
 /// What the audio loop tops up on the reference endpoint: the keep-alive.
@@ -701,14 +726,23 @@ mod tests {
     }
 
     /// gui/F1: the default speakers picked as the output, or the output cable left as Windows'
-    /// default playback device, run with a warning.
+    /// default playback device, run with a warning, and in shared mode: exclusive there would keep
+    /// every other app from playing sound. Anywhere else the output is exclusive as asked.
     #[test]
     fn the_output_is_checked_against_the_default_playback_device() {
         let name = || "Speakers".to_owned();
-        assert_eq!(output_check(true, false, name()), Some(Warning::OutputIsSpeakers("Speakers".into())));
-        assert_eq!(output_check(true, true, name()), Some(Warning::CableIsDefaultPlayback("Speakers".into())));
-        assert_eq!(output_check(false, true, name()), None);
-        assert_eq!(output_check(false, false, name()), None, "not the default: may be a cable we don't know");
+        for asked in [false, true] {
+            let speakers = Warning::OutputIsSpeakers { name: name(), exclusive_withheld: asked };
+            assert_eq!(output_check(true, false, name(), asked), Some(speakers));
+            let cable = Warning::CableIsDefaultPlayback { name: name(), exclusive_withheld: asked };
+            assert_eq!(output_check(true, true, name(), asked), Some(cable));
+            assert_eq!(output_check(false, true, name(), asked), None);
+            assert_eq!(output_check(false, false, name(), asked), None, "not the default: may be a cable we don't know");
+        }
+        assert_eq!(output_exclusive(true, true), Err(ExclusiveRefusal::DefaultPlayback), "the default playback device: shared");
+        assert_eq!(output_exclusive(true, false), Ok(true));
+        assert_eq!(output_exclusive(false, true), Ok(false), "not asked: nothing withheld");
+        assert_eq!(output_exclusive(false, false), Ok(false));
     }
 
     /// One mic packet of `frames` per wake.

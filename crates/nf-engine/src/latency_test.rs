@@ -27,7 +27,7 @@ use wasapi::{DeviceEnumerator, Direction};
 
 use crate::api::{
     CableLatencyReport, CableLatencyRequest, EngineError, LatencyMode, LatencyProgress, LatencyReport, LatencyTest, LatencyTestRequest,
-    StreamInfo,
+    StreamInfo, output_target_text,
 };
 use crate::audio::{AudioShared, RENDER_BUFFER_HNS};
 use crate::control::{Inner, claim_test, lock};
@@ -408,7 +408,7 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.budget = budget;
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
-    let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive };
+    let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive, fixed_ms: st.targets.output_ms };
     report.conditions = conditions(
         st.mic.as_ref(),
         st.output.as_ref(),
@@ -665,11 +665,12 @@ pub(crate) fn mode_warnings(req: &LatencyTestRequest, aec_enabled: bool) -> Vec<
     w
 }
 
-/// The output's target at the end of a test, and whether it adapts (`IoConfig::adaptive_output`).
+/// The output's target at the end of a test, whether it adapts (`IoConfig::adaptive_output`), and the fixed one it started at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct OutputTarget {
     pub(crate) ms: f32,
     pub(crate) adaptive: bool,
+    pub(crate) fixed_ms: f32,
 }
 
 /// The record of how the test ran: engine periods, RAW, autoconvert, exclusive mode, the output's target and the devices.
@@ -691,9 +692,9 @@ pub(crate) fn conditions(
     if let Some(o) = output {
         parts.push(describe_stream("output", o));
     }
-    if target.ms > 0.0 {
-        let how = if target.adaptive { "adaptive, at the end" } else { "fixed" };
-        parts.push(format!("output target {:.1} ms ({how})", target.ms));
+    let target = output_target_text(target.ms, target.adaptive, target.fixed_ms);
+    if !target.is_empty() {
+        parts.push(target);
     }
     parts.push(describe_stream("probe", probe));
     parts.push(describe_stream("capture", capture));
@@ -952,7 +953,7 @@ mod tests {
             &s("CABLE-B Output", false, false, false),
             LatencyMode::VirtualLoop,
             true,
-            OutputTarget { ms: 22.0, adaptive: false },
+            OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0 },
         );
         assert_eq!(
             c,
@@ -969,18 +970,29 @@ mod tests {
             &s("CABLE Output", false, false, false),
             LatencyMode::VirtualLoop,
             true,
-            OutputTarget { ms: 5.0, adaptive: true },
+            OutputTarget { ms: 5.0, adaptive: true, fixed_ms: 14.0 },
         );
         assert!(c.contains("mic: CABLE-A Output (48000 Hz, 2 ch, 3.33 ms period, exclusive 16-bit)"), "{c}");
         assert!(
             c.contains(
-                "output: CABLE Input (48000 Hz, 2 ch, 2.00 ms period, exclusive 16-bit); output target 5.0 ms (adaptive, at the end)"
+                "output: CABLE Input (48000 Hz, 2 ch, 2.00 ms period, exclusive 16-bit); output target 5.0 ms at the end (adaptive, \
+                 down from 14.0 ms)"
+            ),
+            "{c}"
+        );
+        // At the fixed target (a run's first two minutes, or back there after an underrun): said neutrally, as a snapshot.
+        let start = OutputTarget { ms: 14.0, adaptive: true, fixed_ms: 14.0 };
+        let c = conditions(None, None, &s("A", false, false, false), &s("B", false, false, false), LatencyMode::VirtualLoop, true, start);
+        assert!(
+            c.contains(
+                "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 120 s of running, and \
+                 goes back up to it after an underrun)"
             ),
             "{c}"
         );
         // Asked for in exclusive mode and refused: shared, and why.
         let refused = StreamInfo { exclusive_refused: Some("another app is using it".into()), ..s("CABLE Input", false, false, false) };
-        let target = OutputTarget { ms: 22.0, adaptive: false };
+        let target = OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0 };
         let c = conditions(None, Some(&refused), &refused, &refused, LatencyMode::VirtualLoop, true, target);
         assert!(c.contains("CABLE Input (48000 Hz, 2 ch, 10.00 ms period, shared: exclusive refused (another app is using it))"), "{c}");
     }

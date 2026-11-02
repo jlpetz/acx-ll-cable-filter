@@ -1,8 +1,8 @@
 //! WASAPI stream wrappers (engine.md "stream"). Each opens one stream and converts at the edge to the
 //! app's 48 kHz mono f32. Shared mode, but for the mic and the output when they're asked for in
-//! exclusive mode (`IoConfig::mic_exclusive`, `output_exclusive`; engine.md, "Exclusive mode"):
+//! exclusive mode (`IoConfig::mic_exclusive`, `output_exclusive`, the default; engine.md, "Exclusive mode"):
 //! event-driven at the device's smallest suitable period, in the best format it takes, falling back
-//! to shared mode with a warning when it refuses (exclusive.rs has the choices and the fall-back).
+//! to shared mode with a note when it refuses (exclusive.rs has the choices and the fall-back).
 //!
 //! Format rule: with the mix format at 48 kHz, use it as is (we downmix or upmix the channels, and
 //! the mic may use IAudioClient3's small periods); otherwise ask for 48 kHz f32 at the mix's
@@ -27,6 +27,7 @@ use crate::convert::{SampleFormat, from_mono, to_mono};
 use crate::errors::{StreamRole, Warning, describe_refusal, hr};
 use crate::exclusive::{
     EventRender, ExclusiveFormat, ExclusiveRefusal, PeriodDevice, RING_FRAMES, exclusive_or_shared, exclusive_periods, first_exclusive,
+    formats_to_try,
 };
 use crate::pipeline::{CaptureSource, ClockReading, Hr, Packet, RenderSink};
 use crate::timing::Qpc;
@@ -187,7 +188,7 @@ pub(crate) struct CaptureStream {
 
 impl CaptureStream {
     /// The mic. Asked for in exclusive mode, that first (event-driven at its period: exclusive.rs), and shared mode with the
-    /// warning saying why when the device refuses. In shared mode, RAW where supported (and asked), IAudioClient3's smallest
+    /// note saying why when the device refuses. In shared mode, RAW where supported (and asked), IAudioClient3's smallest
     /// suitable period where the driver allows (and asked, and the mix is 48 kHz), each falling back.
     pub(crate) fn open_mic(device: &Device, opts: MicOptions) -> Result<(Self, Option<Warning>), WasapiError> {
         let name = device.get_friendlyname().unwrap_or_default();
@@ -552,7 +553,7 @@ pub(crate) enum Output {
 
 impl Output {
     /// The output as `IoConfig` asks for it: exclusive mode first when asked, else (or when the device refuses, with the
-    /// warning) shared mode.
+    /// note) shared mode.
     pub(crate) fn open(device: &Device, exclusive: bool, buffer_hns: i64) -> Result<(Self, Option<Warning>), WasapiError> {
         let name = device.get_friendlyname().unwrap_or_default();
         let (mut out, warning) = exclusive_or_shared(
@@ -585,6 +586,14 @@ impl Output {
 
     pub(crate) fn is_exclusive(&self) -> bool {
         matches!(self, Output::Exclusive(_))
+    }
+
+    /// Records why an output asked for in exclusive mode was opened shared without trying (`audio::output_exclusive`), for
+    /// its readout.
+    pub(crate) fn withheld(&mut self, why: ExclusiveRefusal) {
+        if let Output::Shared(s) = self {
+            s.info.refused = Some(why);
+        }
     }
 
     /// Starts the stream. In exclusive mode the first buffer (the prefill's zeros) goes in before the start, as WASAPI wants,
@@ -747,19 +756,22 @@ fn exclusive_candidates(mix: &WaveFormat) -> impl Iterator<Item = (WaveFormat, E
     })
 }
 
-/// An event-driven exclusive-mode client on `device` (exclusive.rs): each format of [`ExclusiveFormat::ALL`] it takes, best
-/// first, at each of [`exclusive_periods`] (the choice, the device's minimum, its default), until one initialises
-/// ([`first_exclusive`]: a refused period tries the next period, a refused format the next format, anything else ends it).
+/// An event-driven exclusive-mode client on `device` (exclusive.rs): each format of [`ExclusiveFormat::ALL`] it takes (all of
+/// them when the check takes none: [`formats_to_try`]), best first, at each of [`exclusive_periods`] (the choice, the
+/// device's minimum, its default), until one initialises ([`first_exclusive`]: a refused period tries the next period, a
+/// refused format the next format, anything else ends it).
 /// Returns the client, its format, which one that is, and the period in frames (its buffer). Not real-time.
 fn open_exclusive(
     device: &Device, dir: Direction, mix: &WaveFormat,
 ) -> Result<(AudioClient, WaveFormat, ExclusiveFormat, usize), ExclusiveRefusal> {
     let refused = |e: WasapiError| ExclusiveRefusal::Refused(hr_of(&e));
     let probe = device.get_iaudioclient().map_err(refused)?;
-    // The quirks retry a format as a plain WAVEFORMATEX and with other channel masks; the accepted one comes back.
-    let formats: Vec<(WaveFormat, ExclusiveFormat)> = exclusive_candidates(mix)
+    // The quirks retry a format as a plain WAVEFORMATEX and with other channel masks; the accepted one comes back. None
+    // accepted: the initialise says why (in use, not allowed, or unsupported after all).
+    let accepted: Vec<(WaveFormat, ExclusiveFormat)> = exclusive_candidates(mix)
         .filter_map(|(want, kind)| probe.is_supported_exclusive_with_quirks(&want).ok().map(|f| (f, kind)))
         .collect();
+    let formats = formats_to_try(accepted, || exclusive_candidates(mix).collect());
     let (default_hns, min_hns) = probe.get_device_period().map_err(refused)?;
     drop(probe);
     first_exclusive(&formats, &exclusive_periods(default_hns, min_hns), |(fmt, kind), period_hns| {

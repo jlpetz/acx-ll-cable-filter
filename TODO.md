@@ -88,7 +88,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 8. [engine] Audio I/O: mic capture, cable render, loopback reference
 **Priority**: High (phase 1) | **Status**: built in v0 (nf-engine) and reviewed 2026-10-26; live test pending (VB-CABLE).
-- `wasapi` crate, event-driven shared mode; IAudioClient3 small periods where the driver allows, else 10 ms; exclusive mic as an advanced option.
+- `wasapi` crate. Exclusive mode by default for the mic (3.33 ms) and the output (2 ms; never on Windows' default playback device), falling back to shared (IAudioClient3 small periods where the driver allows, else 10 ms) with a note (owner, 2026-11-02).
 - Mic in RAW mode where supported. The reference is a loopback of the chosen speakers, zero-filled through silence. `SetDuckingPreference(TRUE)` on our sessions.
 - **Requirement:** every audio thread (capture, DSP, render, inference worker) registers with MMCSS "Pro Audio" (`AvSetMmThreadCharacteristicsW`). MMCSS gives it priority 23-26 (High category; `SystemResponsiveness` keeps 20% for others) and tags it Deadline QoS. Without the tag, a minimised or occluded window puts the process at Low QoS. MMCSS priority also weighs foreground state, so check dropouts with the window minimised in phase 1.
 - Threads are joined by SPSC rings; no allocation or locks on audio threads; device-change rebuilds on a control thread.
@@ -144,8 +144,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Layer 0 offline conformance (#2). Layer 1 always-on readout: capture QPC stamps (`BufferInfo`) vs cable play-out (`AudioClock`), with Chromium's sanity checks and ring occupancy subtracted (console in phase 1). Layer 2 virtual loop (two cables). Layer 3 real mic and speakers, captured together.
 - Probes: sweep or a coded pulse for bypassed and acoustic paths; clean speech with GCC-PHAT (Hilbert-envelope fallback) through the model; AEC off or an exclude-self process-loopback reference.
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
-- Opt-in latency options built and run live (2026-11-01): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
-**Next**: the owner decides the defaults (exclusive locks the endpoint; the exclusive mic lengthens the reference lead, #10); longer soak runs for glitches; layer 3 in phase 2.
+- Latency options (2026-11-01), the defaults since 2026-11-02 (owner: the lowest latency by default, with switches to turn each off, e.g. for recording the raw mic): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
+**Next**: longer soak runs for glitches; IAudioClient3 small periods on the output and the speakers' keep-alive (shorter loopback packets, a shorter reference lead, #10), to verify on real hardware; layer 3 in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---
@@ -230,5 +230,5 @@ oise-filter	est-audio`; no audio in git. Catalogue: `doc/todo/14-test-audio-cata
 - Owner: tell the user when a device or driver delivers in bursts or late, so they can fix it; and a calibration that sizes the buffers to the devices, not too big or small.
 - Proposed: a health readout per stream (steady or bursty, how late, drift, glitches, with a plain verdict and what to try), and a calibration (passive: measure delivery and set the starting targets; active with speakers: time the echo path and check it against the reference's lead, #10).
 - Most of the measures exist: the latency budget (#13), the reference's facts (#10), the counters, the live probe.
-**Next**: after the exclusive-mode A/B (#13): define the verdicts and thresholds, then `noise-filter devices --check`.
+**Next**: define the verdicts and thresholds, then `noise-filter devices --check` (real-hardware data needed for the thresholds).
 **Detail**: `doc/todo/21-device-health.md`

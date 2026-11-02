@@ -37,6 +37,12 @@ use super::signals::{Scene, Turn, turn_at, turn_len};
 /// `--echo-delay`'s default (typical speakers) and its range, in ms.
 pub const DEFAULT_ECHO_DELAY_MS: f32 = 25.0;
 pub const MAX_ECHO_DELAY_MS: f32 = 300.0;
+/// The shortest echo delay the echo canceller serves with the exclusive mic (the default since 2026-11-02), in ms: the mic's
+/// blocks come fresher, so the reference's lead rose to 18.3 ms on the cables (12-14 shared), and an echo needs about that
+/// plus a little to come after its reference (TODO 10's detail, the echo floor). The default delay stays over it.
+pub const EXCLUSIVE_MIC_ECHO_FLOOR_MS: f32 = 20.0;
+// The default delay is one the canceller serves with the default (exclusive) mic, with room for the lead's take-to-take spread.
+const _: () = assert!(DEFAULT_ECHO_DELAY_MS >= EXCLUSIVE_MIC_ECHO_FLOOR_MS + 4.0);
 /// The most the rig may put a zero-delay echo before (or after) its reference's tap for the take to make up for it.
 pub const MAX_RIG_OFFSET_MS: f64 = 250.0;
 /// The measurement looks this far either side of the delay the calibration expects: room for a jump of the reference's read
@@ -410,6 +416,12 @@ mod tests {
     const FS: f64 = 48_000.0;
     /// One sample, in ms.
     const SAMPLE_MS: f64 = 1000.0 / FS;
+
+    /// The exclusive mic's floor is the one that applies by default (the default delay is over it: a const assertion).
+    #[test]
+    fn the_exclusive_mics_echo_floor_is_the_default_one() {
+        assert!(nf_engine::IoConfig::default().mic_exclusive);
+    }
 
     /// `x` delayed by `d` samples (a fraction through a 33-tap Blackman-windowed sinc), the same length.
     fn delayed(x: &[f32], d: f64) -> Vec<f32> {

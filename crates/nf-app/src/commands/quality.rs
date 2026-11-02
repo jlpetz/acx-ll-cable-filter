@@ -69,13 +69,14 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     // Armed before the start, the chain recorder holds the run from its first block (its whole history, for a rerun). The echo
     // test times its marker in it, and measures where the echo landed.
     let recorder = if args.save.is_some() || plan.is_some() {
-        let limit = recording_limit(&scene, plan.as_ref(), cfg.io.adaptive_output);
+        let limit = recording_limit(&scene, plan.as_ref(), super::run::target_wait(&cfg, args.settle).waits());
         Some(engine.record_chain(limit).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?)
     } else {
         None
     };
     super::run::start_engine(&engine, &cfg)?;
-    let take = play(&engine, &cfg, &scene, plan.as_ref(), recorder.as_ref(), Route { probe, capture, far, text: route });
+    let route = Route { probe, capture, far, text: route };
+    let take = play(&engine, &cfg, args.settle, &scene, plan.as_ref(), recorder.as_ref(), route);
     // Before the engine stops, so the recording ends with the take rather than with the run.
     let chain = recorder.map(ChainRecorder::stop);
     engine.stop();
@@ -156,12 +157,13 @@ fn route(devices: &[DeviceInfo], probe: &str, far: Option<&str>, capture: &str) 
     format!("playing on {}{far}, recording {}", name(probe), name(capture))
 }
 
-/// The chain recorder's limit: the take (the settle, the adaptive target's wait with `--adaptive-output`, the lead, the echo
-/// test's calibration, the scene and the tail) and a minute to spare, within the engine's 15 minutes.
-fn recording_limit(scene: &Scene, plan: Option<&Plan>, adaptive: bool) -> f64 {
+/// The chain recorder's limit: the take (the settle, the adaptive target's wait when `waits` (`--settle` with the adaptive
+/// target), the lead, the echo test's calibration, the scene and the tail) and a minute to spare, within the engine's 15
+/// minutes.
+fn recording_limit(scene: &Scene, plan: Option<&Plan>, waits: bool) -> f64 {
     let r = PlayRecordRequest::default();
     let calibration = plan.map_or(0.0, |p| p.latest.max(p.scene_at) as f64 / f64::from(SAMPLE_RATE));
-    let wait = if adaptive { super::run::ADAPTIVE_WAIT_S as f64 } else { 0.0 };
+    let wait = if waits { crate::cli::ADAPTIVE_WAIT_S as f64 } else { 0.0 };
     let take =
         scene.input.len() as f64 / f64::from(SAMPLE_RATE) + calibration + SETTLE.as_secs_f64() + wait + f64::from(r.lead_s + r.tail_s);
     (take + 60.0).min(MAX_CHAIN_RECORDING_S)
@@ -315,11 +317,12 @@ impl EchoTake {
     }
 }
 
+/// One take: the settle (and with `settle`, the adaptive output target's wait), then the scene played and recorded.
 fn play(
-    engine: &Engine, cfg: &EngineConfig, scene: &Scene, plan: Option<&Plan>, recorder: Option<&ChainRecorder>, route: Route,
+    engine: &Engine, cfg: &EngineConfig, settle: bool, scene: &Scene, plan: Option<&Plan>, recorder: Option<&ChainRecorder>, route: Route,
 ) -> Result<Take, Failure> {
     wait_running(engine)?;
-    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg) {
+    if console::sleep_unless_stopped(SETTLE) || super::run::wait_for_adaptive_target(engine, cfg, settle) {
         return Err(Failure::no_result("Cancelled before the test started."));
     }
     let before = engine.telemetry();
@@ -406,26 +409,26 @@ fn play(
         delay: Err("no chain recording".into()),
     });
     let scene_at = recorded.lead_frames + plan.map_or(0, |p| p.scene_at as usize);
-    let conditions = conditions(&engine.status(), &after);
+    let conditions = conditions(&engine.status(), &after, engine.buffer_targets().output_ms);
     let dropouts = Dropouts::between(&before, &after, &recorded);
     Ok(Take { dropouts, recorded, scene_at, engine: readings, budget, echo, conditions, warnings })
 }
 
 /// The filter's streams as they ran (shared or exclusive, and its format; the periods; RAW) and its output target at the
-/// take's end, fixed or adaptive: "filter mic CABLE-A Output (48000 Hz, 2 ch, period 3.33 ms, exclusive 16-bit); output
-/// CABLE Input (...); output target 14.0 ms (fixed)".
-pub fn conditions(status: &EngineStatus, t: &TelemetrySnapshot) -> String {
+/// take's end, fixed or adaptive (against `fixed_ms`, the fixed one it starts at: at it, or down from it):
+/// "filter mic CABLE-A Output (48000 Hz, 2 ch, period 3.33 ms, exclusive 16-bit); output CABLE Input (...); output target
+/// 14.0 ms (fixed)".
+pub fn conditions(status: &EngineStatus, t: &TelemetrySnapshot, fixed_ms: f32) -> String {
     let stream = |label: &str, s: Option<&nf_engine::StreamInfo>| match s {
         Some(s) => format!("{label} {}", stream_text(s)),
         None => format!("{label} --"),
     };
-    let how = if t.output_adaptive { "adaptive, at the end" } else { "fixed" };
-    format!(
-        "filter {}; {}; output target {} ms ({how})",
-        stream("mic", status.mic.as_ref()),
-        stream("output", status.output.as_ref()),
-        fixed(f64::from(t.output_target_ms), 1)
-    )
+    let mut parts = vec![format!("filter {}", stream("mic", status.mic.as_ref())), stream("output", status.output.as_ref())];
+    let target = nf_engine::output_target_text(t.output_target_ms, t.output_adaptive, fixed_ms);
+    if !target.is_empty() {
+        parts.push(target);
+    }
+    parts.join("; ")
 }
 
 /// The echo test's calibration, beside the take: every [`CALIBRATION_POLL`] it copies what the chain recorder has added, and
@@ -963,6 +966,7 @@ mod tests {
             noise: None,
             far_speech: None,
             save: None,
+            settle: false,
         }
     }
 
@@ -1093,12 +1097,19 @@ mod tests {
         let status = EngineStatus { mic: Some(stream("CABLE-A Output")), output: Some(excl), ..Default::default() };
         let t = TelemetrySnapshot { output_target_ms: 5.0, output_adaptive: true, ..Default::default() };
         assert_eq!(
-            conditions(&status, &t),
+            conditions(&status, &t, 14.0),
             "filter mic CABLE-A Output (48000 Hz, 2 ch, period 10.00 ms); output CABLE Input (48000 Hz, 2 ch, period 2.00 ms, \
-             exclusive 16-bit); output target 5.0 ms (adaptive, at the end)"
+             exclusive 16-bit); output target 5.0 ms at the end (adaptive, down from 14.0 ms)"
         );
-        let none = conditions(&EngineStatus::default(), &TelemetrySnapshot { output_target_ms: 22.0, ..Default::default() });
+        // A take that didn't --settle (or went back after an underrun): at the fixed target, and it says what that means.
+        let start = conditions(&status, &TelemetrySnapshot { output_target_ms: 14.0, ..t }, 14.0);
+        assert!(start.ends_with(
+            "output target 14.0 ms at the end (adaptive, at the fixed target: it comes down only after 120 s of running, and goes \
+             back up to it after an underrun)"
+        ));
+        let none = conditions(&EngineStatus::default(), &TelemetrySnapshot { output_target_ms: 22.0, ..Default::default() }, 22.0);
         assert_eq!(none, "filter mic --; output --; output target 22.0 ms (fixed)");
+        assert_eq!(conditions(&EngineStatus::default(), &TelemetrySnapshot::default(), 0.0), "filter mic --; output --", "stopped");
     }
 
     #[test]
@@ -1623,7 +1634,7 @@ mod tests {
         assert!(chain_line(&CHAIN_FILES, &ChainRecording::default()).contains("got no blocks"));
     }
 
-    /// The chain recorder covers the take: the settle, the adaptive target's wait (with `--adaptive-output`), the lead, the
+    /// The chain recorder covers the take: the settle, the adaptive target's wait (with `--settle`), the lead, the
     /// echo test's calibration, the scene and the tail, and a minute more.
     #[test]
     fn the_recorder_covers_the_take() {
@@ -1635,7 +1646,7 @@ mod tests {
         let with = recording_limit(&scene, Some(&plan), false);
         assert!((with - plain - plan.latest as f64 / 48_000.0).abs() < 1e-9, "{with}");
         let adaptive = recording_limit(&scene, None, true);
-        assert!((adaptive - plain - super::super::run::ADAPTIVE_WAIT_S as f64).abs() < 1e-9, "{adaptive}");
+        assert!((adaptive - plain - crate::cli::ADAPTIVE_WAIT_S as f64).abs() < 1e-9, "{adaptive}");
     }
 
     #[test]

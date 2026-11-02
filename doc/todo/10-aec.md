@@ -207,7 +207,7 @@ period plus the device's buffer), but low-latency ones may not be. Lowering it m
 starts at one loopback period + 2 ms, the newest reference a mic block can be sure of), or letting the mic wait for the
 reference only when the echo path is that short, which costs that wait in latency.
 
-With the exclusive mic (`--exclusive-mic`, #13: mic blocks reach the app 0.8 ms after capture instead of about 16) the lead rose to 18.3 ms: the mic is processed before the loopback, still on its 10 ms shared period, has delivered as recent a reference. The floor rises by as much (about 20 ms). At 25 ms it cancelled a median 54.5 dB a far-only turn.
+With the exclusive mic (the default since 2026-11-02, #13; `--no-exclusive-mic` or the window's "Exclusive microphone" switch turns it off: mic blocks reach the app 0.8 ms after capture instead of about 16) the lead rose to 18.3 ms: each mic block is processed before the loopback, still on its 10 ms shared period, has delivered as recent a reference. The floor rises by as much, to about 20 ms (`quality::echo_delay::EXCLUSIVE_MIC_ECHO_FLOOR_MS`), and applies by default now: speakers whose echo comes back sooner than that after the mix echo through more (the window's switch line says to try it off when echo gets through with echo cancelling on; whether the exclusive mic should yield to shared when AEC is on is open, ours to propose). At 25 ms (the echo test's default, over the floor) it cancelled a median 54.5 dB a far-only turn.
 
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).

@@ -137,16 +137,18 @@ pub struct IoConfig {
     /// Keep a silent render stream open on the reference endpoint so its loopback never stops.
     pub keep_alive_reference: bool,
     /// Open the output in WASAPI exclusive mode, event-driven at the device's smallest period (2 ms or more), falling back
-    /// to shared mode with a warning when the device refuses. It locks the endpoint: no other app can play into it, which
-    /// suits the output cable (only the filter plays into it). Off by default.
+    /// to shared mode with a note when the device refuses. It locks the endpoint: no other app can play into it, which
+    /// suits the output cable (only the filter plays into it; the apps read its other side, which stays shared). On by
+    /// default (the owner, 2026-11-02: the lowest latency by default; on VB-CABLE it took 30 ms off the readout).
     pub output_exclusive: bool,
     /// Open the mic in WASAPI exclusive mode, event-driven on its own small period, falling back to shared mode with a
-    /// warning. While the filter runs no other app can record from that mic: they should use the filtered mic (the
-    /// cable). Off by default.
+    /// note. While the filter runs no other app can record from that mic directly: they use the filtered mic (the cable).
+    /// On by default (the owner, 2026-11-02); off for someone who records the raw mic in another app as well.
     pub mic_exclusive: bool,
     /// Let the output's fill target follow the delivery it sees: down, slowly (after two minutes), to one period + the
-    /// margin + the largest lateness measured; up at once after an underrun. Off by default: the target is then one
-    /// period + one block + the margin.
+    /// margin + the largest lateness measured; up at once after an underrun, which can cost up to three glitches a run
+    /// that the fixed target (one period + one block + the margin) would have ridden out. On by default (the owner,
+    /// 2026-11-02); off for a recording that must have none.
     pub adaptive_output: bool,
 }
 
@@ -157,9 +159,25 @@ impl Default for IoConfig {
             raw_mic: true,
             output_margin_ms: 2.0,
             keep_alive_reference: true,
-            output_exclusive: false,
-            mic_exclusive: false,
-            adaptive_output: false,
+            output_exclusive: true,
+            mic_exclusive: true,
+            adaptive_output: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owner's decision (2026-11-02): the lowest-latency I/O by default, exclusive output and mic and the adaptive
+    /// output target; the rest as before.
+    #[test]
+    fn the_lowest_latency_io_is_the_default() {
+        let io = IoConfig::default();
+        assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output);
+        assert!(io.low_latency_periods && io.raw_mic && io.keep_alive_reference);
+        assert_eq!(io.output_margin_ms, 2.0);
+        assert_eq!(EngineConfig::default().io, io);
     }
 }
