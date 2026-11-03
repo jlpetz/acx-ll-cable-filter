@@ -109,15 +109,46 @@ pub(crate) fn frames_to_hns(frames: usize) -> i64 {
 }
 
 /// The exclusive periods to try, in 100 ns units, best first: [`exclusive_period`]'s choice, then the device's minimum
-/// (from [`MIN_PERIOD_FRAMES`]: the probe saw VB-CABLE take its 3 ms, not 3.33), then its default, each once.
-pub(crate) fn exclusive_periods(default_hns: i64, min_hns: i64) -> Vec<i64> {
-    let mut periods = vec![frames_to_hns(exclusive_period(default_hns, min_hns))];
-    for p in [min_hns.max(frames_to_hns(MIN_PERIOD_FRAMES)), default_hns] {
-        if p > 0 && !periods.contains(&p) {
+/// (from [`MIN_PERIOD_FRAMES`]: the probe saw VB-CABLE take its 3 ms, not 3.33), then its default, each once. None is
+/// under `floor` frames (0 for none: the exclusive period guard's for a stream it stepped up, control.rs); a floor past
+/// the default leaves the floor alone, which the device may refuse (the stream then runs shared, with the note).
+pub(crate) fn exclusive_periods(default_hns: i64, min_hns: i64, floor: usize) -> Vec<i64> {
+    let floor_hns = if floor > 0 { frames_to_hns(floor) } else { 0 };
+    let mut periods = vec![frames_to_hns(exclusive_period(default_hns, min_hns, floor))];
+    for p in [min_hns.max(frames_to_hns(MIN_PERIOD_FRAMES)).max(floor_hns), default_hns] {
+        if p > 0 && p >= floor_hns && !periods.contains(&p) {
             periods.push(p);
         }
     }
     periods
+}
+
+/// What the exclusive period guard (control.rs) holds for a stream it had to step up: the next start opens it at this
+/// period (frames at 48 kHz) or longer, or in shared mode once even a block's period (the default's) was too short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeriodFloor {
+    AtLeast(usize),
+    Shared,
+}
+
+/// The guard's next step for a stream that ran at `frames`: the next period that tiles the block (2, 2.5, 3.33, 5 and
+/// 10 ms), or shared mode past a block.
+pub(crate) fn next_floor(frames: usize) -> PeriodFloor {
+    (frames + 1..=BLOCK).find(|&p| p >= MIN_PERIOD_FRAMES && BLOCK.is_multiple_of(p)).map_or(PeriodFloor::Shared, PeriodFloor::AtLeast)
+}
+
+/// The guard's floors, by endpoint id: what the next start opens the mic and the output at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeriodFloors {
+    pub(crate) mic: Option<(String, PeriodFloor)>,
+    pub(crate) output: Option<(String, PeriodFloor)>,
+}
+
+impl PeriodFloors {
+    /// The floor `entry` holds for the endpoint `id`, if it's that endpoint's.
+    pub(crate) fn of(entry: &Option<(String, PeriodFloor)>, id: Option<&str>) -> Option<PeriodFloor> {
+        entry.as_ref().filter(|(e, _)| Some(e.as_str()) == id).map(|(_, f)| *f)
+    }
 }
 
 /// The first exclusive stream `init` opens, trying each format (best first) at each period (best first): a refused period
@@ -170,14 +201,14 @@ pub(crate) fn formats_to_try<F>(accepted: Vec<F>, candidates: impl FnOnce() -> V
 /// blocks end, so a block is complete when its last sample's packet is (144-frame packets, 3 ms, finish a block up to
 /// 2 ms after its end, 1 ms on average; 160-frame ones, 3.33 ms, never); on the output it puts five events in each of
 /// a 2 ms period's blocks, and divisors of 480 are aligned for most drivers' 128-byte rule (any refusal of that is
-/// retried at the size the driver gives).
-pub(crate) fn exclusive_period(default_hns: i64, min_hns: i64) -> usize {
+/// retried at the size the driver gives). From `floor` frames up (the exclusive period guard's; 0 for none).
+pub(crate) fn exclusive_period(default_hns: i64, min_hns: i64, floor: usize) -> usize {
     // Periods in 100 ns units are rounded (512 frames reads 106 667): within a hundredth of a frame is that frame.
     let frames = |hns: i64, round_up: bool| {
         let x = hns.max(0) as f64 * SAMPLE_RATE as f64 / HNS_PER_S;
         (if round_up && (x - x.round()).abs() > 0.01 { x.ceil() } else { x.round() }) as usize
     };
-    let lo = frames(min_hns, true).max(MIN_PERIOD_FRAMES);
+    let lo = frames(min_hns, true).max(MIN_PERIOD_FRAMES).max(floor);
     let default = if default_hns > 0 { frames(default_hns, false) } else { BLOCK };
     (lo..=default.max(lo)).find(|&p| BLOCK.is_multiple_of(p)).unwrap_or(lo)
 }
@@ -438,30 +469,51 @@ mod tests {
     /// up to its default gets its minimum.
     #[test]
     fn the_period_is_the_smallest_that_tiles_the_block() {
-        assert_eq!(exclusive_period(100_000, 20_000), 96, "VB-CABLE's render side: 2 ms");
-        assert_eq!(exclusive_period(100_000, 30_000), 160, "VB-CABLE's capture side: 3 ms -> 3.33 ms");
-        assert_eq!(exclusive_period(100_000, 29_025), 160);
-        assert_eq!(exclusive_period(100_000, 10_000), 96, "never under 2 ms");
-        assert_eq!(exclusive_period(100_000, 0), 96);
-        assert_eq!(exclusive_period(100_000, 50_000), 240);
-        assert_eq!(exclusive_period(100_000, 100_000), 480);
-        assert_eq!(exclusive_period(106_667, 106_667), 512, "past the block: the minimum");
-        assert_eq!(exclusive_period(0, 20_000), 96, "no default: up to a block");
-        assert_eq!(exclusive_period(30_000, 25_000), 120, "the default caps the search");
-        assert_eq!(exclusive_period(26_000, 26_000), 125, "nothing tiles below the default: the minimum");
+        assert_eq!(exclusive_period(100_000, 20_000, 0), 96, "VB-CABLE's render side: 2 ms");
+        assert_eq!(exclusive_period(100_000, 30_000, 0), 160, "VB-CABLE's capture side: 3 ms -> 3.33 ms");
+        assert_eq!(exclusive_period(100_000, 29_025, 0), 160);
+        assert_eq!(exclusive_period(100_000, 10_000, 0), 96, "never under 2 ms");
+        assert_eq!(exclusive_period(100_000, 0, 0), 96);
+        assert_eq!(exclusive_period(100_000, 50_000, 0), 240);
+        assert_eq!(exclusive_period(100_000, 100_000, 0), 480);
+        assert_eq!(exclusive_period(106_667, 106_667, 0), 512, "past the block: the minimum");
+        assert_eq!(exclusive_period(0, 20_000, 0), 96, "no default: up to a block");
+        assert_eq!(exclusive_period(30_000, 25_000, 0), 120, "the default caps the search");
+        assert_eq!(exclusive_period(26_000, 26_000, 0), 125, "nothing tiles below the default: the minimum");
     }
 
     /// The periods tried: the choice, the device's minimum and its default, each once and never under 2 ms. VB-CABLE's
     /// capture side: 3.33 ms, then the 3 ms the probe saw it take, then 10 ms; its render side: 2 ms, then 10.
     #[test]
     fn the_periods_tried_are_the_choice_the_minimum_and_the_default() {
-        assert_eq!(exclusive_periods(100_000, 30_000), [33_333, 30_000, 100_000]);
-        assert_eq!(exclusive_periods(100_000, 20_000), [20_000, 100_000]);
-        assert_eq!(exclusive_periods(100_000, 10_000), [20_000, 100_000], "never under 2 ms");
-        assert_eq!(exclusive_periods(100_000, 29_025), [33_333, 29_025, 100_000]);
-        assert_eq!(exclusive_periods(0, 20_000), [20_000]);
+        assert_eq!(exclusive_periods(100_000, 30_000, 0), [33_333, 30_000, 100_000]);
+        assert_eq!(exclusive_periods(100_000, 20_000, 0), [20_000, 100_000]);
+        assert_eq!(exclusive_periods(100_000, 10_000, 0), [20_000, 100_000], "never under 2 ms");
+        assert_eq!(exclusive_periods(100_000, 29_025, 0), [33_333, 29_025, 100_000]);
+        assert_eq!(exclusive_periods(0, 20_000, 0), [20_000]);
         assert_eq!(frames_to_hns(160), 33_333);
         assert_eq!(frames_to_hns(144), 30_000);
+    }
+
+    /// The period guard's ladder (control.rs): the next period that tiles the block, then shared mode; and the periods
+    /// tried from a floor, none under it (a floor past the default is tried alone).
+    #[test]
+    fn a_stepped_up_stream_opens_from_its_floor() {
+        let ladder: Vec<_> = [96, 120, 144, 160, 240, 480, 512].into_iter().map(next_floor).collect();
+        use PeriodFloor::{AtLeast, Shared};
+        assert_eq!(ladder, [AtLeast(120), AtLeast(160), AtLeast(160), AtLeast(240), AtLeast(480), Shared, Shared]);
+        assert_eq!(exclusive_period(100_000, 20_000, 120), 120);
+        assert_eq!(exclusive_period(100_000, 30_000, 120), 160, "the device's minimum still holds");
+        assert_eq!(exclusive_period(30_000, 20_000, 160), 160, "past the default: the floor");
+        assert_eq!(exclusive_periods(100_000, 20_000, 120), [25_000, 100_000]);
+        assert_eq!(exclusive_periods(100_000, 30_000, 160), [33_333, 100_000], "the 3 ms minimum is under the floor");
+        assert_eq!(exclusive_periods(100_000, 20_000, 480), [100_000]);
+        assert_eq!(exclusive_periods(30_000, 20_000, 160), [33_333], "the 3 ms default is under the floor");
+        let floors = PeriodFloors { mic: Some(("mic1".into(), AtLeast(240))), output: None };
+        assert_eq!(PeriodFloors::of(&floors.mic, Some("mic1")), Some(AtLeast(240)));
+        assert_eq!(PeriodFloors::of(&floors.mic, Some("mic2")), None, "another endpoint");
+        assert_eq!(PeriodFloors::of(&floors.mic, None), None);
+        assert_eq!(PeriodFloors::of(&floors.output, Some("mic1")), None);
     }
 
     /// Each format at each period: a refused period goes on to the next, a refused format to the next format, anything else

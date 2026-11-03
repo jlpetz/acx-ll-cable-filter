@@ -51,7 +51,7 @@ impl std::fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 /// How one stream was opened.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StreamInfo {
     pub device_name: String,
     /// The device-side format (before conversion to the app's 48 kHz mono).

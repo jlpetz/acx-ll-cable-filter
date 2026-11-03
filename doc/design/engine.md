@@ -342,6 +342,19 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
   delay. The thread reads the mic at each wake, and its work between the mic's events is a block (0.1-0.3 ms) and the
   output's answers, so what can miss it is the thread itself being held up (preempted, a page fault, a slow driver
   call): MMCSS's priority is what keeps it on time, the window minimised included.
+- **The period guard** (`control::PeriodGuard`, `exclusive::next_floor`): both deadlines are the PC's as much as ours. A
+  PC whose drivers hold the CPU past a period (DPC latency: some network, GPU and ACPI drivers hold it for milliseconds,
+  and MMCSS can't preempt a DPC) makes the thread answer late, or lose the mic's packet, however light its work. So a
+  stream that misses three deadlines in ten minutes of one run (the output's late answers, `output_late_answers`; the
+  exclusive mic's capture glitches; the run's first 5 s don't count, as the start's own hold-ups would only come back)
+  steps up to the next period that tiles the block (2, 2.5, 3.33, 5, 10 ms), by one forced restart (the flight
+  recorder's notes say "the exclusive period guard"), and stays there for later starts on that endpoint while the process
+  runs (`Inner::period_floors`, by endpoint id; `exclusive_periods` tries nothing under the floor, and a floor past the
+  default is tried alone). Past a block's period the stream runs shared. Each start under a floor carries
+  `Warning::ExclusivePeriodRaised`, a note that says which stream, at what, and points at LatencyMon. One click doesn't
+  move it (a USB device plugged in, a driver's one-off), and neither do a short ring's underruns (the adaptive target's
+  affair). Item 2 of the real-hardware list (the owner's go, 2026-11-03); untested on real hardware, where a PC with bad
+  DPC latency is the test.
 - **Formats at the edge** (convert.rs): 16-bit and 24-bit are written at the scale they're read at, rounded to the
   nearest step: a 16-bit mic passes a 16-bit cable unchanged in passthrough. No dither: the shared engine converts our
   float to a 16-bit cable without one too, the rounding error (-101 dBFS RMS) is under any mic's own noise, and a dither

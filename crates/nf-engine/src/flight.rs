@@ -211,6 +211,8 @@ pub(crate) enum Note {
     Restarting(&'static str),
     /// The run carries on without its echo reference, worded.
     ReferenceLost(String),
+    /// The exclusive period guard stepped a stream up (control.rs), worded.
+    PeriodRaised(String),
     /// Stopped by the user (`Engine::stop`).
     Stopped,
 }
@@ -222,6 +224,7 @@ impl Note {
             Note::StartFailed(m) => format!("a start failed: {m}"),
             Note::Restarting(why) => format!("the streams restart ({why})"),
             Note::ReferenceLost(m) => format!("the echo reference was lost: {m}"),
+            Note::PeriodRaised(m) => format!("the exclusive period guard: {m}"),
             Note::Stopped => "the filter was stopped".to_owned(),
         }
     }

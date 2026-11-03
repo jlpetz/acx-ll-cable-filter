@@ -473,6 +473,27 @@ The same command and conditions with `--flight`; the log is `Downloads\nf-scratc
 - **Otherwise:** readout 20.2 ms median, p95 20.6; app path 40.3 ms; 180,001 wakes of one block; 0 real-time heap
   allocations; the output drift reading ended at -0.7 ppm (not high this time).
 
+## Real hardware: what of VB-CABLE's behaviour comes back (2026-11-03)
+The owner asked whether the quirks the soaks showed would come back on real hardware or in our own driver, and so need
+handling. Our reading (the owner's go for items 2 and 3, 2026-11-03):
+- **Bursty delivery** (packets in twos and threes): real on USB and Bluetooth devices; the adaptive target handles it.
+- **A clock that stalls or steps:** real (USB clock recovery, a driver re-syncing). What it broke was our rule, not the
+  audio: the late-answer check extrapolated a stalled reading past everything handed. Fixed (item 2(a), 3ca7d3f): past
+  2 periods since the last answer the gap proves it late; between 1.5 and 2 only the position the device reported can.
+  Late answers are counted apart (`output_late_answers`, chain_blocks.csv's `out_late`, the report's "a late answer")
+  and don't raise the adaptive target, which a deeper queue can't help.
+- **Late answers of our own:** real on any PC whose drivers hold the CPU past a 2 ms period (DPC latency; MMCSS can't
+  preempt a DPC). Item 2(b), the exclusive period guard (engine.md, "Exclusive mode"): three missed deadlines in ten
+  minutes of one run (late answers on the output, capture glitches on the exclusive mic; not in the run's first 5 s) step
+  that stream up a period by one restart (2, 2.5, 3.33, 5, 10 ms, then shared mode), remembered by endpoint for the
+  process, with a note naming LatencyMon. Why these numbers: one click is a one-off to put up with, three in ten minutes
+  is a PC that will keep doing it; per run, so a restart starts clean; for the process, not saved, so a fixed driver or
+  another PC isn't held back. Not done: stepping back down later (each try would cost clicks and a restart). The
+  thresholds are ours, to set on real hardware.
+- **Loopback hiccups and the echo floor:** a real risk with any speakers. Item 3 (next): the speakers' keep-alive at
+  IAudioClient3's smallest shared period (shorter loopback packets, a shorter reference lead), and a guard for an echo
+  path shorter than the lead (TODO 10).
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

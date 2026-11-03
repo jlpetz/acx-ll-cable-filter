@@ -169,6 +169,8 @@ pub(crate) struct MicOptions {
     pub raw: bool,
     /// Exclusive mode first (`IoConfig::mic_exclusive`); RAW and IAudioClient3 are shared mode's.
     pub exclusive: bool,
+    /// The exclusive period guard's floor for this mic, in frames (0: none; control.rs).
+    pub exclusive_floor: usize,
 }
 
 /// One capture stream, in shared mode (or the mic in exclusive mode): the mic (event-driven), the latency test's output capture
@@ -197,7 +199,7 @@ impl CaptureStream {
             opts.exclusive,
             StreamRole::Mic,
             &name,
-            || Self::open_mic_exclusive(device, &name, &mix),
+            || Self::open_mic_exclusive(device, &name, &mix, opts.exclusive_floor),
             || Self::open_mic_shared(device, &name, &mix, opts),
         )?;
         if let Some(Warning::ExclusiveUnavailable { why, .. }) = &warning {
@@ -206,8 +208,8 @@ impl CaptureStream {
         Ok((mic, warning))
     }
 
-    fn open_mic_exclusive(device: &Device, name: &str, mix: &WaveFormat) -> Result<Self, ExclusiveRefusal> {
-        let (client, fmt, kind, frames) = open_exclusive(device, Direction::Capture, mix)?;
+    fn open_mic_exclusive(device: &Device, name: &str, mix: &WaveFormat, floor: usize) -> Result<Self, ExclusiveRefusal> {
+        let (client, fmt, kind, frames) = open_exclusive(device, Direction::Capture, mix, floor)?;
         let info = exclusive_info(name, &fmt, frames, kind);
         Self::finish(client, &fmt, true, info).map_err(|e| ExclusiveRefusal::Refused(hr_of(&e)))
     }
@@ -485,11 +487,11 @@ pub(crate) struct ExclusiveRenderDevice {
 
 impl ExclusiveRenderDevice {
     /// The output in exclusive mode, or why not (the caller falls back to shared mode).
-    pub(crate) fn open(device: &Device) -> Result<Self, ExclusiveRefusal> {
+    pub(crate) fn open(device: &Device, floor: usize) -> Result<Self, ExclusiveRefusal> {
         let refused = |e: WasapiError| ExclusiveRefusal::Refused(hr_of(&e));
         let name = device.get_friendlyname().unwrap_or_default();
         let mix = device.get_iaudioclient().and_then(|c| c.get_mixformat()).map_err(refused)?;
-        let (client, fmt, kind, period) = open_exclusive(device, Direction::Render, &mix)?;
+        let (client, fmt, kind, period) = open_exclusive(device, Direction::Render, &mix, floor)?;
         let format = sample_format(&fmt).ok_or(ExclusiveRefusal::NoFormat)?;
         // After initialise, before start.
         let event = client.set_get_eventhandle().map_err(refused)?;
@@ -562,15 +564,15 @@ pub(crate) enum Output {
 }
 
 impl Output {
-    /// The output as `IoConfig` asks for it: exclusive mode first when asked, else (or when the device refuses, with the
-    /// note) shared mode.
-    pub(crate) fn open(device: &Device, exclusive: bool, buffer_hns: i64) -> Result<(Self, Option<Warning>), WasapiError> {
+    /// The output as `IoConfig` asks for it: exclusive mode first when asked (at `floor` frames or longer: the exclusive
+    /// period guard's, 0 for none), else (or when the device refuses, with the note) shared mode.
+    pub(crate) fn open(device: &Device, exclusive: bool, buffer_hns: i64, floor: usize) -> Result<(Self, Option<Warning>), WasapiError> {
         let name = device.get_friendlyname().unwrap_or_default();
         let (mut out, warning) = exclusive_or_shared(
             exclusive,
             StreamRole::Output,
             &name,
-            || ExclusiveRenderDevice::open(device).map(|d| Output::Exclusive(EventRender::new(d, RING_FRAMES))),
+            || ExclusiveRenderDevice::open(device, floor).map(|d| Output::Exclusive(EventRender::new(d, RING_FRAMES))),
             || RenderStream::open(device, buffer_hns).map(Output::Shared),
         )?;
         if let (Output::Shared(s), Some(Warning::ExclusiveUnavailable { why, .. })) = (&mut out, &warning) {
@@ -786,7 +788,7 @@ fn exclusive_candidates(mix: &WaveFormat) -> impl Iterator<Item = (WaveFormat, E
 /// refused format the next format, anything else ends it).
 /// Returns the client, its format, which one that is, and the period in frames (its buffer). Not real-time.
 fn open_exclusive(
-    device: &Device, dir: Direction, mix: &WaveFormat,
+    device: &Device, dir: Direction, mix: &WaveFormat, floor: usize,
 ) -> Result<(AudioClient, WaveFormat, ExclusiveFormat, usize), ExclusiveRefusal> {
     let refused = |e: WasapiError| ExclusiveRefusal::Refused(hr_of(&e));
     let probe = device.get_iaudioclient().map_err(refused)?;
@@ -798,7 +800,7 @@ fn open_exclusive(
     let formats = formats_to_try(accepted, || exclusive_candidates(mix).collect());
     let (default_hns, min_hns) = probe.get_device_period().map_err(refused)?;
     drop(probe);
-    first_exclusive(&formats, &exclusive_periods(default_hns, min_hns), |(fmt, kind), period_hns| {
+    first_exclusive(&formats, &exclusive_periods(default_hns, min_hns, floor), |(fmt, kind), period_hns| {
         init_exclusive(device, fmt, &dir, period_hns).map(|(client, frames)| (client, fmt.clone(), *kind, frames))
     })
 }

@@ -32,6 +32,7 @@ use crate::errors::{
     Fault, StartFailure, StreamRole, describe_fault, describe_reference_lost, describe_start_failure, describe_warning, hr,
     no_output_message, remedy_for_fault, remedy_for_start, same_device_message,
 };
+use crate::exclusive::{PeriodFloor, PeriodFloors, next_floor};
 use crate::flight::{self, Note};
 use crate::latency_test::{TapPort, tap_channel};
 use crate::recorder;
@@ -58,6 +59,14 @@ const RETRY_FIRST: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(10);
 /// Device events held during a start, at most (they're re-judged when it finishes).
 const MAX_DEFERRED: usize = 64;
+/// The exclusive period guard (`PeriodGuard`): this many missed deadlines on a stream in [`STRIKE_WINDOW`] of one run step
+/// it up a period. One is a click to put up with (a USB device plugged in, a driver's one-off); three in ten minutes is a
+/// PC whose drivers hold the CPU past the period, and will keep doing it.
+const STRIKES: usize = 3;
+const STRIKE_WINDOW: Duration = Duration::from_secs(600);
+/// A run's first seconds don't count against its periods: the start's own hold-ups (the model loading, the first page
+/// faults) say nothing of the PC's steady state, and would only come back at a longer period.
+const GRACE: Duration = Duration::from_secs(5);
 /// A run that stays up this long was healthy: a fault after it starts the backoff (and the log's
 /// failure streak) over. Before it, a run that opens and faults again (a mic that sends nothing, a
 /// flapping USB link) keeps backing off instead of restarting every 2.5 s.
@@ -224,6 +233,9 @@ pub(crate) struct Inner {
     /// (`remember_mic_delivery`): what the next start's automatic model depth goes by when it opens the same mic the same
     /// way (TODO 5). In memory for the process.
     pub(crate) mic_delivery: Mutex<Option<(crate::audio::MicOpening, nf_core::config::MicDelivery)>>,
+    /// The exclusive period guard's floors (`PeriodGuard`): the periods its streams stepped up to, by endpoint, for every
+    /// later start. In memory for the process.
+    pub(crate) period_floors: Mutex<PeriodFloors>,
 }
 
 impl Inner {
@@ -245,6 +257,7 @@ impl Inner {
             flight: Mutex::new(flight::Slot::default()),
             flying: AtomicBool::new(false),
             mic_delivery: Mutex::new(None),
+            period_floors: Mutex::new(PeriodFloors::default()),
         })
     }
 
@@ -343,8 +356,8 @@ impl Inner {
     }
 
     /// A (re)start that has come due: runs it if it's still needed (`restart_due`), with the wanted
-    /// config. Errors land in the status.
-    fn restart(self: &Arc<Self>, forced: bool) -> Outcome {
+    /// config. Errors land in the status. `stepped`: the exclusive period guard asked for it.
+    fn restart(self: &Arc<Self>, forced: bool, stepped: bool) -> Outcome {
         let mut run = lock(&self.run);
         let wanted = {
             let d = lock(&self.desired);
@@ -360,6 +373,7 @@ impl Inner {
             d.running.is_some()
         };
         let why = match (forced, running) {
+            (true, true) if stepped => "the exclusive period guard",
             (true, _) => "a device change",
             (false, true) => "a settings change",
             (false, false) => "a retry",
@@ -369,6 +383,36 @@ impl Inner {
             Ok(()) => Outcome::Started,
             Err(f) => Outcome::Down { transient: f.transient },
         }
+    }
+
+    /// The exclusive period guard's look at the live run (`PeriodGuard`): a stream that kept missing its deadline gets a
+    /// longer period (or shared mode) for the next start, logged and noted. `true` when one did: the run restarts.
+    fn watch_periods(&self, guard: &mut PeriodGuard, now: Instant) -> bool {
+        let steps = {
+            let d = lock(&self.desired);
+            let Some(run) = d.started_at.filter(|_| d.running.is_some()) else { return false };
+            let st = lock(&self.status);
+            let t = &self.telemetry;
+            let mic = Watched::of(st.mic.as_ref(), st.mic_id.as_deref(), t.capture_glitches.load(Relaxed));
+            let output = Watched::of(st.output.as_ref(), st.output_id.as_deref(), t.output_late_answers.load(Relaxed));
+            guard.check(now, run, mic, output)
+        };
+        let mut floors = lock(&self.period_floors);
+        let floors = &mut *floors;
+        let mut stepped = false;
+        for (role, step, slot) in [(StreamRole::Mic, steps.mic, &mut floors.mic), (StreamRole::Output, steps.output, &mut floors.output)] {
+            let Some(step) = step else { continue };
+            let what = match step.1 {
+                PeriodFloor::AtLeast(n) => format!("an exclusive period of {:.2} ms or longer", frames_ms(n)),
+                PeriodFloor::Shared => "shared mode".to_owned(),
+            };
+            let line = format!("{} kept missing its deadline at its exclusive period; restarting it at {what}", role.noun());
+            log::warn!("{line}");
+            flight::note(self, Note::PeriodRaised(line));
+            *slot = Some(step);
+            stepped = true;
+        }
+        stepped
     }
 
     /// Notices a run that stopped by itself (a fault, or the thread ending) or lost its reference,
@@ -565,6 +609,88 @@ pub(crate) fn restart_due(wanted: Option<&EngineConfig>, running: Option<&Engine
     }
 }
 
+/// Frames at 48 kHz in ms.
+fn frames_ms(frames: usize) -> f64 {
+    frames as f64 * 1000.0 / f64::from(nf_core::SAMPLE_RATE)
+}
+
+/// An exclusive stream as the period guard watches it: its endpoint, its period (frames) and its count of missed
+/// deadlines (the output's late answers; the mic's lost samples, `capture_glitches`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Watched {
+    pub(crate) id: String,
+    pub(crate) frames: usize,
+    pub(crate) count: u64,
+}
+
+impl Watched {
+    /// The stream if it runs exclusive and has an endpoint id to remember it by.
+    fn of(info: Option<&StreamInfo>, id: Option<&str>, count: u64) -> Option<Self> {
+        let info = info.filter(|i| i.exclusive.is_some())?;
+        let frames = (f64::from(info.period_ms) * f64::from(nf_core::SAMPLE_RATE) / 1000.0).round() as usize;
+        Some(Self { id: id?.to_owned(), frames, count })
+    }
+}
+
+/// The exclusive period guard (engine.md, "Exclusive mode"). An exclusive stream has a period to answer its device in: the
+/// output's next buffer, the mic's before the device overwrites it. A PC whose drivers hold the CPU longer than that (DPC
+/// latency: some network, GPU and ACPI drivers do, for milliseconds) clicks at every hold-up, however light our own work
+/// is. A stream that misses [`STRIKES`] deadlines in [`STRIKE_WINDOW`] of one run (not counting its first [`GRACE`]) steps
+/// up to the next period that tiles the block (`exclusive::next_floor`: 2, 2.5, 3.33, 5, 10 ms), by one restart, and stays
+/// there for later starts in the process; past a block's period it runs shared. Once per stream per run. Pure, for tests:
+/// fed the run, the streams and their counters.
+#[derive(Debug, Default)]
+pub(crate) struct PeriodGuard {
+    /// The run watched (when it started), and when its strikes start counting.
+    run: Option<(Instant, Instant)>,
+    mic: Strikes,
+    output: Strikes,
+}
+
+#[derive(Debug, Default)]
+struct Strikes {
+    /// The count last seen.
+    seen: u64,
+    /// When the strikes inside the window came.
+    at: std::collections::VecDeque<Instant>,
+    /// Stepped this run already: the restart is on its way.
+    stepped: bool,
+}
+
+impl Strikes {
+    /// The count now: whether the stream has struck out (once).
+    fn check(&mut self, now: Instant, count: u64, counting: bool) -> bool {
+        let new = count.saturating_sub(self.seen);
+        self.seen = count;
+        if !counting || self.stepped {
+            return false;
+        }
+        for _ in 0..new.min(STRIKES as u64) {
+            self.at.push_back(now);
+        }
+        while self.at.front().is_some_and(|&t| now.duration_since(t) > STRIKE_WINDOW) {
+            self.at.pop_front();
+        }
+        self.stepped = self.at.len() >= STRIKES;
+        self.stepped
+    }
+}
+
+impl PeriodGuard {
+    /// One look at the live run (`started`: when it did, its identity): the floors to set for the streams that struck out.
+    pub(crate) fn check(&mut self, now: Instant, started: Instant, mic: Option<Watched>, output: Option<Watched>) -> PeriodFloors {
+        if self.run.is_none_or(|(s, _)| s != started) {
+            *self = Self { run: Some((started, now + GRACE)), ..Self::default() };
+        }
+        let counting = self.run.is_some_and(|(_, from)| now >= from);
+        let step = |s: &mut Strikes, w: Option<Watched>| {
+            let w = w?;
+            s.check(now, w.count, counting).then(|| (w.id, next_floor(w.frames)))
+        };
+        PeriodFloors { mic: step(&mut self.mic, mic), output: step(&mut self.output, output) }
+    }
+}
+
 /// When the control thread next (re)starts, and why.
 #[derive(Debug, Default)]
 pub(crate) struct Schedule {
@@ -578,6 +704,8 @@ pub(crate) struct Schedule {
     retry_at: Option<Instant>,
     /// The retry's current step; kept across a run that went down before it was healthy.
     backoff: Option<Duration>,
+    /// The exclusive period guard asked for the restart (`period_step`).
+    stepped: bool,
 }
 
 impl Schedule {
@@ -594,6 +722,17 @@ impl Schedule {
         self.forced = true;
         self.first.get_or_insert(now);
         self.restart_at.get_or_insert(now + DEBOUNCE);
+    }
+
+    /// The exclusive period guard stepped a stream up: a forced restart, as for a device event.
+    pub(crate) fn period_step(&mut self, now: Instant) {
+        self.stepped = true;
+        self.device_event(now);
+    }
+
+    /// Whether the restart [`Schedule::take_due`] gave was the period guard's (asked once).
+    pub(crate) fn take_stepped(&mut self) -> bool {
+        std::mem::take(&mut self.stepped)
     }
 
     /// The run went down, or a (re)start failed: a transient cause retries after the backoff,
@@ -768,6 +907,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         recorder: rec_end,
         flight: flight_end,
         mic_delivery: lock(&inner.mic_delivery).clone(),
+        floors: lock(&inner.period_floors).clone(),
         ready: ready_tx,
         done: done_tx,
     };
@@ -1085,6 +1225,7 @@ fn control_main(weak: Weak<Inner>, rx: Receiver<Ctl>, tx: Sender<Ctl>) {
     }
     drop(tx);
     let mut sched = Schedule::default();
+    let mut guard = PeriodGuard::default();
     // The lost-reference check (wasapi/B): when it's next due, and its current step.
     let mut probe_at: Option<Instant> = None;
     let mut probe_step = PROBE_FIRST;
@@ -1105,9 +1246,12 @@ fn control_main(weak: Weak<Inner>, rx: Receiver<Ctl>, tx: Sender<Ctl>) {
         }
         if let Outcome::Down { transient } = inner.check_health() {
             sched.down(Instant::now(), transient, inner.was_healthy());
+        } else if inner.watch_periods(&mut guard, Instant::now()) {
+            sched.period_step(Instant::now());
         }
         if let Some(forced) = sched.take_due(Instant::now()) {
-            match inner.restart(forced) {
+            let stepped = sched.take_stepped();
+            match inner.restart(forced, stepped) {
                 Outcome::Started => sched.running(),
                 // A failed start continues the streak.
                 Outcome::Down { transient } => sched.down(Instant::now(), transient, false),
@@ -1497,6 +1641,54 @@ mod tests {
         assert_eq!(s.take_due(t0 + Duration::from_millis(300)), Some(true));
         assert_eq!(s.take_due(t0 + Duration::from_secs(5)), None, "once");
         assert_eq!(s.wait(t0), POLL);
+        // The period guard's restart: forced, as a device event's, and said once.
+        s.period_step(t0);
+        assert!(s.take_due(t0).is_none());
+        assert_eq!(s.take_due(t0 + DEBOUNCE), Some(true));
+        assert!(s.take_stepped());
+        assert!(!s.take_stepped());
+    }
+
+    /// The exclusive period guard: three missed deadlines in ten minutes of one run step a stream up once (the next period
+    /// that tiles the block, by its endpoint); the run's first seconds, strikes that fall out of the window, a shared
+    /// stream and another run don't count.
+    #[test]
+    fn the_period_guard_steps_a_stream_up_after_three_strikes() {
+        use crate::exclusive::PeriodFloor::{AtLeast, Shared};
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let w = |id: &str, frames, count| Some(Watched { id: id.into(), frames, count });
+        let mut g = PeriodGuard::default();
+        let none = PeriodFloors::default();
+        // Two late answers in the grace, then one at 10 s and one at 11 min (by when the first has left the window), then
+        // two more: the third in the window steps the output up.
+        assert_eq!(g.check(at(1), t0, w("mic", 160, 0), w("out", 96, 2)), none, "the grace");
+        assert_eq!(g.check(at(10), t0, w("mic", 160, 0), w("out", 96, 3)), none);
+        assert_eq!(g.check(at(670), t0, w("mic", 160, 0), w("out", 96, 4)), none);
+        assert_eq!(g.check(at(671), t0, w("mic", 160, 0), w("out", 96, 5)), none, "the first fell out of the window");
+        let steps = g.check(at(672), t0, w("mic", 160, 0), w("out", 96, 6));
+        assert_eq!(steps, PeriodFloors { mic: None, output: Some(("out".into(), AtLeast(120))) });
+        assert_eq!(g.check(at(673), t0, w("mic", 160, 0), w("out", 96, 9)), none, "once per run");
+        // The mic: three lost-sample glitches in one look; at a block's period, shared mode next.
+        let steps = g.check(at(674), t0, w("mic", 480, 3), w("out", 96, 9));
+        assert_eq!(steps, PeriodFloors { mic: Some(("mic".into(), Shared)), output: None });
+        // A new run starts over (its counters were reset), with its own grace.
+        let t1 = at(700);
+        assert_eq!(g.check(at(701), t1, w("mic", 160, 5), w("out", 120, 5)), none, "the new run's grace");
+        assert_eq!(g.check(at(710), t1, w("mic", 160, 6), None), none, "the output runs shared: not watched");
+        assert_eq!(g.check(at(711), t1, w("mic", 160, 8), None), PeriodFloors { mic: Some(("mic".into(), AtLeast(240))), output: None });
+    }
+
+    /// The guard watches a stream that runs exclusive and has an id, at its period in frames.
+    #[test]
+    fn the_period_guard_watches_exclusive_streams() {
+        let info = |exclusive, period_ms| StreamInfo { exclusive, period_ms, ..StreamInfo::default() };
+        let watched = Watched::of(Some(&info(Some("32-bit float"), 10.0 / 3.0)), Some("mic"), 4);
+        assert_eq!(watched, Some(Watched { id: "mic".into(), frames: 160, count: 4 }));
+        assert_eq!(Watched::of(Some(&info(Some("24-bit"), 2.0)), Some("out"), 0).map(|w| w.frames), Some(96));
+        assert_eq!(Watched::of(Some(&info(None, 10.0)), Some("mic"), 4), None, "shared");
+        assert_eq!(Watched::of(Some(&info(Some("16-bit"), 2.0)), None, 4), None, "no id");
+        assert_eq!(Watched::of(None, Some("mic"), 4), None);
     }
 
     /// wasapi/A: a transient fault retries on a timer with backoff (0.5 s doubling to 10 s); a

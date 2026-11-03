@@ -128,6 +128,9 @@ pub(crate) enum Warning {
     /// The mic or the output was asked for in exclusive mode and runs in shared mode: the device (this endpoint name)
     /// refused it. A note, not a warning: exclusive mode is the default, so a refusal is ordinary.
     ExclusiveUnavailable { role: StreamRole, device: String, why: ExclusiveRefusal },
+    /// The exclusive period guard (control.rs) stepped this stream's exclusive period up after late answers or lost
+    /// samples, or turned it to shared mode once a block's period was too short as well. A note.
+    ExclusivePeriodRaised { role: StreamRole, device: String, floor: crate::exclusive::PeriodFloor },
 }
 
 impl StartFailure {
@@ -337,6 +340,7 @@ pub(crate) fn describe_warning(w: &Warning) -> String {
             withheld_text(*exclusive_withheld)
         ),
         Warning::ExclusiveUnavailable { role, device, why } => describe_exclusive_fallback(*role, device, *why),
+        Warning::ExclusivePeriodRaised { role, device, floor } => describe_period_raised(*role, device, *floor),
     }
 }
 
@@ -355,7 +359,29 @@ impl Warning {
     /// A note rather than a warning: how the engine runs, which needs nothing done (`EngineStatus::notes`). Exclusive mode is
     /// the default (the owner, 2026-11-02), so a device that refuses it is ordinary: the stream runs shared, as it did before.
     pub(crate) fn is_note(&self) -> bool {
-        matches!(self, Warning::ExclusiveUnavailable { .. })
+        matches!(self, Warning::ExclusiveUnavailable { .. } | Warning::ExclusivePeriodRaised { .. })
+    }
+}
+
+/// The note for a stream the exclusive period guard stepped up: the audio thread missed its device's deadline at the
+/// shorter period (or lost the mic's samples) again and again, as a PC whose drivers hold the CPU (DPC latency) does.
+fn describe_period_raised(role: StreamRole, device: &str, floor: crate::exclusive::PeriodFloor) -> String {
+    let noun = role.noun();
+    let missed = match role {
+        StreamRole::Mic => "it lost samples",
+        _ => "the filter answered it late",
+    };
+    let why = "as the PC held the filter's audio thread up past it (LatencyMon shows which driver does)";
+    match floor {
+        crate::exclusive::PeriodFloor::AtLeast(frames) => format!(
+            "{noun} ({device}) runs at an exclusive period of {:.2} ms or longer until the filter's app restarts: at the \
+             shorter one {missed} again and again, {why}. That costs a little latency and saves the clicks.",
+            frames as f64 * 1000.0 / f64::from(nf_core::SAMPLE_RATE)
+        ),
+        crate::exclusive::PeriodFloor::Shared => format!(
+            "{noun} ({device}) runs in shared mode until the filter's app restarts: in exclusive mode {missed} again and \
+             again, {why}. Shared mode has more latency and more room for that."
+        ),
     }
 }
 
@@ -532,6 +558,29 @@ mod tests {
         // A UI thread's COM: said plainly; anything else keeps its code
         assert!(describe_com_failure(hr::RPC_E_CHANGED_MODE).contains("worker thread"));
         assert_eq!(describe_com_failure(hr::E_FAIL), "Windows audio couldn't be initialised (error 0x80004005).");
+    }
+
+    /// The exclusive period guard's note (control.rs): which stream, at what, why, and what it costs.
+    #[test]
+    fn a_stepped_up_period_is_a_note() {
+        use crate::exclusive::PeriodFloor;
+        let note = |role, floor| {
+            let w = Warning::ExclusivePeriodRaised { role, device: "Speakers (USB)".into(), floor };
+            assert!(w.is_note());
+            describe_warning(&w)
+        };
+        assert_eq!(
+            note(StreamRole::Output, PeriodFloor::AtLeast(160)),
+            "The output device (Speakers (USB)) runs at an exclusive period of 3.33 ms or longer until the filter's app \
+             restarts: at the shorter one the filter answered it late again and again, as the PC held the filter's audio \
+             thread up past it (LatencyMon shows which driver does). That costs a little latency and saves the clicks."
+        );
+        assert_eq!(
+            note(StreamRole::Mic, PeriodFloor::Shared),
+            "The microphone (Speakers (USB)) runs in shared mode until the filter's app restarts: in exclusive mode it lost \
+             samples again and again, as the PC held the filter's audio thread up past it (LatencyMon shows which driver \
+             does). Shared mode has more latency and more room for that."
+        );
     }
 
     /// Exclusive mode is the default (the owner, 2026-11-02), so a refusal is ordinary: a note, not a warning, that says which

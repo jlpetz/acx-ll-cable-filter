@@ -107,6 +107,8 @@ pub(crate) struct AudioArgs {
     /// The mic an earlier run in this process measured, as it opened then, and how it delivered (the control side's
     /// memory, for the automatic model depth: `choose_model_depth`).
     pub(crate) mic_delivery: Option<(MicOpening, MicDelivery)>,
+    /// The exclusive period guard's floors (control.rs): the periods its streams stepped up to after late answers.
+    pub(crate) floors: crate::exclusive::PeriodFloors,
     /// The one-shot "running" (or the failure) for `start()`.
     pub(crate) ready: SyncSender<Result<Opened, StartFailure>>,
     /// Dropped when the thread ends: the control thread waits on it to join with a timeout.
@@ -178,7 +180,7 @@ fn worker_main(jobs: Receiver<AudioArgs>) {
 }
 
 fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
-    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mut flight, mic_delivery, ready, done } = args;
+    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mut flight, mic_delivery, floors, ready, done } = args;
     // Declared first, so dropped last: both signal "gone" after every stream is released.
     let _done = done;
     let _exit = ExitFlag(shared.clone());
@@ -188,7 +190,7 @@ fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
         }
         None => {
             let ends = Ends { tap, recorder: &mut recorder, flight: &mut flight };
-            run(Run { config, telemetry, controls, shared, ends, mic_delivery, ready, mmcss })
+            run(Run { config, telemetry, controls, shared, ends, mic_delivery, floors, ready, mmcss })
         }
     }
     // A chain recorder the run never took (the start failed, or it stopped before its next wake) goes back, so a failed
@@ -205,6 +207,7 @@ struct Run<'a> {
     shared: Arc<AudioShared>,
     ends: Ends<'a>,
     mic_delivery: Option<(MicOpening, MicDelivery)>,
+    floors: crate::exclusive::PeriodFloors,
     ready: SyncSender<Result<Opened, StartFailure>>,
     mmcss: &'a Mmcss,
 }
@@ -251,12 +254,12 @@ impl Ticks for QpcTicks {
 }
 
 fn run(r: Run<'_>) {
-    let Run { config, telemetry, controls, shared, mut ends, mic_delivery, ready, mmcss } = r;
+    let Run { config, telemetry, controls, shared, mut ends, mic_delivery, floors, ready, mmcss } = r;
     let mut warnings = Vec::new();
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
     }
-    let (mut session, ids) = match open_session(&config, &controls, &shared, mic_delivery.as_ref(), &mut warnings) {
+    let (mut session, ids) = match open_session(&config, &controls, &shared, mic_delivery.as_ref(), &floors, &mut warnings) {
         Ok(s) => s,
         Err(f) => {
             let _ = ready.send(Err(f));
@@ -367,7 +370,7 @@ struct Ids {
 /// run measured of the mic, for the automatic model depth.
 fn open_session(
     config: &EngineConfig, controls: &Arc<ChainControls>, run_shared: &Arc<AudioShared>, mic_delivery: Option<&(MicOpening, MicDelivery)>,
-    warnings: &mut Vec<Warning>,
+    floors: &crate::exclusive::PeriodFloors, warnings: &mut Vec<Warning>,
 ) -> Result<(Session, Ids), StartFailure> {
     let aec_wanted = config.processing.aec_enabled;
     let en = DeviceEnumerator::new().map_err(|e| StartFailure::Enumerator(hr_of(&e)))?;
@@ -384,7 +387,7 @@ fn open_session(
     let out_cable = is_virtual_cable(&out_name) || out_adapter.as_deref().is_some_and(is_virtual_cable);
     let default_out = en.get_default_device_for_role(&Direction::Render, &Role::Console).ok().and_then(|d| d.get_id().ok());
     let out_default = default_out.is_some() && default_out == ids_out;
-    if let Some(w) = output_check(out_default, out_cable, out_name, config.io.output_exclusive) {
+    if let Some(w) = output_check(out_default, out_cable, out_name.clone(), config.io.output_exclusive) {
         warnings.push(w);
     }
 
@@ -406,11 +409,31 @@ fn open_session(
     let open = |role: StreamRole| move |e: wasapi::WasapiError| StartFailure::Open { role, hr: hr_of(&e) };
     // Exclusive mode where asked (the default; engine.md, "Exclusive mode"): a device that refuses it runs shared, with a
     // note (`Warning::is_note`). Never the output on the default playback device: the output check's warning says so.
-    let mic_options = MicOptions { low_latency: config.io.low_latency_periods, raw: config.io.raw_mic, exclusive: config.io.mic_exclusive };
+    // The exclusive period guard's floors (control.rs): a stream that answered late at its period opens at a longer one,
+    // or in shared mode once a block's period was too short as well; a note says so.
+    use crate::exclusive::{PeriodFloor, PeriodFloors};
+    let mic_floor = config.io.mic_exclusive.then(|| PeriodFloors::of(&floors.mic, mic_dev.get_id().ok().as_deref())).flatten();
+    let out_floor = config.io.output_exclusive.then(|| PeriodFloors::of(&floors.output, ids_out.as_deref())).flatten();
+    let at_least = |f: Option<PeriodFloor>| match f {
+        Some(PeriodFloor::AtLeast(n)) => n,
+        _ => 0,
+    };
+    let mic_options = MicOptions {
+        low_latency: config.io.low_latency_periods,
+        raw: config.io.raw_mic,
+        exclusive: config.io.mic_exclusive && mic_floor != Some(PeriodFloor::Shared),
+        exclusive_floor: at_least(mic_floor),
+    };
     let (mic, mic_warning) = CaptureStream::open_mic(&mic_dev, mic_options).map_err(open(StreamRole::Mic))?;
-    let out_exclusive = output_exclusive(config.io.output_exclusive, out_default);
+    let out_exclusive = output_exclusive(config.io.output_exclusive && out_floor != Some(PeriodFloor::Shared), out_default);
     let (mut out, out_warning) =
-        Output::open(&out_dev, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS).map_err(open(StreamRole::Output))?;
+        Output::open(&out_dev, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS, at_least(out_floor)).map_err(open(StreamRole::Output))?;
+    let mic_name = mic.info.stream_info().device_name;
+    for (role, floor, device) in [(StreamRole::Mic, mic_floor, mic_name), (StreamRole::Output, out_floor, out_name)] {
+        if let Some(floor) = floor {
+            warnings.push(Warning::ExclusivePeriodRaised { role, device, floor });
+        }
+    }
     if let Err(why) = out_exclusive {
         out.withheld(why);
     }

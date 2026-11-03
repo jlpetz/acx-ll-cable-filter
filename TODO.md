@@ -152,7 +152,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
 - Latency options (2026-11-01), the defaults since 2026-11-02 (owner: the lowest latency by default, with switches to turn each off, e.g. for recording the raw mic): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
 - Three 30-minute soaks (2026-11-02/03): readout about 20 ms, one output underrun each at 110-128 s; the flight recorder (e6a2624) shows VB-CABLE's output clock stalling about 3 ms then, with the thread, the mic and our queue fine. The first walk waits for a second window since b53a965.
-**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03) IAudioClient3 small periods on the output and the speakers' keep-alive (shorter loopback packets, a shorter reference lead, #10), to verify on real hardware; layer 3 in phase 2.
+**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03; for real hardware, late answers told from clock noise, 3ca7d3f, and the exclusive period guard, 2026-11-03) the speakers' keep-alive at IAudioClient3's smallest period and an echo-path guard (#10); thresholds and layer 3 on real hardware in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---
