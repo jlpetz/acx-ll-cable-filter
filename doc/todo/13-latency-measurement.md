@@ -460,9 +460,14 @@ The same command and conditions with `--flight`; the log is `Downloads\nf-scratc
   the readout stepped from 23.5 to 26.7 ms and stayed. So VB-CABLE's render side re-syncs (its clock stalls about 3 ms)
   about two minutes after the stream opens, as the cables' 11 ms steps elsewhere (#9) suggest. Real hardware should not do
   this; our own driver (#19) won't.
-- **A counting quirk:** that block counted an output underrun with no silence played (`out_silence` 0) and a full queue,
-  which neither of the exclusive output's own underrun paths (a short ring, a late answer) can produce without silence.
-  To find, so a device's clock step reads as one, not as an underrun that marks the soak not clean.
+- **A counting quirk, found and fixed (4f30e5e):** that block counted an output underrun with `out_silence` 0. Our bug:
+  stream.rs's `Output` wrapper forwarded `take_underruns` to the exclusive sink but not `take_silence`, whose default was
+  0, so live the silence an exclusive underrun played never reached the counters or the CSV (the tests used the sink
+  directly). Both are forwarded now, and neither has a default, so a sink or wrapper that leaves one out won't compile.
+  The underrun itself was most likely the exclusive output's late-answer rule counting stale periods when VB-CABLE's clock
+  stepped. The owner's call (2026-11-03): no engine changes for VB-CABLE's own quirks, since the goal is our own driver.
+  A 3-minute check run after the fix was clean (the two-minute step didn't come), so the silence report is still to be
+  seen live.
 - **The echo reference:** three more dumps (bursts of short takes at 642 and 1053 s, a timeline jump at 1708 s), each with
   the audio thread and the mic on time: cable B's loopback delivering late. 137 short takes and 3 jumps over the run.
 - **Otherwise:** readout 20.2 ms median, p95 20.6; app path 40.3 ms; 180,001 wakes of one block; 0 real-time heap
