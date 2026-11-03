@@ -415,6 +415,13 @@ impl RenderStream {
 }
 
 impl RenderSink for RenderStream {
+    // A shared stream: the engine drains it and plays its own silence, so there's nothing to take.
+    fn take_underruns(&mut self) -> u64 {
+        0
+    }
+    fn take_silence(&mut self) -> u64 {
+        0
+    }
     fn buffer_frames(&self) -> usize {
         self.buffer_frames
     }
@@ -680,8 +687,15 @@ impl RenderSink for Output {
     #[inline]
     fn take_underruns(&mut self) -> u64 {
         match self {
-            Output::Shared(_) => 0,
+            Output::Shared(s) => s.take_underruns(),
             Output::Exclusive(e) => e.take_underruns(),
+        }
+    }
+    #[inline]
+    fn take_silence(&mut self) -> u64 {
+        match self {
+            Output::Shared(s) => s.take_silence(),
+            Output::Exclusive(e) => e.take_silence(),
         }
     }
 }

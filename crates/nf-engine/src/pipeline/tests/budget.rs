@@ -27,6 +27,12 @@ struct Lagged {
 }
 
 impl RenderSink for Lagged {
+    fn take_underruns(&mut self) -> u64 {
+        0
+    }
+    fn take_silence(&mut self) -> u64 {
+        0
+    }
     fn buffer_frames(&self) -> usize {
         self.sink.buffer_frames()
     }

@@ -406,6 +406,12 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
+        fn take_underruns(&mut self) -> u64 {
+            0
+        }
+        fn take_silence(&mut self) -> u64 {
+            0
+        }
         fn buffer_frames(&self) -> usize {
             self.buffer
         }

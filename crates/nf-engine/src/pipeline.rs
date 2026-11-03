@@ -108,15 +108,13 @@ pub(crate) trait RenderSink {
     fn clock(&mut self) -> Result<Option<ClockReading>, Hr>;
     /// Underruns the sink saw itself since the last call: an event-driven exclusive output whose ring was short of a period
     /// at a device event, or that answered one late (`exclusive::EventRender`). 0 for a stream the device drains by itself.
-    fn take_underruns(&mut self) -> u64 {
-        0
-    }
+    /// No default, nor for [`Self::take_silence`]: a wrapper that forwarded one and not the other (stream.rs's `Output`
+    /// forwarded only this one, so live the silence always read 0, TODO 13's soak 3) must not compile.
+    fn take_underruns(&mut self) -> u64;
     /// Silence the sink's device played in our stream since the last call, in frames: an event-driven exclusive output's ring
     /// short at an event, or the periods of an event answered late. [`Self::clock`] leaves it out of the position, so the
     /// fill doesn't see it; every later sample plays that much later. 0 for a stream the device drains by itself.
-    fn take_silence(&mut self) -> u64 {
-        0
-    }
+    fn take_silence(&mut self) -> u64;
 }
 
 /// The output's drift loop, as nf-core's `DriftController` provides it (the reference has its own:
@@ -1473,6 +1471,12 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
+        fn take_underruns(&mut self) -> u64 {
+            0
+        }
+        fn take_silence(&mut self) -> u64 {
+            0
+        }
         fn buffer_frames(&self) -> usize {
             self.buffer
         }
@@ -2255,6 +2259,12 @@ mod tests {
     }
 
     impl RenderSink for NullSink {
+        fn take_underruns(&mut self) -> u64 {
+            0
+        }
+        fn take_silence(&mut self) -> u64 {
+            0
+        }
         fn buffer_frames(&self) -> usize {
             4800
         }
@@ -2503,6 +2513,12 @@ mod tests {
     }
 
     impl RenderSink for StepSink {
+        fn take_underruns(&mut self) -> u64 {
+            0
+        }
+        fn take_silence(&mut self) -> u64 {
+            0
+        }
         fn buffer_frames(&self) -> usize {
             4800
         }

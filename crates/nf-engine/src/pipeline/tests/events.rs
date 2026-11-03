@@ -69,6 +69,12 @@ impl VSink {
 }
 
 impl RenderSink for VSink {
+    fn take_underruns(&mut self) -> u64 {
+        0
+    }
+    fn take_silence(&mut self) -> u64 {
+        0
+    }
     fn buffer_frames(&self) -> usize {
         4800
     }
