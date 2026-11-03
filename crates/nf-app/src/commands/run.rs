@@ -856,6 +856,11 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool, clipped: bool) -> Stri
         if t.reference_target_ms > REFERENCE_TARGET_HIGH_MS {
             reference.push_str(" high");
         }
+        // The echo-path guard's mic hold: the lead and target above are the echo path's, less it.
+        if t.echo_hold_ms > 0.0 {
+            let trial = if t.echo_guard == nf_engine::ECHO_GUARD_TRIAL { " trial" } else { "" };
+            let _ = write!(reference, " held {}{trial}", fixed(f64::from(t.echo_hold_ms), 1));
+        }
     }
     format!(
         "{state:<8} in {}/{} dBFS{clip}  out {}/{}  lat {latency}{target}  cpu {} µs  drift {}/{} ppm{reference}  \

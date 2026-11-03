@@ -117,10 +117,10 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal, and a chain recorder added. With a calibrated, realistic echo delay (`quality --echo-delay`, default 25 ms) the echo drops 45-62 dB a far-only turn, as offline; an echo arriving sooner than the reference's lead (12-14 ms) after its tap cancels less (13 ms 45 dB, 10 ms 39, 5 ms 17, 0 ms 11). One earlier take, 14 dB, stays unexplained.
 - `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
-- Proposed (#17, awaiting the owner): a CLAP-shaped stage with the mic on the main input, the speaker reference on a second input port, one output.
+- CLAP-shaped (#17, the owner's call): the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: lower the lead's floor for short echo paths (a smaller loopback period, or a mic wait only when the path is that short); recorded pairs in #2; real speakers in phase 2. A low take's chain recording (`quality --save`) shows why.
+**Next**: the echo-path guard (built 2026-11-03, ours: the mic waits only for an echo that comes before its reference, on a trial; offline a 5 ms echo's ERLE 6.9 to 19.3 dB) to check live on the rig (`quality --test echo --echo-delay 5`, `10`, and `--no-echo-guard`), then on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2.
 **Detail**: `doc/todo/10-aec.md`
 
 ---
@@ -152,7 +152,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
 - Latency options (2026-11-01), the defaults since 2026-11-02 (owner: the lowest latency by default, with switches to turn each off, e.g. for recording the raw mic): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
 - Three 30-minute soaks (2026-11-02/03): readout about 20 ms, one output underrun each at 110-128 s; the flight recorder (e6a2624) shows VB-CABLE's output clock stalling about 3 ms then, with the thread, the mic and our queue fine. The first walk waits for a second window since b53a965.
-**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03; for real hardware, late answers told from clock noise, 3ca7d3f, and the exclusive period guard, 2026-11-03) the speakers' keep-alive at IAudioClient3's smallest period and an echo-path guard (#10); thresholds and layer 3 on real hardware in phase 2.
+**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03; for real hardware, late answers told from clock noise, 3ca7d3f, and the exclusive period guard, 2026-11-03) the echo-path guard's live check (#10; the keep-alive at a small period dropped: it shortens the speakers' own path as much); thresholds and layer 3 on real hardware in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---

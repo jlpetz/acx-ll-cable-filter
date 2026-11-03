@@ -415,6 +415,18 @@ impl Inner {
         stepped
     }
 
+    /// The echo-path guard's moves (echo_guard.rs), from the telemetry the audio thread publishes each second: logged, and
+    /// noted for the flight recorder. `last`: the state and hold seen before.
+    fn watch_echo_guard(&self, last: &mut (u8, f32)) {
+        let t = &self.telemetry;
+        let state = t.echo_guard.load(Relaxed);
+        let now = (state, t.echo_hold_ms.load());
+        if let Some(line) = echo_guard_line(std::mem::replace(last, now), now) {
+            log::info!("the echo-path guard: {line}");
+            flight::note(self, Note::EchoGuard(line));
+        }
+    }
+
     /// Notices a run that stopped by itself (a fault, or the thread ending) or lost its reference,
     /// and logs real-time heap allocations once.
     fn check_health(self: &Arc<Self>) -> Outcome {
@@ -607,6 +619,24 @@ pub(crate) fn restart_due(wanted: Option<&EngineConfig>, running: Option<&Engine
         (Some(_), None) => true,
         (Some(w), Some(r)) => forced || restart_needed(r, aec_built, w),
     }
+}
+
+/// What the log says of a move of the echo-path guard (echo_guard.rs), from its state and hold before and now
+/// (`Telemetry::echo_guard`, `echo_hold_ms`); `None` for nothing to say (a start, a stop, or no move).
+pub(crate) fn echo_guard_line((was, was_ms): (u8, f32), (is, ms): (u8, f32)) -> Option<String> {
+    use nf_core::telemetry::{ECHO_GUARD_COOLING as COOLING, ECHO_GUARD_HELD as HELD, ECHO_GUARD_TRIAL as TRIAL};
+    Some(match (was, is) {
+        (w, TRIAL) if w != TRIAL => {
+            format!("an echo reaches the mic before its reference, and AEC3 can't cancel it: the mic waits {ms:.1} ms, on a trial")
+        }
+        (TRIAL, HELD) => format!("the trial cancelled the echo: the mic keeps waiting {ms:.1} ms"),
+        (TRIAL, TRIAL) | (TRIAL, 0) | (HELD, 0) => return None,
+        (TRIAL, _) => "the trial didn't cancel the echo: the mic's wait goes, and the next trial waits".to_owned(),
+        (HELD, HELD) if (ms - was_ms).abs() >= 0.05 => format!("the mic's wait is now {ms:.1} ms (it was {was_ms:.1})"),
+        (HELD, COOLING) => "the wait no longer cancels the echo: it goes, and the next trial waits ten minutes".to_owned(),
+        (HELD, h) if h != HELD => "the echo has gone: the mic's wait goes".to_owned(),
+        _ => return None,
+    })
 }
 
 /// Frames at 48 kHz in ms.
@@ -849,6 +879,9 @@ fn clear_targets(t: &Telemetry) {
     for f in [&t.mic_exclusive, &t.output_exclusive, &t.output_adaptive, &t.output_target_on_trial] {
         f.store(false, Relaxed);
     }
+    t.echo_hold_ms.store(0.0);
+    t.echo_guard.store(0, Relaxed);
+    t.echo_correlation.store(0.0);
 }
 
 pub(crate) fn start(inner: &Arc<Inner>, config: &EngineConfig) -> Result<(), EngineError> {
@@ -1226,6 +1259,7 @@ fn control_main(weak: Weak<Inner>, rx: Receiver<Ctl>, tx: Sender<Ctl>) {
     drop(tx);
     let mut sched = Schedule::default();
     let mut guard = PeriodGuard::default();
+    let mut echo_seen = (0u8, 0.0f32);
     // The lost-reference check (wasapi/B): when it's next due, and its current step.
     let mut probe_at: Option<Instant> = None;
     let mut probe_step = PROBE_FIRST;
@@ -1249,6 +1283,7 @@ fn control_main(weak: Weak<Inner>, rx: Receiver<Ctl>, tx: Sender<Ctl>) {
         } else if inner.watch_periods(&mut guard, Instant::now()) {
             sched.period_step(Instant::now());
         }
+        inner.watch_echo_guard(&mut echo_seen);
         if let Some(forced) = sched.take_due(Instant::now()) {
             let stepped = sched.take_stepped();
             match inner.restart(forced, stepped) {
@@ -1677,6 +1712,27 @@ mod tests {
         assert_eq!(g.check(at(701), t1, w("mic", 160, 5), w("out", 120, 5)), none, "the new run's grace");
         assert_eq!(g.check(at(710), t1, w("mic", 160, 6), None), none, "the output runs shared: not watched");
         assert_eq!(g.check(at(711), t1, w("mic", 160, 8), None), PeriodFloors { mic: Some(("mic".into(), AtLeast(240))), output: None });
+    }
+
+    /// The echo-path guard's moves, as the log words them: a trial, kept or not; a trim; the wait let go; and nothing at a
+    /// run's start or stop.
+    #[test]
+    fn the_echo_path_guard_s_moves_are_logged() {
+        use nf_core::telemetry::{ECHO_GUARD_COOLING as C, ECHO_GUARD_HELD as H, ECHO_GUARD_TRIAL as T, ECHO_GUARD_WATCHING as W};
+        let line = |a, b| echo_guard_line(a, b);
+        assert_eq!(line((0, 0.0), (W, 0.0)), None, "a start");
+        assert_eq!(line((W, 0.0), (W, 0.0)), None);
+        let trial = line((W, 0.0), (T, 10.0)).unwrap();
+        assert_eq!(trial, "an echo reaches the mic before its reference, and AEC3 can't cancel it: the mic waits 10.0 ms, on a trial");
+        assert_eq!(line((T, 10.0), (T, 10.0)), None);
+        assert_eq!(line((T, 10.0), (H, 10.0)).unwrap(), "the trial cancelled the echo: the mic keeps waiting 10.0 ms");
+        assert!(line((T, 10.0), (C, 0.0)).unwrap().starts_with("the trial didn't cancel the echo"));
+        assert_eq!(line((H, 16.3), (H, 8.3)).unwrap(), "the mic's wait is now 8.3 ms (it was 16.3)");
+        assert_eq!(line((H, 8.3), (H, 8.3)), None);
+        assert!(line((H, 8.3), (C, 0.0)).unwrap().contains("ten minutes"));
+        assert_eq!(line((H, 8.3), (W, 0.0)).unwrap(), "the echo has gone: the mic's wait goes");
+        assert_eq!(line((H, 8.3), (0, 0.0)), None, "a stop");
+        assert_eq!(line((C, 0.0), (W, 0.0)), None);
     }
 
     /// The guard watches a stream that runs exclusive and has an id, at its period in frames.

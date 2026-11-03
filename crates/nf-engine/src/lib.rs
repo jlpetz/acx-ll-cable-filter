@@ -33,6 +33,7 @@ mod control;
 mod convert;
 mod csv;
 mod devices;
+mod echo_guard;
 mod errors;
 mod exclusive;
 mod fifo;

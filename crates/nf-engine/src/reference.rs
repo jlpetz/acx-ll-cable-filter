@@ -203,6 +203,8 @@ pub(crate) struct Reference {
     needs: Needs,
     /// What the last take did, for the chain recorder.
     facts: ReferenceFacts,
+    /// The echo-path guard's hold's growth since the last take ([`Reference::held`]).
+    held_by: i64,
 }
 
 impl Reference {
@@ -237,7 +239,15 @@ impl Reference {
             settle_at: START_BLOCKS,
             needs: Needs::new(),
             facts: ReferenceFacts::default(),
+            held_by: 0,
         }
+    }
+
+    /// The echo-path guard's hold grew by `by` samples (pipeline.rs): the mic's blocks, read as captured that much later from
+    /// the next, call for reference samples as much newer. The read position moves on by as much at the next take, the jump
+    /// the facts show, so the lead the loop reads holds still; before the first reading the alignment takes it in.
+    pub(crate) fn held(&mut self, by: usize) {
+        self.held_by += by as i64;
     }
 
     /// Empties the FIFO (the stream was dropped mid-run).
@@ -252,7 +262,6 @@ impl Reference {
     }
 
     /// The lead target, in samples.
-    #[cfg(test)]
     pub(crate) fn target(&self) -> f64 {
         self.target
     }
@@ -437,6 +446,11 @@ impl Reference {
     /// the block's capture time. Counts gaps, jumps after the start-up, and slips.
     pub(crate) fn take(&mut self, mic: MicTime, out: &mut [f32], c: &mut Counters) -> usize {
         self.facts = ReferenceFacts { lead_reading_ms: f32::NAN, ..ReferenceFacts::default() };
+        let held = std::mem::take(&mut self.held_by);
+        if held != 0 && self.started {
+            self.move_read(held);
+            self.jumped(ReferenceFacts::HELD, held as f64);
+        }
         let stamps_ok = mic.stamp.is_some() && self.stamps.trusted();
         if self.started && stamps_ok != self.stamped {
             if self.blocks < START_BLOCKS {

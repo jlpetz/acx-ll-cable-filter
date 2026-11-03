@@ -209,6 +209,34 @@ reference only when the echo path is that short, which costs that wait in latenc
 
 With the exclusive mic (the default since 2026-11-02, #13; `--no-exclusive-mic` or the window's "Exclusive microphone" switch turns it off: mic blocks reach the app 0.8 ms after capture instead of about 16) the lead rose to 18.3 ms: each mic block is processed before the loopback, still on its 10 ms shared period, has delivered as recent a reference. The floor rises by as much, to about 20 ms (`quality::echo_delay::EXCLUSIVE_MIC_ECHO_FLOOR_MS`), and applies by default now: speakers whose echo comes back sooner than that after the mix echo through more (the window's switch line says to try it off when echo gets through with echo cancelling on; whether the exclusive mic should yield to shared when AEC is on is open, ours to propose). At 25 ms (the echo test's default, over the floor) it cancelled a median 54.5 dB a far-only turn.
 
+## The echo-path guard (built 2026-11-03, ours)
+The floor above is the lead: an echo that reaches the mic sooner after its tap comes before its reference, and AEC3 can't
+place it. The two ways down were a smaller loopback period or a mic wait only when the path is that short. The first is
+dropped (#13's detail: the speakers' own output path shortens about as much as the loopback's packets, so the margin
+doesn't reliably grow, and every app on the speakers would run at the small period). The second is built, as the
+echo-path guard (`echo_guard.rs`; engine.md, "The echo-path guard"; `io.echo_guard`, on by default, `--no-echo-guard`):
+- It holds the mic back (each block processed later, read by the reference loop as captured later, so the reference served
+  is that much newer) only for an echo seen that AEC3 can't place: the mic's energy envelope following the far end's
+  (correlation 0.4 or more over 5 s; headphones show none), AEC3's ERLE under 10 dB and its delay estimate 0 or 4 ms.
+- On a trial first: the hold that brings the lead to 2 ms, kept only if AEC3's ERLE then rises 4 dB to 10 or more; trimmed
+  once to what AEC3's delay estimate says the echo needs, plus 4 ms; let go when the echo goes or the hold stops helping.
+- Why a trial: AEC3 reads its delay in 4 ms steps less its headroom, so a short echo it does place reads 0 as well; with
+  no echo at all (headphones) the ERLE is low too. Only the ERLE after a trial tells.
+- Offline (`the_echo_path_guard_holds_the_mic_for_an_early_echo`, steady 10 ms delivery, a 12 ms lead, 100 s of the echo
+  scene through AEC3), AEC3's ERLE over the last 20 s:
+
+| Echo after the tap | Guard off | Guard on (hold) |
+|---|---|---|
+| 5 ms, near voice silent | 6.9 dB | 19.3 dB (10 ms) |
+| 40 ms, near voice silent | 19.4 dB | 19.4 dB (none) |
+| 5 ms, near voice in its turns | 6.8 dB | 15.9 dB (10 ms) |
+| 40 ms, near voice in its turns | 15.5 dB | 15.5 dB (none) |
+
+  AEC3's delay estimate read 24 ms for the 40 ms echo's 28 ms past the lead: it errs short, which the trim's margin
+  allows for.
+- Live: not yet. The rig takes are scripted (`quality --test echo --echo-delay 5`, the same with `--no-echo-guard`, then
+  10 and 25 ms, 150 s each); on 2026-11-03 the owner's RDP session was disconnected, so the session had no audio endpoints.
+
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).
   - Where the OEM supplies no Communications-mode processing, this path gets Voice Clarity (Windows 11 client editions).

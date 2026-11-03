@@ -424,6 +424,12 @@ pub struct Telemetry {
     /// The adaptive target holds for a trial, the window that proves the delivery before it first comes down: its lowering is
     /// still to come (nf-engine `out_target.rs`; `--settle` waits past it). Published each second.
     pub output_target_on_trial: AtomicBool,
+    /// The echo-path guard (nf-engine `echo_guard.rs`): the mic hold it set, in ms (0 without one: the reference's lead and
+    /// target are published less it), where it is ([`ECHO_GUARD_WATCHING`] and on; 0 when it isn't running), and the
+    /// envelopes' correlation it last read (an echo at 0.4 and up). Published each second.
+    pub echo_hold_ms: AtomicF32,
+    pub echo_guard: AtomicU8,
+    pub echo_correlation: AtomicF32,
     /// The noise model runs on an inference worker (a model pack, TODO 6): the `inference_*` counters below are its
     /// (`nf_core::noise::InferenceStats`), published once a second.
     pub inference_active: AtomicBool,
@@ -445,6 +451,13 @@ pub struct Telemetry {
     /// ([`WakeBlocks::misses_at`]).
     pub wake_blocks: [AtomicU64; 4],
 }
+
+/// [`Telemetry::echo_guard`]'s values: watching for an echo before its reference, on a trial hold, holding, and cooling
+/// down after a trial that didn't help.
+pub const ECHO_GUARD_WATCHING: u8 = 1;
+pub const ECHO_GUARD_TRIAL: u8 = 2;
+pub const ECHO_GUARD_HELD: u8 = 3;
+pub const ECHO_GUARD_COOLING: u8 = 4;
 
 /// [`WakeBlocks::delivery`]'s thresholds: the wakes it needs (10 s of a block a wake), and the blocks per miss at depth 1
 /// that still count as a block at a time.
@@ -562,6 +575,9 @@ pub struct TelemetrySnapshot {
     pub output_exclusive: bool,
     pub output_adaptive: bool,
     pub output_target_on_trial: bool,
+    pub echo_hold_ms: f32,
+    pub echo_guard: u8,
+    pub echo_correlation: f32,
     pub inference_active: bool,
     pub inference_runs: u64,
     pub inference_misses: u64,
@@ -693,6 +709,9 @@ impl Telemetry {
             output_exclusive: self.output_exclusive.load(Relaxed),
             output_adaptive: self.output_adaptive.load(Relaxed),
             output_target_on_trial: self.output_target_on_trial.load(Relaxed),
+            echo_hold_ms: self.echo_hold_ms.load(),
+            echo_guard: self.echo_guard.load(Relaxed),
+            echo_correlation: self.echo_correlation.load(),
             inference_active: self.inference_active.load(Relaxed),
             inference_runs: self.inference_runs.load(Relaxed),
             inference_misses: self.inference_misses.load(Relaxed),

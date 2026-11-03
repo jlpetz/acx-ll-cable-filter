@@ -78,6 +78,8 @@ pub struct IoOptions {
     pub mic_exclusive: Option<bool>,
     /// `--adaptive-output`, `--no-adaptive-output`: the output's target follows the delivery.
     pub adaptive_output: Option<bool>,
+    /// `--echo-guard`, `--no-echo-guard`: the mic waits for an echo that comes before its reference.
+    pub echo_guard: Option<bool>,
 }
 
 /// `run`'s options, which `latency` and `quality` take too.
@@ -452,6 +454,8 @@ impl IoOptions {
             "--no-exclusive-mic" => self.mic_exclusive = Some(!switch(flag, inline)?),
             "--adaptive-output" => self.adaptive_output = Some(switch(flag, inline)?),
             "--no-adaptive-output" => self.adaptive_output = Some(!switch(flag, inline)?),
+            "--echo-guard" => self.echo_guard = Some(switch(flag, inline)?),
+            "--no-echo-guard" => self.echo_guard = Some(!switch(flag, inline)?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -928,8 +932,8 @@ OPTIONS (run, latency, quality):
   DEV is a device id or part of its name (exact name first, then the first match, any case).
 
 LATENCY OPTIONS (run, latency, quality): the lowest latency is the default; each --no-...
-turns one off, and the plain flag (--exclusive-output, --exclusive-mic, --adaptive-output)
-turns it back on over a --config file that has it off. Your apps record the output cable's
+turns one off, and the plain flag (--exclusive-output, --exclusive-mic, --adaptive-output,
+--echo-guard) turns it back on over a --config file that has it off. Your apps record the output cable's
 other side, which stays shared whatever these say.
   --no-exclusive-output
                      Play into the output in shared mode, through Windows' audio engine.
@@ -958,6 +962,12 @@ other side, which stays shared whatever these say.
                      after a third it stays fixed. So a rare hiccup the fixed target would
                      ride out can cost a glitch, up to three in a run: turn it off for a
                      recording that must have none
+  --no-echo-guard    Never hold the microphone back for the echo canceller. With it on, when
+                     the speakers' sound reaches the mic before the canceller has it (speakers
+                     faster than the reference's lead) and so echoes through, the filter holds
+                     the mic until it does: on a trial first, kept only if it cancels the
+                     echo, trimmed to what the echo needs. It costs that wait in latency (up
+                     to 16 ms) only then, and a short gap where it starts and ends
   A device that refuses exclusive mode runs in shared mode, with a note saying why, what it
   costs and how to fix it.
   --settle           (latency, quality) Wait for the adaptive output target to come down
@@ -1150,17 +1160,24 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(e.io, IoOptions { output_exclusive: Some(false), mic_exclusive: Some(false), adaptive_output: Some(false) });
+        let off = Some(false);
+        assert_eq!(e.io, IoOptions { output_exclusive: off, mic_exclusive: off, adaptive_output: off, echo_guard: None });
         let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--exclusive-output", "--exclusive-mic", "--adaptive-output"]) else {
             panic!()
         };
-        assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: Some(true) });
+        let on = Some(true);
+        assert_eq!(e.io, IoOptions { output_exclusive: on, mic_exclusive: on, adaptive_output: on, echo_guard: None });
         let Ok(Command::Run(RunArgs { engine: e, .. })) =
             p(&["run", "--no-exclusive-output", "--exclusive-output", "--adaptive-output", "--no-adaptive-output"])
         else {
             panic!()
         };
-        assert_eq!(e.io, IoOptions { output_exclusive: Some(true), mic_exclusive: None, adaptive_output: Some(false) }, "the last wins");
+        let last = IoOptions { output_exclusive: Some(true), mic_exclusive: None, adaptive_output: Some(false), echo_guard: None };
+        assert_eq!(e.io, last, "the last wins");
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--no-echo-guard"]) else { panic!() };
+        assert_eq!(e.io, IoOptions { echo_guard: Some(false), ..Default::default() });
+        let Ok(Command::Run(RunArgs { engine: e, .. })) = p(&["run", "--no-echo-guard", "--echo-guard"]) else { panic!() };
+        assert_eq!(e.io.echo_guard, Some(true));
         assert_eq!(err(&["run", "--exclusive-mic=yes"]), "--exclusive-mic takes no value");
         assert_eq!(err(&["run", "--no-exclusive-mic=1"]), "--no-exclusive-mic takes no value");
         let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--no-exclusive-output"]) else { panic!() };
@@ -1178,7 +1195,7 @@ mod tests {
         let help = help_text();
         for flag in [
             "--exclusive-output", "--exclusive-mic", "--adaptive-output", "--no-exclusive-output", "--no-exclusive-mic",
-            "--no-adaptive-output",
+            "--no-adaptive-output", "--echo-guard", "--no-echo-guard",
         ] {
             assert!(help.contains(flag), "{flag}");
         }
@@ -1188,6 +1205,7 @@ mod tests {
         assert!(help.contains("filtered mic") && help.contains("record the raw microphone in another app"));
         assert!(help.contains("loses mic audio") && help.contains("up to three in a run") && help.contains("must have none"));
         assert!(help.contains("a note saying why, what it") && help.contains("20 ms or more after"));
+        assert!(help.contains("kept only if it cancels the") && help.contains("only then, and a short gap"));
     }
 
     /// `--settle` (latency, quality) waits for the adaptive target before measuring; off unless given. It needs the adaptive

@@ -490,9 +490,16 @@ handling. Our reading (the owner's go for items 2 and 3, 2026-11-03):
   is a PC that will keep doing it; per run, so a restart starts clean; for the process, not saved, so a fixed driver or
   another PC isn't held back. Not done: stepping back down later (each try would cost clicks and a restart). The
   thresholds are ours, to set on real hardware.
-- **Loopback hiccups and the echo floor:** a real risk with any speakers. Item 3 (next): the speakers' keep-alive at
-  IAudioClient3's smallest shared period (shorter loopback packets, a shorter reference lead), and a guard for an echo
-  path shorter than the lead (TODO 10).
+- **Loopback hiccups and the echo floor:** a real risk with any speakers. Item 3 was two parts:
+  - (a) The speakers' keep-alive at IAudioClient3's smallest shared period, for shorter loopback packets and so a
+    shorter lead. Dropped on a closer look (ours, 2026-11-03): the speakers' engine period sets their own output path
+    as well as the loopback's packets, so a smaller one brings the echo sooner by about as much as it brings the
+    reference sooner, and the margin AEC3 needs doesn't reliably grow (by how Windows stamps loopback packets it could
+    shrink). It would also switch every app on the speakers to the small period (CPU, power, and glitches on a PC with
+    bad DPC latency), and the rig can't tell (its echo delay is synthetic).
+  - (b) A mic wait only when the echo path is shorter than the lead: the echo-path guard (TODO 10's detail; engine.md),
+    built 2026-11-03. It measures rather than predicts, so it holds whatever the stamps mean. Offline a 5 ms echo's
+    ERLE went from 6.9 to 19.3 dB; the rig's live check waits for the owner's RDP session.
 
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI

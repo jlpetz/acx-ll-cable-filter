@@ -24,11 +24,14 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
     (`ExclusiveRenderDevice` behind `exclusive::EventRender`), either way a `RenderSink` to the pipeline.
   - `LoopbackStream`: shared-mode loopback capture of a render endpoint.
   - `KeepAlive`: a silent render stream on the reference endpoint at its default period, so its
-    loopback never stops.
+    loopback never stops. Not at IAudioClient3's small period (TODO 13's real-hardware notes): that switches every
+    stream on the speakers, and shortens their own output path about as much as the loopback's packets.
 - `exclusive`: exclusive mode apart from WASAPI: the period and format choices, the fall-back to shared mode, and the
   event-driven output's ring (below, "Exclusive mode").
 - `out_target`: the adaptive output target (below, "The output target").
 - `reference`: the reference's timeline (below, "The reference").
+- `echo_guard`: the echo-path guard, the mic's hold for an echo that comes before its reference (below, "The echo-path
+  guard").
 - `audio`: the audio thread (below).
 - `models`: the noise model by the config's name, and the one chain constructor (below, "The inference worker").
 - `control`: `Inner` (telemetry, status, the command channel, the audio-thread handle),
@@ -372,7 +375,8 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
   the help and the window's lines say so).
 - **The echo floor:** the exclusive mic's blocks come fresher, so the reference's lead rose to 18.3 ms on the cables
   (12-14 shared), and the shortest echo AEC3 can cancel to about 20 ms (TODO 10's detail). Speakers whose output latency
-  is under that echo through; `quality --test echo`'s default delay (25 ms) is over it.
+  is under that would echo through; the echo-path guard (below) holds the mic back for them, only as long as their echo
+  needs. `quality --test echo`'s default delay (25 ms) is over it.
 - Telemetry `mic_exclusive`, `output_exclusive` (set at the start, cleared at the stop); `StreamInfo::exclusive` names
   the format, and `StreamInfo::exclusive_refused` why a stream asked for in exclusive mode runs shared (the reports'
   conditions say it with the stream).
@@ -568,6 +572,7 @@ drift). AEC3 kept 1-6 dB of its own ERLE. The timeline replaces it:
   its own is left out.
 - Telemetry: `reference_fill_ms` is the low-passed lead, `reference_target_ms` its target,
   `reference_stamped` whether the stamps time it, `reference_drift_ppm` the loop's drift estimate.
+  Both lead and target are published as the echo path sees them, less the echo-path guard's hold (below).
 
 Replayed through the pipeline, the four 30 s traces from the cables (`live_probe.rs`;
 `pipeline/tests/timeline.rs`) went from 206-283 gaps, 205-282 drops and up to 2021 slips to 0-3
@@ -579,6 +584,43 @@ loopback's 27 ms lead in a 25 ms echo path isn't causal (AEC3's delay estimate r
 falls 6 dB). The synthetic scenes there test bursts, drift up to ±300 ppm, stalls, losses, silence
 without the keep-alive, late wakes, a late loopback, streams without stamps and stamps that are off
 or noisy; `NF_SEED` plays them with another seed.
+
+## The echo-path guard (`echo_guard.rs`; TODO 10, 13)
+AEC3 cancels an echo only once it reaches the mic after the reference sample served with it, so the reference's lead
+(above) has to be under the echo path's own delay: from the loopback's tap through the speakers' output latency and the
+air. The lead is what the loopback's delivery needs, 12-14 ms on the cables with the shared mic and 18 with the exclusive
+one (the echo floor, "Exclusive mode"). Most speakers' echo comes later than that; low-latency ones may not, and then the
+echo comes first and AEC3 can't place it (its delay estimate reads 0, its ERLE 6-8 dB against 16-18: TODO 10's sweep).
+`io.echo_guard` (on by default, ours; `--no-echo-guard`) watches for that, once a second on the audio thread, and holds the
+mic back when it sees it:
+- **The hold:** each block is processed `hold` samples after it could be, and the reference loop reads it as captured that
+  much later, so it serves the newer reference the wait let the loopback deliver: the lead the echo path sees is the
+  loop's less the hold. The loop's need, target and readings are all unchanged by it (`take_reference` shifts the
+  block's capture time; `Reference::held` moves the read position with a growing hold, the jump the facts show as
+  `held`). A growing hold queues the extra as silence on the output (its next block comes that much later, so nothing
+  runs short); a shrinking one drops that much of the oldest mic audio (`mic_discarded`). Each is one short gap. The
+  backlog the output's corrections count leaves the held samples out. The hold is at most 30 ms.
+- **What it watches:** an echo (the mic's energy envelope, a value a block, correlated with the far end's at 0.4 or more
+  over the last 5 s, at the best of ±3 blocks: headphones and the near talker alone show none) that AEC3 can't place
+  (with the far end playing, its ERLE under 10 dB and its delay estimate at most 4 ms; it reads in 4 ms steps less its
+  headroom, so a short echo it does place reads 0 too, and only the ERLE tells them apart). Only seconds AEC3 ran on
+  count (switched off live, it's not watched), and only once the run is 20 s old with 10 s of the far end playing, so
+  an echo AEC3 can place has been cancelled by then.
+- **The trial:** five such seconds in a row hold the mic to an effective lead of 2 ms (if that's 3 ms of hold or more).
+  AEC3 gets 8 seconds of the far end to find the echo again (a jump costs it 5-10 s), and the next 8 judge it: an ERLE 4
+  dB over the suspect seconds' and 10 dB or more in half of them keeps the hold; otherwise it goes, and no trial comes
+  for ten minutes (a minute when the far end didn't play enough to judge in two). Kept, AEC3's delay estimate over its
+  next 8 cancelling seconds says what the echo path didn't need: the hold gives back all but 4 ms of it, once (AEC3
+  read 24 ms for 28 offline, so the estimate errs short). Five suspect seconds again take the trim back, and then let
+  the hold go (ten minutes' cooldown); a minute of the far end with no echo seen (headphones put on) lets it go.
+- **Seen:** telemetry's `echo_hold_ms` (the hold, as the next block takes it up), `echo_guard` (watching, trial, held,
+  cooling; 0 when it isn't running) and `echo_correlation`; `run`'s status line ("held 10.0 trial"), the quality report's
+  engine line and the window's reference line say so, and the control thread logs each move and notes it for the
+  flight recorder.
+- **Offline** (`pipeline/tests/timeline.rs`, `the_echo_path_guard_holds_the_mic_for_an_early_echo`: steady 10 ms delivery,
+  a 12 ms lead, 100 s of the quality test's echo scene through AEC3): an echo 5 ms after its tap, AEC3's ERLE over the
+  last 20 s 6.9 dB without the guard and 19.3 dB with it (a 10 ms hold), as good as a 40 ms echo's 19.4, which gets no
+  hold; with the near voice in its turns, 6.8 and 15.9 dB.
 
 ## WASAPI hot-path rules (doc/dev/api/wasapi.md)
 - `read_from_device` returns one packet per call: loop until it returns 0 frames. Read into

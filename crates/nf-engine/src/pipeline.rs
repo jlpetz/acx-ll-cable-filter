@@ -27,6 +27,7 @@ use rtrb::Producer;
 
 use crate::api::{ChainBlock, OutputFacts, ThreadFacts};
 use crate::budget::{self, BudgetStats, WakeLog};
+use crate::echo_guard::{self, EchoGuard};
 use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
 use crate::recorder::ChainTx;
@@ -306,6 +307,13 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     has_reference: bool,
     reference: Reference,
     ref_rs: R,
+    /// The echo-path guard (`IoConfig::echo_guard`; echo_guard.rs), with a reference; the hold it wants, and the hold (mic
+    /// samples each block waits for past its own, which the reference loop reads as captured that much later), and this
+    /// second's blocks that AEC3 ran on.
+    echo_guard: Option<EchoGuard>,
+    hold_wanted: usize,
+    hold: usize,
+    aec_blocks: u32,
     // Output.
     out_drift: D,
     out_rs: R,
@@ -392,6 +400,10 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             has_reference: cfg.ref_period.is_some(),
             reference: Reference::new(cfg.ref_target(), cfg.ref_period.unwrap_or(BLOCK)),
             ref_rs,
+            echo_guard: None,
+            hold_wanted: 0,
+            hold: 0,
+            aec_blocks: 0,
             out_drift,
             out_rs,
             out_target: cfg.out_target(),
@@ -447,6 +459,21 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self
     }
 
+    /// The echo-path guard (`IoConfig::echo_guard`; echo_guard.rs) watches for an echo that comes before its reference, and
+    /// holds the mic back when it sees one. Only with a reference.
+    pub(crate) fn with_echo_guard(mut self) -> Self {
+        if self.has_reference {
+            self.echo_guard = Some(EchoGuard::new());
+        }
+        self
+    }
+
+    /// The echo-path guard's hold now, in samples.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> usize {
+        self.hold
+    }
+
     /// [`Self::with_adaptive_target`] with the old single-stage lowering (out_target.rs), for the simulations that compare it
     /// or that start where the target has come down.
     #[cfg(test)]
@@ -466,7 +493,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.out_drift.set_target(target as f32);
     }
 
-    /// The reference's lead target now, in samples.
+    /// The reference's lead target now, in samples (the loop's: the echo path's is this less the hold).
     #[cfg(test)]
     pub(crate) fn ref_target(&self) -> usize {
         self.reference.target() as usize
@@ -516,7 +543,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// keep-alive are serviced only then; performance/F3).
     #[inline]
     pub(crate) fn block_ready(&self) -> bool {
-        self.mic.len() >= BLOCK
+        self.mic.len() >= BLOCK + self.hold
     }
 
     /// Stops using the reference after its stream failed (wasapi/B): the chain gets dithered zeros
@@ -628,7 +655,10 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     pub(crate) fn process_block<P: BlockProcessor, S: RenderSink, T: Ticks>(
         &mut self, proc: &mut P, sink: &mut S, ticks: &mut T, tel: &Telemetry, readout: bool,
     ) -> Result<bool, Hr> {
-        if self.mic.len() < BLOCK {
+        if self.hold != self.hold_wanted {
+            self.move_hold();
+        }
+        if self.mic.len() < BLOCK + self.hold {
             return Ok(false);
         }
         let t0 = ticks.ticks();
@@ -646,8 +676,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
         self.dither.apply(&mut self.mic_blk[..], DITHER);
         self.take_reference(head, t_capture);
+        if let Some(g) = self.echo_guard.as_mut().filter(|_| self.has_reference) {
+            g.block(&self.mic_blk, &self.ref_blk);
+        }
 
         let report = proc.process(&self.mic_blk, &self.ref_blk, &mut self.out_blk, ticks);
+        self.aec_blocks += u32::from(report.aec_ticks > 0);
         let times = t_capture.filter(|_| readout).map(|capture_hns| BlockTimes { capture_hns, wake_hns, chain: proc.latency() });
         // Recorded after the write, with the block's budget, whether or not the write failed (as before the budget). The
         // block's time is taken before the recorders' copies.
@@ -674,6 +708,42 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         Ok(true)
     }
 
+    /// Moves the echo-path guard's hold to the one it wants, before a block (echo_guard.rs). A longer hold queues the extra
+    /// as silence on the output, since the mic's next block comes that much later, and the reference's timeline moves on
+    /// by as much at its next take (the block's capture time as its loop reads it moves with the hold, so the lead it sees
+    /// holds still). A shorter one drops that much of the oldest mic audio, so the next block comes that much sooner, and
+    /// the timeline goes on as it was (the capture times move back with the hold as far as the drop moves them on). Each is
+    /// one jump in the audio, at a hold's start, its trim and its end.
+    fn move_hold(&mut self) {
+        let (from, to) = (self.hold, self.hold_wanted);
+        if to > from {
+            self.queue_silence(to - from);
+            if self.has_reference {
+                self.reference.held(to - from);
+            }
+        } else {
+            let n = (from - to).min(self.mic.len());
+            self.mic_discarded += self.mic.discard(n) as u64;
+        }
+        self.hold = to;
+    }
+
+    /// Queues `n` zeros behind the pending samples (dropping the oldest pending ones past its room, as a block would).
+    fn queue_silence(&mut self, n: usize) {
+        let n = n.min(self.pending.len());
+        let over = (self.pending_len + n).saturating_sub(self.pending.len());
+        if over > 0 {
+            self.consume_pending(over);
+            self.counters.output_drops += 1;
+            self.counters.output_dropped_frames += over as u64;
+        }
+        let start = self.pending_len;
+        if let Some(dst) = self.pending.get_mut(start..start + n) {
+            dst.fill(0.0);
+            self.pending_len += n;
+        }
+    }
+
     /// Whether a statistics period just ended (call [`Self::publish_second`] then).
     #[inline]
     pub(crate) fn second_due(&self) -> bool {
@@ -691,9 +761,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.dither.apply(&mut self.ref_blk[..], DITHER);
             return;
         }
+        // Under the echo-path guard's hold the block is read as captured that much later: the reference loop then holds its
+        // lead on the newer reference the wait let the loopback deliver.
+        let held = self.hold as f64 * HNS_PER_SAMPLE;
         let mic = MicTime {
-            stamp: t_capture.filter(|_| self.mic_stamps.trusted()),
-            delivered: self.mic_last_hns - self.mic_abs.saturating_sub(head) as f64 * HNS_PER_SAMPLE,
+            stamp: t_capture.filter(|_| self.mic_stamps.trusted()).map(|t| t + held),
+            delivered: self.mic_last_hns - self.mic_abs.saturating_sub(head) as f64 * HNS_PER_SAMPLE + held,
             scatter: self.mic_stamps.scatter_hns(),
         };
         let n = self.reference.take(mic, &mut self.ref_in[..], &mut self.counters);
@@ -810,7 +883,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         if let Some(c) = clock {
             (facts.clock_pos, facts.clock_qpc_hns) = (c.pos_frames, c.qpc_hns);
         }
-        let backlog = self.mic.len() / BLOCK * BLOCK;
+        // The mic blocks this wake will still process: the echo-path guard's hold waits.
+        let backlog = self.mic.len().saturating_sub(self.hold) / BLOCK * BLOCK;
         let low = padding < self.out_period;
         if padding == 0 && self.out_started {
             // The device ran dry: its position may have moved on through the silence it played.
@@ -1119,12 +1193,30 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.output_target_on_trial.store(self.adaptive.as_ref().is_some_and(AdaptiveTarget::on_trial), Relaxed);
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
+        // The echo-path guard's second (echo_guard.rs): AEC3's estimates if it ran on (nearly) every block of it, and the hold
+        // it wants, which the next block takes up. Without the reference (dropped mid-run) the hold goes. Published as wanted,
+        // with the lead and target below less it.
+        let aec = proc.aec_stats();
+        let ran = std::mem::take(&mut self.aec_blocks) * 10 >= 9 * STATS_BLOCKS as u32;
+        if let Some(g) = self.echo_guard.as_mut() {
+            let target = self.reference.target();
+            let lead = if self.has_reference { g.second(aec.filter(|_| ran), target) } else { None };
+            self.hold_wanted = echo_guard::hold_for(lead, target);
+            tel.echo_correlation.store(g.correlation);
+        }
+        let hold_ms = self.hold_wanted as f32 * (1000.0 / SAMPLE_RATE as f32);
+        // The hold before the state, which the control thread reads first (`control::echo_guard_line`).
+        tel.echo_hold_ms.store(hold_ms);
+        if let Some(g) = self.echo_guard.as_ref() {
+            tel.echo_guard.store(g.state() as u8, Relaxed);
+        }
         if self.has_reference {
             // The reference's "fill" is its lead over the mic block, the quantity its loop holds,
-            // and its target can move (reference.rs). Whether the stamps time it, too.
+            // and its target can move (reference.rs). Whether the stamps time it, too. Both as the echo
+            // path sees them: less the echo-path guard's hold, which the loop reads as later capture.
             tel.reference_drift_ppm.store(self.reference.drift_ppm());
-            tel.reference_fill_ms.store(self.reference.lead_ms());
-            tel.reference_target_ms.store(self.reference.target_ms());
+            tel.reference_fill_ms.store(self.reference.lead_ms() - hold_ms);
+            tel.reference_target_ms.store(self.reference.target_ms() - hold_ms);
             tel.reference_stamped.store(self.reference.stamped(), Relaxed);
         } else {
             // None, or dropped mid-run.
@@ -1150,7 +1242,6 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.reference_coarse_drops.store(c.reference_drops, Relaxed);
         tel.tap_overflows.store(c.tap_overflows, Relaxed);
 
-        let aec = proc.aec_stats();
         if let Some(a) = aec {
             tel.aec_delay_ms.store(a.echo_delay_ms);
             tel.aec_erle_db.store(a.erle_db);
@@ -1601,6 +1692,79 @@ mod tests {
             p.publish_second(&tel, &spy, 0, 0, 0);
             assert!((tel.reference_target_ms.load() - 12.0).abs() < 1e-3 && (tel.reference_fill_ms.load() - 12.0).abs() < 0.1);
         }
+    }
+
+    /// The mic's and the reference's first samples a block, for the echo path's moves.
+    #[derive(Default)]
+    struct PairSpy(Vec<(f32, f32)>);
+
+    impl BlockProcessor for PairSpy {
+        fn process<T: Ticks>(&mut self, mic: &Block, r: &Block, out: &mut Block, _t: &mut T) -> ChainReport {
+            self.0.push((mic[0], r[0]));
+            *out = *mic;
+            ChainReport::default()
+        }
+        fn aec_stats(&self) -> Option<AecStats> {
+            None
+        }
+    }
+
+    /// The echo-path guard's hold (echo_guard.rs), moved by hand on steady, index-coded streams: a 5 ms hold queues 5 ms of
+    /// silence on the output (the next block comes that much later, and nothing runs short), and from that block on the
+    /// reference served is 240 samples newer against the mic, with no gap, slip or jump of the loop; letting it go drops
+    /// 240 mic samples, and the reference goes on as before against the mic. Published, the lead and its target are the
+    /// echo path's: less the hold.
+    #[test]
+    fn the_echo_hold_moves_the_reference_against_the_mic() {
+        let mut p = pipe(true);
+        let mut sink = FakeSink::new(4800);
+        p.prefill(&mut sink).unwrap();
+        let tel = Telemetry::new();
+        let mut spy = PairSpy::default();
+        // After the first block's own zeros (the starting fill).
+        let mut started = 0;
+        let (mut mic, mut lb) = (FakeCapture::default(), FakeCapture::default());
+        let (t, h, ran) = (1e10, 1e7 / 48_000.0, 1920usize);
+        let t_lb = t - ran as f64 * h;
+        push_tapped(&mut lb, 0, ran, t_lb);
+        for w in 0..60usize {
+            p.hold_wanted = match w {
+                20..40 => 240,
+                _ => 0,
+            };
+            let now = t + (w + 1) as f64 * 100_000.0 + 5_000.0;
+            mic.push((w * 480) as u64, Some((t + (w * 480) as f64 * h) as u64), idx1(w * 480, 480));
+            push_tapped(&mut lb, ran + w * 480, ran + (w + 1) * 480, t_lb);
+            sink.advance(480.0, 100_000.0);
+            p.drain_mic(&mut mic, now).unwrap();
+            p.drain_reference(&mut lb, now).unwrap();
+            while p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap() {}
+            if w == 0 {
+                started = sink.written.len();
+            }
+            if w == 30 {
+                p.publish_second(&tel, &spy, 0, 0, 0);
+                assert!((tel.echo_hold_ms.load() - 5.0).abs() < 1e-3);
+                assert!((tel.reference_target_ms.load() - 7.0).abs() < 1e-3, "{}", tel.reference_target_ms.load());
+            }
+        }
+        // The echo path in samples a block (the reference's index less the mic's), and the mic's steps between blocks.
+        let path: Vec<f32> = spy.0.iter().map(|&(m, r)| r - m).collect();
+        let mut runs: Vec<(f32, usize)> = Vec::new();
+        for &d in &path {
+            match runs.last_mut() {
+                Some((v, n)) if *v == d => *n += 1,
+                _ => runs.push((d, 1)),
+            }
+        }
+        let c = (ran - 576) as f32;
+        assert_eq!(runs.iter().map(|r| r.0).collect::<Vec<_>>(), [c, c + 240.0, c], "{runs:?}");
+        let steps: Vec<f32> = spy.0.windows(2).map(|w| w[1].0 - w[0].0).filter(|&s| s != 480.0).collect();
+        assert_eq!(steps, [720.0], "the mic jumps once, where the hold goes");
+        let c = p.counters;
+        assert_eq!((c.reference_gaps, c.reference_drops, c.reference_slips, c.render_underruns, c.output_deficits), (0, 0, 0, 0, 0));
+        let zeros = sink.written[started..].iter().filter(|&&v| v == 0.0).count();
+        assert_eq!(zeros, 240, "the hold's start, as silence");
     }
 
     #[test]
@@ -2366,7 +2530,9 @@ mod tests {
         drop(one);
         let lost = lost.load(std::sync::atomic::Ordering::Acquire);
         assert!(lost > 0 || blocks < 340, "the ring was full for a while");
-        assert_eq!(recorded + lost, (warm + blocks) as u64, "every block recorded or counted lost");
+        // A block a wake, but for the one an echo-path hold's start waits out.
+        assert_eq!(recorded + lost, p.blocks, "every block recorded or counted lost");
+        assert!(p.blocks + 1 >= (warm + blocks) as u64);
         (allocs, frees)
     }
 
@@ -2379,6 +2545,12 @@ mod tests {
         // With the adaptive output target too (exclusive mode's path: pipeline/tests/exclusive.rs).
         let mut p = pipe(true).with_adaptive_target();
         assert_eq!(wake_ups(&mut p, 1_000, 10), (0, 0), "with the adaptive target");
+        // With the echo-path guard, and a hold that starts in the warm-up and goes at the guard's first second (it sees no
+        // echo): its seconds, the held blocks and the hold's end.
+        let mut p = pipe(true).with_echo_guard();
+        p.hold_wanted = 240;
+        assert_eq!(wake_ups(&mut p, 1_000, 10), (0, 0), "with the echo-path guard");
+        assert_eq!(p.hold(), 0, "the guard let the hold go");
     }
 
     /// The same with nf-core's real drift loop and resampler; run with `--ignored`.

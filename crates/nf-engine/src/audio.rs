@@ -285,6 +285,9 @@ fn run(r: Run<'_>) {
     if config.io.adaptive_output {
         pipe = pipe.with_adaptive_target();
     }
+    if config.io.echo_guard {
+        pipe = pipe.with_echo_guard();
+    }
     let mut targets = BufferTargets {
         output_ms: pipe.out_target() as f32 * 1000.0 / SAMPLE_RATE as f32,
         reference_ms: ref_target as f32 * 1000.0 / SAMPLE_RATE as f32,

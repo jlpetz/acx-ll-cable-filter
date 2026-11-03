@@ -545,6 +545,9 @@ pub struct EngineReadings {
     pub reference_jumps: u64,
     pub aec_delay_ms: f32,
     pub aec_erle_db: f32,
+    /// The echo-path guard's mic hold at the take's end (ms; 0 without one), and whether it was still on its trial.
+    pub echo_hold_ms: f32,
+    pub echo_trial: bool,
     /// What the output side did over the take (TODO 9): a move of the output path's delay that these don't show happened in
     /// the devices, after the filter's output took the samples.
     pub output: OutputEvents,
@@ -564,6 +567,8 @@ impl EngineReadings {
             reference_jumps: t.reference_coarse_drops.saturating_sub(before.reference_coarse_drops),
             aec_delay_ms: t.aec_delay_ms,
             aec_erle_db: t.aec_erle_db,
+            echo_hold_ms: t.echo_hold_ms,
+            echo_trial: t.echo_guard == nf_engine::ECHO_GUARD_TRIAL,
             output: OutputEvents::between(before, t),
         }
     }
@@ -592,6 +597,10 @@ impl EngineReadings {
                 fixed(f64::from(self.aec_delay_ms), 1),
                 fixed(f64::from(self.aec_erle_db), 1)
             );
+            if self.echo_hold_ms > 0.0 {
+                let trial = if self.echo_trial { ", on its trial" } else { "" };
+                let _ = write!(s, "; the mic held {} ms for the echo (the echo-path guard{trial})", fixed(f64::from(self.echo_hold_ms), 1));
+            }
         }
         s
     }
@@ -1150,6 +1159,8 @@ mod tests {
             reference_jumps: 0,
             aec_delay_ms: 40.0,
             aec_erle_db: 31.25,
+            echo_hold_ms: 0.0,
+            echo_trial: false,
             output: OutputEvents { slips: 7, slip_net: -1, ..Default::default() },
         };
         let report = format_report(QualityTest::Echo, &echo, &take(&["CABLE-A Input", "CABLE-B Input"], aec));
@@ -1470,12 +1481,20 @@ mod tests {
             reference_jumps: 1,
             aec_delay_ms: 52.0,
             aec_erle_db: 12.0,
+            echo_hold_ms: 0.0,
+            echo_trial: false,
             output: OutputEvents { coarse_drops: 1, dropped_frames: 480, slips: 5, slip_net: 3, ..Default::default() },
         });
         assert_eq!(r.output_line(), "output events              1 coarse drop (10.0 ms dropped); 5 slips (net +3 samples) over the take");
         assert!(r.line().contains("lead 12.5 ms by delivery (target 12.0), 3 slips and 1 jumps over the take"), "{}", r.line());
         let off = EngineReadings { output_drift_ppm: f32::NAN, ..Default::default() };
         assert_eq!(off.line(), format!("{:<26} output drift -- ppm", "engine"));
+        let held = EngineReadings { echo_hold_ms: 10.0, echo_trial: true, ..r };
+        assert!(
+            held.line().ends_with("ERLE 12.0 dB; the mic held 10.0 ms for the echo (the echo-path guard, on its trial)"),
+            "{}",
+            held.line()
+        );
     }
 
     /// `x` read at `n - d(n)` (4-point Lagrange interpolation): a path whose delay is `d(n)` samples at output sample `n`.

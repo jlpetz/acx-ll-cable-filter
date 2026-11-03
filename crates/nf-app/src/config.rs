@@ -80,6 +80,9 @@ impl IoOptions {
         if let Some(v) = self.adaptive_output {
             io.adaptive_output = v;
         }
+        if let Some(v) = self.echo_guard {
+            io.echo_guard = v;
+        }
     }
 }
 
@@ -234,8 +237,11 @@ mod tests {
         assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output, "on by default");
         IoOptions::default().apply(&mut io);
         assert_eq!(io, nf_engine::IoConfig::default(), "nothing given changes nothing");
-        IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) }.apply(&mut io);
-        assert!(!io.output_exclusive && io.mic_exclusive && !io.adaptive_output);
+        IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false), echo_guard: None }.apply(&mut io);
+        assert!(!io.output_exclusive && io.mic_exclusive && !io.adaptive_output && io.echo_guard);
+        IoOptions { echo_guard: Some(false), ..Default::default() }.apply(&mut io);
+        assert!(!io.echo_guard);
+        IoOptions { echo_guard: Some(true), ..Default::default() }.apply(&mut io);
         IoOptions { output_exclusive: Some(true), ..Default::default() }.apply(&mut io);
         assert!(io.output_exclusive && !io.adaptive_output);
         let with = |file: &str, io: IoOptions| {
@@ -253,11 +259,11 @@ mod tests {
         // A file's false stays false, and a flag goes over the file either way
         let off = r#"{"engine": {"io": {"output_exclusive": false, "mic_exclusive": false, "adaptive_output": false}}}"#;
         assert_eq!(with(off, IoOptions::default()), (false, false, false));
-        let on = IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: None };
+        let on = IoOptions { output_exclusive: Some(true), mic_exclusive: Some(true), adaptive_output: None, echo_guard: None };
         assert_eq!(with(off, on), (true, true, false));
         let bare = r#"{"io": {"mic_exclusive": false}}"#;
         assert_eq!(with(bare, IoOptions::default()), (true, false, true), "a bare engine config");
-        let no = IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false) };
+        let no = IoOptions { output_exclusive: Some(false), mic_exclusive: None, adaptive_output: Some(false), echo_guard: None };
         assert_eq!(with(bare, no.clone()), (false, false, false));
         // Without a file, the flags over the defaults
         let args = EngineArgs { output: Some("{ren-3}".into()), io: no, ..Default::default() };

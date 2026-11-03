@@ -11,7 +11,8 @@ pub use nf_core::config::{
 };
 pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{
-    BudgetTotals, EngineState, LatencyBudget, MeterSnapshot, OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, WakeBlocks,
+    BudgetTotals, ECHO_GUARD_COOLING, ECHO_GUARD_HELD, ECHO_GUARD_TRIAL, ECHO_GUARD_WATCHING, EngineState, LatencyBudget, MeterSnapshot,
+    OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, WakeBlocks,
 };
 
 /// Endpoint direction.
@@ -498,12 +499,15 @@ impl ReferenceFacts {
     pub const UNSTAMPED: u16 = 1 << 7;
     /// The loop coasted on its drift estimate: the loopback wasn't fresh, or the reading was too far off to use.
     pub const COASTED: u16 = 1 << 8;
+    /// The echo-path guard's hold grew (nf-engine `echo_guard.rs`): the read position moved on with it, the lead the loop reads
+    /// unmoved. (A hold that shrinks drops mic samples instead: `ChainBlock::mic_discarded`.)
+    pub const HELD: u16 = 1 << 9;
 
     #[rustfmt::skip]
-    const NAMES: [(u16, &'static str); 9] = [
+    const NAMES: [(u16, &'static str); 10] = [
         (Self::NO_READING, "no-reading"), (Self::ALIGNED, "aligned"), (Self::CENTRED, "centred"), (Self::BROKEN, "broken"),
         (Self::STEPPED, "stepped"), (Self::RETARGETED, "retargeted"), (Self::RESTARTED, "restarted"),
-        (Self::UNSTAMPED, "unstamped"), (Self::COASTED, "coasted"),
+        (Self::UNSTAMPED, "unstamped"), (Self::COASTED, "coasted"), (Self::HELD, "held"),
     ];
 
     /// The names of the events at this block ("aligned", "coasted", ...), in the order of their bits.

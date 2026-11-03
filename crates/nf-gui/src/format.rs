@@ -211,6 +211,11 @@ pub(crate) fn clocks(t: &TelemetrySnapshot) -> String {
     if t.reference_target_ms > REFERENCE_TARGET_HIGH_MS {
         s.push_str(", high for speakers");
     }
+    // The echo-path guard's mic hold (nf-engine echo_guard.rs): the lead above is the echo path's, less it.
+    if t.echo_hold_ms > 0.0 {
+        let trial = if t.echo_guard == nf_engine::ECHO_GUARD_TRIAL { ", on a trial" } else { "" };
+        s.push_str(&format!(" · Mic held for the echo: {} ms{trial}", fixed(t.echo_hold_ms, 1)));
+    }
     s
 }
 

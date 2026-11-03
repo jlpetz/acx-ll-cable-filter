@@ -17,6 +17,7 @@ use nf_stages::{Aec3Stage, synth};
 
 use super::events::VSink;
 use super::*;
+use crate::echo_guard::LOW_ERLE_DB;
 use crate::reference::LEAD_CAP;
 
 /// One logged packet (live_probe.rs): the wake it was read at and its stamp, in hns from the probe's start (the stamp
@@ -116,7 +117,12 @@ pub(super) fn replay_into<P: BlockProcessor>(
         if p.block_ready() {
             p.drain_reference(&mut lb, now).unwrap();
         }
-        while p.process_block(proc, &mut sink, &mut ticks, &tel, false).unwrap() {}
+        while p.process_block(proc, &mut sink, &mut ticks, &tel, false).unwrap() {
+            // Once a second, as the audio loop does: the adaptive target's lowering, the echo-path guard's second.
+            if p.second_due() {
+                p.publish_second(&tel, proc, 0, 0, 0);
+            }
+        }
     }
     p
 }
@@ -800,7 +806,8 @@ impl BlockProcessor for AecProc {
         self.mic.extend_from_slice(mic);
         self.out.extend_from_slice(out);
         self.stats.push(self.stage.aec_stats());
-        ChainReport::default()
+        // It ran (the echo-path guard counts the blocks AEC3 ran on).
+        ChainReport { aec_ticks: 1, ..ChainReport::default() }
     }
     fn aec_stats(&self) -> Option<AecStats> {
         Some(self.stage.aec_stats())
@@ -957,6 +964,12 @@ fn aec_result(a: &AecProc, sc: &EchoScene, echo_at: &dyn Fn(usize) -> f32) -> Ae
 /// Replays `rows` with the echo scene's audio through the pipeline into AEC3, the echo `echo_ms` behind the loopback's
 /// tap (by the rows' own stamp lines, so the clocks' drift is in it). Returns the pipeline and the result.
 fn aec_run(rows: &[Row], sc: &EchoScene, echo_ms: f64) -> (Pipeline, AecResult) {
+    let (p, _, r) = aec_run_in(cable_pipe(), rows, sc, echo_ms);
+    (p, r)
+}
+
+/// [`aec_run`] through a pipeline of the caller's; AEC3's own figures too.
+fn aec_run_in(pipe: Pipeline, rows: &[Row], sc: &EchoScene, echo_ms: f64) -> (Pipeline, AecProc, AecResult) {
     let (m, l) = (stamp_line(rows, 0), stamp_line(rows, 1));
     let m0 = rows.iter().find(|r| r.kind == 0).map_or(0, |r| r.code);
     let l0 = rows.iter().find(|r| r.kind == 1).map_or(0, |r| r.code);
@@ -977,9 +990,55 @@ fn aec_run(rows: &[Row], sc: &EchoScene, echo_ms: f64) -> (Pipeline, AecResult) 
     let lb_of =
         |pos: u64, n: usize| -> Vec<f32> { (pos..pos + n as u64).map(|i| sc.far.get(i as usize).copied().unwrap_or(0.0)).collect() };
     let mut a = AecProc::new();
-    let p = replay(rows, &mut a, &mic_of, &lb_of);
+    let p = replay_into(pipe, rows, &mut a, &mic_of, &lb_of);
     let r = aec_result(&a, sc, &echo_at);
-    (p, r)
+    (p, a, r)
+}
+
+/// The echo-path guard (echo_guard.rs) offline, through AEC3: steady delivery on 10 ms periods (a lead target of 12 ms),
+/// the echo scene without the near voice, for 100 s. An echo 5 ms behind the loopback's tap comes before its reference:
+/// without the guard AEC3 can't place it (its ERLE stays low); with it, a trial holds the mic 10 ms (a 2 ms lead), AEC3
+/// cancels, and the hold stays. An echo at 40 ms AEC3 places: no hold. Then the same with the near voice in its turns,
+/// printed. `--ignored --nocapture`; 100 s of AEC3 a run, so in release.
+#[test]
+#[ignore]
+fn the_echo_path_guard_holds_the_mic_for_an_early_echo() {
+    const SECS: f64 = 100.0;
+    let rows = scene_rows(&Scene::new(Delivery::Steady, Delivery::Steady, 30.0), SECS);
+    let len = (SECS as usize + 2) * 48_000;
+    // AEC3's ERLE over the last 20 s (the mean of its finite reports).
+    let late_erle = |a: &AecProc| {
+        let v: Vec<f32> = a.stats.iter().rev().take(2_000).map(|s| s.erle_db).filter(|v| v.is_finite()).collect();
+        v.iter().sum::<f32>() / v.len().max(1) as f32
+    };
+    let mut failed = Vec::new();
+    for near in [false, true] {
+        let sc = EchoScene::new(len, near, None);
+        for echo_ms in [5.0, 40.0] {
+            for guard in [false, true] {
+                let pipe = if guard { cable_pipe().with_echo_guard() } else { cable_pipe() };
+                let (p, a, r) = aec_run_in(pipe, &rows, &sc, echo_ms);
+                let (hold, erle) = (p.hold() as f64 / 48.0, late_erle(&a));
+                eprintln!(
+                    "  near {near:5}, echo {echo_ms:2.0} ms, guard {guard:5}: hold {hold:4.1} ms, target {:4.1} ms; AEC3's ERLE over the last \
+                     20 s {erle:5.1} dB, its delay {:3.0} ms; far only {:5.1} dB; reference gaps {}, drops {}",
+                    p.ref_target() as f64 / 48.0,
+                    r.delay,
+                    r.far_only,
+                    p.counters.reference_gaps,
+                    p.counters.reference_drops,
+                );
+                if near {
+                    continue;
+                }
+                let want_hold = guard && echo_ms < 10.0;
+                if (hold > 0.0) != want_hold || (want_hold && erle < LOW_ERLE_DB) {
+                    failed.push(format!("echo {echo_ms} ms, guard {guard}: hold {hold} ms, ERLE {erle} dB"));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
 }
 
 /// The offline AEC3 check (TODO 10): each trace's delivery, and the synthetic scenes' (bursty; a stall in the start-up; 3 s

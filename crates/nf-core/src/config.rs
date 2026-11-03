@@ -271,6 +271,11 @@ pub struct IoConfig {
     /// that the fixed target (one period + one block + the margin) would have ridden out. On by default (the owner,
     /// 2026-11-02); off for a recording that must have none.
     pub adaptive_output: bool,
+    /// The echo-path guard (nf-engine `echo_guard.rs`): with echo cancelling on, when an echo seen comes before its reference
+    /// (speakers whose output latency is under the reference's lead), hold the mic back until the reference is in time,
+    /// on a trial first, and only as long as needed. Costs the hold in latency (up to 16 ms) only then. On by default
+    /// (ours, 2026-11-03).
+    pub echo_guard: bool,
 }
 
 impl Default for IoConfig {
@@ -283,6 +288,7 @@ impl Default for IoConfig {
             output_exclusive: true,
             mic_exclusive: true,
             adaptive_output: true,
+            echo_guard: true,
         }
     }
 }
@@ -315,7 +321,7 @@ mod tests {
     #[test]
     fn the_lowest_latency_io_is_the_default() {
         let io = IoConfig::default();
-        assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output);
+        assert!(io.output_exclusive && io.mic_exclusive && io.adaptive_output && io.echo_guard);
         assert!(io.low_latency_periods && io.raw_mic && io.keep_alive_reference);
         assert_eq!(io.output_margin_ms, 2.0);
         assert_eq!(EngineConfig::default().io, io);

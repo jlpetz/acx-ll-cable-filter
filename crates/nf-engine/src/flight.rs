@@ -213,6 +213,8 @@ pub(crate) enum Note {
     ReferenceLost(String),
     /// The exclusive period guard stepped a stream up (control.rs), worded.
     PeriodRaised(String),
+    /// The echo-path guard moved the mic's hold (echo_guard.rs; control.rs's `echo_guard_line`), worded.
+    EchoGuard(String),
     /// Stopped by the user (`Engine::stop`).
     Stopped,
 }
@@ -225,6 +227,7 @@ impl Note {
             Note::Restarting(why) => format!("the streams restart ({why})"),
             Note::ReferenceLost(m) => format!("the echo reference was lost: {m}"),
             Note::PeriodRaised(m) => format!("the exclusive period guard: {m}"),
+            Note::EchoGuard(m) => format!("the echo-path guard: {m}"),
             Note::Stopped => "the filter was stopped".to_owned(),
         }
     }
