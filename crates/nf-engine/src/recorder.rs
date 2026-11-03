@@ -24,12 +24,14 @@ use std::time::{Duration, Instant};
 use nf_core::{BLOCK, Block};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
-use crate::api::{ChainBlock, ChainParams, ChainRecording, EngineError, GateMode, GateParams, MAX_CHAIN_RECORDING_S, OutputFacts};
+use crate::api::{
+    ChainBlock, ChainParams, ChainRecording, EngineError, GateMode, GateParams, MAX_CHAIN_RECORDING_S, OutputFacts, ThreadFacts,
+};
 use crate::control::{Inner, lock};
 use crate::handover::{self, End, Handed, Port};
 
-/// The ring's capacity: 4 s of blocks (about 2.4 MB). The drain thread empties it every 20 ms.
-const RING_BLOCKS: usize = 400;
+/// The ring's capacity: 4 s of blocks (about 2.5 MB). The drain thread empties it every 20 ms (the flight recorder's too).
+pub(crate) const RING_BLOCKS: usize = 400;
 const DRAIN_EVERY: Duration = Duration::from_millis(20);
 /// How long a stop waits for the audio thread to hand the ring back (it looks once a wake, every 10 ms or so).
 const RETURN_WAIT: Duration = Duration::from_millis(500);
@@ -48,7 +50,7 @@ pub(crate) struct ChainItem {
 }
 
 impl ChainItem {
-    const BLANK: Self = Self {
+    pub(crate) const BLANK: Self = Self {
         block: ChainBlock {
             index: 0,
             capture_qpc_hns: 0.0,
@@ -95,12 +97,31 @@ impl ChainItem {
                 clock_pos: 0.0,
                 clock_qpc_hns: 0.0,
             },
+            thread: ThreadFacts {
+                wake_hns: 0.0,
+                wake_gap_ms: 0.0,
+                wakes: 0,
+                out_wakes: 0,
+                stalls: 0,
+                mic_glitches: 0,
+                process_us: 0.0,
+                model_misses: 0,
+            },
         },
         lost: 0,
         mic: [0.0; BLOCK],
         reference: [0.0; BLOCK],
         output: [0.0; BLOCK],
     };
+}
+
+/// A ring of [`RING_BLOCKS`] items with its pages touched (filled and emptied once), so the audio thread never faults on them:
+/// made on the control side, for the chain recorder and for each of the flight recorder's runs.
+pub(crate) fn touched_ring() -> (Producer<ChainItem>, Consumer<ChainItem>) {
+    let (mut ring, mut rx) = RingBuffer::<ChainItem>::new(RING_BLOCKS);
+    while ring.push(ChainItem::BLANK).is_ok() {}
+    while rx.pop().is_ok() {}
+    (ring, rx)
 }
 
 /// What the audio thread holds while it records: the ring's producer, and the count of blocks the ring had no room for,
@@ -219,9 +240,7 @@ pub(crate) fn arm(inner: &Arc<Inner>, max_seconds: f64) -> Result<Handle, Engine
     if inner.recording.swap(true, AcqRel) {
         return Err(EngineError("The chain is being recorded already.".into()));
     }
-    let (mut ring, mut rx) = RingBuffer::<ChainItem>::new(RING_BLOCKS);
-    while ring.push(ChainItem::BLANK).is_ok() {}
-    while rx.pop().is_ok() {}
+    let (ring, rx) = touched_ring();
     let tx = ChainTx::new(ring);
     let lost = tx.lost();
     let state = Arc::new(DrainState::default());

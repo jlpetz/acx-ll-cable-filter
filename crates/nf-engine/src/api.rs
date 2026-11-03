@@ -575,6 +575,41 @@ impl Default for OutputFacts {
     }
 }
 
+/// What the audio thread itself did around one block ([`ChainBlock::thread`]; engine.md, "The flight recorder"): when it woke,
+/// how long since it had woken before, the waits that timed out and the mic's glitches since the block before, and how long
+/// the block took it. With the mic's delivery ([`ChainBlock::mic_wake_hns`], [`ChainBlock::mic_queued`]) and the output's
+/// padding they tell a thread that was held up (a long gap between wakes, the mic's samples waiting when it woke) from a
+/// device that stopped delivering (wakes on time, or waits timing out, and no packets) from an output that ran dry (the thread
+/// and the mic on time, the device's padding gone). A few stores a block, always (the block's time is the clock reading its
+/// timing takes anyway).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ThreadFacts {
+    /// The QPC time (100 ns units) of the wake that processed the block; 0 when unknown.
+    pub wake_hns: f64,
+    /// The longest time between two of the thread's wakes since the block before's wake, the one that ended at this block's
+    /// included, in ms; 0 for a later block of the same wake.
+    pub wake_gap_ms: f32,
+    /// The thread's wakes since the block before's, this block's own included: 0 for a later block of the same wake, more
+    /// than 1 when wakes in between brought less than a block.
+    pub wakes: u32,
+    /// Of those wakes, the ones an exclusive output's event made (reported first when both have fired). Always 0 with a
+    /// shared output: the thread then waits on the mic's events alone, and a thread held up can't be told from a mic's driver
+    /// that held its samples back and delivered them at once.
+    pub out_wakes: u32,
+    /// Stalls since the block before: wakes that found nothing from the mic (neither its event nor a packet) 100 ms or more
+    /// after its last (a wait timing out; with an exclusive output's events waking the thread, once in each 100 ms).
+    pub stalls: u32,
+    /// Mic glitches since the block before: packets flagged discontinuous or missing by device position, and the FIFO
+    /// overflowing (telemetry's `capture_glitches`).
+    pub mic_glitches: u32,
+    /// The block's own time on the audio thread, in µs: from taking it off the mic FIFO to its output written (the chain's
+    /// processing included, the recorders' copies not).
+    pub process_us: f32,
+    /// Blocks a model pack's inference worker had no result for in time (the substitute played) since the block before; 0
+    /// without a pack.
+    pub model_misses: u32,
+}
+
 /// A clock's drift against the mic's, fitted over a chain recording's blocks ([`clock_drift`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DriftFit {
@@ -658,6 +693,19 @@ pub struct ChainBlock {
     /// What the output side did at this block: where it went in the device's stream, the fill and target, and its slip, zeros,
     /// drops, underrun and re-anchor.
     pub output: OutputFacts,
+    /// What the audio thread did around this block: its wake, the gap before it, stalls, mic glitches and model misses since
+    /// the block before, and the block's processing time.
+    pub thread: ThreadFacts,
+}
+
+/// The columns of [`chain_blocks_csv`], comma-separated (engine.md, "The chain recorder" and "The flight recorder"; `quality
+/// --save`'s `chain_blocks.csv`).
+pub const CHAIN_BLOCK_COLUMNS: &str = crate::csv::COLUMNS;
+
+/// A chain recording's blocks as CSV: [`CHAIN_BLOCK_COLUMNS`], then a row a block. Times are QPC in 100 ns units; a number
+/// that's unknown is empty, and so are the reference's columns without a reference and the budget's without a budget.
+pub fn chain_blocks_csv(blocks: &[ChainBlock]) -> String {
+    crate::csv::chain_blocks(blocks)
 }
 
 /// What [`ChainRecorder::stop`] gives: every block the chain processed while it recorded, the chain's input and output.
@@ -733,6 +781,110 @@ impl ChainRecorder {
     /// Stops recording (the recording ends at about this moment) and returns it. It waits up to about half a second for
     /// the audio thread to hand the ring back.
     pub fn stop(self) -> ChainRecording {
+        self.inner.stop()
+    }
+}
+
+/// The flight recorder's audio when it's kept, in seconds before a trigger: `run --flight-audio`'s (about 0.6 MB a second
+/// in memory, the post-roll's included).
+pub const FLIGHT_AUDIO_S: f64 = 5.0;
+
+/// The flight recorder's settings ([`Engine::arm_flight_recorder`]; engine.md, "The flight recorder"). [`FlightConfig::new`]
+/// gives the defaults.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlightConfig {
+    /// Where the dumps go, a folder each (`flight-<local time>-<trigger>`); made if it isn't there.
+    pub dir: std::path::PathBuf,
+    /// The per-block facts kept before a trigger, in seconds (1-60; default 10).
+    pub facts_s: f64,
+    /// The audio kept before a trigger (the chain's mic, reference and output, as the chain recorder keeps them), in seconds
+    /// (0-30); 0, the default, keeps none.
+    pub audio_s: f64,
+    /// How long a dump waits after its trigger, recording, before it's written, in seconds (0.1-10; default 3).
+    pub post_roll_s: f64,
+    /// The least time between two dumps for the same kind of trigger (the output, the mic, the audio thread, the echo
+    /// reference, the model, a fault), in seconds (0-3600; default 60). Triggers in between are counted, not dumped.
+    pub min_interval_s: f64,
+    /// The most dumps one arming writes for each kind of trigger (at least 1; default 3), so a kind that keeps misbehaving
+    /// (the second soak's loopback, for minutes) can't use up the dumps another needs later.
+    pub max_dumps_per_kind: u32,
+    /// The most dumps one arming writes in all (at least 1; default 20: with the defaults, more than the six kinds' 3 each
+    /// can use, so it bounds the disk without crowding a kind out).
+    pub max_dumps: u32,
+    /// The most dump folders kept in `dir`: after each dump the oldest beyond this are deleted (at least 1; default 20). Only
+    /// folders named as the recorder names them, with a `summary.txt`, are touched.
+    pub keep_dumps: usize,
+}
+
+impl FlightConfig {
+    /// The defaults, writing into `dir`: 10 s of facts before a trigger, no audio, 3 s after it, at most one dump a minute
+    /// and 3 an arming for each kind of trigger, 20 in all, and the newest 20 dumps kept in `dir`.
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            facts_s: 10.0,
+            audio_s: 0.0,
+            post_roll_s: 3.0,
+            min_interval_s: 60.0,
+            max_dumps_per_kind: 3,
+            max_dumps: 20,
+            keep_dumps: 20,
+        }
+    }
+}
+
+/// One dump the flight recorder wrote ([`FlightStats::dumps`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlightDump {
+    /// The dump's folder: `flight_blocks.csv`, `summary.txt`, and the WAVs when audio was kept.
+    pub path: std::path::PathBuf,
+    /// What triggered it, in words ("an output underrun"): the most serious of the triggers that came together (the output's,
+    /// then the mic's, the thread's, a fault, the reference's, the model's).
+    pub trigger: String,
+    /// The other triggers it holds, by their names (`output-deficit`, `reference-short`: engine.md lists them), once each:
+    /// those at the same blocks, and in its post-roll.
+    pub also: Vec<&'static str>,
+    /// When, in seconds after the recorder was armed, and by the wall clock (local time, as the app's log has it).
+    pub at_s: f64,
+    pub local_time: String,
+    /// The summary's reading of the facts around it, in one sentence.
+    pub verdict: String,
+}
+
+/// What a flight recorder has done so far ([`FlightRecorder::stats`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FlightStats {
+    /// The dumps written, in order.
+    pub dumps: Vec<FlightDump>,
+    /// Triggers that made no dump of their own: within `min_interval_s` of their kind's last dump, past its
+    /// `max_dumps_per_kind`, or past `max_dumps`. (Those in a pending dump's post-roll of a kind it holds, or within half a
+    /// second of its trigger, are in that dump.)
+    pub suppressed: u64,
+    /// The same by kind, those with any, in words ("the echo reference", 94).
+    pub suppressed_by: Vec<(&'static str, u64)>,
+    /// Blocks the recorder has seen, and blocks lost because its ring was full.
+    pub blocks: u64,
+    pub lost_blocks: u64,
+    /// Dumps that couldn't be written, worded.
+    pub errors: Vec<String>,
+}
+
+/// An armed flight recorder ([`Engine::arm_flight_recorder`]). Its own thread keeps the last seconds of every block's facts
+/// (and audio, if asked) and writes them out when something goes wrong. Dropping it stops it, as [`FlightRecorder::stop`]
+/// does.
+pub struct FlightRecorder {
+    pub(crate) inner: crate::flight::Handle,
+}
+
+impl FlightRecorder {
+    /// The dumps and counts so far (the dump being written may not be in yet).
+    pub fn stats(&self) -> FlightStats {
+        self.inner.stats()
+    }
+
+    /// Stops it: the triggers still in their post-rolls are dumped now, with what there is. It waits for those writes, and up
+    /// to about half a second for the audio thread to hand the live run's ring back.
+    pub fn stop(self) -> FlightStats {
         self.inner.stop()
     }
 }
@@ -843,5 +995,20 @@ impl Engine {
     /// the streams). One recorder at a time.
     pub fn record_chain(&self, max_seconds: f64) -> Result<ChainRecorder, EngineError> {
         crate::recorder::arm(&self.inner, max_seconds).map(|inner| ChainRecorder { inner })
+    }
+
+    /// Arms the flight recorder (engine.md, "The flight recorder"): the last `facts_s` seconds of every block's facts (and
+    /// `audio_s` of its audio) kept in memory, and written into `dir` when something goes wrong: an output underrun, deficit
+    /// or coarse drop; a mic stall, glitch, skip or overflow; the audio thread waking late or taking too long on a block; an
+    /// echo reference that jumps, runs short in a burst or is lost; a model pack's miss; or a fault that stops the audio. Each
+    /// dump waits `post_roll_s` after its trigger and holds a CSV of the blocks, a summary in words, and the audio if kept.
+    ///
+    /// Unlike the chain recorder it follows the engine across its restarts (each run gets a ring of its own) and keeps
+    /// recording after each dump, until stopped. Armed before [`Engine::start`] it records from the first run's first block;
+    /// armed while running, from the next wake. On the audio thread it costs what the chain recorder costs: one block's
+    /// facts and audio copied into a pre-allocated ring a block (about 6 KB). One flight recorder at a time; it runs beside a
+    /// chain recorder.
+    pub fn arm_flight_recorder(&self, config: FlightConfig) -> Result<FlightRecorder, EngineError> {
+        crate::flight::arm(&self.inner, config).map(|inner| FlightRecorder { inner })
     }
 }

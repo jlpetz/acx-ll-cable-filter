@@ -1,15 +1,19 @@
 //! `devices --check`: the filter runs quietly on the chosen devices for a few seconds (15 by default), with the chain recorder
 //! keeping each block's facts, and then says how each stream delivered (`crate::health`, TODO 21): steady, in bursts or late,
 //! its drift and glitches, and what to try. Echo cancelling is on unless `--no-aec`, so the speakers' loopback is checked too.
-//! It only reports: nothing is saved (no calibration yet). Exit 0 once it has run, 3 when Ctrl+C stopped it before 3 s.
+//! It saves no calibration (none yet). The flight recorder is armed for it (engine.md, "The flight recorder"; `--flight DIR`,
+//! the log's `flight` folder by default): if a stream misbehaves during the check, the dump it writes is named at the end of
+//! the report. A recorder that can't be armed (its folder can't be made) is a warning, and the check runs without it: the
+//! check is the diagnostic, the recorder only adds to it. Exit 0 once it has run, 3 when Ctrl+C stopped it before 3 s.
 //!
 //! The figures are one run's: the blocks are the chain recording's (it ends with the run it began with), the streams as that
 //! run opened them, and its counters as its last publication had them. After a restart they stay the first run's: the
 //! next run's counters start again from 0.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use nf_engine::{Engine, EngineStatus, TelemetrySnapshot};
+use nf_engine::{Engine, EngineStatus, FlightConfig, FlightStats, TelemetrySnapshot};
 
 use super::list_devices;
 use crate::cli::CheckArgs;
@@ -30,6 +34,11 @@ pub fn check(args: &CheckArgs) -> Result<(), Failure> {
     // Armed before the start: the recording holds the run from its first block.
     let recorder =
         engine.record_chain(f64::from(args.seconds) + 5.0).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?;
+    // Not needed for the check: without it, a warning, and the report says so.
+    let flight = super::run::arm_flight(&engine, &args.flight).map_err(|e| {
+        say!("warning: Couldn't arm the flight recorder ({e}); the check runs without it.");
+        e.to_string()
+    });
     super::run::start_engine(&engine, &cfg)?;
     say!("Checking the devices for {} s: the filter runs as usual meanwhile. Ctrl+C stops it sooner.", args.seconds);
     let mut run = FirstRun::new(engine.status(), engine.telemetry());
@@ -59,6 +68,8 @@ pub fn check(args: &CheckArgs) -> Result<(), Failure> {
     // Before the engine stops, so the recording ends with the check rather than with the run.
     let chain = recorder.stop();
     engine.stop();
+    // After the stop: the triggers still in their post-rolls are dumped now, with what there is.
+    let flight = flight.map(|f| (f.recorder.stop(), f.config));
     console::finished();
     if cancelled && seconds < MIN_REPORT_S {
         return Err(Failure::no_result("The check was cancelled before it had measured enough."));
@@ -70,8 +81,39 @@ pub fn check(args: &CheckArgs) -> Result<(), Failure> {
     let restarted = run.restarted || chain.run_ended;
     let figures = health::measure(&chain.blocks, &run.counters, &run.status, seconds, restarted);
     let verdicts = health::assess(&figures);
-    say!("{}", health::format(&figures, &verdicts));
+    let flight = flight.as_ref().map(|(stats, cfg)| (stats, cfg)).map_err(String::as_str);
+    say!("{}\n\n{}", health::format(&figures, &verdicts), flight_report(flight));
     Ok(())
+}
+
+/// The report's last part: what the flight recorder wrote during the check (its stats and settings), each dump's folder with
+/// what triggered it and its reading, or that nothing triggered; or, when it couldn't be armed, why.
+fn flight_report(flight: Result<(&FlightStats, &FlightConfig), &str>) -> String {
+    let mut s = String::from("Flight recorder: ");
+    let (stats, cfg) = match flight {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = write!(s, "off for this check: it couldn't be armed ({e}).");
+            return s;
+        }
+    };
+    if stats.dumps.is_empty() {
+        s.push_str("nothing it watches for went wrong (underruns, stalls, glitches, late wakes, the reference's jumps or bursts).");
+    } else {
+        let n = stats.dumps.len();
+        let _ = write!(s, "{n} {} in {}:", if n == 1 { "dump" } else { "dumps" }, cfg.dir.display());
+        for d in &stats.dumps {
+            let _ = write!(s, "\n  - {}", super::run::dump_line(d));
+        }
+        s.push_str("\n  Each folder's summary.txt says what happened around it; flight_blocks.csv has every block.");
+    }
+    if stats.suppressed > 0 {
+        let _ = write!(s, "\n  {}.", super::run::held_back(stats, cfg));
+    }
+    for e in &stats.errors {
+        let _ = write!(s, "\n  A dump wasn't written: {e}");
+    }
+    s
 }
 
 /// The run the check began with, as the check saw it once a second: its streams (as it opened them) and its counters, held
@@ -106,6 +148,8 @@ impl FirstRun {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use nf_engine::StreamInfo;
 
     use super::*;
@@ -122,6 +166,37 @@ mod tests {
             exclusive: None,
             exclusive_refused: None,
         }
+    }
+
+    /// The report names each dump (its folder, what triggered it, its reading), or says nothing triggered, or that the
+    /// recorder couldn't be armed and why.
+    #[test]
+    fn the_report_names_the_flight_recorders_dumps() {
+        let dir = Path::new("C:\\flight");
+        let cfg = FlightConfig::new(dir);
+        let none = flight_report(Ok((&FlightStats { blocks: 1_500, ..Default::default() }, &cfg)));
+        assert!(none.starts_with("Flight recorder: nothing it watches for went wrong"), "{none}");
+        let d = nf_engine::FlightDump {
+            path: dir.join("flight-20261102-140312-output-underrun"),
+            trigger: "an output underrun".into(),
+            also: Vec::new(),
+            at_s: 7.26,
+            local_time: "2026-11-02 14:03:12.345".into(),
+            verdict: "The output ran dry at block 700.".into(),
+        };
+        let stats = FlightStats { dumps: vec![d], suppressed: 2, suppressed_by: vec![("the mic", 2)], ..Default::default() };
+        let one = flight_report(Ok((&stats, &cfg)));
+        assert!(
+            one.starts_with("Flight recorder: 1 dump in C:\\flight:\n  - at 7.3 s (2026-11-02 14:03:12.345), an output underrun: "),
+            "{one}"
+        );
+        assert!(one.contains("flight-20261102-140312-output-underrun The output ran dry at block 700."), "{one}");
+        assert!(one.contains("2 more triggers not dumped (2 of the mic; at most one dump every 60 s"), "{one}");
+        let off = flight_report(Err("The flight recorder can't use C:\\flight: Access is denied."));
+        assert_eq!(
+            off,
+            "Flight recorder: off for this check: it couldn't be armed (The flight recorder can't use C:\\flight: Access is denied.)."
+        );
     }
 
     /// The first run's streams and counters are kept: a later look fills in a stream it hadn't reported, a stopped engine's

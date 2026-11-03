@@ -46,8 +46,10 @@ sonora-nnnoiseless). The public API (`crates/nf-engine/src/api.rs`) is fixed; im
     4, 8...
 - `latency_test`: below.
 - `recorder`: the chain recorder (below): what the chain got and gave live, block by block.
+- `flight`: the flight recorder (below): the last seconds of the blocks' facts, written out when something goes wrong.
+- `csv`: the recorders' blocks as CSV (`chain_blocks_csv`: `chain_blocks.csv`, and the flight recorder's rows).
 - `handover`: handing a ring's producer to the audio thread and back, lock-free (the latency test's
-  tap and the chain recorder).
+  tap and the recorders).
 - `timing`: QPC helpers (`now_100ns()`, conversion to ms).
 
 ## The audio thread (one, MMCSS "Pro Audio", kept between runs)
@@ -100,16 +102,17 @@ error and stop):
    loopback onto the reference's timeline (a FIFO of about 500 ms; "The reference" below). A
    failing loopback or keep-alive drops the reference for the rest of the run (dithered zeros, a
    warning), and the mic path carries on.
-   Then the hand-overs (`handover.rs`): the latency test's tap and the chain recorder are taken
-   from their command rings, before this wake's blocks, and handed back when they're done.
+   Then the hand-overs (`handover.rs`): the latency test's tap, the chain recorder and the flight
+   recorder's ring are taken from their command rings, before this wake's blocks, and handed back
+   when they're done.
 3. While the mic FIFO holds ≥ 480:
    - Take one block.
    - **Reference:** the timeline serves 480 samples (±1 when its loop slips) for this block, with
      zeros for any that haven't arrived, and `SlipResampler::resample` makes them 480 ("The
      reference" below).
    - `chain.process_timed(mic, ref, out, qpc_now)`.
-   - **Chain recorder**, while one is armed: the block's mic, reference and output, and its facts,
-     into its ring ("The chain recorder" below).
+   - **Chain recorder** and **flight recorder**, while armed: the block's mic, reference and output,
+     and its facts, into each one's ring ("The chain recorder", "The flight recorder" below).
    - **Output slip:** `out_slip = out_drift.update(output_fill)`, where the fill is frames written
      (and pending) minus the device position carried forward to now (at most a period), calibrated
      to the padding by a one-period window over the sawtooth the device's period steps make
@@ -317,7 +320,9 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
 - **The thread's second deadline:** a render event must be answered within a period (2 ms). The wait lists the output's
   event first, and the loop answers it at the top of each wake and after each block (0.1-0.3 ms of work), so the longest
   answer is one block's work plus the wake's own (reading the mic, servicing the reference). A stall is now timed by the
-  mic's events (`StallWatch`: 100 ms without one), since the output's wake the thread every 2 ms.
+  mic (`StallWatch`: 100 ms with neither its event nor a packet), since the output's wake the thread every 2 ms. A wake
+  the output's event made that finds the mic's packets waiting is no stall: a thread held up past 100 ms finds both events
+  fired, and the wait reports the output's (`audio::mic_wake`; `pipeline/tests/flight.rs`).
 - **The mic** in exclusive mode is an event-driven exclusive `CaptureStream`: a packet a period, read into the mic FIFO
   as any packet is; its stamps and device positions are GetBuffer's as in shared mode, so the reference's lead (read
   against the mic's capture stamps), the stamps' trust, the budget's mic delivery and the gap filling hold as they are.
@@ -722,6 +727,125 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   saved WAVs. A recording armed while running, or with blocks lost, starts from a state the rerun doesn't have; one whose
   settings changed matches a rerun with one config only up to the change (`ChainRecording::settings_changed_at`).
   `reproducible` checks all three.
+- **The thread's facts** (`ThreadFacts`, the last of `ChainBlock`'s; the flight recorder's, below): the wake that processed
+  the block, the longest gap between wakes since the block before's, the wakes (and those the exclusive output's event made)
+  and stalls since then, the mic's glitches, the block's own time and a model pack's misses. `chain_blocks.csv` has them as
+  its last columns.
+
+## The flight recorder (`flight.rs`, TODO 13 and 21)
+The last seconds of every block's facts, kept in memory and written out when something goes wrong, so a soak or a user's run
+shows what ran dry (`Engine::arm_flight_recorder`; `run --flight` and `devices --check`: app.md, "The flight recorder"). The
+two 30-minute soaks on the dev VM's cables each had one output underrun near two minutes in, and `run` kept no per-block log.
+- **On the audio thread, nothing new.** It pushes the chain recorder's item (`ChainItem`: the block's facts, `ChainBlock`, and
+  its mic, reference and output) into a ring of the flight recorder's own (`Pipeline::flight`), beside the chain recorder's
+  when both are armed: one item copied into a pre-allocated rtrb ring a block (about 6 KB; a full ring loses the block,
+  counted), what the chain recorder costs. The facts it needs are those the thread writes anyway, and the thread's own
+  (`ThreadFacts`, below) are a few stores a block, armed or not, the block's time being the clock reading its timing takes
+  anyway. The audio thread only flags; the control side detects. The no-allocation test runs with both rings armed.
+- **The thread's facts** (`ChainBlock::thread`, `ThreadFacts`; in `chain_blocks.csv` too): the wake that processed the block
+  (QPC), the longest gap between the thread's wakes since the block before's (0 for a later block of the same wake; `drain_mic`
+  is called once a wake), the wakes since the block before's and those of them the exclusive output's event made
+  (`out_wakes`; 0 with a shared output, `Pipeline::count_out_wake`), the stalls (wakes with nothing from the mic, neither its
+  event nor a packet, 100 ms after its last; `Pipeline::count_stall`, both from the loop's mic step, `audio::mic_wake`), the
+  mic's glitches, the block's own time (from taking it off the mic FIFO to its output written; the recorders' copies not),
+  and a model pack's misses (its worker's counter, one relaxed load a block). With the mic's delivery (`mic_wake_hns`,
+  `mic_queued`) and the output's padding they tell a thread that was held up (a long gap between wakes with no stall, and
+  the mic's samples waiting when it woke: whole blocks queued, several blocks at one wake, or a glitch, an exclusive mic's
+  one-period buffer overrunning) from a device that stopped delivering (wakes on time, or stalls, and a gap between the
+  mic's delivering wakes) from an output that ran dry (the thread and the mic on time, the device's padding gone). That
+  takes an exclusive output: its events wake the thread every few ms whatever the mic does. With a shared output the thread
+  waits on the mic's events alone, and a thread held up 60 ms and a mic's driver that held its packets back 60 ms and then
+  delivered them at once give the same facts (`out_wakes` 0 tells the reading so).
+- **Its rings follow the engine.** The chain recorder's recording ends with its run; the flight recorder gives each run a ring
+  of its own while it's armed, made and its pages touched on the control side as the start makes the run's hand-over rings
+  (`flight::run_channel`, beside the chain recorder's), put in the run's command ring so the run's first wake takes it
+  before its first block, its consumer handed to the recorder's thread with the run's number since arming. A start that
+  fails hands its ring back untaken (`run_job`), freed with the port; a run that ends drops its producer with its pipeline
+  (the run is over), and the thread drops the ring once it's empty. Armed during a live run, the live run's ring goes to its
+  command ring and is taken at the next wake. Stopped, the thread drops its consumers, the live run hands its ring back at
+  its next wake (the stop waits up to 500 ms for it, as the chain recorder's does) and it's freed on the control side. One
+  flight recorder at a time; it runs beside a chain recorder (`devices --check` arms both).
+- **The drain side** (`flight::Core`, pure; its thread, `nf-flight`, normal priority, every 20 ms): a ring of the last
+  `facts_s` + `post_roll_s` of blocks (10 + 3 s by default; an entry is a block's facts, its run, its sequence number since
+  arming, the blocks its ring lost before it, and the triggers it showed, about 0.3 KB: 0.4 MB), and when `audio_s` asks
+  (0 by default; `run --flight-audio`: 5 s) a ring of `audio_s` + `post_roll_s` of audio (5.8 KB a block: 4.6 MB at 5 s),
+  both allocated when it's armed and never grown (`the_recorders_memory_is_bounded`), and the control side's last 64 notes.
+- **Triggers**, from each block's facts, per run (`flight::Watch`):
+  - the output: an underrun, a deficit (zeros written), a coarse drop (pending samples dropped, or the block skipped); never
+    at a run's first block, which sets the starting fill (its facts count none there);
+  - the mic: a stall (100 ms with nothing from it), its FIFO overflowing (`mic_discarded`), a position skip
+    (`mic_skipped`), a glitch (`ThreadFacts::mic_glitches`; the run's first packet is never one, though many drivers flag
+    the first packet after a start discontinuous: `drain_mic`);
+  - the audio thread, from the run's second second on (its first is the streams starting): a wake 40 ms or more after the
+    one before with no wait timing out (its waits time out at 100 ms; an exclusive output's events wake it every few ms), a
+    block that took 5 ms or more (half a block);
+  - the echo reference, after its start-up (260 blocks from its alignment, as `devices --check` counts it; its alignment,
+    centring and raises there are by design): a jump of its timeline (broken, stepped, retargeted or centred), a burst of
+    short takes (5 of the last 100 blocks' takes owed samples, 5% of a second; the next burst once a whole second has had
+    none), and the reference lost (a block without it after one with it);
+  - a model pack's miss (its worker's result not there in time);
+  and from the control side (`flight::note`), a fault that stopped the audio (`check_health`, worded as the status words it).
+  The control side also notes, for the summary, a failed start, a restart and why (a device change, a settings change, a
+  retry), a lost reference and a stop.
+- **A dump.** A trigger starts one and waits out the post-roll (`post_roll_s` of blocks after it, or that long and 0.5 s more
+  by the clock when no blocks come: the audio stopped). A later trigger goes into a pending dump that holds its kind, or
+  whose trigger came half a second (50 blocks) or less before it, whatever its kind: the same incident (a stall's first
+  block has its underrun, skip and glitch; a held thread's, its underrun and late wake). The most serious of those leads
+  the dump (the output, then the mic, the thread, a fault, the reference, the model), its window re-centred on it, if its
+  kind may have a dump. Any other trigger opens a dump of its own, with its whole pre- and post-roll, overlapping another
+  kind's if need be (soak 2's reference bursts and the underrun 18 s later; or an underrun 2.9 s into a burst's post-roll):
+  up to one pending a kind. A dump is cut as its post-roll's last block comes in (`Core::feed`), the ring then holding
+  exactly its window, however many blocks a drain brings at once. Its window (`facts_s` before the trigger to the
+  post-roll's end; the audio's `audio_s` before it) goes into a folder of its own in `dir`, `flight-YYYYMMDD-HHMMSS-<trigger>`
+  (local time; `-2` and on for a name taken). The wall clock is the system's now less how long ago the trigger was by QPC.
+  Written on the recorder's thread (a write slower than its ring's 4 s would lose blocks, counted). `FlightDump` has its
+  headline (`trigger`) and the other triggers it holds by name (`also`), and `run`'s line names both.
+  - `flight_blocks.csv`, a row a block: `run` (since arming, from 1; each start takes the next, a failed one too), `t_s`
+    (seconds since arming, by the block's wake), `trigger` (the block's triggers, `|`-joined: `output-underrun`,
+    `output-deficit`, `output-drop`, `mic-stall`, `mic-overflow`, `mic-skip`, `mic-glitch`, `late-wake`, `slow-block`,
+    `reference-lost`, `reference-jump`, `reference-short`, `model-miss`), `lost` (blocks its ring had lost before it, in its
+    run), then `chain_blocks.csv`'s columns (`nf_engine::CHAIN_BLOCK_COLUMNS`, written by `nf_engine::chain_blocks_csv`;
+    csv.rs lists them): the chain recorder's facts above, and the thread's last, `wake_hns, wake_gap_ms, wakes, out_wakes,
+    stalls, mic_glitches, process_us, model_misses`.
+  - `summary.txt`: what triggered, when (local time, seconds since arming, the block and the run), the window and the audio,
+    the other triggers in the dump, the window's triggers it doesn't hold (before its trigger, or another dump's after it),
+    the triggers the rate limit held back since the last dump by kind, a reading of the facts,
+    the facts around it in words (the output's padding, fill, target, zeros, drops and silence; the thread's usual and
+    longest gap between wakes in the 200 ms before, its stalls, what woke it (the mic alone, or the output's events too),
+    its slowest block; the mic's usual and longest gap
+    between deliveries, its queue and its first sample's age; the reference's lead, target, freshness, short takes and jumps;
+    lost blocks), the control side's notes, and the files.
+  - `mic.wav`, `ref.wav`, `out.wav` (48 kHz mono float: the chain's input and output, as the chain recorder keeps them)
+    when audio is kept.
+  The reading (`flight::read`) is a heuristic, in this order: a fault, as worded; a gap between the thread's wakes in the
+  200 ms before the trigger of three times its usual and 15 ms more, with no stall, is the thread held up when the mic's
+  samples were waiting as it woke (else the devices' events came late), but with a shared output (no `out_wakes` in the
+  run) the thread held up or the mic's driver holding its samples back, which it says it can't tell apart; stalls, or a
+  gap between the mic's deliveries of three times its usual and 20 ms more, is the mic stopping; a block of 5 ms or more
+  is the processing falling behind; otherwise, with both on time, it's the device the trigger names (the output running
+  dry or overfilling, the loopback late or broken, the mic losing samples, the model's worker late).
+- **Rate-limited and bounded:** at most one dump a `min_interval_s` (60 s) and `max_dumps_per_kind` (3) an arming for each
+  kind of trigger (the output, the mic, the thread, a fault, the reference, the model), so a misbehaving loopback (the
+  second soak's 1,109 short takes over minutes, from 92 s and again at 1234 s) can't use up what an output underrun needs,
+  18 s later or 13 minutes later (`a_kind_that_keeps_misbehaving_cant_crowd_out_another_later`); at most `max_dumps` (20)
+  in all, more than the six kinds' 3 each, so with the defaults it bounds the disk without crowding a kind out. The rest
+  are counted (`FlightStats::suppressed`, by kind in `suppressed_by` and the next dump's summary). On disk, after each dump,
+  the oldest dump folders in `dir` past `keep_dumps` (20) are deleted, only folders named exactly as the recorder names
+  them (`flight-`, 8 digits, `-`, 6 digits, `-`, a trigger's name, and `-2` to `-999`) with a `summary.txt`: about 0.4 MB
+  a dump with the facts alone, 5 MB with 5 s of audio.
+- **Tests** (no devices): flight.rs (a window with its pre- and post-roll and audio; the rate limit by kind, a kind's cap
+  and in all; soak 2's shape, the reference's bursts for minutes and underruns at 110 s and 900 s, both dumped; a trigger of
+  another kind late in a post-roll dumped on its own, and one within half a second leading the dump; a dump cut whole
+  whatever the drain's batches; the memory bounded, two dumps pending at once; the reference's start-up; a fault dumped by
+  the clock when no blocks come, and a stop's flush; the reading of a held thread (with an exclusive output, and with a
+  shared one), a quiet mic and a dry output; the files, the retention and its names; and the threads end to end with fake
+  runs: across a restart, a fault noted, armed while running); `pipeline/tests/flight.rs`, scenes through the pipeline, the
+  loop's mic step (`audio::mic_wake`) and the core, the thread's waits simulated as the loop's (the output's event reported
+  first): a mic that stops for 150 ms at 20 s (one dump, its trigger the first block after the stall with its deficit,
+  stall, skip and glitch, its window the 10 s before and the 3 s after, read as the mic stopping, and written out); a
+  thread held 120 ms with an exclusive output (no stall, read as the thread); a mic's driver holding its packets back 60 ms
+  with it (the mic); and, with a shared output, a thread held 60 ms and a driver holding back 60 ms (the same facts and
+  reading, saying it can't tell); and the no-allocation test with both rings.
 
 ## Testing (no devices; CLAUDE.md)
 - Unit-test:

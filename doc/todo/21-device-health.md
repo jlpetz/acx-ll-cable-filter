@@ -110,6 +110,29 @@ restart the first run's, its counters up to its last whole second, with a warnin
   steady", which a stream bursty or stale for another reason (1% owed, 2% stale, untrusted stamps) contradicted next to
   its verdict; it now says of the rise alone "so the rise itself is no sign of bursts" (tested both ways).
 
+## The flight recorder in the check (built 2026-11-03, ours)
+The owner's ask, telling users when a device or driver misbehaves, at the moment it happens rather than as a run's averages:
+the engine's flight recorder (engine.md, "The flight recorder") keeps the last 10 s of every block's facts and, on an output
+underrun, a mic stall or glitch, a late wake of the audio thread, the reference's jumps or bursts of short takes, a model miss
+or a fault, writes them with a reading in words (a held-up thread, a mic that stopped delivering, an output that ran dry).
+- **`devices --check` arms it always** (into `%LOCALAPPDATA%\noise-filter\flight`, or `--flight DIR`): the report ends with
+  "Flight recorder:" and names each dump (its folder, what triggered it, its reading), or says nothing went wrong. One that
+  can't be armed (its folder can't be made) is a warning, and the check runs without it, its report saying so.
+- **The stall count changed** (a fix found with it): a stall now needs a wake with nothing from the mic, neither its event
+  nor a packet. With the exclusive output a thread held up past 100 ms counted one although the mic's packets were waiting,
+  so the check's "glitches and stalls" could blame a mic for the system's hold-up. And a mic packet flagged discontinuous
+  is no glitch when it's the run's first (many drivers flag the first after a start; unverified here: the cables don't),
+  which would have made every check on such a mic report a glitch and write a dump. The first real-mic checks should
+  confirm both.
+- **Telling the thread from the device** takes the exclusive output: its events wake the thread every few ms whatever the
+  mic does. With a shared output (the default playback device, or `--no-exclusive-output`) the thread wakes on the mic's
+  events alone, and a held thread and a mic's driver that held its packets back look the same; the reading says it can't
+  tell rather than blame the device (`ThreadFacts::out_wakes`).
+- **For the window later** (TODO 15): `Engine::arm_flight_recorder` with `FlightRecorder::stats` (each dump's folder,
+  trigger, time and reading) is the API to show a user "your microphone stopped delivering for 160 ms at 14:03:12" and
+  where the facts are. Retention is the engine's (the newest 20 dumps in the folder), so an always-on recorder stays under
+  about 10 MB. Whether the window arms it always is still to decide.
+
 ## Open
 - Thresholds for "bursty" and "late", from real devices (the cables are the only data so far; #8's detail file). The first
   `devices --check` runs on real mics and speakers give them.

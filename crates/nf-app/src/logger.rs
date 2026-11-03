@@ -36,6 +36,12 @@ pub fn default_path() -> PathBuf {
     base.join("noise-filter").join("noise-filter.log")
 }
 
+/// The flight recorder's dumps (`run --flight`, `devices --check`; app.md, "The flight recorder"): a `flight` folder beside the
+/// log, `%LOCALAPPDATA%\noise-filter\flight`.
+pub fn flight_dir() -> PathBuf {
+    default_path().parent().map_or_else(|| std::env::temp_dir().join("noise-filter"), Path::to_path_buf).join("flight")
+}
+
 /// Installs the file logger at Info. Fails only if a logger is already set.
 pub fn init(path: PathBuf) -> Result<(), log::SetLoggerError> {
     log::set_boxed_logger(Box::new(FileLogger::new(path, MAX_LOG_BYTES)))?;

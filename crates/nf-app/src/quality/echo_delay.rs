@@ -927,6 +927,7 @@ mod tests {
                     settings: ChainParams::default(),
                     budget: None,
                     output: Default::default(),
+                    thread: Default::default(),
                 }
             })
             .collect();
@@ -1357,6 +1358,7 @@ mod tests {
                     settings: ChainParams::default(),
                     budget: None,
                     output: Default::default(),
+                    thread: Default::default(),
                 }
             })
             .collect();

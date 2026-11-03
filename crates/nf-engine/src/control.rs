@@ -32,6 +32,7 @@ use crate::errors::{
     Fault, StartFailure, StreamRole, describe_fault, describe_reference_lost, describe_start_failure, describe_warning, hr,
     no_output_message, remedy_for_fault, remedy_for_start, same_device_message,
 };
+use crate::flight::{self, Note};
 use crate::latency_test::{TapPort, tap_channel};
 use crate::recorder;
 use crate::sched::Com;
@@ -215,6 +216,10 @@ pub(crate) struct Inner {
     pub(crate) test_running: AtomicBool,
     /// A chain recorder is armed (one at a time).
     pub(crate) recording: AtomicBool,
+    /// The flight recorder's: the armed one, and the live run's hand-over (flight.rs).
+    pub(crate) flight: Mutex<flight::Slot>,
+    /// A flight recorder is armed (one at a time).
+    pub(crate) flying: AtomicBool,
     /// The last mic a run measured, as it opened (its endpoint, mode, period and options), and how it delivered
     /// (`remember_mic_delivery`): what the next start's automatic model depth goes by when it opens the same mic the same
     /// way (TODO 5). In memory for the process.
@@ -237,6 +242,8 @@ impl Inner {
             ctl: Mutex::new(None),
             test_running: AtomicBool::new(false),
             recording: AtomicBool::new(false),
+            flight: Mutex::new(flight::Slot::default()),
+            flying: AtomicBool::new(false),
             mic_delivery: Mutex::new(None),
         })
     }
@@ -303,6 +310,7 @@ impl Inner {
             let f = Fault::Stream { role: StreamRole::Reference, hr: hr::AUDCLNT_E_DEVICE_INVALIDATED };
             if st.lose_reference(f) {
                 log::warn!("the echo reference went away; carrying on without it");
+                flight::note(self, Note::ReferenceLost(describe_reference_lost(f)));
             }
         }
         restart
@@ -343,10 +351,20 @@ impl Inner {
             d.config.clone().filter(|_| restart_due(d.config.as_ref(), d.running.as_ref(), d.aec_built, forced))
         };
         let Some(cfg) = wanted else { return Outcome::Idle };
-        if lock(&self.desired).streak.is_none() {
-            // Retries in a streak of failures go unlogged; `fail` logs what matters.
-            log::info!("restarting the audio streams");
-        }
+        let running = {
+            let d = lock(&self.desired);
+            if d.streak.is_none() {
+                // Retries in a streak of failures go unlogged; `fail` logs what matters.
+                log::info!("restarting the audio streams");
+            }
+            d.running.is_some()
+        };
+        let why = match (forced, running) {
+            (true, _) => "a device change",
+            (false, true) => "a settings change",
+            (false, false) => "a retry",
+        };
+        flight::note(self, Note::Restarting(why));
         match start_locked(self, &mut run, &cfg) {
             Ok(()) => Outcome::Started,
             Err(f) => Outcome::Down { transient: f.transient },
@@ -380,6 +398,7 @@ impl Inner {
                         }
                     }
                     let remedy = fault.and_then(remedy_for_fault);
+                    flight::note(self, Note::Fault(msg.clone()));
                     *lock(&self.status) = StatusInfo { message: Some(msg), remedy, ..StatusInfo::default() };
                     self.telemetry.set_state(EngineState::Error);
                     // A device that went away, is busy or is being reset (a format change, an
@@ -391,6 +410,7 @@ impl Inner {
                 let live = lock(&self.current).as_ref().is_some_and(|c| Arc::ptr_eq(c, &shared));
                 if live && st.lose_reference(f) {
                     log::warn!("the echo reference failed ({f:?}); carrying on without it");
+                    flight::note(self, Note::ReferenceLost(describe_reference_lost(f)));
                 }
             }
         }
@@ -733,8 +753,10 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
     let shared = Arc::new(AudioShared::default());
     shared.readout.store(readout, Relaxed);
     let (port, end) = tap_channel();
-    // A chain recorder armed before this start goes in now, so the run's first wake takes it before its first block.
+    // A chain recorder armed before this start goes in now, so the run's first wake takes it before its first block; and an
+    // armed flight recorder's ring for this run.
     let (rec_port, rec_end) = recorder::run_channel(inner);
+    let (flight_port, flight_end) = flight::run_channel(inner);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::channel();
     let args = AudioArgs {
@@ -744,6 +766,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         shared: shared.clone(),
         tap: end,
         recorder: rec_end,
+        flight: flight_end,
         mic_delivery: lock(&inner.mic_delivery).clone(),
         ready: ready_tx,
         done: done_tx,
@@ -759,6 +782,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
             *lock(&inner.current) = Some(shared);
             *lock(&inner.tap) = Some(port);
             recorder::run_started(inner, rec_port);
+            flight::run_started(inner, flight_port);
             let aec_built = opened.aec_built;
             *lock(&inner.status) = status_from(opened);
             let (stale, deferred) = settle_start(inner, config, Some(aec_built));
@@ -770,17 +794,20 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         Ok(Err(f)) => {
             settle_worker(run, worker, handle);
             recorder::run_failed(inner, rec_port);
+            flight::run_failed(flight_port);
             Err(fail(inner, &f, config))
         }
         Err(RecvTimeoutError::Timeout) => {
             handle.shared.command.store(CMD_STOP, Relaxed);
             settle_worker(run, worker, handle);
             recorder::run_failed(inner, rec_port);
+            flight::run_failed(flight_port);
             Err(fail(inner, &StartFailure::Timeout, config))
         }
         Err(RecvTimeoutError::Disconnected) => {
             settle_worker(run, worker, handle);
             recorder::run_failed(inner, rec_port);
+            flight::run_failed(flight_port);
             Err(fail(inner, &StartFailure::ThreadDied, config))
         }
     }
@@ -834,6 +861,7 @@ fn fail(inner: &Inner, f: &StartFailure, config: &EngineConfig) -> Failed {
     if let Some(line) = streak_line(&mut lock(&inner.desired).streak, &msg, "audio start failed") {
         log::warn!("{line}");
     }
+    flight::note(inner, Note::StartFailed(msg.clone()));
     {
         let mut st = lock(&inner.status);
         st.message = Some(msg.clone());
@@ -938,6 +966,7 @@ fn stop_locked(inner: &Inner, run: &mut RunState) {
     *lock(&inner.current) = None;
     *lock(&inner.tap) = None;
     recorder::run_stopped(inner);
+    flight::run_stopped(inner);
     lock(&inner.desired).running = None;
     clear_targets(&inner.telemetry);
 }
@@ -978,6 +1007,7 @@ fn join_or_detach(h: AudioHandle) -> bool {
 }
 
 pub(crate) fn stop(inner: &Arc<Inner>) {
+    flight::note(inner, Note::Stopped);
     let mut run = lock(&inner.run);
     {
         // Not meant to run any more: the control thread's retry disarms (it checks `armed`).

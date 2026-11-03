@@ -2,24 +2,34 @@
 //! second, until Ctrl+C (or the console closing) stops it cleanly, or `--seconds` have passed (a soak). Then a summary of the
 //! whole run: its dropouts, the output's events, the latency and its budget, the drift (a [`Tally`] of the status lines'
 //! snapshots, and one more publication's after the loop, so the last moments count). A soak's exit code says whether it was
-//! clean: nothing glitched and no real-time heap allocation (app.md, "Exit codes"); a run without `--seconds` exits 0.
+//! clean: nothing glitched and no real-time heap allocation (app.md, "Exit codes"); a run without `--seconds` exits 0. With
+//! `--flight` the flight recorder is armed before the start (engine.md, "The flight recorder"): each dump it writes is noted
+//! as it comes, and the summary lists them.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use nf_engine::{
-    BudgetTotals, EngineConfig, EngineState, EngineStatus, LatencyBudget, OutputEvents, REFERENCE_TARGET_HIGH_MS, StreamInfo,
-    TelemetrySnapshot, WakeBlocks,
+    BudgetTotals, EngineConfig, EngineState, EngineStatus, FLIGHT_AUDIO_S, FlightConfig, FlightDump, FlightRecorder, FlightStats,
+    LatencyBudget, OutputEvents, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot, WakeBlocks,
 };
 
 use super::{budget_text, db, fixed, list_devices};
-use crate::cli::{ADAPTIVE_WAIT_S, RunArgs};
+use crate::cli::{ADAPTIVE_WAIT_S, FlightArgs, RunArgs};
 use crate::exit::Failure;
-use crate::{config, console};
+use crate::{config, console, logger};
 
 pub fn run(args: &RunArgs) -> Result<(), Failure> {
     let cfg = config::engine_config(&args.engine, list_devices)?;
-    let engine = start(&cfg)?;
+    let engine = nf_engine::Engine::new();
+    // Armed before the start, so it holds the first run from its first block.
+    let flight = args
+        .flight
+        .as_ref()
+        .map(|f| arm_flight(&engine, f))
+        .transpose()
+        .map_err(|e| Failure::error(format!("Couldn't arm the flight recorder: {e}")))?;
+    start_engine(&engine, &cfg)?;
     say!("{LEGEND}");
     if let Some(n) = args.seconds {
         say!("Running for {n} s (Ctrl+C stops it sooner), then a summary of the run.");
@@ -31,6 +41,7 @@ pub fn run(args: &RunArgs) -> Result<(), Failure> {
     let limit = args.seconds.map(|n| Duration::from_secs(u64::from(n)));
     let mut tally = Tally::new(&engine.telemetry());
     let mut cut_short = false;
+    let mut dumps_said = 0;
     loop {
         let wait = limit.map_or(Duration::from_secs(1), |l| l.saturating_sub(started.elapsed()).min(Duration::from_secs(1)));
         if console::sleep_unless_stopped(wait) {
@@ -64,6 +75,12 @@ pub fn run(args: &RunArgs) -> Result<(), Failure> {
         let clipped = engine.take_clip();
         tally.see(&t, clipped);
         say!("{}", status_line(&t, status.retrying, clipped));
+        if let Some(f) = &flight {
+            for d in f.recorder.stats().dumps.iter().skip(dumps_said) {
+                say!("flight: {}", dump_line(d));
+                dumps_said += 1;
+            }
+        }
         if limit.is_some_and(|l| started.elapsed() >= l) {
             break;
         }
@@ -77,10 +94,86 @@ pub fn run(args: &RunArgs) -> Result<(), Failure> {
     let (end, status, fixed_target) = (engine.telemetry(), engine.status(), engine.buffer_targets().output_ms);
     engine.stop();
     say!("Stopped.");
+    // After the stop: the triggers still in their post-rolls are dumped now, with what there is.
+    let flight = flight.map(|f| (f.recorder.stop(), f.config));
     let summary = tally.summary(started.elapsed().as_secs_f64(), &end, &status, fixed_target);
     say!("{}", summary.text());
+    if let Some((stats, cfg)) = &flight {
+        say!("{}", flight_lines(stats, cfg));
+    }
     console::finished();
     summary.result(cut_short, limit.is_some())
+}
+
+/// An armed flight recorder, and its settings (the folder it writes into, its limits).
+pub(super) struct Flight {
+    pub(super) recorder: FlightRecorder,
+    pub(super) config: FlightConfig,
+}
+
+/// Arms the flight recorder on `engine` (before its start) with `--flight`'s folder (the log's `flight` folder by default)
+/// and `--flight-audio`, and says so; else says why not (`run` stops, `devices --check` carries on without it).
+pub(super) fn arm_flight(engine: &nf_engine::Engine, args: &FlightArgs) -> Result<Flight, nf_engine::EngineError> {
+    let dir = args.dir.clone().unwrap_or_else(logger::flight_dir);
+    let cfg = FlightConfig { audio_s: if args.audio { FLIGHT_AUDIO_S } else { 0.0 }, ..FlightConfig::new(&dir) };
+    let recorder = engine.arm_flight_recorder(cfg.clone())?;
+    let audio = if args.audio { format!(" and the last {} s of audio", fixed(cfg.audio_s, 0)) } else { String::new() };
+    say!(
+        "The flight recorder is on: it keeps the last {} s of every block's facts{audio}, and when something glitches writes \
+         them into {} ({}; the newest {} kept there).",
+        fixed(cfg.facts_s, 0),
+        dir.display(),
+        flight_limits(&cfg),
+        cfg.keep_dumps
+    );
+    Ok(Flight { recorder, config: cfg })
+}
+
+/// The flight recorder's limits in words: "at most one dump every 60 s and 3 in all for each kind of trigger, 20 in all".
+pub(super) fn flight_limits(cfg: &FlightConfig) -> String {
+    format!(
+        "at most one dump every {} s and {} in all for each kind of trigger, {} in all",
+        fixed(cfg.min_interval_s, 0),
+        cfg.max_dumps_per_kind,
+        cfg.max_dumps
+    )
+}
+
+/// One dump, in a line: when, what (and the other triggers it holds), where, and its reading.
+pub(super) fn dump_line(d: &FlightDump) -> String {
+    let also = if d.also.is_empty() { String::new() } else { format!(" (with {})", d.also.join(", ")) };
+    format!("at {} s ({}), {}{also}: {} {}", fixed(d.at_s, 1), d.local_time, d.trigger, d.path.display(), d.verdict)
+}
+
+/// The triggers the flight recorder's limits held back, by kind: "102 more triggers not dumped (102 of the echo reference;
+/// at most ...)".
+pub(super) fn held_back(stats: &FlightStats, cfg: &FlightConfig) -> String {
+    let kinds: Vec<String> = stats.suppressed_by.iter().map(|(k, n)| format!("{n} of {k}")).collect();
+    format!("{} not dumped ({}; {})", count(stats.suppressed, "more trigger", "more triggers"), kinds.join(", "), flight_limits(cfg))
+}
+
+/// The summary's flight recorder lines: its dumps, what its limits held back, the blocks it lost, and write errors.
+pub fn flight_lines(stats: &FlightStats, cfg: &FlightConfig) -> String {
+    let mut s = String::new();
+    if stats.dumps.is_empty() {
+        let _ = write!(s, "  {:<15}nothing triggered in {} blocks", "flight", stats.blocks);
+    } else {
+        let n = stats.dumps.len();
+        let _ = write!(s, "  {:<15}{} in {}:", "flight", count(n as u64, "dump", "dumps"), cfg.dir.display());
+        for d in &stats.dumps {
+            let _ = write!(s, "\n  {:<15}- {}", "", dump_line(d));
+        }
+    }
+    if stats.suppressed > 0 {
+        let _ = write!(s, "\n  {:<15}{}", "", held_back(stats, cfg));
+    }
+    if stats.lost_blocks > 0 {
+        let _ = write!(s, "\n  {:<15}{} lost (its ring was full)", "", count(stats.lost_blocks, "block", "blocks"));
+    }
+    for e in &stats.errors {
+        let _ = write!(s, "\n  {:<15}a dump wasn't written: {e}", "");
+    }
+    s
 }
 
 /// The longest wait for the engine's next publication (it comes once a second).
@@ -869,6 +962,45 @@ pub fn stream_text(s: &StreamInfo) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The summary's flight recorder lines: each dump (when, what, where, its reading), what the rate limit held back, lost
+    /// blocks and write errors; or that nothing triggered.
+    #[test]
+    fn the_summary_lists_the_flight_recorders_dumps() {
+        use std::path::Path;
+
+        use super::{FlightConfig, FlightDump, FlightStats, flight_lines};
+        let dir = Path::new("C:\\flight");
+        let cfg = FlightConfig::new(dir);
+        let quiet = flight_lines(&FlightStats { blocks: 180_000, ..Default::default() }, &cfg);
+        assert_eq!(quiet, "  flight         nothing triggered in 180000 blocks");
+        let dump = FlightDump {
+            path: dir.join("flight-20261102-140312-output-underrun"),
+            trigger: "an output underrun".into(),
+            also: vec!["output-deficit", "late-wake"],
+            at_s: 110.04,
+            local_time: "2026-11-02 14:03:12.345".into(),
+            verdict: "The audio thread was held up.".into(),
+        };
+        let stats = FlightStats {
+            dumps: vec![dump],
+            suppressed: 3,
+            suppressed_by: vec![("the output", 1), ("the echo reference", 2)],
+            lost_blocks: 1,
+            errors: vec!["disk full".into()],
+            blocks: 9,
+        };
+        let lines: Vec<String> = flight_lines(&stats, &cfg).lines().map(str::to_owned).collect();
+        assert_eq!(lines, [
+            "  flight         1 dump in C:\\flight:",
+            "                 - at 110.0 s (2026-11-02 14:03:12.345), an output underrun (with output-deficit, late-wake): \
+                 C:\\flight\\flight-20261102-140312-output-underrun The audio thread was held up.",
+            "                 3 more triggers not dumped (1 of the output, 2 of the echo reference; at most one dump every 60 s \
+                 and 3 in all for each kind of trigger, 20 in all)",
+            "                 1 block lost (its ring was full)",
+            "                 a dump wasn't written: disk full",
+        ]);
+    }
+
     /// The lab tests measure what the product does by default, at once: the adaptive target at its fixed start, which they
     /// say; `--settle` waits for it (and only then does the chain recorder allow for the wait); a fixed target has nothing
     /// to wait for.

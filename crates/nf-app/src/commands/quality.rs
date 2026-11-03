@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use nf_core::{BLOCK, SAMPLE_RATE};
 use nf_engine::{
-    ChainBlock, ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, EngineStatus, Flow, LatePart, LateStart,
-    LatencyBudget, MAX_CHAIN_RECORDING_S, OutputEvents, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS,
-    TelemetrySnapshot, TrackRole,
+    ChainRecorder, ChainRecording, DeviceInfo, Engine, EngineConfig, EngineState, EngineStatus, Flow, LatePart, LateStart, LatencyBudget,
+    MAX_CHAIN_RECORDING_S, OutputEvents, PlayRecordRequest, PlayRecordResult, PlayTrack, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot,
+    TrackRole,
 };
 
 use super::run::stream_text;
@@ -665,32 +665,9 @@ fn save(dir: &Path, scene: &Scene, far: Option<&[f32]>, recording: &[f32], align
 /// The chain recording's files, beside the take's WAVs.
 const CHAIN_FILES: [&str; 5] = ["chain_mic.wav", "chain_ref.wav", "chain_out.wav", "chain_blocks.csv", "chain_config.json"];
 
-/// `chain_blocks.csv`'s columns, a row a block (`nf_engine::ChainBlock`): the block's index and the mic's timing and moves
-/// (samples its FIFO discarded, device position it skipped unfilled); the reference's take (`ReferenceFacts`; empty without a
-/// reference), with `path`, the mic's index less the reference's, the echo path as the engine holds it (it moves by
-/// `mic_discarded` on the mic's side, and on the reference's by a slip, `consumed` other than 480, and a jump, `jumped`);
-/// AEC3's own estimates; 1 where the chain's settings changed from the block before; the latency readout's budget
-/// (`nf_engine::LatencyBudget`; empty without one): mic delivery, wait, the chain's offset, the output queue and the render
-/// side in ms, and the readout, which is mic delivery + wait + queue + render side (the chain's offset isn't in it); and what
-/// the output side did (`nf_engine::OutputFacts`, TODO 9): the device-stream index the block's first sample went to (block to
-/// block it moves by the last block's 480 and its slip, or nothing when that one was skipped, plus this block's zeros less its
-/// dropped samples), the device's padding and our pending samples when it was written, the fill the drift loop read and its
-/// target (samples), the slip (-1, 0, +1), the zeros written (a deficit), the pending samples dropped, 1 where the block itself
-/// was dropped (skipped), an underrun, a re-anchor of the fill's calibration, the silence an exclusive device played since the
-/// block before (samples), and the device's clock as the block read it (its position in our stream's frames, and the QPC time
-/// it belongs to: `nf_engine::clock_drift` fits the drift from those). Times are QPC in 100 ns units; a number that's unknown
-/// is empty.
-const CHAIN_COLUMNS: &str = "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,\
-                             ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,\
-                             consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed,\
-                             mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,\
-                             out_index,out_padding,out_pending,out_fill,out_target,out_slip,out_zeros,out_dropped,out_skipped,\
-                             out_underrun,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns";
-const CHAIN_BUDGET_COLUMNS: usize = 6;
-const CHAIN_REFERENCE_COLUMNS: usize = 15;
-
 /// Writes the chain recording into `dir`: what the chain got (mic and reference) and gave, as 48 kHz mono float WAVs, a CSV
-/// row a block, and the engine config the take ran with (`process --config` reads it). Returns the files' names.
+/// row a block (`nf_engine::chain_blocks_csv`, its columns `CHAIN_BLOCK_COLUMNS`: engine.md, "The chain recorder"), and the
+/// engine config the take ran with (`process --config` reads it). Returns the files' names.
 fn save_chain(dir: &Path, cfg: &EngineConfig, chain: &ChainRecording) -> Result<Vec<&'static str>, Failure> {
     let [mic, reference, out, blocks, config] = CHAIN_FILES;
     wav::write_mono_f32(&dir.join(mic), &chain.mic)?;
@@ -700,90 +677,10 @@ fn save_chain(dir: &Path, cfg: &EngineConfig, chain: &ChainRecording) -> Result<
         let path = dir.join(name);
         std::fs::write(&path, text).map_err(|e| Failure::error(format!("Couldn't write {}: {e}", path.display())))
     };
-    write(blocks, chain_csv(chain))?;
+    write(blocks, nf_engine::chain_blocks_csv(&chain.blocks))?;
     let json = serde_json::to_string_pretty(cfg).map_err(|e| Failure::error(format!("Couldn't write {config}: {e}")))?;
     write(config, json)?;
     Ok(CHAIN_FILES.to_vec())
-}
-
-/// `chain_blocks.csv`: [`CHAIN_COLUMNS`], then a row a block.
-fn chain_csv(chain: &ChainRecording) -> String {
-    let num = |v: f64, places: usize| if v.is_finite() { format!("{v:.places$}") } else { String::new() };
-    let mut s = String::with_capacity((chain.blocks.len() + 1) * 160);
-    s.push_str(CHAIN_COLUMNS);
-    s.push('\n');
-    let mut last = None;
-    for b in &chain.blocks {
-        let _ = write!(
-            s,
-            "{},{},{},{},{},{},{},{}",
-            b.index,
-            num(b.capture_qpc_hns, 1),
-            u8::from(b.mic_stamped),
-            b.mic_index,
-            num(b.mic_wake_hns, 1),
-            b.mic_queued,
-            b.mic_discarded,
-            b.mic_skipped
-        );
-        match &b.reference {
-            Some(r) => {
-                let events: Vec<&str> = r.event_names().collect();
-                let _ = write!(
-                    s,
-                    ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                    r.read_index,
-                    i128::from(b.mic_index) - i128::from(r.read_index),
-                    num(f64::from(r.lead_reading_ms), 3),
-                    num(f64::from(r.lead_ms), 3),
-                    num(f64::from(r.target_ms), 3),
-                    num(f64::from(r.drift_ppm), 2),
-                    u8::from(r.stamped),
-                    u8::from(r.fresh),
-                    u8::from(r.delivered),
-                    r.buffered,
-                    r.consumed,
-                    r.owed,
-                    r.missing,
-                    r.jumped,
-                    events.join("|")
-                );
-            }
-            None => s.push_str(&",".repeat(CHAIN_REFERENCE_COLUMNS)),
-        }
-        let changed = last.is_some_and(|l: &ChainBlock| !b.settings.same(&l.settings));
-        let _ = write!(s, ",{},{},{}", num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
-        match &b.budget {
-            Some(t) => {
-                for v in [t.mic_ms, t.wait_ms, t.chain_ms, t.queue_ms, t.render_ms, t.readout_ms()] {
-                    let _ = write!(s, ",{}", num(f64::from(v), 3));
-                }
-            }
-            None => s.push_str(&",".repeat(CHAIN_BUDGET_COLUMNS)),
-        }
-        let o = &b.output;
-        let _ = write!(
-            s,
-            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            o.index,
-            o.padding,
-            o.pending,
-            num(f64::from(o.fill), 1),
-            o.target,
-            o.slip,
-            o.zeros,
-            o.dropped,
-            u8::from(o.skipped),
-            u8::from(o.underrun),
-            u8::from(o.reanchored),
-            o.silence,
-            num(o.clock_pos, 1),
-            num(o.clock_qpc_hns, 1)
-        );
-        s.push('\n');
-        last = Some(b);
-    }
-    s
 }
 
 /// What was saved of the chain, in one line: how much, from where in the run, what was lost or cut, and how to rerun it.
@@ -1015,7 +912,7 @@ fn difference(a: f32, b: f32, signed: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nf_engine::{ChainParams, DeviceSelection, OutputFacts, ReferenceFacts, StreamInfo};
+    use nf_engine::{CHAIN_BLOCK_COLUMNS, ChainBlock, ChainParams, DeviceSelection, OutputFacts, ReferenceFacts, StreamInfo, ThreadFacts};
 
     use super::*;
     use crate::cli::Processing;
@@ -1739,6 +1636,16 @@ mod tests {
                 clock_pos: if index == 0 { 96.0 } else { f64::NAN },
                 clock_qpc_hns: if index == 0 { 10_000_180_000.0 } else { f64::NAN },
             },
+            thread: ThreadFacts {
+                wake_hns: 1e10 + index as f64 * 1e5 + 2e5,
+                wake_gap_ms: if index == 0 { 10.0 } else { 0.0 },
+                wakes: u32::from(index == 0),
+                out_wakes: 0,
+                stalls: 0,
+                mic_glitches: u32::from(index == 1),
+                process_us: 87.5,
+                model_misses: 0,
+            },
         }
     }
 
@@ -1784,16 +1691,18 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3);
         let columns = lines[0].split(',').count();
-        assert_eq!(lines[0], CHAIN_COLUMNS);
+        assert_eq!(lines[0], CHAIN_BLOCK_COLUMNS);
         assert!(lines.iter().all(|l| l.split(',').count() == columns), "{csv}");
         assert_eq!(
             lines[1],
             "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,,3.25,0,\
-             19.500,0.125,10.000,21.250,22.000,62.875,1056,960,0,1019.8,1056,0,0,0,0,0,0,0,96.0,10000180000.0"
+             19.500,0.125,10.000,21.250,22.000,62.875,1056,960,0,1019.8,1056,0,0,0,0,0,0,0,96.0,10000180000.0,\
+             10000200000.0,10.000,1,0,0,0,87.5,0"
         );
         assert_eq!(
             lines[2],
-            "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1,,,,,,,1536,960,0,1019.8,1056,-1,96,0,0,1,0,46,,"
+            "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,,3.25,1,,,,,,,1536,960,0,1019.8,1056,-1,96,0,0,1,0,46,,,\
+             10000300000.0,0.000,0,0,0,1,87.5,0"
         );
         let back = crate::config::load(&dir.join("chain_config.json")).unwrap();
         assert_eq!(back, cfg, "process --config reads it");

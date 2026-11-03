@@ -98,14 +98,26 @@ pub struct RunArgs {
     pub engine: EngineArgs,
     /// `--seconds N`: stop after N seconds; `None` runs until Ctrl+C.
     pub seconds: Option<u32>,
+    /// `--flight [DIR]` (or `--flight-audio`): the flight recorder armed; `None` without.
+    pub flight: Option<FlightArgs>,
+}
+
+/// The flight recorder's options (engine.md, "The flight recorder"; app.md, "The flight recorder").
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FlightArgs {
+    /// `--flight DIR`: where the dumps go; `None`: the log's folder's `flight` (`logger::flight_dir`).
+    pub dir: Option<PathBuf>,
+    /// `--flight-audio`: keep the last `nf_engine::FLIGHT_AUDIO_S` of audio too.
+    pub audio: bool,
 }
 
 /// `devices --check`: `run`'s options (the devices to check; echo cancelling on unless `--no-aec`, so the speakers' loopback is
-/// checked too) and how long to listen.
+/// checked too), how long to listen, and the flight recorder's options (it's always armed for the check).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckArgs {
     pub engine: EngineArgs,
     pub seconds: u32,
+    pub flight: FlightArgs,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -307,6 +319,17 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// An option's optional value: after `=`, or the next argument when it isn't an option (`--flight DIR`, or `--flight`
+    /// alone).
+    fn optional_value(&mut self, inline: Option<&'a str>) -> Option<&'a str> {
+        if inline.is_some() {
+            return inline;
+        }
+        let next = self.args.get(self.pos).map(String::as_str).filter(|v| !v.starts_with('-'))?;
+        self.pos += 1;
+        Some(next)
+    }
+
     /// The option's value: after `=`, or the next argument whatever it looks like.
     fn value(&mut self, flag: &str, inline: Option<&'a str>) -> Result<&'a str, UsageError> {
         if let Some(v) = inline {
@@ -466,11 +489,28 @@ fn seconds(flag: &str, v: &str, lo: u32, hi: u32) -> Result<u32, UsageError> {
     }
 }
 
+/// `--flight [DIR]` and `--flight-audio`, into `f`; false for another option.
+fn take_flight<'a>(p: &mut Parser<'a>, flag: &str, inline: Option<&'a str>, f: &mut FlightArgs) -> Result<bool, UsageError> {
+    match flag {
+        "--flight" => {
+            if let Some(dir) = p.optional_value(inline) {
+                f.dir = Some(PathBuf::from(text(flag, dir)?));
+            }
+        }
+        "--flight-audio" => f.audio = switch(flag, inline)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn parse_run(p: &mut Parser<'_>) -> Result<RunArgs, UsageError> {
     let mut r = RunArgs::default();
     while let Some(arg) = p.next() {
         match arg {
             Arg::Flag("--seconds", inline) => r.seconds = Some(seconds("--seconds", p.value("--seconds", inline)?, 1, MAX_RUN_SECONDS)?),
+            Arg::Flag(flag @ ("--flight" | "--flight-audio"), inline) => {
+                take_flight(p, flag, inline, r.flight.get_or_insert_with(FlightArgs::default))?;
+            }
             Arg::Flag(flag, inline) => {
                 if !r.engine.take(p, flag, inline)? {
                     return Err(p.unknown(flag));
@@ -484,7 +524,7 @@ fn parse_run(p: &mut Parser<'_>) -> Result<RunArgs, UsageError> {
 
 /// `devices` alone lists them; `devices --check` checks them, and takes `--seconds` and `run`'s options.
 fn parse_devices(p: &mut Parser<'_>) -> Result<Command, UsageError> {
-    let (mut check, mut secs, mut engine) = (false, None, EngineArgs::default());
+    let (mut check, mut secs, mut engine, mut flight) = (false, None, EngineArgs::default(), FlightArgs::default());
     // The first option given that only the check uses
     let mut check_option: Option<&str> = None;
     while let Some(arg) = p.next() {
@@ -493,6 +533,10 @@ fn parse_devices(p: &mut Parser<'_>) -> Result<Command, UsageError> {
             Arg::Flag("--seconds", inline) => {
                 secs = Some(seconds("--seconds", p.value("--seconds", inline)?, MIN_CHECK_SECONDS, MAX_CHECK_SECONDS)?);
                 check_option.get_or_insert("--seconds");
+            }
+            Arg::Flag(flag @ ("--flight" | "--flight-audio"), inline) => {
+                take_flight(p, flag, inline, &mut flight)?;
+                check_option.get_or_insert(flag);
             }
             Arg::Flag(flag, inline) => {
                 if !engine.take(p, flag, inline)? {
@@ -504,7 +548,7 @@ fn parse_devices(p: &mut Parser<'_>) -> Result<Command, UsageError> {
         }
     }
     match (check, check_option) {
-        (true, _) => Ok(Command::DeviceCheck(CheckArgs { engine, seconds: secs.unwrap_or(DEFAULT_CHECK_SECONDS) })),
+        (true, _) => Ok(Command::DeviceCheck(CheckArgs { engine, seconds: secs.unwrap_or(DEFAULT_CHECK_SECONDS), flight })),
         (false, None) => Ok(Command::Devices),
         (false, Some(flag)) => Err(usage(format!("{flag} is for 'devices --check': add --check, or drop it"))),
     }
@@ -828,16 +872,19 @@ pub fn help_text() -> String {
 Usage:
   noise-filter [gui]             Open the settings window (the default)
   noise-filter devices           List the recording and playback devices
-  noise-filter devices --check [--seconds N] [OPTIONS]
+  noise-filter devices --check [--seconds N] [--flight DIR] [--flight-audio] [OPTIONS]
                                  Run the filter quietly for N s (default {check_s}, {check_lo}-{check_hi}) and say
                                  how each stream delivers: steady, in bursts or late, its drift and
                                  glitches, and what to try. Echo cancelling is on (so the speakers'
                                  loopback is checked too) unless --no-aec. The thresholds are
-                                 provisional: they come from virtual cables, not real hardware yet
-  noise-filter run [--seconds N] [OPTIONS]
+                                 provisional: they come from virtual cables, not real hardware yet.
+                                 The flight recorder is on (FLIGHT RECORDER below), and the
+                                 report names any dump it wrote
+  noise-filter run [--seconds N] [--flight [DIR]] [--flight-audio] [OPTIONS]
                                  Run the filter without the window; Ctrl+C stops it. --seconds stops
                                  it after N s (a soak, up to a day; its exit code says whether it was
-                                 clean). Either way it ends with a summary (dropouts, latency, drift)
+                                 clean). Either way it ends with a summary (dropouts, latency, drift,
+                                 and the flight recorder's dumps)
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
                        [--through-model] [--settle] [OPTIONS]
                                  Measure the latency with sweeps and print the report
@@ -863,6 +910,15 @@ Usage:
   noise-filter setup-large-pages [--sid SID]
                                  Grant the lock-pages privilege (asks for elevation)
   noise-filter --help | --version
+
+FLIGHT RECORDER (run --flight; always on in devices --check):
+  --flight [DIR]     Keep the last 10 s of every block's facts and, when the output, the mic,
+                     the audio thread, the echo reference or the model misbehaves (an underrun,
+                     a stall, a glitch, a late wake, a jump), write them out with a summary of
+                     what happened, into a folder of its own in DIR (default
+                     %LOCALAPPDATA%\\noise-filter\\flight). At most one dump a minute and 3 in
+                     all for each kind, 20 a run; the newest 20 dumps are kept there
+  --flight-audio     Keep the last {flight_audio_s} s of audio too (the chain's mic, reference and output)
 
 OPTIONS (run, latency, quality):
   --config FILE      Settings JSON: the window's settings.json, or an engine config
@@ -987,6 +1043,7 @@ Log: %LOCALAPPDATA%\\noise-filter\\noise-filter.log",
         check_s = DEFAULT_CHECK_SECONDS,
         check_lo = MIN_CHECK_SECONDS,
         check_hi = MAX_CHECK_SECONDS,
+        flight_audio_s = nf_engine::FLIGHT_AUDIO_S,
         snrs = playlist::DEFAULT_SNRS_DB.map(|d| format!("{d:.0}")).join(","),
         clip_s = DEFAULT_CLIP_S,
     )
@@ -1071,6 +1128,7 @@ mod tests {
                     io: IoOptions::default(),
                 },
                 seconds: None,
+                flight: None,
             }))
         );
         assert_eq!(p(&["run"]), Ok(Command::Run(RunArgs::default())));
@@ -1491,11 +1549,38 @@ mod tests {
         assert_eq!(err(&["run", "--seconds"]), "--seconds needs a value");
     }
 
+    /// `--flight` arms the flight recorder, into the next argument when it isn't an option (or after `=`), else the log's
+    /// folder; `--flight-audio` keeps audio too, and arms it alone. `devices --check` always arms it: there the options only
+    /// choose the folder and the audio.
+    #[test]
+    fn flight_takes_an_optional_folder_and_audio() {
+        let flight = |args: &[&str]| match p(args) {
+            Ok(Command::Run(r)) => r.flight,
+            other => panic!("{other:?}"),
+        };
+        let dir = |d: &str| Some(PathBuf::from(d));
+        assert_eq!(flight(&["run"]), None);
+        assert_eq!(flight(&["run", "--flight"]), Some(FlightArgs::default()));
+        assert_eq!(flight(&["run", "--flight", "--seconds", "60"]), Some(FlightArgs::default()));
+        assert_eq!(flight(&["run", "--flight", "C:\\soak"]), Some(FlightArgs { dir: dir("C:\\soak"), audio: false }));
+        assert_eq!(flight(&["run", "--flight=D:\\x y", "--flight-audio"]), Some(FlightArgs { dir: dir("D:\\x y"), audio: true }));
+        assert_eq!(flight(&["run", "--flight-audio"]), Some(FlightArgs { dir: None, audio: true }));
+        let Ok(Command::Run(r)) = p(&["run", "--seconds", "1800", "--flight", "soak", "--output", "CABLE Input"]) else { panic!() };
+        assert_eq!((r.seconds, r.flight.and_then(|f| f.dir), r.engine.output.as_deref()), (Some(1800), dir("soak"), Some("CABLE Input")));
+        assert_eq!(err(&["run", "--flight-audio=yes"]), "--flight-audio takes no value");
+        assert_eq!(err(&["run", "--flight="]), "--flight needs a value");
+        let Ok(Command::DeviceCheck(c)) = p(&["devices", "--check", "--flight", "here", "--flight-audio"]) else { panic!() };
+        assert_eq!(c.flight, FlightArgs { dir: dir("here"), audio: true });
+        assert_eq!(err(&["devices", "--flight", "here"]), "--flight is for 'devices --check': add --check, or drop it");
+        assert!(help_text().contains("--flight [DIR]") && help_text().contains("--flight-audio"));
+    }
+
     /// `devices` lists; `devices --check` takes `--seconds` (5-120, 15 by default) and `run`'s options, which the list refuses.
     #[test]
     fn devices_check_takes_seconds_and_runs_options() {
         assert_eq!(p(&["devices"]), Ok(Command::Devices));
-        assert_eq!(p(&["devices", "--check"]), Ok(Command::DeviceCheck(CheckArgs { engine: EngineArgs::default(), seconds: 15 })));
+        let check = CheckArgs { engine: EngineArgs::default(), seconds: 15, flight: FlightArgs::default() };
+        assert_eq!(p(&["devices", "--check"]), Ok(Command::DeviceCheck(check)));
         let Ok(Command::DeviceCheck(c)) = p(&["devices", "--mic", "USB", "--check", "--seconds", "30", "--no-aec", "--no-exclusive-mic"])
         else {
             panic!()

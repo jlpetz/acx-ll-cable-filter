@@ -413,6 +413,42 @@ The same command and conditions as the first soak; the log is `Downloads\nf-scra
 - **Next:** a flight recorder (the last seconds of per-block facts kept in memory and written out when an underrun or a
   reference jump happens), so a soak or a user's run shows what ran dry.
 
+## The flight recorder (built 2026-11-03, ours)
+For the soaks' unexplained underruns (both near two minutes, the second at the fixed 14 ms target) and the second soak's
+reference trouble: `run --flight [DIR]` keeps the last 10 s of every block's facts and writes them out, 3 s after, when
+something goes wrong (engine.md, "The flight recorder"; app.md, "The flight recorder"). What it adds over the chain recorder:
+- **It follows the engine** across its restarts (a ring a run) and keeps recording after each dump; memory bounded at
+  0.4 MB (4.6 MB more with `--flight-audio`'s 5 s of audio). On the audio thread it costs the chain recorder's copy a block.
+- **The thread's own facts** a block (`ThreadFacts`, now in `chain_blocks.csv` too): the wake that processed it, the longest
+  gap between wakes before it, the wakes (and those the exclusive output's event made) and stalls since the block before,
+  the mic's glitches, the block's own time, a model's misses. With the mic's delivery and the output's padding and fill
+  they tell a held-up thread from a device that stopped delivering from an output that ran dry; `summary.txt` reads the
+  window that way (a heuristic, said so) and gives the facts around the trigger in words. That takes the exclusive output
+  (the soaks' setup): with a shared one the thread wakes on the mic's events alone, and a held thread and a mic's driver
+  that held its packets back look the same; the reading says so rather than blame either.
+- **Triggers:** an output underrun, deficit or coarse drop; a mic stall, glitch, skip or overflow; a wake 40 ms late or a
+  block of 5 ms (after the run's first second); the reference's jump, a burst of short takes (5 in a second) or its loss
+  (after its start-up); a model miss; a fault. Triggers within half a second share a dump (the most serious leads it);
+  another kind's in a post-roll gets its own. At most one dump a minute and 3 in all for each kind, 20 a run, so the
+  reference's minutes of short takes (soak 2: from 92 s to 595 s, and at 1234 s) can't crowd out the underrun at 110 s or
+  one later; the newest 20 kept in the folder.
+- **Fixed with it (review, 2026-11-03):** a stall now needs a wake with nothing from the mic. With the exclusive output the
+  wait reports the output's event first, so a thread held up past 100 ms counted a stall although the mic's packets were
+  waiting: telemetry's stall count (a soak's exit 6) and the reading both blamed the mic. A dump is now cut as its
+  post-roll's last block comes in, whatever the drain's batches (a starved drain had shortened the pre-roll). The run's
+  first mic packet is no glitch, though many drivers flag it discontinuous (unverified on real mics; the cables don't).
+- **Tested** with the fake devices (`pipeline/tests/flight.rs`, the loop's waits simulated: a 150 ms mic stall at 20 s
+  makes one dump, its window the 10 s before and 3 s after, read as the mic stopping; a thread held 120 ms with the
+  exclusive output, no stall and read as the thread; a mic held back 60 ms with it, the mic; with a shared output a held
+  thread and a held-back mic read the same), and the core's and the threads' own tests (flight.rs, soak 2's shape among
+  them).
+- **For the next soak** (the same conditions as soaks 1 and 2):
+  `noise-filter-cli run --mic "CABLE-A Output" --output "CABLE Input" --aec --reference "CABLE-B Input" --seconds 1800
+  --flight C:\Users\Administrator\Downloads\nf-scratch\flight-soak-3`. Each dump is noted in the log as it's written
+  (`flight: ...`), and the summary lists them; each folder's `summary.txt` says what triggered and what the facts around
+  it show. Expect a dump for the reference's first burst of short takes and one for any underrun; `--flight-audio` adds the
+  WAVs (the mic is silent in these soaks, so they say little).
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

@@ -23,6 +23,9 @@ nf-ort = { workspace = true, optional = true }
 wasapi.workspace = true
 rtrb.workspace = true
 log.workspace = true
+# The flight recorder's dumps (flight.rs): the audio it kept, as 48 kHz mono float WAVs. Its own thread writes them, never the
+# audio thread.
+hound.workspace = true
 # Property store (RAW support) needs the PropertiesSystem, StructuredStorage and Variant features;
 # wasapi enables them too, but `cargo check -p nf-engine` compiles with this list alone.
 windows = { workspace = true, features = [
@@ -34,4 +37,7 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Threading",
     "Win32_System_Performance",
+    # The flight recorder's wall clock: the system time, and its local time for the dump's summary.
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
 ] }

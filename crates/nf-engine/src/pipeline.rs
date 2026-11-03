@@ -9,6 +9,7 @@
 //! Everything called per wake-up or per block is real-time: no allocation, locks, logging,
 //! formatting or panics. Errors are raw HRESULTs.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use nf_core::chain::{Chain, ChainReport};
@@ -17,13 +18,14 @@ use nf_core::dsp::drift::DriftController;
 use nf_core::dsp::meter::MeterBallistics;
 use nf_core::dsp::slip::{Slip, SlipResampler};
 use nf_core::latency::stats::RollingStats;
+use nf_core::noise::InferenceStats;
 use nf_core::rt::Dither;
 use nf_core::stage::AecStats;
 use nf_core::telemetry::{LatencyBudget, Telemetry};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
-use crate::api::{ChainBlock, OutputFacts};
+use crate::api::{ChainBlock, OutputFacts, ThreadFacts};
 use crate::budget::{self, BudgetStats, WakeLog};
 use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
@@ -331,6 +333,20 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     pub(crate) tap: Option<Producer<TapItem>>,
     /// The chain recorder, while one is armed (recorder.rs).
     pub(crate) recorder: Option<ChainTx>,
+    /// The flight recorder's ring for this run, while one is armed (flight.rs): the same items as the chain recorder's.
+    pub(crate) flight: Option<ChainTx>,
+    // The thread's own facts (`ThreadFacts`), kept every block: the last wake's time (`drain_mic` is called once a wake), the
+    // longest gap between wakes and the wakes since the last block (and those the exclusive output's event made), its stalls,
+    // and the glitch and model-miss counts at the last block.
+    last_wake_hns: f64,
+    wake_gap_max_hns: f64,
+    wakes: u32,
+    out_wakes: u32,
+    stalls: u32,
+    glitches_at_block: u64,
+    misses_at_block: u64,
+    /// A model pack's inference worker's counters, for its misses a block (`ThreadFacts::model_misses`).
+    inference: Option<Arc<InferenceStats>>,
     /// Display ballistics for the published meters (DSP-3).
     in_meter: MeterBallistics,
     out_meter: MeterBallistics,
@@ -350,6 +366,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     pub(crate) last_budget: Option<LatencyBudget>,
     /// What the output side did at this block (the chain recorder's).
     pub(crate) last_output: OutputFacts,
+    /// What the thread did around this block (the recorders').
+    pub(crate) last_thread: ThreadFacts,
 }
 
 impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
@@ -390,6 +408,15 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             dither: Dither::new(0x2545_F491),
             tap: None,
             recorder: None,
+            flight: None,
+            last_wake_hns: 0.0,
+            wake_gap_max_hns: 0.0,
+            wakes: 0,
+            out_wakes: 0,
+            stalls: 0,
+            glitches_at_block: 0,
+            misses_at_block: 0,
+            inference: None,
             in_meter: MeterBallistics::new(),
             out_meter: MeterBallistics::new(),
             counters: Counters::default(),
@@ -404,6 +431,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             last_latency_ms: None,
             last_budget: None,
             last_output: OutputFacts::default(),
+            last_thread: ThreadFacts::default(),
         }
     }
 
@@ -439,6 +467,32 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.reference.target() as usize
     }
 
+    /// The model pack's inference worker's counters, for the per-block facts' misses (`None`: RNNoise, no worker). Before the
+    /// run's first block.
+    pub(crate) fn set_inference(&mut self, stats: Option<Arc<InferenceStats>>) {
+        self.misses_at_block = stats.as_ref().map_or(0, |s| s.misses.load(Relaxed));
+        self.inference = stats;
+    }
+
+    /// A stall (the audio loop's: a wake that found nothing from the mic 100 ms after its last; `audio::mic_wake`), for the
+    /// next block's facts.
+    #[inline]
+    pub(crate) fn count_stall(&mut self) {
+        self.stalls = self.stalls.saturating_add(1);
+    }
+
+    /// A wake the exclusive output's event made (`audio::mic_wake`), for the next block's facts (`ThreadFacts::out_wakes`).
+    #[inline]
+    pub(crate) fn count_out_wake(&mut self) {
+        self.out_wakes = self.out_wakes.saturating_add(1);
+    }
+
+    /// The output's wakes and the stalls counted since the last block, for the next block's facts.
+    #[cfg(test)]
+    pub(crate) fn wake_counts(&self) -> (u32, u32) {
+        (self.out_wakes, self.stalls)
+    }
+
     /// Seeds the per-second pool-allocation count with the count after warm-up.
     pub(crate) fn set_alloc_baseline(&mut self, scope_allocs: u64) {
         self.last_pool_allocs = Some(scope_allocs);
@@ -470,13 +524,20 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// Drains every ready mic packet into the mic FIFO. Detects gaps by device position (the
     /// driver's discontinuity flag is rarely set), zero-filling short ones, and keeps the QPC time
     /// of the FIFO's samples from the packet stamps, and the wake that delivered them (the latency budget's). Returns the
-    /// frames read.
+    /// frames read. The run's first packet is no glitch, flagged or not: many drivers flag the first packet after a start
+    /// discontinuous (the stream's state changed), and nothing came before it to be discontinuous with.
     pub(crate) fn drain_mic<C: CaptureSource>(&mut self, src: &mut C, now_hns: f64) -> Result<usize, Hr> {
+        // Called once a wake: the thread's own timing, for the next block's facts.
+        if self.last_wake_hns > 0.0 {
+            self.wake_gap_max_hns = self.wake_gap_max_hns.max(now_hns - self.last_wake_hns);
+        }
+        self.last_wake_hns = now_hns;
+        self.wakes = self.wakes.saturating_add(1);
         let from = self.mic_abs;
         let mut total = 0;
         while let Some(p) = src.read_packet(&mut self.packet)? {
             let n = p.frames.min(self.packet.len());
-            let mut glitch = p.discontinuity;
+            let mut glitch = p.discontinuity && self.mic_next_pos.is_some();
             if let Some(expect) = self.mic_next_pos
                 && p.device_pos != expect
             {
@@ -583,8 +644,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 
         let report = proc.process(&self.mic_blk, &self.ref_blk, &mut self.out_blk, ticks);
         let times = t_capture.filter(|_| readout).map(|capture_hns| BlockTimes { capture_hns, wake_hns, chain: proc.latency() });
-        // Recorded after the write, with the block's budget, whether or not the write failed (as before the budget).
+        // Recorded after the write, with the block's budget, whether or not the write failed (as before the budget). The
+        // block's time is taken before the recorders' copies.
         let pushed = self.push_output(sink, times);
+        let t1 = ticks.ticks();
+        let us = ticks.to_us(t1.wrapping_sub(t0));
+        self.thread_facts(us);
         self.record(proc, head, t_capture, mic_moved);
         pushed?;
         if !readout {
@@ -592,8 +657,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.budget.clear();
         }
 
-        let t1 = ticks.ticks();
-        self.block_us.push(ticks.to_us(t1.wrapping_sub(t0)));
+        self.block_us.push(us);
         if report.aec_ticks > 0 {
             self.aec_us.push(ticks.to_us(report.aec_ticks));
         }
@@ -634,11 +698,34 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.dither.apply(&mut self.ref_blk[..], DITHER);
     }
 
-    /// While the chain recorder is armed, pushes this block to it: the mic and reference blocks as the chain got them, its
-    /// output, and the block's facts (its index, capture time, the mic's moves since the last block, the reference's take,
-    /// AEC3's estimates, the chain's settings). A full ring loses the block, counted.
+    /// The thread's facts for this block (`last_thread`): its wake and the gap before it, the wakes (and the output's), stalls,
+    /// glitches and model misses since the last block, and `process_us`, the block's own time; then the counts start again.
+    /// Every block, armed or not: a few stores and, with a model pack, one relaxed load.
+    fn thread_facts(&mut self, process_us: f32) {
+        let glitches = self.counters.capture_glitches;
+        let misses = self.inference.as_ref().map_or(0, |s| s.misses.load(Relaxed));
+        self.last_thread = ThreadFacts {
+            wake_hns: self.last_wake_hns,
+            wake_gap_ms: (self.wake_gap_max_hns / 1e4) as f32,
+            wakes: self.wakes,
+            out_wakes: self.out_wakes,
+            stalls: self.stalls,
+            mic_glitches: u32::try_from(glitches.saturating_sub(self.glitches_at_block)).unwrap_or(u32::MAX),
+            process_us,
+            model_misses: u32::try_from(misses.saturating_sub(self.misses_at_block)).unwrap_or(u32::MAX),
+        };
+        (self.wake_gap_max_hns, self.wakes, self.out_wakes, self.stalls) = (0.0, 0, 0, 0);
+        (self.glitches_at_block, self.misses_at_block) = (glitches, misses);
+    }
+
+    /// While the chain recorder or the flight recorder is armed, pushes this block to each: the mic and reference blocks as
+    /// the chain got them, its output, and the block's facts (its index, capture time, the mic's moves since the last block,
+    /// the reference's take, AEC3's estimates, the chain's settings, the output's and the thread's facts). A full ring loses
+    /// the block, counted. Each armed recorder costs one item's copy into its ring.
     fn record<P: BlockProcessor>(&mut self, proc: &P, head: u64, t_capture: Option<f64>, (discarded, skipped): (u64, i64)) {
-        let Some(rec) = self.recorder.as_mut() else { return };
+        if self.recorder.is_none() && self.flight.is_none() {
+            return;
+        }
         let aec = proc.aec_stats();
         let block = ChainBlock {
             index: self.blocks,
@@ -655,8 +742,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             settings: proc.params(),
             budget: self.last_budget,
             output: self.last_output,
+            thread: self.last_thread,
         };
-        rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
+        }
+        if let Some(rec) = self.flight.as_mut() {
+            rec.push(block, &self.mic_blk, &self.ref_blk, &self.out_blk);
+        }
     }
 
     /// Slips `out_blk` to the output clock, queues it, writes what fits, and applies the coarse
@@ -1500,11 +1593,13 @@ mod tests {
         assert_eq!(readout_ms(1e7 + 3e7, 1e7), None, "3 s is a bad stamp");
     }
 
+    /// Gaps by device position are glitches, zero-filled up to 100 ms; so is a packet flagged discontinuous, but not the run's
+    /// first (many drivers flag the first packet after a start).
     #[test]
     fn mic_gaps_are_counted_and_zero_filled() {
         let mut p = pipe(false);
         let mut mic = FakeCapture::default();
-        mic.push(0, Some(1e9 as u64), vec![1.0; 480]);
+        mic.packets.push_back((Packet { frames: 480, device_pos: 0, qpc_hns: Some(1e9 as u64), discontinuity: true }, vec![1.0; 480]));
         mic.push(480, Some((1e9 + 1e5) as u64), vec![1.0; 100]);
         // 50 frames missing.
         mic.push(630, None, vec![1.0; 100]);
@@ -2195,6 +2290,9 @@ mod tests {
         let rec_tx = ChainTx::new(rec_tx);
         let lost = rec_tx.lost();
         p.recorder = Some(rec_tx);
+        // The flight recorder's ring beside it: a second copy a block, and the thread's facts.
+        let (flight_tx, mut flight_rx) = rtrb::RingBuffer::<crate::recorder::ChainItem>::new(16);
+        p.flight = Some(ChainTx::new(flight_tx));
         let (mut recorded, mut wake) = (0u64, 0usize);
         let mut ticks = FakeTicks(0);
         let mut one = |p: &mut Pipeline<D, R>| {
@@ -2214,7 +2312,11 @@ mod tests {
             // recorder's, here inline), but for 40 wakes when the recorder's doesn't: its ring fills
             // and blocks are lost, counted.
             while rx.pop().is_ok() {}
+            while flight_rx.pop().is_ok() {}
             wake += 1;
+            if wake % 50 == 0 {
+                p.count_stall();
+            }
             while !(warm + 300..warm + 340).contains(&wake) && rec_rx.pop().is_ok() {
                 recorded += 1;
             }
@@ -2496,6 +2598,7 @@ mod tests {
     mod budget;
     mod events;
     mod exclusive;
+    mod flight;
     mod recorder;
     mod timeline;
 }

@@ -359,6 +359,7 @@ dependencies = [
 name = "nf-engine"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "log",
  "nf-core",
  "nf-mem",

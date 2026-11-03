@@ -102,6 +102,8 @@ pub(crate) struct AudioArgs {
     pub(crate) tap: TapEnd,
     /// The chain recorder's hand-over (recorder.rs); one armed before the start is in its command ring already.
     pub(crate) recorder: End<ChainTx>,
+    /// The flight recorder's (flight.rs): a ring of this run's own is in its command ring already while one is armed.
+    pub(crate) flight: End<ChainTx>,
     /// The mic an earlier run in this process measured, as it opened then, and how it delivered (the control side's
     /// memory, for the automatic model depth: `choose_model_depth`).
     pub(crate) mic_delivery: Option<(MicOpening, MicDelivery)>,
@@ -176,7 +178,7 @@ fn worker_main(jobs: Receiver<AudioArgs>) {
 }
 
 fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
-    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mic_delivery, ready, done } = args;
+    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mut flight, mic_delivery, ready, done } = args;
     // Declared first, so dropped last: both signal "gone" after every stream is released.
     let _done = done;
     let _exit = ExitFlag(shared.clone());
@@ -184,11 +186,16 @@ fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
         Some(code) => {
             let _ = ready.send(Err(StartFailure::Com(code)));
         }
-        None => run(Run { config, telemetry, controls, shared, tap, recorder: &mut recorder, mic_delivery, ready, mmcss }),
+        None => {
+            let ends = Ends { tap, recorder: &mut recorder, flight: &mut flight };
+            run(Run { config, telemetry, controls, shared, ends, mic_delivery, ready, mmcss })
+        }
     }
     // A chain recorder the run never took (the start failed, or it stopped before its next wake) goes back, so a failed
     // start's caller can keep it for the next start (recorder::run_failed). Before `_done`: the caller has it once joined.
+    // The flight recorder's ring goes back too, to be freed on the control side (`flight::run_failed`).
     handover::give_back(&mut recorder);
+    handover::give_back(&mut flight);
 }
 
 struct Run<'a> {
@@ -196,8 +203,7 @@ struct Run<'a> {
     telemetry: Arc<Telemetry>,
     controls: Arc<ChainControls>,
     shared: Arc<AudioShared>,
-    tap: TapEnd,
-    recorder: &'a mut End<ChainTx>,
+    ends: Ends<'a>,
     mic_delivery: Option<(MicOpening, MicDelivery)>,
     ready: SyncSender<Result<Opened, StartFailure>>,
     mmcss: &'a Mmcss,
@@ -245,7 +251,7 @@ impl Ticks for QpcTicks {
 }
 
 fn run(r: Run<'_>) {
-    let Run { config, telemetry, controls, shared, mut tap, recorder, mic_delivery, ready, mmcss } = r;
+    let Run { config, telemetry, controls, shared, mut ends, mic_delivery, ready, mmcss } = r;
     let mut warnings = Vec::new();
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
@@ -337,7 +343,8 @@ fn run(r: Run<'_>) {
         return;
     }
 
-    let mut ends = Ends { tap: &mut tap, recorder };
+    // The model pack's worker's misses, for the per-block facts (`ThreadFacts::model_misses`).
+    pipe.set_inference(session.inference.clone());
     if let Some(f) = audio_loop(&mut session, &mut pipe, &telemetry, &shared, &mut ends, fallback_baseline) {
         shared.fault.store(f.pack(), Relaxed);
     }
@@ -631,24 +638,26 @@ fn start_reference(ka: Option<&mut KeepAlive>, lb: Option<&CaptureStream>) -> Re
     Ok(())
 }
 
-/// Counts the mic's stalls: [`WAIT_MS`] without its event is one, whether the wait timed out (the thread waits on the mic
-/// alone) or an exclusive output's events woke the thread meanwhile (every 2 ms: they'd never let the wait time out).
+/// Counts the mic's stalls: [`WAIT_MS`] with nothing from the mic is one, whether the wait timed out (the thread waits on the
+/// mic alone) or an exclusive output's events woke the thread meanwhile (every 2 ms: they'd never let the wait time out).
+/// Nothing means neither the mic's event nor a packet: a thread held up longer than that, woken by the output's event (it's
+/// reported first when both have fired), finds the mic's packets waiting, and that's no stall.
 #[derive(Clone, Copy, Debug)]
-struct StallWatch {
-    /// The mic's last event, or the last stall counted (hns).
+pub(crate) struct StallWatch {
+    /// The mic's last event or packet, or the last stall counted (hns).
     since_hns: i64,
 }
 
 impl StallWatch {
-    fn new(now_hns: i64) -> Self {
+    pub(crate) fn new(now_hns: i64) -> Self {
         Self { since_hns: now_hns }
     }
 
-    /// A wake at `now_hns`, by the mic's event or not: whether it counts a stall.
+    /// A wake at `now_hns` that had something from the mic (its event, or packets) or not: whether it counts a stall.
     #[inline]
-    fn wake(&mut self, mic_event: bool, now_hns: i64) -> bool {
-        let stall = !mic_event && now_hns - self.since_hns >= i64::from(WAIT_MS) * 10_000;
-        if mic_event || stall {
+    pub(crate) fn wake(&mut self, from_mic: bool, now_hns: i64) -> bool {
+        let stall = !from_mic && now_hns - self.since_hns >= i64::from(WAIT_MS) * 10_000;
+        if from_mic || stall {
             self.since_hns = now_hns;
         }
         stall
@@ -657,9 +666,27 @@ impl StallWatch {
 
 /// What woke the audio thread: the mic's event, the exclusive output's, or neither (the wait timed out).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Wake {
-    mic: bool,
-    out: bool,
+pub(crate) struct Wake {
+    pub(crate) mic: bool,
+    pub(crate) out: bool,
+}
+
+/// One wake's mic, step 1 of the loop (the flight recorder's scenes run it too): the output's wake counted for the block's
+/// facts, every ready mic packet into the mic FIFO (`drain_mic`), then the stall watch, told whether the wake had anything
+/// from the mic. Returns the frames read and whether a stall was counted (the pipeline's count too).
+#[inline]
+pub(crate) fn mic_wake<C: CaptureSource, D: DriftControl, R: Resampler>(
+    pipe: &mut Pipeline<D, R>, src: &mut C, stalls: &mut StallWatch, wake: Wake, now_hns: i64,
+) -> Result<(usize, bool), Hr> {
+    if wake.out {
+        pipe.count_out_wake();
+    }
+    let frames = pipe.drain_mic(src, now_hns as f64)?;
+    let stalled = stalls.wake(wake.mic || frames > 0, now_hns);
+    if stalled {
+        pipe.count_stall();
+    }
+    Ok((frames, stalled))
 }
 
 /// Waits up to `ms` for the mic's event, and for an exclusive output's as well (listed first: when both have fired it's
@@ -673,10 +700,11 @@ fn wait(mic: &CaptureStream, out: &Output, ms: u32) -> Wake {
     Wake { out: r.0 == WAIT_OBJECT_0.0, mic: r.0 == WAIT_OBJECT_0.0 + 1 }
 }
 
-/// The audio thread's ends of the run's hand-overs: the latency test's tap and the chain recorder.
+/// The audio thread's ends of the run's hand-overs: the latency test's tap, the chain recorder and the flight recorder.
 struct Ends<'a> {
-    tap: &'a mut TapEnd,
+    tap: TapEnd,
     recorder: &'a mut End<ChainTx>,
+    flight: &'a mut End<ChainTx>,
 }
 
 /// The loop. Returns the fault that ended it, or `None` when asked to stop.
@@ -690,6 +718,7 @@ fn audio_loop(
     let output_fault = |hr| Some(Fault::Stream { role: StreamRole::Output, hr });
     let mut returning: Option<Producer<TapItem>> = None;
     let mut returning_recorder: Option<ChainTx> = None;
+    let mut returning_flight: Option<ChainTx> = None;
     let mut reference_live = s.lb.is_some();
     loop {
         let wake = wait(&s.mic, &s.out, WAIT_MS);
@@ -701,19 +730,19 @@ fn audio_loop(
         if let Err(hr) = s.out.service(wake.out) {
             return output_fault(hr);
         }
-        if stalls.wake(wake.mic, now) {
-            shared.stalls.fetch_add(1, Relaxed);
-            tel.stalls.fetch_add(1, Relaxed);
-        }
-
-        // 1. Mic: every ready packet into the mic FIFO.
-        match pipe.drain_mic(&mut s.mic, now as f64) {
-            Ok(0) => {
-                if now - last_packet > STALL_LIMIT_HNS {
+        // 1. Mic: every ready packet into the mic FIFO, then the stall watch.
+        match mic_wake(pipe, &mut s.mic, &mut stalls, wake, now) {
+            Ok((frames, stalled)) => {
+                if stalled {
+                    shared.stalls.fetch_add(1, Relaxed);
+                    tel.stalls.fetch_add(1, Relaxed);
+                }
+                if frames > 0 {
+                    last_packet = now;
+                } else if now - last_packet > STALL_LIMIT_HNS {
                     return Some(Fault::MicStalled);
                 }
             }
-            Ok(_) => last_packet = now,
             Err(hr) => return Some(Fault::Stream { role: StreamRole::Mic, hr }),
         }
         // 2. Reference, when a block is due: top up the keep-alive and drain the loopback (polled:
@@ -732,10 +761,11 @@ fn audio_loop(
             shared.reference_fault.store(Fault::Stream { role, hr }.pack(), Relaxed);
             reference_live = false;
         }
-        // The tap and the recorder: taken before this wake's blocks (a recorder armed before the start, at the first wake,
+        // The tap and the recorders: taken before this wake's blocks (a recorder armed before the start, at the first wake,
         // so the run's first block is recorded), and handed back when done, to be freed on the control side.
-        handover::service(&mut pipe.tap, ends.tap, shared.tap_stop.load(Relaxed), &mut returning);
+        handover::service(&mut pipe.tap, &mut ends.tap, shared.tap_stop.load(Relaxed), &mut returning);
         handover::service(&mut pipe.recorder, ends.recorder, false, &mut returning_recorder);
+        handover::service(&mut pipe.flight, ends.flight, false, &mut returning_flight);
 
         // 3. Every complete block; 4. once a second, the slow statistics. The blocks a wake processed are counted (TODO 6:
         //    a model pack's worker misses one for each block past its depth that a wake brings back to back).
@@ -981,6 +1011,21 @@ mod tests {
         assert!(events.iter().all(|&(t, mic)| !w.wake(mic, ms(t))), "the mic delivers: no stall");
         let mut w = StallWatch::new(0);
         assert!(!w.wake(true, ms(99.0)) && !w.wake(false, ms(198.0)) && w.wake(false, ms(199.5)));
+    }
+
+    /// The loop's mic step: a wake by the exclusive output's event (counted for the block's facts) that finds the mic's packets
+    /// waiting is no stall, though the mic's event wasn't the one reported (a thread held up 120 ms finds both fired); one
+    /// that finds nothing from the mic 100 ms after its last is, counted for the block's facts too.
+    #[test]
+    fn a_wake_that_finds_the_mics_packets_is_no_stall() {
+        let mut pipe = test_pipe();
+        let mut mic = Packets { frames: 480, pos: 0, ready: true };
+        let mut stalls = StallWatch::new(0);
+        let out = Wake { mic: false, out: true };
+        assert_eq!(mic_wake(&mut pipe, &mut mic, &mut stalls, out, 1_200_000).unwrap(), (480, false), "held 120 ms: packets");
+        assert_eq!(mic_wake(&mut pipe, &mut mic, &mut stalls, out, 2_200_000).unwrap(), (0, true), "100 ms of nothing");
+        assert_eq!(mic_wake(&mut pipe, &mut mic, &mut stalls, Wake::default(), 2_250_000).unwrap(), (0, false));
+        assert_eq!(pipe.wake_counts(), (2, 1));
     }
 
     #[test]

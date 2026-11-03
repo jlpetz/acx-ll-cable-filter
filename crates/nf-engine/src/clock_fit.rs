@@ -173,7 +173,7 @@ pub(crate) fn clock_drift(blocks: &[ChainBlock]) -> ClockDrift {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{ChainParams, OutputFacts};
+    use crate::api::{ChainParams, OutputFacts, ThreadFacts};
 
     const H: f64 = 1e7 / 48_000.0;
     const T0: f64 = 1e10;
@@ -221,6 +221,7 @@ mod tests {
             settings: ChainParams::default(),
             budget: None,
             output: OutputFacts { clock_pos: pos, clock_qpc_hns: T0 + pos * out_h + 1_000.0 * scatter(k, 3), ..Default::default() },
+            thread: ThreadFacts::default(),
         }
     }
 

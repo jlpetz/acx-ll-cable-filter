@@ -1215,6 +1215,7 @@ mod tests {
                 clock_qpc_hns: 3e5 + pos * 1e7 / 48_000.0 / (1.0 + 50e-6),
                 ..Default::default()
             },
+            thread: Default::default(),
         }
     }
 
