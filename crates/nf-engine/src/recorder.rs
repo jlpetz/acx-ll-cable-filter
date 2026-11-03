@@ -92,6 +92,7 @@ impl ChainItem {
                 dropped: 0,
                 skipped: false,
                 underrun: false,
+                late: false,
                 reanchored: false,
                 silence: 0,
                 clock_pos: 0.0,

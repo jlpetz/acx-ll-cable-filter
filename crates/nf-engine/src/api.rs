@@ -541,6 +541,9 @@ pub struct OutputFacts {
     pub skipped: bool,
     /// An underrun counted at this block: the device found dry, a deficit, or an exclusive output's ring short since the last block.
     pub underrun: bool,
+    /// Of it: an exclusive output's device event answered late since the last block (the thread held up past the
+    /// device's deadline), not its ring short.
+    pub late: bool,
     /// The fill's calibration to the padding started over at this block (the device ran dry, or its clock jumped).
     pub reanchored: bool,
     /// Silence an exclusive output's device played in our stream since the block before, where its ring ran short at an
@@ -567,6 +570,7 @@ impl Default for OutputFacts {
             dropped: 0,
             skipped: false,
             underrun: false,
+            late: false,
             reanchored: false,
             silence: 0,
             clock_pos: f64::NAN,

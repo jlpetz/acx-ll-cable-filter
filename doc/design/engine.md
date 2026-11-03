@@ -308,7 +308,14 @@ on each side (the cables' render side read 26 ms, the mic 16), and exclusive mod
   pipeline counts the sink's underruns once a block however many events ran short, as the shared path counts a dry
   spell: a 40 ms mic stall, a dozen short 2 ms events, is one (not before the first block; the adaptive target rises).
   **A late answer** (the clock past everything handed, and 1.5 periods since the last answer: both, so a clock that leads
-  its buffers can't make every event late) is an underrun too: the device played whatever its other buffer held, and
+  its buffers can't make every event late) is an underrun too. More than 2 periods since the last answer proves it late
+  (the device wants the next buffer within a period of its event, and every event is answered once), and the clock,
+  extrapolated to now, counts its stale periods; between 1.5 and 2 only the position the device itself reported can show
+  it, not one extrapolated: extrapolating a stalled clock's reading by up to a period counted a late answer that wasn't
+  (TODO 13's soak 3, VB-CABLE's render clock stalling at about two minutes). Late answers are taken apart from the short
+  ring's underruns (`RenderSink::take_late`, the `output_late_answers` counter, chain_blocks.csv's `out_late`), and they
+  don't strike the adaptive target: a deeper queue can't make the thread answer sooner, a bigger device period can. The
+  device played whatever its other buffer held, and
   those periods are taken off the clock the same way, as for a device whose stream moves on by them (one that writes the
   late buffer over the one playing instead would read a period high per late answer; unverified on VB-CABLE). The gap is
   timed on QPC from the stream's start (`EventRender::started`), so the first answer, which waits on the rest of the

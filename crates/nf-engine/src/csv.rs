@@ -31,7 +31,7 @@ pub(crate) const COLUMNS: &str = concat!(
     "consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed,",
     "mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,",
     "out_index,out_padding,out_pending,out_fill,out_target,out_slip,out_zeros,out_dropped,out_skipped,",
-    "out_underrun,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns,",
+    "out_underrun,out_late,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns,",
     "wake_hns,wake_gap_ms,wakes,out_wakes,stalls,mic_glitches,process_us,model_misses",
 );
 const BUDGET_COLUMNS: usize = 6;
@@ -108,7 +108,7 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
     let o = &b.output;
     let _ = write!(
         s,
-        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         o.index,
         o.padding,
         o.pending,
@@ -119,6 +119,7 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
         o.dropped,
         u8::from(o.skipped),
         u8::from(o.underrun),
+        u8::from(o.late),
         u8::from(o.reanchored),
         o.silence,
         num(o.clock_pos, 1),

@@ -875,6 +875,12 @@ pub(crate) fn read(w: &Window) -> Reading {
                 "The output overfilled at block {index} {on_time}: the device took its samples more slowly than they came (it \
                  stalled, or its clock ran slow)."
             ),
+            Kind::Output if o.late => format!(
+                "The audio thread answered the exclusive output's event late at block {index}: more than a device period after \
+                 it came, so the device played a stale period of silence (the queue held {} samples: it wasn't dry). A bigger \
+                 device period leaves the thread more room; the filter raises it after repeated late answers.",
+                o.padding
+            ),
             Kind::Output => format!(
                 "The output ran dry at block {index} {on_time}: the device took its samples faster than they came, or its driver \
                  dropped or skipped some (padding {} samples when the block was written).",

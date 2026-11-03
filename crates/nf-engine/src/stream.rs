@@ -415,6 +415,9 @@ impl RenderStream {
 }
 
 impl RenderSink for RenderStream {
+    fn take_late(&mut self) -> u64 {
+        0
+    }
     // A shared stream: the engine drains it and plays its own silence, so there's nothing to take.
     fn take_underruns(&mut self) -> u64 {
         0
@@ -696,6 +699,13 @@ impl RenderSink for Output {
         match self {
             Output::Shared(s) => s.take_silence(),
             Output::Exclusive(e) => e.take_silence(),
+        }
+    }
+    #[inline]
+    fn take_late(&mut self) -> u64 {
+        match self {
+            Output::Shared(s) => s.take_late(),
+            Output::Exclusive(e) => e.take_late(),
         }
     }
 }

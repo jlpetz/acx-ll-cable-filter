@@ -115,6 +115,11 @@ pub(crate) trait RenderSink {
     /// short at an event, or the periods of an event answered late. [`Self::clock`] leaves it out of the position, so the
     /// fill doesn't see it; every later sample plays that much later. 0 for a stream the device drains by itself.
     fn take_silence(&mut self) -> u64;
+    /// Device events answered late since the last call (an event-driven exclusive output: the audio thread was held up
+    /// past its deadline). Counted as underruns too, but apart from [`Self::take_underruns`]' short ring: a deeper queue
+    /// can't help them, a bigger device period can (control.rs's exclusive period guard). 0 for a stream the device
+    /// drains by itself.
+    fn take_late(&mut self) -> u64;
 }
 
 /// The output's drift loop, as nf-core's `DriftController` provides it (the reference has its own:
@@ -238,6 +243,8 @@ pub(crate) struct Counters {
     pub output_reanchors: u64,
     /// Silence an exclusive output's device played in our stream where its ring ran short ([`RenderSink::take_silence`]).
     pub output_silence_frames: u64,
+    /// An exclusive output's device events answered late ([`RenderSink::take_late`]); counted in `render_underruns` too.
+    pub output_late_answers: u64,
     /// Blocks whose reference was (partly) zeros for samples that hadn't arrived: none had yet, or
     /// they came late and were discarded when they did (the timeline kept whole; reference.rs).
     pub reference_gaps: u64,
@@ -782,10 +789,13 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // What the sink saw itself (an exclusive output's ring short at an event). Before the first block it's the output
         // running before the mic, as a shared device's dry start is.
         let sink_dry = sink.take_underruns();
-        // And the silence its device played meanwhile; before the first block, as its underruns, it isn't counted.
+        // Its device events answered late (the thread held up past the device's deadline), and the silence its device
+        // played meanwhile; before the first block, as its underruns, they aren't counted.
+        let late = if self.out_started { sink.take_late() } else { (sink.take_late(), 0).1 };
         let silence = sink.take_silence();
         let silence = if self.out_started { silence } else { 0 };
         self.counters.output_silence_frames += silence;
+        self.counters.output_late_answers += late;
         let mut padding = sink.padding()?;
         let reanchors = self.fill_offset.reanchors;
         let mut facts = OutputFacts {
@@ -815,16 +825,20 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // below fill the device to it.
         let short = low && queued + (BLOCK as f64) < self.out_target as f64;
         let dry = self.out_started && (sink_dry > 0 || (low && padding == 0) || short);
+        // A late answer is an underrun too, but not the queue's: it doesn't strike the adaptive target, as a deeper queue
+        // can't make the thread answer sooner (a bigger device period can: control.rs's exclusive period guard).
+        let late = late > 0;
         // What the adaptive target measures a block's lateness on: the fill before its calibration (out_target.rs).
         let (raw, clocked) = self.raw_fill(clock, padding + self.pending_len);
         facts.fill = fill as f32;
-        if dry {
+        if dry || late {
             // Once a block, as the shared path counts one: a dry spell of many short device events is one underrun.
             self.counters.render_underruns += 1;
             facts.underrun = true;
-            if let Some(t) = self.adaptive.as_mut().and_then(|a| a.underrun(raw, clocked)) {
-                self.set_out_target(t);
-            }
+            facts.late = late;
+        }
+        if dry && let Some(t) = self.adaptive.as_mut().and_then(|a| a.underrun(raw, clocked)) {
+            self.set_out_target(t);
         }
         let target = self.out_target as f64;
         // At the start the target is set exactly; after it, this block counts as well.
@@ -1132,6 +1146,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.output_slip_net.store(c.output_slip_net, Relaxed);
         tel.output_reanchors.store(c.output_reanchors, Relaxed);
         tel.output_silence_frames.store(c.output_silence_frames, Relaxed);
+        tel.output_late_answers.store(c.output_late_answers, Relaxed);
         tel.reference_coarse_drops.store(c.reference_drops, Relaxed);
         tel.tap_overflows.store(c.tap_overflows, Relaxed);
 
@@ -1471,6 +1486,9 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
+        fn take_late(&mut self) -> u64 {
+            0
+        }
         fn take_underruns(&mut self) -> u64 {
             0
         }
@@ -2259,6 +2277,9 @@ mod tests {
     }
 
     impl RenderSink for NullSink {
+        fn take_late(&mut self) -> u64 {
+            0
+        }
         fn take_underruns(&mut self) -> u64 {
             0
         }
@@ -2513,6 +2534,9 @@ mod tests {
     }
 
     impl RenderSink for StepSink {
+        fn take_late(&mut self) -> u64 {
+            0
+        }
         fn take_underruns(&mut self) -> u64 {
             0
         }

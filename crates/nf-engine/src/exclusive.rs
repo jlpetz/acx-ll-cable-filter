@@ -213,6 +213,11 @@ pub(crate) trait PeriodDevice {
 
 /// An answer this many periods after the last (or after the start) may be late: the device clock decides.
 const LATE_GAP_PERIODS: f64 = 1.5;
+/// An answer this many periods after the last is late for certain. The device wants the next buffer within a period of
+/// its event, and every event is answered once: answers `gap` apart, the second came `gap - period + d` after its event
+/// (`d` the first's own delay, `>= 0`), past its deadline whenever `gap > 2 periods`. Between 1.5 and 2 it's late only if
+/// the first answer was slow too, which only the device's own reported position can show (TODO 13's soak 3).
+const CERTAIN_LATE_GAP_PERIODS: f64 = 2.0;
 /// The most a late answer counts as missed, in frames (10 s): a clock position far past what was handed is garbage, and
 /// the counts it would add mustn't overflow (the run stops after 2 s without the mic anyway).
 const MAX_LATE_FRAMES: f64 = 480_000.0;
@@ -226,7 +231,9 @@ const MAX_LATE_FRAMES: f64 = 480_000.0;
 /// was handed, is an underrun too: the device played whatever its other buffer held meanwhile (a stale period, or more),
 /// and those periods are taken off the clock as the silence is, so the indices follow a device whose stream moves on by
 /// them (one that wrote the late buffer over the one playing instead would read that much high: unverified on VB-CABLE).
-/// It takes both the clock's position past what was handed and a gap of 1.5 periods since the last answer, so a clock
+/// Late answers are taken apart from the short ring's underruns ([`RenderSink::take_late`]). A gap of 2 periods since the
+/// last answer proves one late; between 1.5 and 2 only the position the device itself reported can (not one extrapolated:
+/// [`Self::count_stale`]). It takes both the clock's position past what was handed and a gap of 1.5 periods since the last answer, so a clock
 /// that leads its buffers can't make every event look late. The gap is timed on the sink's own clock (QPC) from the
 /// stream's start ([`Self::started`]), so the first answer, which waits on the rest of the start (the mic's start, the
 /// status), is caught late as any other is. A device clock that can't say yet (its position reads 0 for a while after
@@ -254,8 +261,12 @@ pub(crate) struct EventRender<D> {
     events: u64,
     /// When the stream started or the last event was answered (QPC, hns); `None` before the start.
     last_answer_hns: Option<f64>,
-    /// [`LATE_GAP_PERIODS`] in hns.
+    /// [`LATE_GAP_PERIODS`] and [`CERTAIN_LATE_GAP_PERIODS`] in hns.
     late_gap_hns: f64,
+    certain_gap_hns: f64,
+    /// Late answers since the pipeline last asked ([`RenderSink::take_late`]): apart from the short ring's underruns, as
+    /// a deeper queue can't help them (a bigger period can: control.rs's exclusive period guard).
+    late_taken: u64,
     /// A long gap the device's clock couldn't check yet: the next answer it can checks it.
     late_unchecked: bool,
 }
@@ -277,6 +288,8 @@ impl<D: PeriodDevice> EventRender<D> {
             events: 0,
             last_answer_hns: None,
             late_gap_hns: LATE_GAP_PERIODS * period as f64 * HNS_PER_S / SAMPLE_RATE as f64,
+            certain_gap_hns: CERTAIN_LATE_GAP_PERIODS * period as f64 * HNS_PER_S / SAMPLE_RATE as f64,
+            late_taken: 0,
             late_unchecked: false,
         }
     }
@@ -318,10 +331,11 @@ impl<D: PeriodDevice> EventRender<D> {
         if long_gap || self.late_unchecked {
             // A clock that can't say yet (it reads 0 for a while after the start, or erred: the hand-over reports a dead
             // stream) leaves the check to the next answer it can, whatever that one's gap: the stale periods are still
-            // past what was handed then.
+            // past what was handed then, so that check counts as certain.
+            let certain = gap > self.certain_gap_hns || self.late_unchecked;
             self.late_unchecked = false;
             match self.dev.clock() {
-                Ok(Some(c)) => self.count_stale(c),
+                Ok(Some(c)) => self.count_stale(c, certain),
                 _ => self.late_unchecked = true,
             }
         }
@@ -329,10 +343,15 @@ impl<D: PeriodDevice> EventRender<D> {
     }
 
     /// A late answer's stale periods, when the device's clock is past everything handed: the period playing now and any
-    /// before it since the last one handed, none of them ours.
-    fn count_stale(&mut self, c: ClockReading) {
+    /// before it since the last one handed, none of them ours. `certain`: the gap alone proves the answer late, and the
+    /// clock, extrapolated to now, counts how many periods went stale. Otherwise only the position the device itself
+    /// reported can show it: extrapolating a reading by up to a period took a clock that had stalled (VB-CABLE's, about two
+    /// minutes into each soak: TODO 13) for a device that had run past everything handed, and counted a late answer that
+    /// wasn't, with a period of silence that was never played.
+    fn count_stale(&mut self, c: ClockReading, certain: bool) {
         let period = self.period as f64;
-        let past = c.position_now(period) - self.handed as f64;
+        let played = if certain { c.position_now(period) } else { c.pos_frames };
+        let past = played - self.handed as f64;
         if past >= 0.0 {
             // `min` before the cast (NaN fails the test above), and saturating sums: no overflow on a garbage position.
             let periods = ((past.min(MAX_LATE_FRAMES) / period) as u64).saturating_add(1);
@@ -341,7 +360,7 @@ impl<D: PeriodDevice> EventRender<D> {
             self.silence = self.silence.saturating_add(stale);
             self.handed = self.handed.saturating_add(stale);
             self.late = self.late.saturating_add(1);
-            self.underruns = self.underruns.saturating_add(1);
+            self.late_taken = self.late_taken.saturating_add(1);
         }
     }
 
@@ -402,6 +421,10 @@ impl<D: PeriodDevice> RenderSink for EventRender<D> {
 
     fn take_silence(&mut self) -> u64 {
         std::mem::take(&mut self.silence)
+    }
+
+    fn take_late(&mut self) -> u64 {
+        std::mem::take(&mut self.late_taken)
     }
 }
 
@@ -653,7 +676,7 @@ mod tests {
         r.device_mut().tick();
         r.device_mut().tick();
         r.service().unwrap();
-        assert_eq!((r.device().stale, r.take_underruns()), (3, 1), "late: three stale periods");
+        assert_eq!((r.device().stale, r.take_underruns(), r.take_late()), (3, 0, 1), "late (not short): three stale periods");
         assert_eq!((r.counts().1, r.take_silence()), (1, 3 * 96), "and their silence, reported");
         assert_eq!(r.counts().0, 96 + 46 + 3 * 96, "and out of the clock: the next frame handed is still the pipeline's next");
         let dev = r.device_mut().clock().unwrap().unwrap().pos_frames;
@@ -712,7 +735,7 @@ mod tests {
             r.device_mut().tick();
         }
         r.service().unwrap();
-        assert_eq!((r.device().stale, r.counts().1, r.take_underruns()), (2, 1, 1));
+        assert_eq!((r.device().stale, r.counts().1, r.take_late()), (2, 1, 1));
         assert_eq!(r.counts().0, 2 * 96, "two stale periods off the clock");
         let dev = r.device_mut().clock().unwrap().unwrap().pos_frames;
         assert_eq!(dev - r.clock().unwrap().unwrap().pos_frames, 192.0);
@@ -744,7 +767,38 @@ mod tests {
         assert_eq!(b.counts().1, 0, "not yet");
         b.device_mut().tick();
         b.service().unwrap();
-        assert_eq!((b.device().stale, b.counts().1, b.counts().0, b.take_underruns()), (2, 1, 192, 1));
+        assert_eq!((b.device().stale, b.counts().1, b.counts().0, b.take_late()), (2, 1, 192, 1));
+    }
+
+    /// TODO 13's soak 3: an answer 1.55 periods after the last, with the device's clock reading 0.9 of a period into its
+    /// buffer but stamped at the buffer's start. Extrapolated to now (by up to a period) it's past everything handed, which
+    /// counted a late answer, and a period of silence never played. Between 1.5 and 2 periods only the position the device
+    /// itself reported can say, and that is still inside the buffer: not late. Past 2 periods the gap proves it.
+    #[test]
+    fn a_clock_extrapolated_past_what_was_handed_isnt_a_late_answer() {
+        let mut r = EventRender::new(TickDevice::new(96), RING_FRAMES);
+        r.write(&[0.5; 4800]).unwrap();
+        r.preroll().unwrap();
+        r.started();
+        for _ in 0..5 {
+            r.device_mut().tick();
+            r.service().unwrap();
+        }
+        assert_eq!(r.take_late(), 0);
+        let tick = r.device().tick_hns;
+        r.device_mut().tick();
+        r.device_mut().pos_offset = 0.9 * 96.0;
+        r.device_mut().now += 0.55 * tick;
+        r.service().unwrap();
+        assert_eq!((r.take_late(), r.take_underruns(), r.take_silence(), r.counts().1), (0, 0, 0, 0), "not late");
+        // Answered 2.1 periods after the last instead: late for certain, as the device's clock confirms.
+        r.device_mut().pos_offset = 0.0;
+        r.device_mut().tick();
+        r.device_mut().tick();
+        r.device_mut().now += 0.1 * tick;
+        r.service().unwrap();
+        assert_eq!((r.take_late(), r.take_underruns(), r.device().stale), (1, 0, 1), "late, one stale period");
+        assert_eq!(r.take_silence(), 96);
     }
 
     /// A garbage clock position (far past anything handed, or not a number) can't overflow the counts or panic: a late

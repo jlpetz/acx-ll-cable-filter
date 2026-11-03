@@ -406,6 +406,9 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
+        fn take_late(&mut self) -> u64 {
+            0
+        }
         fn take_underruns(&mut self) -> u64 {
             0
         }

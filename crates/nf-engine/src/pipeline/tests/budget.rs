@@ -27,6 +27,9 @@ struct Lagged {
 }
 
 impl RenderSink for Lagged {
+    fn take_late(&mut self) -> u64 {
+        0
+    }
     fn take_underruns(&mut self) -> u64 {
         0
     }

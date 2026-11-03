@@ -161,6 +161,9 @@ pub struct OutputEvents {
     /// event answered late (`output_silence_frames`). Each frame plays every later sample a frame later, until the drift loop
     /// slips it back out. 0 for a shared output, whose device engine plays its own silence outside our stream.
     pub silence_frames: u64,
+    /// Of the underruns, the device events an exclusive output answered late (`output_late_answers`): the audio thread was
+    /// held up past the device's deadline. A deeper queue can't help these; a bigger device period can.
+    pub late_answers: u64,
     /// Deficits: blocks at which zeros were written to top the device up to the target (each counts as an underrun too), and
     /// the zeros written. Each zero lengthens the output path by a sample until the drift loop slips it back out.
     pub deficits: u64,
@@ -183,6 +186,7 @@ impl OutputEvents {
         Self {
             underruns: t.render_underruns,
             silence_frames: t.output_silence_frames,
+            late_answers: t.output_late_answers,
             deficits: t.output_deficits,
             zero_frames: t.output_zero_frames,
             coarse_drops: t.output_coarse_drops,
@@ -202,6 +206,7 @@ impl OutputEvents {
         Self {
             underruns: a.underruns.saturating_sub(b.underruns),
             silence_frames: a.silence_frames.saturating_sub(b.silence_frames),
+            late_answers: a.late_answers.saturating_sub(b.late_answers),
             deficits: a.deficits.saturating_sub(b.deficits),
             zero_frames: a.zero_frames.saturating_sub(b.zero_frames),
             coarse_drops: a.coarse_drops.saturating_sub(b.coarse_drops),
@@ -233,10 +238,17 @@ impl OutputEvents {
         let ms = |frames: u64| format!("{:.1}", frames as f64 * 1000.0 / f64::from(crate::SAMPLE_RATE));
         let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut parts = Vec::new();
+        let late = match self.late_answers {
+            0 => String::new(),
+            n if n == self.underruns => format!(", {}", if n == 1 { "a late answer" } else { "all late answers" }),
+            1 => ", 1 of them a late answer".to_owned(),
+            n => format!(", {n} of them late answers"),
+        };
         match (self.underruns, self.silence_frames) {
             (0, 0) => {}
-            (n, 0) => parts.push(plural(n, "underrun", "underruns")),
-            (n, f) => parts.push(format!("{} ({} ms of silence played)", plural(n, "underrun", "underruns"), ms(f))),
+            (n, 0) if late.is_empty() => parts.push(plural(n, "underrun", "underruns")),
+            (n, 0) => parts.push(format!("{} ({})", plural(n, "underrun", "underruns"), &late[2..])),
+            (n, f) => parts.push(format!("{} ({} ms of silence played{late})", plural(n, "underrun", "underruns"), ms(f))),
         }
         if self.deficits > 0 {
             parts.push(format!("{} ({} ms of zeros)", plural(self.deficits, "deficit", "deficits"), ms(self.zero_frames)));
@@ -390,6 +402,8 @@ pub struct Telemetry {
     pub output_reanchors: AtomicU64,
     /// Silence an exclusive output's device played in our stream where its ring ran short ([`OutputEvents::silence_frames`]).
     pub output_silence_frames: AtomicU64,
+    /// An exclusive output's device events answered late ([`OutputEvents::late_answers`]); also counted as underruns.
+    pub output_late_answers: AtomicU64,
     /// Latency-test tap blocks lost because the tap ring was full.
     pub tap_overflows: AtomicU64,
     /// The targets the drift loops hold, in ms (0 while stopped or without a reference): the output's
@@ -537,6 +551,7 @@ pub struct TelemetrySnapshot {
     pub output_slip_net: i64,
     pub output_reanchors: u64,
     pub output_silence_frames: u64,
+    pub output_late_answers: u64,
     pub tap_overflows: u64,
     pub output_target_ms: f32,
     pub reference_target_ms: f32,
@@ -667,6 +682,7 @@ impl Telemetry {
             output_slip_net: self.output_slip_net.load(Relaxed),
             output_reanchors: self.output_reanchors.load(Relaxed),
             output_silence_frames: self.output_silence_frames.load(Relaxed),
+            output_late_answers: self.output_late_answers.load(Relaxed),
             tap_overflows: self.tap_overflows.load(Relaxed),
             output_target_ms: self.output_target_ms.load(),
             reference_target_ms: self.reference_target_ms.load(),
@@ -781,11 +797,13 @@ mod tests {
         tel.output_slip_net.store(-7, Relaxed);
         tel.output_reanchors.store(1, Relaxed);
         tel.output_silence_frames.store(96, Relaxed);
+        tel.output_late_answers.store(1, Relaxed);
         let after = tel.snapshot();
         let e = OutputEvents::between(&before, &after);
         let expected = OutputEvents {
             underruns: 1,
             silence_frames: 96,
+            late_answers: 1,
             deficits: 1,
             zero_frames: 576,
             coarse_drops: 1,
@@ -807,9 +825,14 @@ mod tests {
         let none = OutputEvents { slips: 37, slip_net: -5, ..Default::default() };
         assert_eq!(none.text(), "no underruns, zeros, drops or re-anchors; 37 slips (net -5 samples)");
         assert_eq!(OutputEvents::default().text(), "no underruns, zeros, drops or re-anchors; no slips");
+        let late = OutputEvents { underruns: 1, silence_frames: 96, late_answers: 1, ..Default::default() };
+        assert_eq!(late.text(), "1 underrun (2.0 ms of silence played, a late answer); no slips");
+        let mixed = OutputEvents { underruns: 3, silence_frames: 192, late_answers: 1, ..Default::default() };
+        assert_eq!(mixed.text(), "3 underruns (4.0 ms of silence played, 1 of them a late answer); no slips");
         let some = OutputEvents {
             underruns: 1,
             silence_frames: 96,
+            late_answers: 0,
             deficits: 1,
             zero_frames: 576,
             coarse_drops: 2,

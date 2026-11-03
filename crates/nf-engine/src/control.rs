@@ -680,9 +680,9 @@ fn reset_telemetry(t: &Telemetry) {
     for c in [
         &t.output_slips, &t.reference_slips, &t.capture_glitches, &t.render_underruns, &t.reference_gaps, &t.stalls,
         &t.output_coarse_drops, &t.reference_coarse_drops, &t.tap_overflows, &t.output_deficits, &t.output_zero_frames,
-        &t.output_dropped_frames, &t.output_reanchors, &t.output_silence_frames, &t.publishes, &t.inference_runs, &t.inference_misses,
-        &t.inference_late, &t.inference_gaps, &t.inference_errors, &t.inference_worker_allocs, &t.inference_worker_fallbacks,
-        &t.wake_blocks[0], &t.wake_blocks[1], &t.wake_blocks[2], &t.wake_blocks[3],
+        &t.output_dropped_frames, &t.output_reanchors, &t.output_silence_frames, &t.output_late_answers, &t.publishes, &t.inference_runs,
+        &t.inference_misses, &t.inference_late, &t.inference_gaps, &t.inference_errors, &t.inference_worker_allocs,
+        &t.inference_worker_fallbacks, &t.wake_blocks[0], &t.wake_blocks[1], &t.wake_blocks[2], &t.wake_blocks[3],
     ] {
         c.store(0, Relaxed);
     }
