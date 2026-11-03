@@ -449,6 +449,25 @@ something goes wrong (engine.md, "The flight recorder"; app.md, "The flight reco
   it show. Expect a dump for the reference's first burst of short takes and one for any underrun; `--flight-audio` adds the
   WAVs (the mic is silent in these soaks, so they say little).
 
+## Soak 3 (2026-11-03, the flight recorder, e6a2624)
+The same command and conditions with `--flight`; the log is `Downloads\nf-scratch\soak-3.txt`, the dumps in
+`Downloads\nf-scratch\flight-soak-3`. Exit 6: one output underrun, at 128 s.
+- **All three soaks had their one underrun near two minutes:** 122, 110 and 128 s.
+- **The flight recorder's dump says it isn't the app.** At block 12802 the audio thread woke every 3.0 ms (the longest gap
+  in the 200 ms before 3.1 ms, no wait timed out, the slowest block 100 us), the mic was on time (its block 0.9 ms old),
+  and the output queue was full (padding 649 samples, 13.5 ms; the fill 14.5 ms against the 14 ms target). What moved was
+  the output device's own clock: 343 frames in 9.1 ms (37.5 a ms against 48), then 428 in 10.1 ms, about 3 ms held back;
+  the readout stepped from 23.5 to 26.7 ms and stayed. So VB-CABLE's render side re-syncs (its clock stalls about 3 ms)
+  about two minutes after the stream opens, as the cables' 11 ms steps elsewhere (#9) suggest. Real hardware should not do
+  this; our own driver (#19) won't.
+- **A counting quirk:** that block counted an output underrun with no silence played (`out_silence` 0) and a full queue,
+  which neither of the exclusive output's own underrun paths (a short ring, a late answer) can produce without silence.
+  To find, so a device's clock step reads as one, not as an underrun that marks the soak not clean.
+- **The echo reference:** three more dumps (bursts of short takes at 642 and 1053 s, a timeline jump at 1708 s), each with
+  the audio thread and the mic on time: cable B's loopback delivering late. 137 short takes and 3 jumps over the run.
+- **Otherwise:** readout 20.2 ms median, p95 20.6; app path 40.3 ms; 180,001 wakes of one block; 0 real-time heap
+  allocations; the output drift reading ended at -0.7 ppm (not high this time).
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.
