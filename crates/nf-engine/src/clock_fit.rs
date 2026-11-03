@@ -216,6 +216,7 @@ mod tests {
                 consumed: 480,
                 ..Default::default()
             }),
+            echo_hold: 0,
             aec_delay_ms: f32::NAN,
             aec_erle_db: f32::NAN,
             settings: ChainParams::default(),

@@ -61,6 +61,7 @@ impl ChainItem {
             mic_discarded: 0,
             mic_skipped: 0,
             reference: None,
+            echo_hold: 0,
             aec_delay_ms: 0.0,
             aec_erle_db: 0.0,
             settings: ChainParams {

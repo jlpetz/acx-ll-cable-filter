@@ -294,15 +294,16 @@ fn path(b: &ChainBlock) -> Option<f64> {
 }
 
 /// The reference's lead over `blocks` in ms: the median of the loop's low-passed lead (its readings are in the mic stamps' 0.5
-/// ms steps, and skewed; the low-pass follows the read position's jumps at once), each taken to the echo path `to`. A block
-/// whose path is a sample longer served a reference sample tapped a sample earlier, so its lead is 1/48 ms more: so a jump of
-/// the read position among them doesn't move it.
+/// ms steps, and skewed; the low-pass follows the read position's jumps at once), less the echo-path guard's hold (the loop
+/// reads a held block as captured that much later), each taken to the echo path `to`. A block whose path is a sample longer
+/// served a reference sample tapped a sample earlier, so its lead is 1/48 ms more: so a jump of the read position among them
+/// doesn't move it.
 fn lead_near(blocks: &[ChainBlock], to: f64) -> Option<f64> {
     let leads: Vec<f64> = blocks
         .iter()
         .filter_map(|b| {
             let (r, p) = (b.reference?, path(b)?);
-            r.lead_ms.is_finite().then(|| f64::from(r.lead_ms) - to_ms(p - to))
+            r.lead_ms.is_finite().then(|| f64::from(r.lead_ms) - to_ms(f64::from(b.echo_hold)) - to_ms(p - to))
         })
         .collect();
     median(&leads)
@@ -922,6 +923,7 @@ mod tests {
                         consumed: 480,
                         ..ReferenceFacts::default()
                     }),
+                    echo_hold: 0,
                     aec_delay_ms: f32::NAN,
                     aec_erle_db: f32::NAN,
                     settings: ChainParams::default(),
@@ -1353,6 +1355,7 @@ mod tests {
                         consumed: f[consumed].parse().unwrap_or(480),
                         ..ReferenceFacts::default()
                     }),
+                    echo_hold: 0,
                     aec_delay_ms: f32::NAN,
                     aec_erle_db: f32::NAN,
                     settings: ChainParams::default(),

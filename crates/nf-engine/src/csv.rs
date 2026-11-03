@@ -28,7 +28,7 @@ use crate::api::ChainBlock;
 pub(crate) const COLUMNS: &str = concat!(
     "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,",
     "ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,",
-    "consumed,owed,missing,jumped,events,aec_delay_ms,aec_erle_db,settings_changed,",
+    "consumed,owed,missing,jumped,events,echo_hold,aec_delay_ms,aec_erle_db,settings_changed,",
     "mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,",
     "out_index,out_padding,out_pending,out_fill,out_target,out_slip,out_zeros,out_dropped,out_skipped,",
     "out_underrun,out_late,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns,",
@@ -96,7 +96,7 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
         None => s.push_str(&",".repeat(REFERENCE_COLUMNS)),
     }
     let changed = last.is_some_and(|l| !b.settings.same(&l.settings));
-    let _ = write!(s, ",{},{},{}", num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
+    let _ = write!(s, ",{},{},{},{}", b.echo_hold, num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
     match &b.budget {
         Some(t) => {
             for v in [t.mic_ms, t.wait_ms, t.chain_ms, t.queue_ms, t.render_ms, t.readout_ms()] {

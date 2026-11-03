@@ -995,33 +995,41 @@ fn aec_run_in(pipe: Pipeline, rows: &[Row], sc: &EchoScene, echo_ms: f64) -> (Pi
     (p, a, r)
 }
 
-/// The echo-path guard (echo_guard.rs) offline, through AEC3: steady delivery on 10 ms periods (a lead target of 12 ms),
-/// the echo scene without the near voice, for 100 s. An echo 5 ms behind the loopback's tap comes before its reference:
-/// without the guard AEC3 can't place it (its ERLE stays low); with it, a trial holds the mic 10 ms (a 2 ms lead), AEC3
-/// cancels, and the hold stays. An echo at 40 ms AEC3 places: no hold. Then the same with the near voice in its turns,
-/// printed. `--ignored --nocapture`; 100 s of AEC3 a run, so in release.
+/// The echo-path guard (echo_guard.rs) offline, through AEC3, with the echo scene. Steady delivery on 10 ms periods (a lead
+/// target of 12 ms), 100 s: an echo 5 ms behind the loopback's tap comes before its reference, and without the guard AEC3
+/// can't place it (its ERLE stays low); with it, a one-period trial (a 2 ms lead) cancels it, and the hold stays. An echo at
+/// 40 ms AEC3 places: no hold. Then the loopback delivered 8 ms later (a target near 22 ms), 160 s: an echo at 15 ms needs
+/// one period, one at 5 ms two (the first trial fails, the second holds). Asserted without the near voice; with it in its
+/// turns, printed. `--ignored --nocapture`; minutes of AEC3, so in release.
 #[test]
 #[ignore]
 fn the_echo_path_guard_holds_the_mic_for_an_early_echo() {
-    const SECS: f64 = 100.0;
-    let rows = scene_rows(&Scene::new(Delivery::Steady, Delivery::Steady, 30.0), SECS);
-    let len = (SECS as usize + 2) * 48_000;
     // AEC3's ERLE over the last 20 s (the mean of its finite reports).
     let late_erle = |a: &AecProc| {
         let v: Vec<f32> = a.stats.iter().rev().take(2_000).map(|s| s.erle_db).filter(|v| v.is_finite()).collect();
         v.iter().sum::<f32>() / v.len().max(1) as f32
     };
+    let steady = Scene::new(Delivery::Steady, Delivery::Steady, 30.0);
+    let later = steady.at(Ev::LoopbackLater(8.0), 0.0);
+    // The scene, its length, the echo's delay, and the hold it should end with (ms).
+    #[rustfmt::skip]
+    let cases = [
+        ("steady", &steady, 100.0, 5.0, 10.0), ("steady", &steady, 100.0, 40.0, 0.0),
+        ("later", &later, 160.0, 15.0, 10.0), ("later", &later, 160.0, 5.0, 20.0),
+    ];
     let mut failed = Vec::new();
-    for near in [false, true] {
-        let sc = EchoScene::new(len, near, None);
-        for echo_ms in [5.0, 40.0] {
+    for (name, scene, secs, echo_ms, want_ms) in cases {
+        let rows = scene_rows(scene, secs);
+        let len = (secs as usize + 2) * 48_000;
+        for near in [false, true] {
+            let sc = EchoScene::new(len, near, None);
             for guard in [false, true] {
                 let pipe = if guard { cable_pipe().with_echo_guard() } else { cable_pipe() };
                 let (p, a, r) = aec_run_in(pipe, &rows, &sc, echo_ms);
                 let (hold, erle) = (p.hold() as f64 / 48.0, late_erle(&a));
                 eprintln!(
-                    "  near {near:5}, echo {echo_ms:2.0} ms, guard {guard:5}: hold {hold:4.1} ms, target {:4.1} ms; AEC3's ERLE over the last \
-                     20 s {erle:5.1} dB, its delay {:3.0} ms; far only {:5.1} dB; reference gaps {}, drops {}",
+                    "  {name:6} near {near:5}, echo {echo_ms:2.0} ms, guard {guard:5}: hold {hold:4.1} ms, target {:4.1} ms; AEC3's \
+                     ERLE over the last 20 s {erle:5.1} dB, its delay {:3.0} ms; far only {:5.1} dB; reference gaps {}, drops {}",
                     p.ref_target() as f64 / 48.0,
                     r.delay,
                     r.far_only,
@@ -1031,9 +1039,9 @@ fn the_echo_path_guard_holds_the_mic_for_an_early_echo() {
                 if near {
                     continue;
                 }
-                let want_hold = guard && echo_ms < 10.0;
-                if (hold > 0.0) != want_hold || (want_hold && erle < LOW_ERLE_DB) {
-                    failed.push(format!("echo {echo_ms} ms, guard {guard}: hold {hold} ms, ERLE {erle} dB"));
+                let want = if guard { want_ms } else { 0.0 };
+                if (hold - want).abs() > 0.01 || (want > 0.0 && erle < LOW_ERLE_DB) {
+                    failed.push(format!("{name}, echo {echo_ms} ms, guard {guard}: hold {hold} ms (want {want}), ERLE {erle} dB"));
                 }
             }
         }

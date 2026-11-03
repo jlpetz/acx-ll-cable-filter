@@ -498,8 +498,8 @@ handling. Our reading (the owner's go for items 2 and 3, 2026-11-03):
     shrink). It would also switch every app on the speakers to the small period (CPU, power, and glitches on a PC with
     bad DPC latency), and the rig can't tell (its echo delay is synthetic).
   - (b) A mic wait only when the echo path is shorter than the lead: the echo-path guard (TODO 10's detail; engine.md),
-    built 2026-11-03. It measures rather than predicts, so it holds whatever the stamps mean. Offline a 5 ms echo's
-    ERLE went from 6.9 to 19.3 dB; the rig's live check waits for the owner's RDP session.
+    built 2026-11-03. It measures rather than predicts, so it holds whatever the stamps mean. Live on the cables
+    (2026-11-04) a 5 ms echo's far-only turns went from 22 to 59 dB at a 20 ms wait, a 10 ms echo's to 59 dB at 10 ms.
 
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI

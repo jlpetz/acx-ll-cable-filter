@@ -120,7 +120,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - CLAP-shaped (#17, the owner's call): the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: the echo-path guard (built 2026-11-03, ours: the mic waits only for an echo that comes before its reference, on a trial; offline a 5 ms echo's ERLE 6.9 to 19.3 dB) to check live on the rig (`quality --test echo --echo-delay 5`, `10`, and `--no-echo-guard`), then on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2.
+**Next**: the echo-path guard (ours, 2026-11-03/04: the mic waits whole loopback periods only for an echo that comes before its reference, on staged trials; live a 5 ms echo's far-only turns 22 to 59 dB at a 20 ms wait, 10 ms at a 10 ms wait) on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2.
 **Detail**: `doc/todo/10-aec.md`
 
 ---
@@ -152,7 +152,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Echo-path delay is measured, not predicted: loopback stamps are mix time, not play-out, and AEC3 mostly ignores `set_stream_delay_ms`. Log engine period, RAW mode and cable settings with every result.
 - Latency options (2026-11-01), the defaults since 2026-11-02 (owner: the lowest latency by default, with switches to turn each off, e.g. for recording the raw mic): exclusive output (2 ms), exclusive mic (3.33 ms), adaptive output target. Readout 64.9 ms shared, 34.6 exclusive output, 24.8 both, 18.1 both + adaptive (app path 28 ms with the chain); no glitches in 30-60 s takes.
 - Three 30-minute soaks (2026-11-02/03): readout about 20 ms, one output underrun each at 110-128 s; the flight recorder (e6a2624) shows VB-CABLE's output clock stalling about 3 ms then, with the thread, the mic and our queue fine. The first walk waits for a second window since b53a965.
-**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03; for real hardware, late answers told from clock noise, 3ca7d3f, and the exclusive period guard, 2026-11-03) the echo-path guard's live check (#10; the keep-alive at a small period dropped: it shortens the speakers' own path as much); thresholds and layer 3 on real hardware in phase 2.
+**Next**: (soak 3's counting quirk fixed, 4f30e5e; no engine changes for VB-CABLE's own quirks, the owner, 2026-11-03; for real hardware, late answers told from clock noise, 3ca7d3f, and the exclusive period guard, 2026-11-03) the echo-path guard checked live on the cables (#10; the keep-alive at a small period dropped: it shortens the speakers' own path as much); thresholds and layer 3 on real hardware in phase 2.
 **Detail**: `doc/todo/13-latency-measurement.md`
 
 ---

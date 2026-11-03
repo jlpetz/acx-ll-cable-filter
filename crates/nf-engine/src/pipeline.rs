@@ -27,7 +27,7 @@ use rtrb::Producer;
 
 use crate::api::{ChainBlock, OutputFacts, ThreadFacts};
 use crate::budget::{self, BudgetStats, WakeLog};
-use crate::echo_guard::{self, EchoGuard};
+use crate::echo_guard::EchoGuard;
 use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
 use crate::recorder::ChainTx;
@@ -656,7 +656,15 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         &mut self, proc: &mut P, sink: &mut S, ticks: &mut T, tel: &Telemetry, readout: bool,
     ) -> Result<bool, Hr> {
         if self.hold != self.hold_wanted {
+            let grew = self.hold_wanted > self.hold;
             self.move_hold();
+            if grew {
+                // The hold's silence goes to the device now: the next block comes only after the hold, and left pending
+                // it would wait for that block while the device ran dry (live, a 20 ms hold over a 14 ms queue played
+                // 6.9 ms of silence of its own).
+                let padding = sink.padding()?;
+                self.flush_pending(sink, padding)?;
+            }
         }
         if self.mic.len() < BLOCK + self.hold {
             return Ok(false);
@@ -815,6 +823,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             mic_discarded: discarded,
             mic_skipped: skipped,
             reference: self.has_reference.then(|| self.reference.facts()),
+            echo_hold: self.hold as u32,
             aec_delay_ms: aec.map_or(f32::NAN, |a| a.echo_delay_ms),
             aec_erle_db: aec.map_or(f32::NAN, |a| a.erle_db),
             settings: proc.params(),
@@ -1199,9 +1208,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let aec = proc.aec_stats();
         let ran = std::mem::take(&mut self.aec_blocks) * 10 >= 9 * STATS_BLOCKS as u32;
         if let Some(g) = self.echo_guard.as_mut() {
-            let target = self.reference.target();
-            let lead = if self.has_reference { g.second(aec.filter(|_| ran), target) } else { None };
-            self.hold_wanted = echo_guard::hold_for(lead, target);
+            let (target, period) = (self.reference.target(), self.reference.period());
+            self.hold_wanted = if self.has_reference { g.second(aec.filter(|_| ran), target, period) } else { 0 };
             tel.echo_correlation.store(g.correlation);
         }
         let hold_ms = self.hold_wanted as f32 * (1000.0 / SAMPLE_RATE as f32);
@@ -1709,11 +1717,11 @@ mod tests {
         }
     }
 
-    /// The echo-path guard's hold (echo_guard.rs), moved by hand on steady, index-coded streams: a 5 ms hold queues 5 ms of
-    /// silence on the output (the next block comes that much later, and nothing runs short), and from that block on the
-    /// reference served is 240 samples newer against the mic, with no gap, slip or jump of the loop; letting it go drops
-    /// 240 mic samples, and the reference goes on as before against the mic. Published, the lead and its target are the
-    /// echo path's: less the hold.
+    /// The echo-path guard's hold (echo_guard.rs), moved by hand on steady, index-coded streams: a hold of a loopback period
+    /// (10 ms) queues 10 ms of silence on the output (the next block comes that much later, and nothing runs short), and from
+    /// that block on the reference served is 480 samples newer against the mic, with no gap, slip or jump of the loop;
+    /// letting it go drops 480 mic samples, and the reference goes on as before against the mic. Published, the lead and its
+    /// target are the echo path's: less the hold.
     #[test]
     fn the_echo_hold_moves_the_reference_against_the_mic() {
         let mut p = pipe(true);
@@ -1729,7 +1737,7 @@ mod tests {
         push_tapped(&mut lb, 0, ran, t_lb);
         for w in 0..60usize {
             p.hold_wanted = match w {
-                20..40 => 240,
+                20..40 => 480,
                 _ => 0,
             };
             let now = t + (w + 1) as f64 * 100_000.0 + 5_000.0;
@@ -1738,14 +1746,19 @@ mod tests {
             sink.advance(480.0, 100_000.0);
             p.drain_mic(&mut mic, now).unwrap();
             p.drain_reference(&mut lb, now).unwrap();
+            let before = sink.written.len();
             while p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap() {}
             if w == 0 {
                 started = sink.written.len();
             }
+            if w == 20 {
+                // The hold's start: no block, and its silence on the device at once (the next block comes a period later).
+                assert_eq!(sink.written[before..], [0.0; 480], "the hold's silence, written now");
+            }
             if w == 30 {
                 p.publish_second(&tel, &spy, 0, 0, 0);
-                assert!((tel.echo_hold_ms.load() - 5.0).abs() < 1e-3);
-                assert!((tel.reference_target_ms.load() - 7.0).abs() < 1e-3, "{}", tel.reference_target_ms.load());
+                assert!((tel.echo_hold_ms.load() - 10.0).abs() < 1e-3);
+                assert!((tel.reference_target_ms.load() - 2.0).abs() < 1e-3, "{}", tel.reference_target_ms.load());
             }
         }
         // The echo path in samples a block (the reference's index less the mic's), and the mic's steps between blocks.
@@ -1758,13 +1771,13 @@ mod tests {
             }
         }
         let c = (ran - 576) as f32;
-        assert_eq!(runs.iter().map(|r| r.0).collect::<Vec<_>>(), [c, c + 240.0, c], "{runs:?}");
+        assert_eq!(runs.iter().map(|r| r.0).collect::<Vec<_>>(), [c, c + 480.0, c], "{runs:?}");
         let steps: Vec<f32> = spy.0.windows(2).map(|w| w[1].0 - w[0].0).filter(|&s| s != 480.0).collect();
-        assert_eq!(steps, [720.0], "the mic jumps once, where the hold goes");
+        assert_eq!(steps, [960.0], "the mic jumps once, where the hold goes");
         let c = p.counters;
         assert_eq!((c.reference_gaps, c.reference_drops, c.reference_slips, c.render_underruns, c.output_deficits), (0, 0, 0, 0, 0));
         let zeros = sink.written[started..].iter().filter(|&&v| v == 0.0).count();
-        assert_eq!(zeros, 240, "the hold's start, as silence");
+        assert_eq!(zeros, 480, "the hold's start, as silence");
     }
 
     #[test]

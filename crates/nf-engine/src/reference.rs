@@ -266,6 +266,11 @@ impl Reference {
         self.target
     }
 
+    /// The loopback's period, in samples.
+    pub(crate) fn period(&self) -> usize {
+        self.period as usize
+    }
+
     pub(crate) fn target_ms(&self) -> f32 {
         (self.target * 1000.0 / SAMPLE_RATE as f64) as f32
     }

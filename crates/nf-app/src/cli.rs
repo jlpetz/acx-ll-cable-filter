@@ -966,8 +966,8 @@ other side, which stays shared whatever these say.
                      the speakers' sound reaches the mic before the canceller has it (speakers
                      faster than the reference's lead) and so echoes through, the filter holds
                      the mic until it does: on a trial first, kept only if it cancels the
-                     echo, trimmed to what the echo needs. It costs that wait in latency (up
-                     to 16 ms) only then, and a short gap where it starts and ends
+                     echo, the shortest wait that does. It costs that wait in latency (up
+                     to 20 ms) only then, and a short gap where it starts and ends
   A device that refuses exclusive mode runs in shared mode, with a note saying why, what it
   costs and how to fix it.
   --settle           (latency, quality) Wait for the adaptive output target to come down

@@ -688,6 +688,10 @@ pub struct ChainBlock {
     pub mic_skipped: i64,
     /// What the reference's timeline did at this block; `None` without a reference (or after it failed and was dropped).
     pub reference: Option<ReferenceFacts>,
+    /// The echo-path guard's mic hold at this block, in samples (0 without one; engine.md, "The echo-path guard"). The
+    /// reference's lead and target in [`Self::reference`] are its loop's, which reads the block as captured this much later:
+    /// the lead the echo path sees is theirs less this.
+    pub echo_hold: u32,
     /// AEC3's own estimates after this block: the echo delay it found and its ERLE (NaN while it has none, or without AEC).
     pub aec_delay_ms: f32,
     pub aec_erle_db: f32,

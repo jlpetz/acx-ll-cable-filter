@@ -273,8 +273,8 @@ pub struct IoConfig {
     pub adaptive_output: bool,
     /// The echo-path guard (nf-engine `echo_guard.rs`): with echo cancelling on, when an echo seen comes before its reference
     /// (speakers whose output latency is under the reference's lead), hold the mic back until the reference is in time,
-    /// on a trial first, and only as long as needed. Costs the hold in latency (up to 16 ms) only then. On by default
-    /// (ours, 2026-11-03).
+    /// on a trial first, and only as long as needed. Costs the hold in latency (whole loopback periods: 10-20 ms on most
+    /// speakers) only then. On by default (ours, 2026-11-03).
     pub echo_guard: bool,
 }
 

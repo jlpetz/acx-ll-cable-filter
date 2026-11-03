@@ -630,6 +630,9 @@ pub(crate) fn echo_guard_line((was, was_ms): (u8, f32), (is, ms): (u8, f32)) -> 
             format!("an echo reaches the mic before its reference, and AEC3 can't cancel it: the mic waits {ms:.1} ms, on a trial")
         }
         (TRIAL, HELD) => format!("the trial cancelled the echo: the mic keeps waiting {ms:.1} ms"),
+        (TRIAL, TRIAL) if (ms - was_ms).abs() >= 0.05 => {
+            format!("the trial didn't cancel the echo: the mic waits {ms:.1} ms now (it was {was_ms:.1}), on a trial")
+        }
         (TRIAL, TRIAL) | (TRIAL, 0) | (HELD, 0) => return None,
         (TRIAL, _) => "the trial didn't cancel the echo: the mic's wait goes, and the next trial waits".to_owned(),
         (HELD, HELD) if (ms - was_ms).abs() >= 0.05 => format!("the mic's wait is now {ms:.1} ms (it was {was_ms:.1})"),
@@ -1725,6 +1728,8 @@ mod tests {
         let trial = line((W, 0.0), (T, 10.0)).unwrap();
         assert_eq!(trial, "an echo reaches the mic before its reference, and AEC3 can't cancel it: the mic waits 10.0 ms, on a trial");
         assert_eq!(line((T, 10.0), (T, 10.0)), None);
+        let up = "the trial didn't cancel the echo: the mic waits 20.0 ms now (it was 10.0), on a trial";
+        assert_eq!(line((T, 10.0), (T, 20.0)).unwrap(), up);
         assert_eq!(line((T, 10.0), (H, 10.0)).unwrap(), "the trial cancelled the echo: the mic keeps waiting 10.0 ms");
         assert!(line((T, 10.0), (C, 0.0)).unwrap().starts_with("the trial didn't cancel the echo"));
         assert_eq!(line((H, 16.3), (H, 8.3)).unwrap(), "the mic's wait is now 8.3 ms (it was 16.3)");

@@ -209,7 +209,7 @@ reference only when the echo path is that short, which costs that wait in latenc
 
 With the exclusive mic (the default since 2026-11-02, #13; `--no-exclusive-mic` or the window's "Exclusive microphone" switch turns it off: mic blocks reach the app 0.8 ms after capture instead of about 16) the lead rose to 18.3 ms: each mic block is processed before the loopback, still on its 10 ms shared period, has delivered as recent a reference. The floor rises by as much, to about 20 ms (`quality::echo_delay::EXCLUSIVE_MIC_ECHO_FLOOR_MS`), and applies by default now: speakers whose echo comes back sooner than that after the mix echo through more (the window's switch line says to try it off when echo gets through with echo cancelling on; whether the exclusive mic should yield to shared when AEC is on is open, ours to propose). At 25 ms (the echo test's default, over the floor) it cancelled a median 54.5 dB a far-only turn.
 
-## The echo-path guard (built 2026-11-03, ours)
+## The echo-path guard (built 2026-11-03, ours; live on the cables 2026-11-03/04)
 The floor above is the lead: an echo that reaches the mic sooner after its tap comes before its reference, and AEC3 can't
 place it. The two ways down were a smaller loopback period or a mic wait only when the path is that short. The first is
 dropped (#13's detail: the speakers' own output path shortens about as much as the loopback's packets, so the margin
@@ -218,24 +218,40 @@ echo-path guard (`echo_guard.rs`; engine.md, "The echo-path guard"; `io.echo_gua
 - It holds the mic back (each block processed later, read by the reference loop as captured later, so the reference served
   is that much newer) only for an echo seen that AEC3 can't place: the mic's energy envelope following the far end's
   (correlation 0.4 or more over 5 s; headphones show none), AEC3's ERLE under 10 dB and its delay estimate 0 or 4 ms.
-- On a trial first: the hold that brings the lead to 2 ms, kept only if AEC3's ERLE then rises 4 dB to 10 or more; trimmed
-  once to what AEC3's delay estimate says the echo needs, plus 4 ms; let go when the echo goes or the hold stops helping.
-- Why a trial: AEC3 reads its delay in 4 ms steps less its headroom, so a short echo it does place reads 0 as well; with
-  no echo at all (headphones) the ERLE is low too. Only the ERLE after a trial tells.
-- Offline (`the_echo_path_guard_holds_the_mic_for_an_early_echo`, steady 10 ms delivery, a 12 ms lead, 100 s of the echo
-  scene through AEC3), AEC3's ERLE over the last 20 s:
+- In whole loopback periods, on trials, smallest first: one period, then two if one didn't help, while the effective lead
+  is over 2 ms. A trial keeps its hold when half its judged seconds have AEC3's ERLE 4 dB up and at 10 or more, or AEC3
+  placing the echo (its delay estimate over 4 ms). Let go when the echo goes, or when it stops helping past the last hold.
+- Why trials: AEC3 reads its delay in 4 ms steps less its headroom, so a short echo it does place reads 0 as well; with no
+  echo at all (headphones) the ERLE is low too. Only what AEC3 does under a hold tells.
 
-| Echo after the tap | Guard off | Guard on (hold) |
-|---|---|---|
-| 5 ms, near voice silent | 6.9 dB | 19.3 dB (10 ms) |
-| 40 ms, near voice silent | 19.4 dB | 19.4 dB (none) |
-| 5 ms, near voice in its turns | 6.8 dB | 15.9 dB (10 ms) |
-| 40 ms, near voice in its turns | 15.5 dB | 15.5 dB (none) |
+Offline (`the_echo_path_guard_holds_the_mic_for_an_early_echo`, the echo scene through AEC3), its ERLE over the last 20 s:
 
-  AEC3's delay estimate read 24 ms for the 40 ms echo's 28 ms past the lead: it errs short, which the trim's margin
-  allows for.
-- Live: not yet. The rig takes are scripted (`quality --test echo --echo-delay 5`, the same with `--no-echo-guard`, then
-  10 and 25 ms, 150 s each); on 2026-11-03 the owner's RDP session was disconnected, so the session had no audio endpoints.
+| Delivery (lead) | Echo after the tap | Guard off | Guard on (hold) |
+|---|---|---|---|
+| steady (12 ms) | 5 ms | 6.9 dB | 19.3 dB (10 ms) |
+| steady (12 ms) | 40 ms | 19.4 dB | 19.4 dB (none) |
+| loopback 8 ms later (20.9 ms) | 15 ms | 6.9 dB | 14.3 dB (10 ms) |
+| loopback 8 ms later (20.9 ms) | 5 ms | 5.5 dB | 13.5 dB (20 ms: the first trial failed) |
+
+With the near voice in its turns the same holds, 2-3 dB lower. AEC3's delay estimate read 24 ms for the 40 ms echo's 28
+ms past the lead (it errs short).
+
+Live (`quality --test echo --echo-delay D`, 150 s, the exclusive mic, an 18 ms lead), three rounds:
+1. **The first version** (a hold by the sample to a 2 ms lead, then a trim): 5 ms held 21.4 ms, far-only turns 58.0 dB
+   median against 22.3 without the guard, but with 62 reference gaps after the hold; 10 ms held and let go (126 gaps,
+   AEC3's ERLE crashed to 0); 25 ms no trial. Two faults showed. The hold (754 samples, 15.7 ms) wasn't whole loopback
+   periods, so at that take's phase it brought one 480-sample packet more by the take, not two: every take 130 samples
+   short until the reference's target rose 5.7 ms. And its silence waited in the pending queue for the next block, 20 ms
+   on, while the exclusive output's 14 ms ran dry (6.9 ms of silence played).
+2. **Whole periods, the silence written at once:** 5 ms held 20 ms, 0 gaps, 0 underruns, far-only 58.8 dB median (55-62 once
+   held). 10 ms held and let go twice, the second time cleanly: AEC3, the echo 11.7 ms after its reference, cancelled it at
+   a delay of 0 (ERLE 9-11), then 13 s on moved its delay to 8 ms and started its filter over (ERLE 0) in the trial's
+   judging, which took that for failure. (In one of the two the rig also slipped 69 ms at 45 s.)
+3. **Staged, placing counts:** 5 ms, a 10 ms trial failed and a 20 ms one held (52-61 dB turns once held, 1 gap, 0
+   underruns); 10 ms, a 10 ms trial held (59.0 dB median, as the 25 ms take's 59.1; 0 gaps, 0 underruns); 25 ms no trial.
+
+Left: the quality report's echo-delay line can quote a turn's lead from before the hold when the hold changes mid-take
+(the turns measured are right); real speakers in phase 2 (TODO 13).
 
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).
