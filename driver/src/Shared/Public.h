@@ -66,7 +66,7 @@ typedef struct _LOOPBACK_FORMAT {
 } LOOPBACK_FORMAT, *PLOOPBACK_FORMAT;
 
 // The streams open on one circuit (EvtCircuitCreateStream to the stream engine's destruction) in one format. Each circuit
-// lists two formats, so two slots a circuit hold every combination it can have open at once.
+// lists two formats, so two slots per circuit cover every format it can have open at once.
 #define LOOPBACK_OPEN_FORMATS 2
 
 typedef struct _LOOPBACK_OPEN {
@@ -94,7 +94,7 @@ typedef struct _LOOPBACK_RING {
     // Counters for the spike, read with the debugger.
     ULONG           IdlePackets;            // capture packets zeroed (all or the end) with no render stream running
     ULONG           MismatchPackets;        // capture packets zeroed because the render and capture formats differ
-    ULONG           RefusedOpens;           // stream creations refused: the other circuit had a stream open in another format
+    ULONG           RefusedOpens;           // stream creations refused (LoopbackStreamOpen): another format open on the other circuit
     ULONG           UnderrunPackets;        // capture packets zeroed at the end because the render audio was not there yet
     ULONGLONG       UnderrunFrames;
     ULONG           OverrunPackets;         // capture packets zeroed at the start because the ring had already overwritten them
