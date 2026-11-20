@@ -22,11 +22,20 @@ the two ends never drift and need no fill control. The render pass copies the ne
 (SetRenderPacket), else the one completing; the capture pass reads one packet a fixed 1 ms lag behind. Both endpoints offer
 48 kHz stereo with float32 first and signed 24-in-32 PCM second. On the Server 2025 spike Windows stored float32 on both
 endpoints and the filter opened exclusive float output. Float32 alone left both interfaces disabled. The loopback copies
-matching formats and emits silence if the two streams negotiate different formats. The [format validation checklist](../doc/todo/19-spike-2026-11-20.md#format-validation)
-covers the integer fallback and Windows 11. The sample's tone, WAV reader and
-SaveData are no longer called. Two of the sample's stream-engine bugs are fixed: UpdatePosition subtracted the glitch
-adjustment (time) from a byte position, and let the position pass the packet in progress (a Pause could then stall the
-next Run's timer for about 111 days); and the first capture packet of a run reported a QPC of 0.
+raw bytes between matching formats only, so a stream is refused at creation (STATUS_NOT_SUPPORTED, counted in
+`RefusedOpens`) while the other endpoint has a stream open in a different format, and its client can retry with that
+format. Each circuit's open formats are recorded in the ring under its lock, so the check and the record are one step.
+The capture side's zero-fill (`MismatchPackets`) stays as the fallback, e.g. for a closed render run's tail read in
+another format. The [format validation checklist](../doc/todo/19-spike-2026-11-20.md#format-validation) covers the
+integer fallback and Windows 11. The sample's tone, WAV reader and SaveData are no longer called.
+
+Three of the sample's stream-engine bugs are fixed. UpdatePosition subtracted the glitch adjustment (time) from a byte
+position, and let the position pass the packet in progress (a Pause could then stall the next Run's timer for about 111
+days). The first capture packet of a run reported a QPC of 0. And `KSCONVERT_PERFORMANCE_TIME` (ks.h) names its argument
+three times, so ScheduleNextPass and UpdatePosition read the clock three times per conversion: across a low-word wrap
+(every 2^32 ticks, about 7 minutes at 10 MHz) the words of two reads could make a time about 429 s off and stall the
+stream. Each conversion now takes one reading (`QpcToHns`), and GetPresentationPosition reports the position and its QPC
+from the same reading (the sample read the clock twice).
 
 ## Building and installing (an elevated Windows PowerShell)
 
@@ -47,3 +56,6 @@ because their x86 tools fail under VS 2026's 64-bit MSBuild (InfVerif looks for 
 `aitstatic.exe` exits 193); InfVerif runs from the WDK's x64 tools instead. From Git Bash, start PowerShell with
 `env -u PSModulePath powershell -File ...`: Git Bash's PSModulePath lists PowerShell 7's modules first, which leaves
 Windows PowerShell without its `Cert:` drive.
+
+Release x64 favours speed: both projects set `FavorSizeOrSpeed` to `Speed`, so cl.exe gets `/Ox /Ot` (the WDK's default
+was `/Ox /Os`). The .sys grew from 54,272 to 57,856 bytes (2026-11-20).
