@@ -216,8 +216,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
 - Base study (2026-10-28): start from the ACX AudioCodec sample, cut down (about 3.5-4.5k lines when done, 19-34 dev-days, an estimate), borrowing low-latency-audio's packet-size code, stream engine and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
 - Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 with the C++ workload, the Spectre libraries and the WDK extension; WDK 10.0.28000.2526 and SDK 10.0.28000.2705 (ACX 1.0/1.1, KMDF up to 1.35, inf2cat, stampinf, infverif, signtool). VB-CABLE 3.3.1.7 loads on Server 2025.
-- Spike started 2026-11-20 on its own box: KMDF 1.35 (owner), the AudioCodec sample imported (a0cccd1) and building, test-signed by `driver/scripts` (ported from TMR-MD); test signing set, the reboot pending.
-**Next**: after the reboot, `driver/scripts/Install-Driver.ps1` (check 1); then checks 2-7, the loopback latency against VB-CABLE last.
+- Spike (2026-11-20, its own box): KMDF 1.35 (owner), the AudioCodec sample (a0cccd1) test-signed by `driver/scripts` (from TMR-MD). Checks 1, 2 and 7 pass (469ca28, fb21e96): installs with two endpoints; 3.33 ms IAudioClient3 periods; a render-to-capture loopback at 12.0 ms alone against VB-CABLE's 50-62, and the filter's output through it 41-48 ms against 51-65.
+**Next**: small periods on the recording side too (a low-latency option in `latency`, and our app holding a small-period stream so Discord's follows); then checks 3-6 (float32, the ring IOCTL, an hour's soak, Driver Verifier).
 **Detail**: `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`, `doc/todo/19-spike-2026-11-20.md`
 
 ---
