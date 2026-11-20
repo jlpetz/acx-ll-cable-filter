@@ -332,7 +332,7 @@ Capture_AllocateSupportedFormats(
     UNREFERENCED_PARAMETER(CodecCapturePinCount);
 
     NTSTATUS status = STATUS_SUCCESS;
-    ACXDATAFORMAT formatPcm48000c2;
+    ACXDATAFORMAT formatFloat48000c2, formatPcm48000c2_24in32;
     ACXDATAFORMATLIST formatList;
 
     WDF_OBJECT_ATTRIBUTES attributes;
@@ -344,10 +344,17 @@ Capture_AllocateSupportedFormats(
     //
 
     //
-    // noise-filter (TODO 19): the render endpoint's one format (Render_AllocateSupportedFormats): 48 kHz 16-bit stereo, so the
-    // loopback pair matches. The jack below already maps two channels (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT).
+    // noise-filter (TODO 19): the same formats as the render endpoint (Render_AllocateSupportedFormats), stereo: the
+    // jack below already maps two channels (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT). Spike check 3: 48 kHz float32
+    // stereo first, so Windows takes it as the endpoint's device format (the shared-mode engine runs the device in
+    // float32 and the filter's exclusive output writes float with no conversion), and 24-in-32 after it. The integer
+    // format has to be there: with float32 alone the circuit's KSCATEGORY_AUDIO interfaces were never enabled and no
+    // endpoints appeared, silently (no event, the device OK; 2026-11-20). Both endpoints list the same formats in the
+    // same order, so their shared streams always match and the loopback copies raw bytes; an exclusive client that
+    // picks 24-in-32 on one end only gets zeros from the loopback (counted).
     //
-    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c2, Circuit, Device, &formatPcm48000c2));
+    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Float48000c2, Circuit, Device, &formatFloat48000c2));
+    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c2_24in32, Circuit, Device, &formatPcm48000c2_24in32));
 
     ///////////////////////////////////////////////////////////
     //
@@ -367,7 +374,8 @@ Capture_AllocateSupportedFormats(
     // The driver uses this DDI to add data formats to the raw
     // processing mode list associated with the current circuit.
     //
-    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm48000c2));
+    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatFloat48000c2));
+    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm48000c2_24in32));
 
     return status;
 }

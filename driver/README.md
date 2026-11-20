@@ -20,7 +20,10 @@ The loopback pair (spike check 7): what's played into the speaker endpoint comes
 non-paged ring on the device, under a spin lock; both streams on one QPC time line (the stream engine's own schedule), so
 the two ends never drift and need no fill control. The render pass copies the next packet once the client has released it
 (SetRenderPacket), else the one completing; the capture pass reads one packet a fixed 1 ms lag behind. Both endpoints offer
-only 48 kHz 16-bit stereo, so the formats always match (other formats would zero-fill). The sample's tone, WAV reader and
+the same two formats in the same order, 48 kHz float32 stereo and then 24-in-32 stereo, so their shared streams always match
+(mismatched formats would zero-fill). Windows takes the first as the device format, so the audio engine runs both ends in
+float32 and the filter's exclusive output writes float with no conversion. The integer format has to be listed too: with
+float32 alone, the circuits' interfaces were never enabled and no endpoints appeared (spike check 3). The sample's tone, WAV reader and
 SaveData are no longer called. Two of the sample's stream-engine bugs are fixed: UpdatePosition subtracted the glitch
 adjustment (time) from a byte position, and let the position pass the packet in progress (a Pause could then stall the
 next Run's timer for about 111 days); and the first capture packet of a run reported a QPC of 0.
@@ -35,6 +38,9 @@ next Run's timer for about 111 days); and the first capture packet of a run repo
    by inf2cat for `10_GE_X64,Server2025_X64` and signed.
 3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
 4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
+5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts
+   them back (`noise-filter devices` lists the ids). `scripts\Get-EndpointFormat.ps1` shows the device format Windows
+   stored for each endpoint.
 
 Needs Visual Studio 2026 (C++ and the WDK extension) and WDK/SDK 10.0.28000. Two WDK checks are switched off in the build
 because their x86 tools fail under VS 2026's 64-bit MSBuild (InfVerif looks for `x86\InfVerif.dll`, ApiValidator's

@@ -141,6 +141,40 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE Pcm48000c2_24in32 =
     }
 }; 
 
+
+//
+// noise-filter (TODO 19, spike check 3): 48 kHz 32-bit float stereo. The Windows audio engine works in float32, so a float
+// endpoint takes the filter's float output with no conversion, and the engine converts for any app that asks for another
+// format (16-bit, mono, another rate) in its existing pass.
+//
+static
+KSDATAFORMAT_WAVEFORMATEXTENSIBLE Float48000c2 =
+{
+    {
+        sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+        0,
+        0,
+        0,
+        STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT),
+        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+    },
+    {
+        {
+            WAVE_FORMAT_EXTENSIBLE,
+            2,
+            48000,
+            384000,
+            8,
+            32,
+            sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+        },
+        32,
+        KSAUDIO_SPEAKER_STEREO,
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+    }
+};
+
 static
 KSDATAFORMAT_WAVEFORMATEXTENSIBLE Pcm192000c2 =
 {
