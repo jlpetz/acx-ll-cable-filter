@@ -1,18 +1,26 @@
 //! nf-vmic-test: spike check 4's tool for the driver's app-fed capture ring (TODO 19; driver/README.md, "App feed").
 //!
 //! - `feed` attaches a ring and writes the test signal, paced by the driver's `read_frame`, until Ctrl+C.
-//! - `verify` records "Microphone (AudioCodec Device)" (shared mode, float32 stereo 48 kHz, RAW where offered) while a feed
-//!   runs, and passes only with proof that the app ring fed the recording: the driver's statistics just before and just after
-//!   it (the same attachment, read throughout, its frames copied), and the signal bit-exact on both channels and in order, with
-//!   silence only where the driver counted underruns (one packet's slack at each end of the recording).
-//! - `stats` prints the driver's NF_VMIC_IOCTL_STATS: the ring's counters, the loopback's, and each stream kind's timer
-//!   lateness histogram (spike check 5).
+//! - `verify` records "Microphone (AudioCodec Device)" (shared mode, float32 stereo 48 kHz, RAW where offered, or the processing
+//!   mode and IAudioClient3 period asked for) while a feed runs, and passes only with proof that the app ring fed the recording:
+//!   the driver's statistics just before and just after it (the same attachment, read throughout, its frames copied), and the
+//!   signal bit-exact on both channels and in order, with silence only where the driver counted underruns, the reader's or a
+//!   secondary stream's (one packet's slack at each end of the recording).
+//! - `stats` prints the driver's NF_VMIC_IOCTL_STATS: the ring's counters (its refusals and its secondary delivery among them),
+//!   the loopback's, and each stream kind's timer lateness histogram (spike check 5).
 //! - `kill-test` starts `feed` as a child and terminates it mid-stream K times (a capture stream reading its ring), checking
 //!   from STATS that each attachment ended through the cancel path within a bound, and that the capture timer kept running.
+//! - `open` opens an endpoint in one format (48 kHz stereo float32, or 24-in-32 PCM), exclusive or shared, prints what
+//!   IsFormatSupported and Initialize returned by name, and holds the stream for N seconds: the format-refusal tests in either
+//!   open order, and a small-period helper.
+//! - `latency` attaches a ring, feeds it at a fill target and records the capture endpoint in the same process, timing each
+//!   frame from the feed's publication to its packet's receipt (the host's QPC when GetBuffer returned, and GetBuffer's device
+//!   QPC position); [`nf_vmic::latency`] has the arithmetic.
 //!
 //! The spike's control device admits SYSTEM and Administrators only: run it elevated. The owner runs it (CLAUDE.md); no test
 //! starts it. Its feed loop prints a status line a second, which formats and allocates: a test tool's liberty, with the ring's
-//! 20 ms of fill (the default target) as the margin.
+//! 20 ms of fill (the default target) as the margin. `latency` prints nothing while it measures, and its feed and capture
+//! threads allocate nothing per block or packet once they run: their logs are sized from `--seconds` before the start.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::fmt::Display;
@@ -21,36 +29,42 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::{Acquire, Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
+use nf_vmic::latency::{self, Block, Continuity, FrameCounts, Log, Receipt, Run, Summary, Weighted};
 use nf_vmic::protocol::{
     self, KIND_CAPTURE, KIND_RENDER, LATENESS_LABELS, RingHeader, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_READING, STATS_ATTACHED,
     STATS_FORMAT_MISMATCH, STATS_LOOPBACK, STATS_READING, Stats, StreamStats,
 };
 use nf_vmic::signal::{self, CheckReport, SequenceChecker};
-use nf_vmic::{AttachError, Device, RingMemory, Writer, top_up};
+use nf_vmic::{AttachError, Attachment, Device, RingMemory, Writer, top_up};
 use wasapi::{
-    AudioCaptureClient, AudioClient, AudioClientProperties, DeviceEnumerator, Direction, Handle, SampleType, StreamMode, StreamOption,
-    WaveFormat,
+    AudioClient, AudioClientProperties, DeviceEnumerator, Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError,
+    WaveFormat, calculate_period_100ns,
 };
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, FALSE, HANDLE, TRUE};
-use windows::Win32::Media::Audio::ENDPOINT_HARDWARE_SUPPORT_VOLUME;
+use windows::Win32::Foundation::{E_FAIL, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, FALSE, HANDLE, TRUE};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::Media::Audio::{
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
+    AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
+    ENDPOINT_HARDWARE_SUPPORT_VOLUME, IAudioCaptureClient, IAudioRenderClient, WAVEFORMATEX,
+};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree};
 use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW,
     SetWaitableTimer, TIMER_ALL_ACCESS, WaitForSingleObject,
 };
-use windows::core::{BOOL, Owned, PCWSTR, w};
+use windows::core::{BOOL, HRESULT, Owned, PCWSTR, w};
 
 /// The capture endpoint the driver's ring feeds (spike check 1's name).
 const ENDPOINT: &str = "Microphone (AudioCodec Device)";
@@ -72,14 +86,18 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       paced by the driver's read_frame, until Ctrl+C (or for N seconds; default 0, until stopped). The capacity is a power
       of two from 1024 to 262144 frames (default 8192). The target is the fill kept, in frames (default 960, 20 ms): at least
       one capture packet (480 frames for a shared stream's 10 ms period), or every pass underruns; the feed ends with an error
-      once the reader's packet shows the target is below it. --start: the first frame's number.
-  nf-vmic-test verify [--seconds N] [--device NAME]
+      once the reader's packet shows the target is below it. --start: the first frame's number. A refusal says why:
+      ERROR_NOT_SUPPORTED (50) means a capture stream is open in a format other than 48 kHz float32 stereo.
+  nf-vmic-test verify [--seconds N] [--device NAME] [--mode raw|default] [--period-frames N]
       Start `feed` first, in another window, and leave it running. Then record the capture endpoint (default \"Microphone
-      (AudioCodec Device)\") in shared mode, float32 stereo 48 kHz, RAW where it's offered, for N seconds (default 10), and
-      check that the app ring fed it: the driver's statistics just before and after (the same attachment, read throughout,
-      its frames copied), and the signal bit-exact on both channels and in order, with silence only where the driver
-      underran (one packet's slack at each end). The recording starts once the stream delivers the signal (2 s at most).
-      Unmute the endpoint, and close other apps that record it (the first stream to run holds the ring).
+      (AudioCodec Device)\") in shared mode, float32 stereo 48 kHz, for N seconds (default 10), and check that the app ring
+      fed it: the driver's statistics just before and after (the same attachment, read throughout, its frames copied), and
+      the signal bit-exact on both channels and in order, with silence only where the driver underran (the reader, or a
+      secondary stream; one packet's slack at each end). The recording starts once the stream delivers the signal (2 s at
+      most). --mode: the processing mode the stream asks for (default: RAW where the endpoint offers it, else DEFAULT).
+      --period-frames: open through IAudioClient3's InitializeSharedAudioStream at that engine period, in frames (a
+      small-period helper, or a second client in another mode); the period granted is printed. Unmute the endpoint. The
+      first capture stream to run reads the ring; the driver gives the others its audio as secondary streams.
   nf-vmic-test stats
       Print the driver's statistics.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
@@ -88,8 +106,26 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       attachment ended through the cancel path within 1 s of that. This tool's own capture stream reads the endpoint
       throughout, and its timer must still run after the last kill. --no-capture leaves the reading to another capture
       client: without one the result is INCONCLUSIVE.
+  nf-vmic-test open --device NAME [--render] (--exclusive | --shared) --format float|pcm24 [--period-frames N]
+                    [--mode raw|default] [--seconds N]
+      Open the endpoint (capture, or render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32
+      PCM (a 32-bit container with 24 valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name, then
+      hold the stream running for N seconds (default 10; Ctrl+C ends it sooner): render writes silence; capture counts
+      packets and silent packets, and for float decodes the test signal and counts its codes. --period-frames: exclusive,
+      the period (default: the device's default period); shared, an IAudioClient3 engine period. --mode: the processing
+      mode (default: DEFAULT). Shared mode converts nothing, so a format other than the endpoint's mix format is refused.
+      The driver's statistics before and after are printed where its control device opens. Exit 0: it opened and ran;
+      1: it was refused (the expected result in some tests: the outcome line says which); 3: it opened but stopped running.
+  nf-vmic-test latency [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N] [--mode raw|default]
+                       [--device NAME]
+      In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192)
+      as feed does, and record the capture endpoint (shared, float32 stereo 48 kHz; --mode and --period-frames as for
+      verify). After a 1 s warm-up, for N seconds (default 10, at most 600), time every frame from the store of write_frame
+      that published it to its packet's receipt, by the host's QPC when GetBuffer returned and by GetBuffer's device QPC
+      position: p50, p90, p99 and max in ms for each, with the fill the feed found before each top-up, the underruns and
+      the period granted. Stop any other feed first (the ring must be this process's).
 
-Exit codes: 0 pass, 1 fail, 2 a usage or set-up error, 3 inconclusive.";
+Exit codes: 0 pass, 1 fail, 2 a usage or set-up error, 3 inconclusive (open: 0 opened and ran, 1 refused, 3 stopped).";
 
 fn main() -> ExitCode {
     let Ok(args) = std::env::args_os().skip(1).map(|a| a.into_string()).collect::<Result<Vec<String>, _>>() else {
@@ -102,6 +138,8 @@ fn main() -> ExitCode {
         Some("verify") => verify(rest),
         Some("stats") => stats(rest),
         Some("kill-test") => kill_test(rest),
+        Some("open") => open(rest),
+        Some("latency") => latency(rest),
         Some("help" | "-h" | "--help") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -165,9 +203,32 @@ impl<'a> Opts<'a> {
     }
 
     fn value<T: FromStr>(&self, name: &str, default: T) -> Result<T, String> {
+        Ok(self.optional(name)?.unwrap_or(default))
+    }
+
+    /// The option's value, or `None` where it isn't given.
+    fn optional<T: FromStr>(&self, name: &str) -> Result<Option<T>, String> {
         match self.values.iter().find(|(n, _)| *n == name) {
+            None => Ok(None),
+            Some((_, v)) => v.parse().map(Some).map_err(|_| format!("{name}: can't read {v:?}")),
+        }
+    }
+
+    /// `--mode raw|default`, or `default` where it isn't given.
+    fn mode(&self, default: Mode) -> Result<Mode, String> {
+        match self.optional::<String>("--mode")?.as_deref() {
             None => Ok(default),
-            Some((_, v)) => v.parse().map_err(|_| format!("{name}: can't read {v:?}")),
+            Some("raw") => Ok(Mode::Raw),
+            Some("default") => Ok(Mode::Default),
+            Some(other) => Err(format!("--mode {other:?}: raw or default")),
+        }
+    }
+
+    /// `--period-frames N`: an engine period or an exclusive period, from 1 to a second's frames.
+    fn period_frames(&self) -> Result<Option<u32>, String> {
+        match self.optional::<u32>("--period-frames")? {
+            Some(n) if n == 0 || n > protocol::SAMPLE_RATE => Err(format!("--period-frames {n}: from 1 to {}", protocol::SAMPLE_RATE)),
+            other => Ok(other),
         }
     }
 }
@@ -283,6 +344,432 @@ fn state_text(state: u32, packet_frames: u32) -> String {
 /// STATS shows a ring attached and the capture stream holding it reading it (not a format mismatch).
 fn is_reading(s: &Stats) -> bool {
     stats_state(s) == STATE_ATTACHED | STATE_READING
+}
+
+// ---- streams: formats, processing modes, HRESULTs, opening a client ----
+
+/// The processing mode a stream asks for: AUDCLNT_STREAMOPTIONS_RAW, set before Initialize, or none (DEFAULT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// RAW where the endpoint takes it, else DEFAULT (verify's, latency's and kill-test's default).
+    RawWhereOffered,
+    Raw,
+    Default,
+}
+
+/// A stream's sample format: 48 kHz stereo, eight bytes a frame (`protocol::FRAME_BYTES`) either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    /// IEEE float32: the ring's format, and the endpoints' device format (spike check 3).
+    Float,
+    /// Signed PCM with 24 valid bits in a 32-bit container (the sample in the high three bytes): the endpoints' second format.
+    Pcm24,
+}
+
+impl Format {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "float" => Ok(Self::Float),
+            "pcm24" => Ok(Self::Pcm24),
+            _ => Err(format!("--format {s:?}: float or pcm24")),
+        }
+    }
+
+    /// The format as a WAVEFORMATEXTENSIBLE, front left and right.
+    fn wave(self) -> WaveFormat {
+        let rate = protocol::SAMPLE_RATE as usize;
+        match self {
+            Self::Float => WaveFormat::new(32, 32, &SampleType::Float, rate, 2, None),
+            Self::Pcm24 => WaveFormat::new(32, 24, &SampleType::Int, rate, 2, None),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Float => "48 kHz stereo float32",
+            Self::Pcm24 => "48 kHz stereo 24-in-32 PCM",
+        }
+    }
+}
+
+/// How a stream is opened (always event-driven).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamSpec {
+    exclusive: bool,
+    format: Format,
+    /// Exclusive: the period, in frames (default: the device's default period). Shared: the engine period asked of
+    /// IAudioClient3::InitializeSharedAudioStream (default: IAudioClient::Initialize, at the engine's period).
+    period_frames: Option<u32>,
+    mode: Mode,
+}
+
+impl StreamSpec {
+    /// verify's, kill-test's and latency's stream: shared float32 (the mix format, checked first), RAW where offered.
+    const SHARED_FLOAT: Self = Self { exclusive: false, format: Format::Float, period_frames: None, mode: Mode::RawWhereOffered };
+
+    fn describe(&self) -> String {
+        let mode = match self.mode {
+            Mode::RawWhereOffered => "RAW where offered",
+            Mode::Raw => "RAW",
+            Mode::Default => "DEFAULT mode",
+        };
+        let period = match (self.exclusive, self.period_frames) {
+            (true, Some(n)) => format!("a {n}-frame ({:.2} ms) period", ms(u64::from(n))),
+            (true, None) => "the device's default period".into(),
+            (false, Some(n)) => format!("an IAudioClient3 engine period of {n} frames ({:.2} ms)", ms(u64::from(n))),
+            (false, None) => "the engine's period".into(),
+        };
+        format!("{}, {}, {mode}, {period}", if self.exclusive { "exclusive" } else { "shared" }, self.format.name())
+    }
+}
+
+/// A shared stream's buffer: 100 ms (a reader that only has to keep up, not be quick).
+const SHARED_BUFFER_HNS: i64 = 1_000_000;
+
+/// QueryPerformanceCounter, now (ticks).
+fn qpc_now() -> u64 {
+    let mut t = 0i64;
+    // SAFETY: writes the counter to `t`; it can't fail on Windows XP and later.
+    let _ = unsafe { QueryPerformanceCounter(&mut t) };
+    t as u64
+}
+
+/// QueryPerformanceCounter's frequency (ticks a second; fixed at boot).
+fn qpc_frequency() -> u64 {
+    let mut f = 0i64;
+    // SAFETY: writes the frequency to `f`; it can't fail on Windows XP and later.
+    let _ = unsafe { QueryPerformanceFrequency(&mut f) };
+    (f as u64).max(1)
+}
+
+/// HRESULTs by name: the ones WASAPI's calls return, and HRESULT_FROM_WIN32 and HRESULT_FROM_NT of the errors a driver's
+/// refusal is likely to surface as.
+mod hresult {
+    use windows::Win32::Foundation::{
+        E_ABORT, E_ACCESSDENIED, E_FAIL, E_HANDLE, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, E_UNEXPECTED,
+        ERROR_BUSY, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INVALID_FUNCTION, ERROR_NO_SYSTEM_RESOURCES,
+        ERROR_NOT_FOUND, ERROR_NOT_READY, ERROR_NOT_SUPPORTED, NTSTATUS, S_FALSE, S_OK, STATUS_DEVICE_BUSY, STATUS_DEVICE_REMOVED,
+        STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
+        STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, WIN32_ERROR,
+    };
+    use windows::Win32::Media::Audio::{
+        AUDCLNT_E_ALREADY_INITIALIZED, AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL, AUDCLNT_E_BUFFER_ERROR, AUDCLNT_E_BUFFER_OPERATION_PENDING,
+        AUDCLNT_E_BUFFER_SIZE_ERROR, AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, AUDCLNT_E_BUFFER_TOO_LARGE, AUDCLNT_E_CPUUSAGE_EXCEEDED,
+        AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED, AUDCLNT_E_ENGINE_FORMAT_LOCKED,
+        AUDCLNT_E_ENGINE_PERIODICITY_LOCKED, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED, AUDCLNT_E_EVENTHANDLE_NOT_SET,
+        AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED, AUDCLNT_E_EXCLUSIVE_MODE_ONLY, AUDCLNT_E_INCORRECT_BUFFER_SIZE,
+        AUDCLNT_E_INVALID_DEVICE_PERIOD, AUDCLNT_E_INVALID_SIZE, AUDCLNT_E_INVALID_STREAM_FLAG, AUDCLNT_E_NOT_INITIALIZED,
+        AUDCLNT_E_NOT_STOPPED, AUDCLNT_E_OUT_OF_ORDER, AUDCLNT_E_RAW_MODE_UNSUPPORTED, AUDCLNT_E_RESOURCES_INVALIDATED,
+        AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_THREAD_NOT_REGISTERED, AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_E_WRONG_ENDPOINT_TYPE,
+        AUDCLNT_S_BUFFER_EMPTY, AUDCLNT_S_POSITION_STALLED, AUDCLNT_S_THREAD_ALREADY_REGISTERED,
+    };
+    use windows::core::HRESULT;
+
+    #[rustfmt::skip]
+    pub(super) const NAMES: [(HRESULT, &str); 50] = [
+        (S_OK, "S_OK"),
+        (S_FALSE, "S_FALSE"),
+        (AUDCLNT_S_BUFFER_EMPTY, "AUDCLNT_S_BUFFER_EMPTY"),
+        (AUDCLNT_S_THREAD_ALREADY_REGISTERED, "AUDCLNT_S_THREAD_ALREADY_REGISTERED"),
+        (AUDCLNT_S_POSITION_STALLED, "AUDCLNT_S_POSITION_STALLED"),
+        (AUDCLNT_E_NOT_INITIALIZED, "AUDCLNT_E_NOT_INITIALIZED"),
+        (AUDCLNT_E_ALREADY_INITIALIZED, "AUDCLNT_E_ALREADY_INITIALIZED"),
+        (AUDCLNT_E_WRONG_ENDPOINT_TYPE, "AUDCLNT_E_WRONG_ENDPOINT_TYPE"),
+        (AUDCLNT_E_DEVICE_INVALIDATED, "AUDCLNT_E_DEVICE_INVALIDATED"),
+        (AUDCLNT_E_NOT_STOPPED, "AUDCLNT_E_NOT_STOPPED"),
+        (AUDCLNT_E_BUFFER_TOO_LARGE, "AUDCLNT_E_BUFFER_TOO_LARGE"),
+        (AUDCLNT_E_OUT_OF_ORDER, "AUDCLNT_E_OUT_OF_ORDER"),
+        (AUDCLNT_E_UNSUPPORTED_FORMAT, "AUDCLNT_E_UNSUPPORTED_FORMAT"),
+        (AUDCLNT_E_INVALID_SIZE, "AUDCLNT_E_INVALID_SIZE"),
+        (AUDCLNT_E_DEVICE_IN_USE, "AUDCLNT_E_DEVICE_IN_USE"),
+        (AUDCLNT_E_BUFFER_OPERATION_PENDING, "AUDCLNT_E_BUFFER_OPERATION_PENDING"),
+        (AUDCLNT_E_THREAD_NOT_REGISTERED, "AUDCLNT_E_THREAD_NOT_REGISTERED"),
+        (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED, "AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED"),
+        (AUDCLNT_E_ENDPOINT_CREATE_FAILED, "AUDCLNT_E_ENDPOINT_CREATE_FAILED"),
+        (AUDCLNT_E_SERVICE_NOT_RUNNING, "AUDCLNT_E_SERVICE_NOT_RUNNING"),
+        (AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED, "AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED"),
+        (AUDCLNT_E_EXCLUSIVE_MODE_ONLY, "AUDCLNT_E_EXCLUSIVE_MODE_ONLY"),
+        (AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL, "AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL"),
+        (AUDCLNT_E_EVENTHANDLE_NOT_SET, "AUDCLNT_E_EVENTHANDLE_NOT_SET"),
+        (AUDCLNT_E_INCORRECT_BUFFER_SIZE, "AUDCLNT_E_INCORRECT_BUFFER_SIZE"),
+        (AUDCLNT_E_BUFFER_SIZE_ERROR, "AUDCLNT_E_BUFFER_SIZE_ERROR"),
+        (AUDCLNT_E_CPUUSAGE_EXCEEDED, "AUDCLNT_E_CPUUSAGE_EXCEEDED"),
+        (AUDCLNT_E_BUFFER_ERROR, "AUDCLNT_E_BUFFER_ERROR"),
+        (AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, "AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED"),
+        (AUDCLNT_E_INVALID_DEVICE_PERIOD, "AUDCLNT_E_INVALID_DEVICE_PERIOD"),
+        (AUDCLNT_E_INVALID_STREAM_FLAG, "AUDCLNT_E_INVALID_STREAM_FLAG"),
+        (AUDCLNT_E_RESOURCES_INVALIDATED, "AUDCLNT_E_RESOURCES_INVALIDATED"),
+        (AUDCLNT_E_RAW_MODE_UNSUPPORTED, "AUDCLNT_E_RAW_MODE_UNSUPPORTED"),
+        (AUDCLNT_E_ENGINE_PERIODICITY_LOCKED, "AUDCLNT_E_ENGINE_PERIODICITY_LOCKED"),
+        (AUDCLNT_E_ENGINE_FORMAT_LOCKED, "AUDCLNT_E_ENGINE_FORMAT_LOCKED"),
+        (E_FAIL, "E_FAIL"),
+        (E_ABORT, "E_ABORT"),
+        (E_NOTIMPL, "E_NOTIMPL"),
+        (E_NOINTERFACE, "E_NOINTERFACE"),
+        (E_POINTER, "E_POINTER"),
+        (E_UNEXPECTED, "E_UNEXPECTED"),
+        (E_ACCESSDENIED, "E_ACCESSDENIED"),
+        (E_HANDLE, "E_HANDLE"),
+        (E_OUTOFMEMORY, "E_OUTOFMEMORY"),
+        (E_INVALIDARG, "E_INVALIDARG"),
+        (HRESULT::from_win32(ERROR_NOT_SUPPORTED.0), "HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)"),
+        (HRESULT::from_win32(ERROR_BUSY.0), "HRESULT_FROM_WIN32(ERROR_BUSY)"),
+        (HRESULT::from_win32(ERROR_GEN_FAILURE.0), "HRESULT_FROM_WIN32(ERROR_GEN_FAILURE)"),
+        (HRESULT::from_win32(ERROR_NOT_FOUND.0), "HRESULT_FROM_WIN32(ERROR_NOT_FOUND)"),
+        (HRESULT::from_nt(STATUS_NOT_SUPPORTED.0), "HRESULT_FROM_NT(STATUS_NOT_SUPPORTED)"),
+    ];
+
+    /// Win32 errors (facility 7) and NTSTATUSes (the FACILITY_NT bit) the table above doesn't name in full.
+    #[rustfmt::skip]
+    const WIN32: [(WIN32_ERROR, &str); 5] = [
+        (ERROR_INVALID_FUNCTION, "ERROR_INVALID_FUNCTION"),
+        (ERROR_FILE_NOT_FOUND, "ERROR_FILE_NOT_FOUND"),
+        (ERROR_NOT_READY, "ERROR_NOT_READY"),
+        (ERROR_DEVICE_NOT_CONNECTED, "ERROR_DEVICE_NOT_CONNECTED"),
+        (ERROR_NO_SYSTEM_RESOURCES, "ERROR_NO_SYSTEM_RESOURCES"),
+    ];
+    #[rustfmt::skip]
+    const NT: [(NTSTATUS, &str); 8] = [
+        (STATUS_UNSUCCESSFUL, "STATUS_UNSUCCESSFUL"),
+        (STATUS_NOT_SUPPORTED, "STATUS_NOT_SUPPORTED"),
+        (STATUS_INVALID_PARAMETER, "STATUS_INVALID_PARAMETER"),
+        (STATUS_INVALID_DEVICE_REQUEST, "STATUS_INVALID_DEVICE_REQUEST"),
+        (STATUS_INVALID_DEVICE_STATE, "STATUS_INVALID_DEVICE_STATE"),
+        (STATUS_INSUFFICIENT_RESOURCES, "STATUS_INSUFFICIENT_RESOURCES"),
+        (STATUS_DEVICE_BUSY, "STATUS_DEVICE_BUSY"),
+        (STATUS_DEVICE_REMOVED, "STATUS_DEVICE_REMOVED"),
+    ];
+
+    /// `hr` by name where it has one, always with its value, and the system's text for it where there's no name.
+    pub(super) fn name(hr: HRESULT) -> String {
+        let code = hr.0 as u32;
+        if let Some((_, n)) = NAMES.iter().find(|(h, _)| *h == hr) {
+            return format!("{n} (0x{code:08X})");
+        }
+        if code & 0xFFFF_0000 == 0x8007_0000
+            && let Some((_, n)) = WIN32.iter().find(|(e, _)| e.0 == code & 0xFFFF)
+        {
+            return format!("HRESULT_FROM_WIN32({n}) (0x{code:08X})");
+        }
+        if hr.0 < 0
+            && code & 0x1000_0000 != 0
+            && let Some((_, n)) = NT.iter().find(|(s, _)| s.0 as u32 == code & !0x1000_0000)
+        {
+            return format!("HRESULT_FROM_NT({n}) (0x{code:08X})");
+        }
+        let message = hr.message();
+        let message = message.trim();
+        if message.is_empty() { format!("0x{code:08X}") } else { format!("0x{code:08X}: {message}") }
+    }
+}
+
+/// The HRESULT behind a wasapi error; the crate's own errors (not a COM call's) as the nearest code.
+fn hresult_of(e: &WasapiError) -> HRESULT {
+    match e {
+        WasapiError::Windows(w) | WasapiError::RegisterNotifications(w) => w.code(),
+        WasapiError::UnsupportedFormat | WasapiError::UnsupportedSubformat(_) => AUDCLNT_E_UNSUPPORTED_FORMAT,
+        _ => E_FAIL,
+    }
+}
+
+/// A call that failed while a stream was being opened, with its HRESULT: a refusal, for `open`.
+#[derive(Debug)]
+struct Refusal {
+    call: &'static str,
+    hr: HRESULT,
+    /// The crate's text, where the error wasn't a COM call's.
+    text: Option<String>,
+}
+
+impl Refusal {
+    fn at(call: &'static str, e: WasapiError) -> Self {
+        let text = (!matches!(e, WasapiError::Windows(_))).then(|| e.to_string());
+        Self { call, hr: hresult_of(&e), text }
+    }
+}
+
+impl Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} returned {}", self.call, hresult::name(self.hr))?;
+        match &self.text {
+            Some(t) => write!(f, " ({t})"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A stream initialised, and what it was granted.
+struct Opened {
+    client: AudioClient,
+    exclusive: bool,
+    raw: bool,
+    /// Initialize or InitializeSharedAudioStream: the call that opened it.
+    init_call: &'static str,
+    /// The buffer, in frames (an exclusive event-driven stream's is its period).
+    buffer_frames: u32,
+    /// Shared: the engine's current period in this mode, in frames (IAudioClient3), where it says.
+    engine_period: Option<u32>,
+    /// The device's default period, in frames.
+    default_period: u32,
+    /// Shared: the IAudioClient3 engine period asked for.
+    asked_period: Option<u32>,
+    /// What happened on the way: a RAW refusal fallen back from, an exclusive buffer realigned.
+    notes: Vec<String>,
+}
+
+impl Opened {
+    /// The period granted, in frames: exclusive, the buffer; shared, the engine's period in this mode (the device's default
+    /// period where IAudioClient3 can't say).
+    fn period_frames(&self) -> u32 {
+        if self.exclusive { self.buffer_frames } else { self.engine_period.unwrap_or(self.default_period) }
+    }
+
+    fn describe(&self) -> String {
+        let raw = if self.raw { "RAW" } else { "DEFAULT mode" };
+        let period = self.period_frames();
+        let how = match (self.exclusive, self.asked_period, self.engine_period) {
+            (true, _, _) => "the exclusive period".to_string(),
+            (false, Some(asked), _) => format!("the engine period, IAudioClient3; {asked} asked"),
+            (false, None, Some(_)) => "the engine period".to_string(),
+            (false, None, None) => "the device's default period; IAudioClient3 didn't say the engine's".to_string(),
+        };
+        format!(
+            "{}, {raw}, period {period} frames ({:.2} ms: {how}), buffer {} frames ({:.2} ms)",
+            if self.exclusive { "exclusive" } else { "shared" },
+            ms(u64::from(period)),
+            self.buffer_frames,
+            ms(u64::from(self.buffer_frames))
+        )
+    }
+}
+
+/// The endpoint called `name` in direction `dir` (its friendly name, as Sound settings shows it).
+fn find_endpoint(name: &str, dir: Direction) -> Result<wasapi::Device, String> {
+    let kind = if dir == Direction::Capture { "capture" } else { "render" };
+    let enumerator = DeviceEnumerator::new().map_err(werr)?;
+    let devices = enumerator.get_device_collection(&dir).map_err(werr)?;
+    devices.get_device_with_name(name).map_err(|_| {
+        let names: Vec<String> = (&devices).into_iter().filter_map(|d| d.ok()?.get_friendlyname().ok()).collect();
+        format!("no {kind} endpoint {name:?}; there are: {}", names.join("; "))
+    })
+}
+
+/// A format in words: rate, channels, and the sample type with its container and valid bits.
+fn describe_format(f: &WaveFormat) -> String {
+    let (bits, valid) = (f.get_bitspersample(), f.get_validbitspersample());
+    let kind = match f.get_subformat() {
+        Ok(SampleType::Float) => format!("{bits}-bit float"),
+        Ok(SampleType::Int) if valid == bits || valid == 0 => format!("{bits}-bit PCM"),
+        Ok(SampleType::Int) => format!("{valid}-in-{bits} PCM"),
+        Err(_) => format!("{bits}-bit, not PCM or float"),
+    };
+    format!("{} Hz, {} ch, {kind}", f.get_samplespersec(), f.get_nchannels())
+}
+
+/// IsFormatSupported's HRESULT for `format` in that share mode, on a fresh client (no stream is made), and in shared mode the
+/// closest format it offered instead (S_FALSE).
+fn is_format_supported(device: &wasapi::Device, format: &WaveFormat, exclusive: bool) -> Result<(HRESULT, Option<String>), String> {
+    let client = device.get_iaudioclient().map_err(werr)?;
+    let mut closest: *mut WAVEFORMATEX = std::ptr::null_mut();
+    let (mode, out) = if exclusive { (AUDCLNT_SHAREMODE_EXCLUSIVE, None) } else { (AUDCLNT_SHAREMODE_SHARED, Some(&raw mut closest)) };
+    // SAFETY: a COM call on our client; `format` outlives it, and `closest` is a local the call may set to a CoTaskMemAlloc'd
+    // format (shared mode only).
+    let hr = unsafe { client.as_iaudioclient().IsFormatSupported(mode, format.as_waveformatex_ref(), out) };
+    if closest.is_null() {
+        return Ok((hr, None));
+    }
+    // SAFETY: WASAPI's own format, valid for its cbSize; read once, then freed once with the allocator it came from.
+    let parsed = unsafe { WaveFormat::parse(closest) };
+    // SAFETY: as above.
+    unsafe { CoTaskMemFree(Some(closest.cast())) };
+    Ok((hr, Some(parsed.map_or_else(|e| format!("unreadable ({e})"), |f| describe_format(&f)))))
+}
+
+/// The engine periods IAudioClient3 offers for `format` on `device`, in words, where it says.
+fn engine_periods(device: &wasapi::Device, format: &WaveFormat) -> Option<String> {
+    let p = device.get_iaudioclient().ok()?.get_shared_mode_engine_period(format).ok()?;
+    Some(format!(
+        "IAudioClient3's engine periods for {}: default {}, fundamental {}, from {} to {} frames",
+        describe_format(format),
+        p.default,
+        p.fundamental,
+        p.min,
+        p.max
+    ))
+}
+
+/// Opens a client on `device` as `spec` says: RAW (or not) first, then Initialize (exclusive, or shared at the engine's
+/// period) or IAudioClient3's InitializeSharedAudioStream (shared, `period_frames`). Event-driven; nothing converted. The
+/// first call that fails is the refusal; RAW where offered tries again without RAW first.
+fn open_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec) -> Result<Opened, Refusal> {
+    match spec.mode {
+        Mode::Raw => init_client(device, dir, spec, true),
+        Mode::Default => init_client(device, dir, spec, false),
+        Mode::RawWhereOffered => init_client(device, dir, spec, true).or_else(|raw| {
+            let mut o = init_client(device, dir, spec, false)?;
+            o.notes.insert(0, format!("RAW refused ({raw}); DEFAULT mode instead, so the endpoint's effects, if any, run"));
+            Ok(o)
+        }),
+    }
+}
+
+/// A fresh client, with RAW set (before Initialize, as IAudioClient2 requires) when asked.
+fn new_client(device: &wasapi::Device, raw: bool) -> Result<AudioClient, Refusal> {
+    let client = device.get_iaudioclient().map_err(|e| Refusal::at("IMMDevice::Activate", e))?;
+    if raw {
+        client
+            .set_properties(AudioClientProperties::new().set_option(StreamOption::Raw))
+            .map_err(|e| Refusal::at("SetClientProperties (RAW)", e))?;
+    }
+    Ok(client)
+}
+
+fn init_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec, raw: bool) -> Result<Opened, Refusal> {
+    let rate = i64::from(protocol::SAMPLE_RATE);
+    let format = spec.format.wave();
+    let mut client = new_client(device, raw)?;
+    let mut notes = Vec::new();
+    let (default_hns, _) = client.get_device_period().map_err(|e| Refusal::at("GetDevicePeriod", e))?;
+    let init_call = if spec.exclusive {
+        let period_hns = spec.period_frames.map_or(default_hns, |n| calculate_period_100ns(i64::from(n), rate));
+        if let Err(e) = client.initialize_client(&format, &dir, &StreamMode::EventsExclusive { period_hns }) {
+            if hresult_of(&e) != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED {
+                return Err(Refusal::at("Initialize", e));
+            }
+            // Microsoft's recovery: the failed client's buffer size, on a fresh client.
+            let frames = client.get_buffer_size().map_err(|e| Refusal::at("GetBufferSize", e))?;
+            notes.push(format!("Initialize returned AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED; opened again at the aligned {frames} frames"));
+            client = new_client(device, raw)?;
+            let period_hns = calculate_period_100ns(i64::from(frames), rate);
+            client
+                .initialize_client(&format, &dir, &StreamMode::EventsExclusive { period_hns })
+                .map_err(|e| Refusal::at("Initialize", e))?;
+        }
+        "Initialize"
+    } else if let Some(frames) = spec.period_frames {
+        client
+            .initialize_shared_audio_stream(&format, TimingMode::Events, frames)
+            .map_err(|e| Refusal::at("InitializeSharedAudioStream", e))?;
+        "InitializeSharedAudioStream"
+    } else {
+        let mode = StreamMode::EventsShared { autoconvert: false, buffer_duration_hns: SHARED_BUFFER_HNS };
+        client.initialize_client(&format, &dir, &mode).map_err(|e| Refusal::at("Initialize", e))?;
+        "Initialize"
+    };
+    let buffer_frames = client.get_buffer_size().map_err(|e| Refusal::at("GetBufferSize", e))?;
+    // Another client in this mode may hold the engine at another period: this is what applies.
+    let engine_period = if spec.exclusive { None } else { client.get_current_shared_mode_engine_period().ok().map(|(_, f)| f) };
+    Ok(Opened {
+        client,
+        exclusive: spec.exclusive,
+        raw,
+        init_call,
+        buffer_frames,
+        engine_period,
+        default_period: ((default_hns.max(0) * rate + 5_000_000) / 10_000_000) as u32,
+        asked_period: if spec.exclusive { None } else { spec.period_frames },
+        notes,
+    })
 }
 
 // ---- feed ----
@@ -436,9 +923,10 @@ fn print_ring_counters(h: &RingHeader) {
 // ---- verify ----
 
 fn verify(args: &[String]) -> Result<Verdict, String> {
-    let o = Opts::parse(args, &["--seconds", "--device"], &[])?;
+    let o = Opts::parse(args, &["--seconds", "--device", "--mode", "--period-frames"], &[])?;
     let seconds: u64 = o.value("--seconds", 10)?;
     let name: String = o.value("--device", ENDPOINT.to_string())?;
+    let spec = StreamSpec { period_frames: o.period_frames()?, mode: o.mode(Mode::RawWhereOffered)?, ..StreamSpec::SHARED_FLOAT };
     if seconds == 0 || seconds > 86_400 {
         return Err(format!("--seconds {seconds}: from 1 to 86400"));
     }
@@ -448,7 +936,7 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         return Err("no app ring is attached: start `nf-vmic-test feed` first (elevated, in another window) and leave it running".into());
     }
     let _com = Com::mta()?;
-    let mut capture = Capture::open(&name)?;
+    let mut capture = Capture::open(&name, spec)?;
     println!("recording {name:?} for {seconds} s: {}", capture.describe());
     capture.print_volume_notes();
     let _pro_audio = ProAudio::join();
@@ -461,16 +949,29 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
     let (b, a) = (&before.ring, &after.ring);
     let mut c = Checks::default();
     println!("checks:");
-    for check in verify_checks(&before, &after, r, capture.lost_frames, capture.discontinuities) {
+    let seen =
+        StreamSeen { lost_frames: capture.lost_frames, discontinuities: capture.discontinuities, packet: capture.opened.period_frames() };
+    for check in verify_checks(&before, &after, r, &seen) {
         c.check(check.ok, check.name, check.detail);
     }
     let not_reader = a.not_reader_packets.saturating_sub(b.not_reader_packets);
     println!(
-        "  the driver over the recording: resyncs +{}, format mismatch +{} packets, a second capture stream +{} packets{}",
+        "  the driver over the recording: resyncs +{}, format mismatch +{} packets, passes of a stream that isn't the reader +{}{}",
         a.resyncs.saturating_sub(b.resyncs),
         a.mismatch_packets.saturating_sub(b.mismatch_packets),
         not_reader,
-        if not_reader != 0 { " (another app records the endpoint and may hold the ring: close it)" } else { "" }
+        if not_reader != 0 {
+            " (two capture streams: the first to run reads the ring, the other gets its audio as a secondary)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  secondary streams: +{} frames of the ring's audio, +{} zero-filled; refusals: ATTACH for a format +{}, capture opens +{}",
+        after.secondary_frames_copied.saturating_sub(before.secondary_frames_copied),
+        after.secondary_underrun_frames.saturating_sub(before.secondary_underrun_frames),
+        a.format_rejects.saturating_sub(b.format_rejects),
+        a.refused_capture_opens.saturating_sub(b.refused_capture_opens)
     );
     for (index, left, right) in &r.first_corrupt {
         let (l, rt) = (f32::from_bits(*left), f32::from_bits(*right));
@@ -486,14 +987,30 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
     }
 }
 
+/// What verify's own capture stream counted: frames the engine dropped, discontinuities after its first packet, and its
+/// period (frames).
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamSeen {
+    lost_frames: u64,
+    discontinuities: u64,
+    packet: u32,
+}
+
 /// verify's checks of a recording (`r`) against the driver's statistics just before and just after it, and the capture stream's
 /// own counts. All must pass for proof that the app ring fed the recording.
-fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, lost_frames: u64, discontinuities: u64) -> Vec<Check> {
-    let packet = u64::from(before.reader_packet_frames.max(after.reader_packet_frames));
+///
+/// The recording may come from the reader or from a secondary stream (another capture stream ran first): the silence allowed is
+/// what the driver zero-filled for either (UnderrunFrames and SecondaryUnderrunFrames over the recording), and the slack at the
+/// edges is a packet of the larger of the reader's and this stream's.
+fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSeen) -> Vec<Check> {
+    let packet = u64::from(before.reader_packet_frames.max(after.reader_packet_frames).max(seen.packet));
     let (b, a) = (&before.ring, &after.ring);
     let same = after.attached_pid == before.attached_pid && a.attaches == b.attaches;
     let copied = a.frames_copied.saturating_sub(b.frames_copied);
-    let underrun = a.underrun_frames.saturating_sub(b.underrun_frames);
+    let reader_underrun = a.underrun_frames.saturating_sub(b.underrun_frames);
+    let secondary_underrun = after.secondary_underrun_frames.saturating_sub(before.secondary_underrun_frames);
+    let underrun = reader_underrun + secondary_underrun;
+    let underrun_text = format!("{underrun} frames (the reader {reader_underrun}, secondary streams {secondary_underrun})");
     let silence = r.zeros_before_signal + r.zeros_inside + r.zeros_after_signal;
     vec![
         Check {
@@ -534,7 +1051,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, lost_frames: u6
             ok: r.zeros_inside <= underrun + packet,
             name: "silence inside the signal",
             detail: format!(
-                "{} frames in {} runs; the driver underran {underrun} frames over the recording (one {packet}-frame packet more \
+                "{} frames in {} runs; the driver underran {underrun_text} over the recording (one {packet}-frame packet more \
                  allowed)",
                 r.zeros_inside, r.zero_runs_inside
             ),
@@ -547,7 +1064,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, lost_frames: u6
             ok: silence <= underrun + 2 * packet,
             name: "all the silence",
             detail: format!(
-                "{silence} frames ({} before the signal, {} inside, {} after); the driver underran {underrun} frames over the \
+                "{silence} frames ({} before the signal, {} inside, {} after); the driver underran {underrun_text} over the \
                  recording (a {packet}-frame packet more allowed at each end)",
                 r.zeros_before_signal, r.zeros_inside, r.zeros_after_signal
             ),
@@ -561,9 +1078,12 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, lost_frames: u6
             ),
         },
         Check {
-            ok: lost_frames == 0 && discontinuities == 0,
+            ok: seen.lost_frames == 0 && seen.discontinuities == 0,
             name: "the capture stream",
-            detail: format!("{lost_frames} frames lost by the engine, {discontinuities} discontinuities after its first packet"),
+            detail: format!(
+                "{} frames lost by the engine, {} discontinuities after its first packet",
+                seen.lost_frames, seen.discontinuities
+            ),
         },
     ]
 }
@@ -679,14 +1199,14 @@ struct Volume {
     hardware: u32,
 }
 
-/// A shared-mode, event-driven capture stream, float32 stereo 48 kHz (the endpoint's mix format: no conversion), RAW where the
-/// endpoint takes it (no effects). `!Send` (the wasapi objects): made, used and dropped on one thread.
+/// An event-driven capture stream (`open_client`): verify's, kill-test's and latency's (shared float32 stereo 48 kHz, the
+/// endpoint's mix format: no conversion), or `open`'s, in the format and mode asked for. It reads packets straight from the
+/// engine's buffer through IAudioCaptureClient (GetBuffer's device QPC position, and the QPC just after the call returned).
+/// `!Send` (the COM objects): made, used and dropped on one thread.
 struct Capture {
-    client: AudioClient,
-    capture: AudioCaptureClient,
+    opened: Opened,
+    capture: IAudioCaptureClient,
     event: Handle,
-    buf: Vec<u8>,
-    raw: bool,
     volume: Option<Volume>,
     next_index: Option<u64>,
     frames: u64,
@@ -698,49 +1218,64 @@ struct Capture {
     longest_wait: Duration,
 }
 
+/// One capture packet, as GetBuffer handed it out (the bytes are the engine's, until ReleaseBuffer).
+struct Packet<'a> {
+    bytes: &'a [u8],
+    frames: u32,
+    /// AUDCLNT_BUFFERFLAGS_SILENT: the packet is silence, whatever its bytes.
+    silent: bool,
+    /// GetBuffer's device QPC position, in 100 ns units: the time the endpoint gives for the packet's first frame (`None`
+    /// where it flagged AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR).
+    qpc_hns: Option<u64>,
+    /// QueryPerformanceCounter, read just after GetBuffer returned (ticks).
+    host_qpc: u64,
+}
+
+impl Packet<'_> {
+    /// The frames as float32 stereo (a float stream's).
+    fn float_frames(&self) -> impl Iterator<Item = [f32; 2]> + '_ {
+        let (chunks, _) = self.bytes.as_chunks::<8>();
+        chunks.iter().map(|&[a, b, c, d, e, f, g, h]| [f32::from_le_bytes([a, b, c, d]), f32::from_le_bytes([e, f, g, h])])
+    }
+}
+
 fn werr(e: wasapi::WasapiError) -> String {
     e.to_string()
 }
 
 impl Capture {
-    fn open(name: &str) -> Result<Self, String> {
-        let enumerator = DeviceEnumerator::new().map_err(werr)?;
-        let devices = enumerator.get_device_collection(&Direction::Capture).map_err(werr)?;
-        let device = devices.get_device_with_name(name).map_err(|_| {
-            let names: Vec<String> = (&devices).into_iter().filter_map(|d| d.ok()?.get_friendlyname().ok()).collect();
-            format!("no capture endpoint {name:?}; there are: {}", names.join("; "))
-        })?;
+    /// verify's, kill-test's and latency's stream on the capture endpoint `name`: shared float32, as `spec` says (its mode and
+    /// IAudioClient3 period), after a check that the endpoint mixes at 48 kHz float32 stereo (bit-exact needs it).
+    fn open(name: &str, spec: StreamSpec) -> Result<Self, String> {
+        let device = find_endpoint(name, Direction::Capture)?;
         let mix = device.get_iaudioclient().map_err(werr)?.get_mixformat().map_err(werr)?;
         let float = matches!(mix.get_subformat(), Ok(SampleType::Float));
         if mix.get_samplespersec() != protocol::SAMPLE_RATE || mix.get_nchannels() != 2 || mix.get_bitspersample() != 32 || !float {
-            return Err(format!(
-                "{name:?} mixes at {} Hz, {} channels, {}-bit {}: bit-exact needs a 48 kHz float32 stereo device format",
-                mix.get_samplespersec(),
-                mix.get_nchannels(),
-                mix.get_bitspersample(),
-                if float { "float" } else { "integer" },
-            ));
+            return Err(format!("{name:?} mixes at {}: bit-exact needs a 48 kHz float32 stereo device format", describe_format(&mix)));
+        }
+        if spec.period_frames.is_some()
+            && let Some(periods) = engine_periods(&device, &spec.format.wave())
+        {
+            println!("note: {periods}");
         }
         let volume = endpoint_volume(&device);
-        let format = WaveFormat::new(32, 32, &SampleType::Float, protocol::SAMPLE_RATE as usize, 2, None);
-        // RAW first; a refused initialise leaves the client unusable, so the fallback takes a fresh one.
-        let (client, raw) = match Self::client(&device, &format, true) {
-            Ok(c) => (c, true),
-            Err(e) => {
-                eprintln!("note: RAW refused ({e}); the endpoint's effects, if any, run");
-                (Self::client(&device, &format, false).map_err(werr)?, false)
-            }
-        };
-        let event = client.set_get_eventhandle().map_err(werr)?;
-        let capture = client.get_audiocaptureclient().map_err(werr)?;
-        let buffer_frames = client.get_buffer_size().map_err(werr)? as usize;
+        let opened = open_client(&device, Direction::Capture, &spec).map_err(|r| format!("{name:?} refused the stream: {r}"))?;
+        for note in &opened.notes {
+            eprintln!("note: {note}");
+        }
+        Self::new(opened, volume)
+    }
+
+    /// The capture side of an opened client: its event, and its IAudioCaptureClient.
+    fn new(opened: Opened, volume: Option<Volume>) -> Result<Self, String> {
+        let event = opened.client.set_get_eventhandle().map_err(werr)?;
+        // SAFETY: a COM call on an initialised client (open_client), which hands out its capture interface, reference-counted.
+        let capture = unsafe { opened.client.as_iaudioclient().GetService::<IAudioCaptureClient>() }
+            .map_err(|e| format!("GetService(IAudioCaptureClient) returned {}", hresult::name(e.code())))?;
         Ok(Self {
-            client,
+            opened,
             capture,
             event,
-            // A packet never exceeds the buffer; twice is the engine's margin (stream.rs).
-            buf: vec![0; 2 * buffer_frames * protocol::FRAME_BYTES as usize],
-            raw,
             volume,
             next_index: None,
             frames: 0,
@@ -752,29 +1287,12 @@ impl Capture {
         })
     }
 
-    fn client(device: &wasapi::Device, format: &WaveFormat, raw: bool) -> Result<AudioClient, wasapi::WasapiError> {
-        let mut client = device.get_iaudioclient()?;
-        if raw {
-            client.set_properties(AudioClientProperties::new().set_option(StreamOption::Raw))?;
-        }
-        // 100 ms of buffer: this reader only has to keep up, not be quick.
-        client.initialize_client(format, &Direction::Capture, &StreamMode::EventsShared {
-            autoconvert: false,
-            buffer_duration_hns: 1_000_000,
-        })?;
-        Ok(client)
-    }
-
     fn describe(&self) -> String {
-        let raw = if self.raw { "RAW" } else { "not RAW" };
-        match self.volume {
-            Some(v) => format!(
-                "float32 stereo 48 kHz, shared, {raw}; endpoint volume {:.0}%, {}",
-                v.level * 100.0,
-                if v.muted { "MUTED" } else { "unmuted" }
-            ),
-            None => format!("float32 stereo 48 kHz, shared, {raw}; endpoint volume unknown"),
-        }
+        let volume = match self.volume {
+            Some(v) => format!("endpoint volume {:.0}%, {}", v.level * 100.0, if v.muted { "MUTED" } else { "unmuted" }),
+            None => "endpoint volume unknown".to_string(),
+        };
+        format!("float32 stereo 48 kHz, {}; {volume}", self.opened.describe())
     }
 
     /// The volume settings that matter here: mute, which the driver has no node for (so Windows applies it to the samples), and
@@ -803,48 +1321,66 @@ impl Capture {
     }
 
     fn start(&self) -> Result<(), String> {
-        self.client.start_stream().map_err(werr)
+        self.opened.client.start_stream().map_err(|e| format!("Start returned {}", hresult::name(hresult_of(&e))))
     }
 
     fn stop(&self) {
-        let _ = self.client.stop_stream();
+        let _ = self.opened.client.stop_stream();
     }
 
-    /// Waits for the stream's event (2 s at most), then hands every frame that's ready to `sink`.
-    fn read(&mut self, mut sink: impl FnMut([f32; 2])) -> Result<(), String> {
+    /// Waits for the stream's event (2 s at most), then hands every packet that's ready to `on_packet`, straight from the
+    /// engine's buffer, with the QPC read just after its GetBuffer returned. Counts the packets, their frames, the silent ones,
+    /// frames the engine dropped (the device position skipped them) and discontinuities. Allocates nothing but an error's text.
+    fn read_packets(&mut self, mut on_packet: impl FnMut(&Packet<'_>)) -> Result<(), String> {
         let t = Instant::now();
         self.event.wait_for_event(2_000).map_err(|_| "no capture event for 2 s: is the endpoint's stream running?".to_string())?;
         self.longest_wait = self.longest_wait.max(t.elapsed());
         loop {
-            let (frames, info) = self.capture.read_from_device(&mut self.buf).map_err(werr)?;
+            let (mut data, mut frames, mut flags, mut position, mut qpc) = (std::ptr::null_mut(), 0u32, 0u32, 0u64, 0u64);
+            // SAFETY: a COM call on our initialised capture client; the out-pointers are locals that outlive it.
+            unsafe { self.capture.GetBuffer(&mut data, &mut frames, &mut flags, Some(&mut position), Some(&mut qpc)) }
+                .map_err(|e| format!("GetBuffer returned {}", hresult::name(e.code())))?;
+            let host_qpc = qpc_now();
             if frames == 0 {
+                // AUDCLNT_S_BUFFER_EMPTY. Releasing 0 frames is always allowed (wasapi's read_from_device does the same).
+                // SAFETY: as above.
+                let _ = unsafe { self.capture.ReleaseBuffer(0) };
                 return Ok(());
             }
-            let frames = u64::from(frames);
             self.packets += 1;
-            self.frames += frames;
+            self.frames += u64::from(frames);
             if let Some(expect) = self.next_index
-                && info.index > expect
+                && position > expect
             {
-                self.lost_frames += info.index - expect;
+                self.lost_frames += position - expect;
             }
             // The stream's first packet may carry the discontinuity flag (the engine's start, not a glitch: inference from
             // reports of it, not checked on this endpoint), so only later ones count.
-            if info.flags.data_discontinuity && self.next_index.is_some() {
+            if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && self.next_index.is_some() {
                 self.discontinuities += 1;
             }
-            self.next_index = Some(info.index + frames);
-            if info.flags.silent {
-                // The crate copies the buffer even for a silent packet; the flag says it's silence.
-                self.silent_packets += 1;
-                (0..frames).for_each(|_| sink([0.0; 2]));
-                continue;
-            }
-            let (chunks, _) = self.buf[..frames as usize * protocol::FRAME_BYTES as usize].as_chunks::<8>();
-            for &[a, b, c, d, e, f, g, h] in chunks {
-                sink([f32::from_le_bytes([a, b, c, d]), f32::from_le_bytes([e, f, g, h])]);
-            }
+            self.next_index = Some(position + u64::from(frames));
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let qpc_hns = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0).then_some(qpc);
+            self.silent_packets += u64::from(silent);
+            // SAFETY: GetBuffer handed out `frames` frames at `data`, each FRAME_BYTES long (both formats' block align: two
+            // 32-bit samples), the engine's until ReleaseBuffer below; nothing writes them meanwhile.
+            let bytes = unsafe { std::slice::from_raw_parts(data, frames as usize * protocol::FRAME_BYTES as usize) };
+            on_packet(&Packet { bytes, frames, silent, qpc_hns, host_qpc });
+            // SAFETY: releases all of the packet just read; `bytes` isn't used past here.
+            unsafe { self.capture.ReleaseBuffer(frames) }.map_err(|e| format!("ReleaseBuffer returned {}", hresult::name(e.code())))?;
         }
+    }
+
+    /// [`Self::read_packets`], frame by frame as float32 stereo: a silent packet as that many frames of silence.
+    fn read(&mut self, mut sink: impl FnMut([f32; 2])) -> Result<(), String> {
+        self.read_packets(|p| {
+            if p.silent {
+                (0..p.frames).for_each(|_| sink([0.0; 2]));
+            } else {
+                p.float_frames().for_each(&mut sink);
+            }
+        })
     }
 
     fn print_counters(&self) {
@@ -857,6 +1393,55 @@ impl Capture {
             self.discontinuities,
             self.longest_wait.as_secs_f64() * 1000.0
         );
+    }
+}
+
+/// An event-driven render stream that plays silence (`open --render`). `!Send`, like [`Capture`].
+struct Render {
+    opened: Opened,
+    render: IAudioRenderClient,
+    event: Handle,
+    packets: u64,
+    frames: u64,
+    longest_wait: Duration,
+}
+
+impl Render {
+    fn new(opened: Opened) -> Result<Self, String> {
+        let event = opened.client.set_get_eventhandle().map_err(werr)?;
+        // SAFETY: a COM call on an initialised client (open_client), which hands out its render interface, reference-counted.
+        let render = unsafe { opened.client.as_iaudioclient().GetService::<IAudioRenderClient>() }
+            .map_err(|e| format!("GetService(IAudioRenderClient) returned {}", hresult::name(e.code())))?;
+        Ok(Self { opened, render, event, packets: 0, frames: 0, longest_wait: Duration::ZERO })
+    }
+
+    /// Fills what the buffer has free with silence: an exclusive stream's whole buffer (its period), a shared one's free space.
+    fn fill_silence(&mut self) -> Result<(), String> {
+        let o = &self.opened;
+        let free = if o.exclusive {
+            o.buffer_frames
+        } else {
+            o.buffer_frames.saturating_sub(o.client.get_current_padding().map_err(|e| format!("GetCurrentPadding: {e}"))?)
+        };
+        if free == 0 {
+            return Ok(());
+        }
+        // SAFETY: a COM call on our initialised render client, for no more than the free frames.
+        unsafe { self.render.GetBuffer(free) }.map_err(|e| format!("GetBuffer returned {}", hresult::name(e.code())))?;
+        // SAFETY: releases the frames just obtained, marked silent: the engine treats them as silence, so nothing is written.
+        unsafe { self.render.ReleaseBuffer(free, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) }
+            .map_err(|e| format!("ReleaseBuffer returned {}", hresult::name(e.code())))?;
+        self.packets += 1;
+        self.frames += u64::from(free);
+        Ok(())
+    }
+
+    /// Waits for the stream's event (2 s at most), then fills the buffer with silence.
+    fn wait_and_fill(&mut self) -> Result<(), String> {
+        let t = Instant::now();
+        self.event.wait_for_event(2_000).map_err(|_| "no render event for 2 s: is the endpoint's stream running?".to_string())?;
+        self.longest_wait = self.longest_wait.max(t.elapsed());
+        self.fill_silence()
     }
 }
 
@@ -899,12 +1484,18 @@ fn print_stats(s: &Stats) {
     }
     let r = &s.ring;
     println!(
-        "  attaches {}, detaches {} (cancel {}, cleanup {}, removal {}), refused busy {}, refused invalid {}",
-        r.attaches, r.detaches, r.detach_cancel, r.detach_cleanup, r.detach_removal, r.busy_rejects, r.invalid_rejects
+        "  attaches {}, detaches {} (cancel {}, cleanup {}, removal {}); ATTACHes refused: busy {}, invalid {}, format {} (a capture \
+         stream open in another format)",
+        r.attaches, r.detaches, r.detach_cancel, r.detach_cleanup, r.detach_removal, r.busy_rejects, r.invalid_rejects, r.format_rejects
+    );
+    println!("  capture stream creations refused {} (a ring attached, the stream in another format)", r.refused_capture_opens);
+    println!(
+        "  passes {}, frames copied {}, underruns {} packets / {} frames, resyncs {}, format mismatch {} packets",
+        r.passes, r.frames_copied, r.underrun_packets, r.underrun_frames, r.resyncs, r.mismatch_packets
     );
     println!(
-        "  passes {}, frames copied {}, underruns {} packets / {} frames, resyncs {}, format mismatch {} packets, second reader {} packets",
-        r.passes, r.frames_copied, r.underrun_packets, r.underrun_frames, r.resyncs, r.mismatch_packets, r.not_reader_packets
+        "  streams that aren't the reader: {} passes; given the ring's audio {} frames, zero-filled {} frames",
+        r.not_reader_packets, s.secondary_frames_copied, s.secondary_underrun_frames
     );
     if s.flags & STATS_LOOPBACK != 0 {
         let l = &s.loopback;
@@ -961,7 +1552,7 @@ fn capture_thread(name: String, stop: Arc<AtomicBool>, ready: mpsc::Sender<Resul
             return CaptureSummary::default();
         }
     };
-    let mut capture = match Capture::open(&name).and_then(|c| c.start().map(|()| c)) {
+    let mut capture = match Capture::open(&name, StreamSpec::SHARED_FLOAT).and_then(|c| c.start().map(|()| c)) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -1130,7 +1721,14 @@ fn kill_test(args: &[String]) -> Result<Verdict, String> {
                 Ok(Some(status)) => format!(" (it exited: {status})"),
                 _ => String::new(),
             };
-            println!("kill {k}/{kills}: FAIL: the child (process {pid}) didn't attach within {} s{exit}", ATTACH_WAIT.as_secs());
+            let now = read_stats(&device)?;
+            let format_rejects = now.ring.format_rejects.saturating_sub(start.ring.format_rejects);
+            let why = if format_rejects != 0 {
+                format!("; the driver refused an ATTACH for the format (+{format_rejects}): {}", protocol::FORMAT_REFUSAL.meaning)
+            } else {
+                String::new()
+            };
+            println!("kill {k}/{kills}: FAIL: the child (process {pid}) didn't attach within {} s{exit}{why}", ATTACH_WAIT.as_secs());
             failures += 1;
             continue;
         }
@@ -1228,12 +1826,20 @@ fn kill_test(args: &[String]) -> Result<Verdict, String> {
     };
     let (f, l) = (&first.ring, &last.ring);
     println!(
-        "attaches +{}, detaches +{} (cancel +{}, cleanup +{}, removal +{})",
+        "attaches +{}, detaches +{} (cancel +{}, cleanup +{}, removal +{}); refused: ATTACH for a format +{}, capture opens +{}",
         l.attaches.saturating_sub(f.attaches),
         l.detaches.saturating_sub(f.detaches),
         l.detach_cancel.saturating_sub(f.detach_cancel),
         l.detach_cleanup.saturating_sub(f.detach_cleanup),
-        l.detach_removal.saturating_sub(f.detach_removal)
+        l.detach_removal.saturating_sub(f.detach_removal),
+        l.format_rejects.saturating_sub(f.format_rejects),
+        l.refused_capture_opens.saturating_sub(f.refused_capture_opens)
+    );
+    println!(
+        "streams that aren't the reader: +{} passes, given the ring's audio +{} frames, zero-filled +{} frames",
+        l.not_reader_packets.saturating_sub(f.not_reader_packets),
+        last.secondary_frames_copied.saturating_sub(first.secondary_frames_copied),
+        last.secondary_underrun_frames.saturating_sub(first.secondary_underrun_frames)
     );
     let verdict = kill_test_verdict(c.failed, unread, timer_runs);
     match verdict {
@@ -1336,6 +1942,673 @@ fn kill_test_verdict(failed_checks: u32, unread_kills: u32, timer_runs: bool) ->
     } else {
         Verdict::Pass
     }
+}
+
+// ---- open ----
+
+/// open's options.
+#[derive(Debug, PartialEq, Eq)]
+struct OpenArgs {
+    name: String,
+    render: bool,
+    spec: StreamSpec,
+    seconds: u64,
+}
+
+fn open_args(args: &[String]) -> Result<OpenArgs, String> {
+    let valued = ["--device", "--format", "--period-frames", "--mode", "--seconds"];
+    let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared"])?;
+    let name: String = o.optional("--device")?.ok_or("--device NAME is required: the endpoint's name, as Sound settings shows it")?;
+    let exclusive = match (o.flag("--exclusive"), o.flag("--shared")) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return Err("one of --exclusive and --shared is required".into()),
+    };
+    let format = Format::parse(&o.optional::<String>("--format")?.ok_or("--format float|pcm24 is required")?)?;
+    let seconds: u64 = o.value("--seconds", 10)?;
+    if seconds == 0 || seconds > 86_400 {
+        return Err(format!("--seconds {seconds}: from 1 to 86400"));
+    }
+    let spec = StreamSpec { exclusive, format, period_frames: o.period_frames()?, mode: o.mode(Mode::Default)? };
+    Ok(OpenArgs { name, render: o.flag("--render"), spec, seconds })
+}
+
+/// How long open's stream ran, and why it stopped if it stopped before its time.
+#[derive(Debug, Default)]
+struct OpenRun {
+    elapsed: Duration,
+    error: Option<String>,
+}
+
+fn open(args: &[String]) -> Result<Verdict, String> {
+    let a = open_args(args)?;
+    let (dir, kind) = if a.render { (Direction::Render, "render") } else { (Direction::Capture, "capture") };
+    // The driver's view, where its control device opens (elevated, the driver loaded): it counts its refusals.
+    let driver = match Device::open() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            println!("note: no driver statistics: {} didn't open ({e})", protocol::USER_PATH);
+            None
+        }
+    };
+    let before = driver.as_ref().and_then(|d| d.stats().ok());
+    let _com = Com::mta()?;
+    let endpoint = find_endpoint(&a.name, dir)?;
+    print_endpoint(&endpoint, &a.name, kind, &a.spec);
+    println!("asking for {}", a.spec.describe());
+    let share = if a.spec.exclusive { "exclusive" } else { "shared" };
+    match is_format_supported(&endpoint, &a.spec.format.wave(), a.spec.exclusive) {
+        Ok((hr, closest)) => println!(
+            "IsFormatSupported ({share}, {}): {}{}",
+            a.spec.format.name(),
+            hresult::name(hr),
+            closest.map(|c| format!("; the closest it offers: {c}")).unwrap_or_default()
+        ),
+        Err(e) => println!("IsFormatSupported: not asked ({e})"),
+    }
+    // SAFETY: the handler only stores to an atomic.
+    if unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) }.is_err() {
+        eprintln!("note: no Ctrl+C handler: Ctrl+C ends the run without its summary");
+    }
+    let opened = match open_client(&endpoint, dir, &a.spec) {
+        Ok(o) => o,
+        Err(r) => {
+            println!("{r}");
+            print_driver_change(driver.as_ref(), before.as_ref());
+            println!("OUTCOME: REFUSED: {r}; the {kind} stream never opened");
+            return Ok(Verdict::Fail);
+        }
+    };
+    for note in &opened.notes {
+        println!("note: {note}");
+    }
+    println!("{}: S_OK; {}", opened.init_call, opened.describe());
+    let run = if a.render { run_render(opened, a.seconds) } else { run_capture(opened, a.spec.format, a.seconds) };
+    print_driver_change(driver.as_ref(), before.as_ref());
+    let secs = run.elapsed.as_secs_f64();
+    match run.error {
+        None => {
+            println!("OUTCOME: OPENED: the {kind} stream ran for {secs:.1} s");
+            Ok(Verdict::Pass)
+        }
+        Some(e) => {
+            println!("OUTCOME: OPENED, then STOPPED after {secs:.1} s: {e}");
+            Ok(Verdict::Inconclusive)
+        }
+    }
+}
+
+/// The endpoint's mix format and device periods, and in shared mode IAudioClient3's engine periods for the format asked for.
+fn print_endpoint(device: &wasapi::Device, name: &str, kind: &str, spec: &StreamSpec) {
+    let client = device.get_iaudioclient().ok();
+    let mix = client.as_ref().and_then(|c| c.get_mixformat().ok()).map_or_else(|| "unknown".to_string(), |m| describe_format(&m));
+    let period = client.as_ref().and_then(|c| c.get_device_period().ok()).map_or_else(
+        || "unknown".to_string(),
+        |(default, min)| format!("{:.2} ms default, {:.2} ms minimum", default as f64 / 1e4, min as f64 / 1e4),
+    );
+    println!("{kind} endpoint {name:?}: mix format {mix}; device period {period}");
+    if !spec.exclusive
+        && let Some(periods) = engine_periods(device, &spec.format.wave())
+    {
+        println!("  {periods}");
+    }
+}
+
+/// What changed in the driver's statistics while open's stream was tried, where its control device opened.
+fn print_driver_change(driver: Option<&Device>, before: Option<&Stats>) {
+    let (Some(d), Some(b)) = (driver, before) else { return };
+    let Ok(a) = d.stats() else {
+        println!("the driver: its statistics didn't read after the stream");
+        return;
+    };
+    let (rb, ra) = (&b.ring, &a.ring);
+    let now = if a.flags & STATS_ATTACHED != 0 {
+        format!("process {}'s ring {}", a.attached_pid, state_text(stats_state(&a), a.reader_packet_frames))
+    } else {
+        "no ring attached".to_string()
+    };
+    println!(
+        "the driver: capture opens refused +{} (a ring attached, the stream in another format), ATTACHes refused for a format +{}, \
+         attaches +{}, capture timer passes +{}; now {now}",
+        ra.refused_capture_opens.saturating_sub(rb.refused_capture_opens),
+        ra.format_rejects.saturating_sub(rb.format_rejects),
+        ra.attaches.saturating_sub(rb.attaches),
+        a.stream[KIND_CAPTURE].timer_passes.saturating_sub(b.stream[KIND_CAPTURE].timer_passes)
+    );
+}
+
+/// What a 24-in-32 PCM capture held: frames all zero, frames with sound, and samples whose padding byte (the low byte, zero
+/// in a well-formed 24-in-32 sample) isn't zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PcmCounts {
+    silent_frames: u64,
+    sound_frames: u64,
+    nonzero_padding: u64,
+}
+
+impl PcmCounts {
+    /// Counts a packet's frames, eight bytes each: two little-endian 32-bit samples.
+    fn count(&mut self, bytes: &[u8]) {
+        for f in bytes.as_chunks::<8>().0 {
+            if f.iter().all(|&b| b == 0) {
+                self.silent_frames += 1;
+            } else {
+                self.sound_frames += 1;
+            }
+            self.nonzero_padding += u64::from(f[0] != 0) + u64::from(f[4] != 0);
+        }
+    }
+}
+
+/// open's capture: reads for `seconds` (or until Ctrl+C), counting what the packets carry, with a status line a second.
+fn run_capture(opened: Opened, format: Format, seconds: u64) -> OpenRun {
+    let mut capture = match Capture::new(opened, None) {
+        Ok(c) => c,
+        Err(e) => return OpenRun { error: Some(e), ..Default::default() },
+    };
+    if let Err(e) = capture.start() {
+        return OpenRun { error: Some(e), ..Default::default() };
+    }
+    let _pro_audio = ProAudio::join();
+    let mut checker = SequenceChecker::new();
+    let mut pcm = PcmCounts::default();
+    let (t0, mut last) = (Instant::now(), Instant::now());
+    let mut error = None;
+    while t0.elapsed() < Duration::from_secs(seconds) && !STOP.load(Relaxed) {
+        let r = capture.read_packets(|p| match format {
+            Format::Float if p.silent => (0..p.frames).for_each(|_| checker.feed([0.0; 2])),
+            Format::Float => p.float_frames().for_each(|f| checker.feed(f)),
+            Format::Pcm24 if p.silent => pcm.silent_frames += u64::from(p.frames),
+            Format::Pcm24 => pcm.count(p.bytes),
+        });
+        if let Err(e) = r {
+            error = Some(e);
+            break;
+        }
+        if last.elapsed() >= Duration::from_secs(1) {
+            last = Instant::now();
+            let carried = match format {
+                Format::Float => {
+                    let r = checker.report();
+                    let silence = r.zeros_before_signal + r.zeros_inside + r.zeros_after_signal;
+                    format!("{} carry a code, {silence} silent, {} neither", r.signal_frames, r.corrupt_frames)
+                }
+                Format::Pcm24 => format!("{} with sound, {} all zero", pcm.sound_frames, pcm.silent_frames),
+            };
+            println!(
+                "{:>7.1} s  {} packets, {} frames ({carried}), {} silent packets",
+                t0.elapsed().as_secs_f64(),
+                capture.packets,
+                capture.frames,
+                capture.silent_packets
+            );
+        }
+    }
+    let elapsed = t0.elapsed();
+    capture.stop();
+    capture.print_counters();
+    match format {
+        Format::Float => {
+            let r = checker.report();
+            println!(
+                "the test signal: {} of {} frames carry a code (codes {:?} to {:?}, {} steps of one); silence {} before, {} inside \
+                 ({} runs), {} after; gaps {} ({} frames), repeats {}, frames neither silence nor a code {}",
+                r.signal_frames,
+                r.frames,
+                r.first_code,
+                r.last_code,
+                r.steps_ok,
+                r.zeros_before_signal,
+                r.zeros_inside,
+                r.zero_runs_inside,
+                r.zeros_after_signal,
+                r.gaps,
+                r.gap_frames,
+                r.repeats,
+                r.corrupt_frames
+            );
+        }
+        Format::Pcm24 => println!(
+            "24-in-32 PCM: {} frames with sound, {} all zero; {} samples with a non-zero padding byte",
+            pcm.sound_frames, pcm.silent_frames, pcm.nonzero_padding
+        ),
+    }
+    OpenRun { elapsed, error }
+}
+
+/// open's render: writes silence for `seconds` (or until Ctrl+C), the first buffer before the start.
+fn run_render(opened: Opened, seconds: u64) -> OpenRun {
+    let mut render = match Render::new(opened) {
+        Ok(r) => r,
+        Err(e) => return OpenRun { error: Some(e), ..Default::default() },
+    };
+    // An event-driven stream wants its first buffer before it starts.
+    if let Err(e) = render.fill_silence() {
+        return OpenRun { error: Some(e), ..Default::default() };
+    }
+    if let Err(e) = render.opened.client.start_stream() {
+        return OpenRun { error: Some(format!("Start returned {}", hresult::name(hresult_of(&e)))), ..Default::default() };
+    }
+    let _pro_audio = ProAudio::join();
+    let (t0, mut last) = (Instant::now(), Instant::now());
+    let mut error = None;
+    while t0.elapsed() < Duration::from_secs(seconds) && !STOP.load(Relaxed) {
+        if let Err(e) = render.wait_and_fill() {
+            error = Some(e);
+            break;
+        }
+        if last.elapsed() >= Duration::from_secs(1) {
+            last = Instant::now();
+            println!("{:>7.1} s  {} buffers, {} frames of silence", t0.elapsed().as_secs_f64(), render.packets, render.frames);
+        }
+    }
+    let elapsed = t0.elapsed();
+    let _ = render.opened.client.stop_stream();
+    println!(
+        "render: {} buffers, {} frames of silence written, longest wait {:.1} ms",
+        render.packets,
+        render.frames,
+        render.longest_wait.as_secs_f64() * 1000.0
+    );
+    OpenRun { elapsed, error }
+}
+
+// ---- latency ----
+
+/// latency: the warm-up once the capture stream runs, before frames are measured; the longest measurement; how long the
+/// capture thread may take to open its stream.
+const LATENCY_WARMUP: Duration = Duration::from_secs(1);
+const LATENCY_MAX_SECONDS: u64 = 600;
+const CAPTURE_OPEN_WAIT: Duration = Duration::from_secs(10);
+/// The capture thread's states ([`LatencyShared::state`]).
+const OPENING: u32 = 0;
+const RUNNING: u32 = 1;
+const FAILED: u32 = 2;
+
+/// What latency's feed (the main thread, which owns the attachment) and its capture thread share.
+struct LatencyShared {
+    /// Set by the feed once the measurement ends: the capture thread stops.
+    stop: AtomicBool,
+    /// OPENING, RUNNING (since `started_qpc`) or FAILED (the thread's result says why).
+    state: AtomicU32,
+    started_qpc: AtomicU64,
+}
+
+/// What latency's capture thread recorded.
+struct CaptureLog {
+    receipts: Log<Receipt>,
+    runs: Log<Run>,
+    counts: FrameCounts,
+    describe: String,
+    packets: u64,
+    silent_packets: u64,
+    lost_frames: u64,
+    discontinuities: u64,
+    longest_wait: Duration,
+    /// Why it stopped before the feed told it to, if it did.
+    error: Option<String>,
+}
+
+/// latency's capture thread: opens the stream, sizes its logs, and records every packet until the feed says stop. Nothing
+/// allocates per packet once the stream runs.
+fn latency_capture(name: &str, spec: StreamSpec, seconds: u64, header: &RingHeader, shared: &LatencyShared) -> Result<CaptureLog, String> {
+    let failed = |e: String| {
+        shared.state.store(FAILED, Release);
+        e
+    };
+    let _com = Com::mta().map_err(failed)?;
+    let mut capture = Capture::open(name, spec).map_err(failed)?;
+    // Sized before the start: every packet of the run at half the granted period (32 frames at the least), four runs each.
+    let packets = latency::packets_for(seconds + LATENCY_WARMUP.as_secs() + 1, (capture.opened.period_frames() / 2).clamp(32, 480));
+    let mut receipts = Log::with_capacity(packets);
+    let mut runs = Log::with_capacity(4 * packets);
+    let mut counts = FrameCounts::default();
+    capture.start().map_err(failed)?;
+    shared.started_qpc.store(qpc_now(), Relaxed);
+    shared.state.store(RUNNING, Release);
+    let _pro_audio = ProAudio::join();
+    let mut error = None;
+    while !shared.stop.load(Relaxed) {
+        let r = capture.read_packets(|p| {
+            // Every frame of the packet was written before this load (the driver copied each only after it read a write_frame
+            // past it), so `written` bounds their frame numbers.
+            let written = header.write_frame.load(Acquire);
+            let first_run = runs.len() as u32;
+            let mut kept = 0u32;
+            if p.silent {
+                counts.silent += u64::from(p.frames);
+            } else {
+                counts.add(&latency::split_runs(p.float_frames(), written, |run| kept += u32::from(runs.push(run))));
+            }
+            receipts.push(Receipt { host_qpc: p.host_qpc, device_hns: p.qpc_hns, frames: p.frames, first_run, runs: kept });
+        });
+        if let Err(e) = r {
+            shared.state.store(FAILED, Release);
+            error = Some(e);
+            break;
+        }
+    }
+    capture.stop();
+    Ok(CaptureLog {
+        receipts,
+        runs,
+        counts,
+        describe: capture.describe(),
+        packets: capture.packets,
+        silent_packets: capture.silent_packets,
+        lost_frames: capture.lost_frames,
+        discontinuities: capture.discontinuities,
+        longest_wait: capture.longest_wait,
+        error,
+    })
+}
+
+/// Why latency's feed loop ended.
+enum LatencyEnd {
+    /// The window was measured, or Ctrl+C cut it short.
+    Done,
+    Driver(io::Error),
+    TargetBelowPacket(u32),
+    CaptureFailed,
+}
+
+/// The measured window: from the first QPC after the warm-up to the feed's stop, with STATS and this ring's underrun count at
+/// each end.
+struct Window {
+    from_qpc: u64,
+    to_qpc: u64,
+    start: Stats,
+    end: Stats,
+    underrun_start: u64,
+    underrun_end: u64,
+}
+
+/// latency's feed, on the thread that owns the attachment: tops the ring up to `target` as feed does, logging each block with
+/// the QPC just after its publication, until the window (`seconds` after the warm-up) is over. Nothing allocates per block.
+fn latency_feed(
+    attachment: &Attachment<'_>, device: &Device, target: u64, seconds: u64, frequency: u64, shared: &LatencyShared,
+    blocks: &mut Log<Block>,
+) -> Result<(LatencyEnd, Option<Window>), String> {
+    let _pro_audio = ProAudio::join();
+    let tick = Tick::new();
+    let ring = attachment.ring();
+    let header = ring.header();
+    let capacity = u64::from(ring.capacity());
+    let mut writer = Writer::new(ring);
+    let (warmup, length) = (LATENCY_WARMUP.as_secs() * frequency, seconds * frequency);
+    let t0 = Instant::now();
+    let mut started: Option<(u64, Stats, u64)> = None;
+    let end = loop {
+        if let Some(status) = attachment.ended() {
+            break LatencyEnd::Driver(status);
+        }
+        // As in feed: PacketFrames first, then State.
+        let packet = header.packet_frames.load(Acquire);
+        if let Some(packet) = packet_above_target(target, header.state.load(Acquire), packet) {
+            break LatencyEnd::TargetBelowPacket(packet);
+        }
+        let read = writer.read_frame();
+        let start = writer.write_frame();
+        let fill = start.saturating_sub(read);
+        let n = top_up(target, fill, capacity.saturating_sub(fill));
+        if n > 0 {
+            writer.produce(n, signal::frame);
+            // Just after produce's store of write_frame, which published the block.
+            blocks.push(Block { qpc: qpc_now(), start, end: writer.write_frame(), read_frame: read });
+        }
+        if STOP.load(Relaxed) {
+            break LatencyEnd::Done;
+        }
+        match shared.state.load(Acquire) {
+            FAILED => break LatencyEnd::CaptureFailed,
+            OPENING if t0.elapsed() >= CAPTURE_OPEN_WAIT => break LatencyEnd::CaptureFailed,
+            RUNNING => {
+                let now = qpc_now();
+                match &started {
+                    // One STATS read at the window's start (and one after its end): not per block.
+                    None if now >= shared.started_qpc.load(Relaxed) + warmup => {
+                        started = Some((now, read_stats(device)?, header.underrun_frames.load(Relaxed)));
+                    }
+                    Some((from, ..)) if now >= from + length => break LatencyEnd::Done,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        tick.wait();
+    };
+    let window = match started {
+        Some((from_qpc, start, underrun_start)) => {
+            let (to_qpc, underrun_end) = (qpc_now(), header.underrun_frames.load(Relaxed));
+            Some(Window { from_qpc, to_qpc, start, end: read_stats(device)?, underrun_start, underrun_end })
+        }
+        None => None,
+    };
+    Ok((end, window))
+}
+
+fn latency(args: &[String]) -> Result<Verdict, String> {
+    let valued = ["--seconds", "--target", "--capacity", "--period-frames", "--mode", "--device"];
+    let o = Opts::parse(args, &valued, &[])?;
+    let seconds: u64 = o.value("--seconds", 10)?;
+    let target: u64 = o.value("--target", 960)?;
+    let capacity: u32 = o.value("--capacity", 8192)?;
+    let name: String = o.value("--device", ENDPOINT.to_string())?;
+    let spec = StreamSpec { period_frames: o.period_frames()?, mode: o.mode(Mode::RawWhereOffered)?, ..StreamSpec::SHARED_FLOAT };
+    if !(1..=LATENCY_MAX_SECONDS).contains(&seconds) {
+        return Err(format!("--seconds {seconds}: from 1 to {LATENCY_MAX_SECONDS}"));
+    }
+    if !protocol::capacity_ok(capacity) {
+        let (min, max) = (protocol::MIN_CAPACITY_FRAMES, protocol::MAX_CAPACITY_FRAMES);
+        return Err(format!("--capacity {capacity}: a power of two from {min} to {max}"));
+    }
+    if target == 0 || target > u64::from(capacity) {
+        return Err(format!("--target {target}: from 1 to the capacity ({capacity}), and at least one capture packet"));
+    }
+    let device = open_device()?;
+    let first = read_stats(&device)?;
+    if first.flags & STATS_ATTACHED != 0 {
+        return Err(format!("process {}'s ring is attached: stop that feed first (latency attaches its own)", first.attached_pid));
+    }
+    let frequency = qpc_frequency();
+    // The feed's log, sized before the start: at most one block a tick (1 ms or more), twice over.
+    let mut blocks = Log::with_capacity(((seconds + LATENCY_WARMUP.as_secs() + 2) * 2_000) as usize);
+    let ring = RingMemory::new(capacity).map_err(|e| e.to_string())?;
+    // Pre-filled to the target as feed does: block 0, published before ATTACH, so not measured.
+    Writer::new(&ring).produce(target, signal::frame);
+    blocks.push(Block { qpc: qpc_now(), start: 0, end: target, read_frame: 0 });
+    // SAFETY: the handler only stores to an atomic.
+    if unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) }.is_err() {
+        eprintln!("note: no Ctrl+C handler: Ctrl+C ends the run without its summary (the driver still detaches the ring)");
+    }
+    let attachment = device.attach(ring).map_err(|e| format!("ATTACH refused: {}{}", e.error, attach_hint(&e)))?;
+    println!(
+        "attached a {capacity}-frame ring, keeping {target} frames ({:.2} ms) in it; recording {name:?} for {seconds} s after a {} s \
+         warm-up (nothing is printed meanwhile)",
+        ms(target),
+        LATENCY_WARMUP.as_secs()
+    );
+    let shared = LatencyShared { stop: AtomicBool::new(false), state: AtomicU32::new(OPENING), started_qpc: AtomicU64::new(0) };
+    let header = attachment.ring().header();
+    let (fed, captured) = thread::scope(|s| {
+        let capture = s.spawn(|| latency_capture(&name, spec, seconds, header, &shared));
+        let fed = latency_feed(&attachment, &device, target, seconds, frequency, &shared, &mut blocks);
+        shared.stop.store(true, Relaxed);
+        (fed, capture.join().unwrap_or_else(|_| Err("the capture thread panicked".to_string())))
+    });
+    let (ring, status) = attachment.detach().map_err(|e| format!("detach: {e}"))?;
+    println!("detached ({})", end_text(&status));
+    print_ring_counters(ring.header());
+    let (end, window) = fed?;
+    let log = captured?;
+    match &end {
+        LatencyEnd::Done => {}
+        LatencyEnd::Driver(status) => println!("the driver ended the attachment: {}", end_text(status)),
+        LatencyEnd::TargetBelowPacket(packet) => println!(
+            "--target {target} is below the reader's {packet}-frame capture packet, so every pass underruns: keep at least one \
+             packet (--target {packet}) or two (--target {})",
+            2 * u64::from(*packet)
+        ),
+        LatencyEnd::CaptureFailed => println!(
+            "the capture stream failed: {}",
+            log.error.as_deref().unwrap_or("it didn't start within the wait (or its thread ended)")
+        ),
+    }
+    println!("the capture stream: {}", log.describe);
+    let Some(w) = window else {
+        println!("FAIL: the capture stream never ran past the {} s warm-up: nothing was measured", LATENCY_WARMUP.as_secs());
+        return Ok(Verdict::Fail);
+    };
+    let report = latency_report(blocks.items(), log.receipts.items(), log.runs.items(), frequency, w.from_qpc, w.to_qpc);
+    print_latency(&report, &log, &w, frequency, target);
+    let mut c = Checks::default();
+    println!("checks:");
+    let dropped = [blocks.dropped(), log.receipts.dropped(), log.runs.dropped()];
+    for check in latency_checks(&report, &log.counts, dropped, log.lost_frames, log.discontinuities) {
+        c.check(check.ok, check.name, check.detail);
+    }
+    if c.failed == 0 && matches!(end, LatencyEnd::Done) {
+        println!("PASS: measured; the latencies above are the result");
+        Ok(Verdict::Pass)
+    } else {
+        println!("FAIL: {} of the checks, or the run ended early", c.failed);
+        Ok(Verdict::Fail)
+    }
+}
+
+/// latency's results, from the logs.
+#[derive(Debug)]
+struct LatencyReport {
+    /// The window's frames: measured, skipped (the pre-fill), never published.
+    measured: latency::Latencies,
+    host: Option<Summary>,
+    device: Option<Summary>,
+    /// The fill the feed found before each top-up in the window, in frames.
+    fill: Option<Summary>,
+    blocks: u64,
+    continuity: Continuity,
+}
+
+/// The latencies of the frames received from `from_qpc` on (block 0, the pre-fill, not measured), the fill the feed found before
+/// each of its blocks between `from_qpc` and `to_qpc`, and whether the window's runs carried every frame once and in order.
+fn latency_report(blocks: &[Block], receipts: &[Receipt], runs: &[Run], frequency: u64, from_qpc: u64, to_qpc: u64) -> LatencyReport {
+    let mut measured = latency::latencies(blocks, receipts, runs, frequency, from_qpc, 1);
+    let host = latency::summarize(&mut measured.host);
+    let device = latency::summarize(&mut measured.device);
+    let mut fills: Vec<Weighted> = blocks
+        .iter()
+        .skip(1)
+        .filter(|b| (from_qpc..=to_qpc).contains(&b.qpc))
+        .map(|b| Weighted { value: b.fill_before() as i64, weight: 1 })
+        .collect();
+    let fill = latency::summarize(&mut fills);
+    let first = receipts.partition_point(|r| r.host_qpc < from_qpc);
+    let from_run = receipts.get(first).map_or(runs.len(), |r| (r.first_run as usize).min(runs.len()));
+    let continuity = latency::continuity(&runs[from_run..]);
+    LatencyReport { measured, host, device, fill, blocks: fills.len() as u64, continuity }
+}
+
+/// latency's checks: something measured, every frame the feed's and in order, the logs big enough, and the stream unbroken.
+/// The latencies themselves are the result, not judged.
+fn latency_checks(r: &LatencyReport, counts: &FrameCounts, dropped: [u64; 3], lost_frames: u64, discontinuities: u64) -> Vec<Check> {
+    let (m, c) = (&r.measured, &r.continuity);
+    vec![
+        Check {
+            ok: m.frames > 0,
+            name: "frames measured",
+            detail: format!("{} frames in {} packets after the warm-up ({} of the pre-fill not measured)", m.frames, m.packets, m.skipped),
+        },
+        Check {
+            ok: c.gaps == 0 && c.repeats == 0,
+            name: "every frame once and in order",
+            detail: format!("gaps {} ({} frames lost), repeats {} ({} frames)", c.gaps, c.gap_frames, c.repeats, c.repeat_frames),
+        },
+        Check {
+            ok: counts.corrupt == 0 && counts.unmatched == 0 && m.unpublished == 0,
+            name: "every frame the feed's",
+            detail: format!(
+                "{} frames neither silence nor a code, {} codes not written yet, {} frames no block published",
+                counts.corrupt, counts.unmatched, m.unpublished
+            ),
+        },
+        Check {
+            ok: dropped.iter().all(|&d| d == 0),
+            name: "the logs held everything",
+            detail: format!("dropped: {} blocks, {} packets, {} runs", dropped[0], dropped[1], dropped[2]),
+        },
+        Check {
+            ok: lost_frames == 0 && discontinuities == 0,
+            name: "the capture stream",
+            detail: format!("{lost_frames} frames lost by the engine, {discontinuities} discontinuities after its first packet"),
+        },
+    ]
+}
+
+/// A latency summary in ms (the samples in 100 ns units).
+fn latency_text(s: &Summary) -> String {
+    let ms = |hns: i64| hns as f64 / 10_000.0;
+    format!(
+        "p50 {:.3} ms, p90 {:.3} ms, p99 {:.3} ms, max {:.3} ms (min {:.3} ms, mean {:.3} ms) over {} frames",
+        ms(s.p50),
+        ms(s.p90),
+        ms(s.p99),
+        ms(s.max),
+        ms(s.min),
+        ms(s.mean),
+        s.count
+    )
+}
+
+fn print_latency(r: &LatencyReport, log: &CaptureLog, w: &Window, frequency: u64, target: u64) {
+    let seconds = (w.to_qpc.saturating_sub(w.from_qpc)) as f64 / frequency as f64;
+    let (s0, s1) = (&w.start, &w.end);
+    let timer = |s: &Stats| s.stream[KIND_CAPTURE];
+    let passes = timer(s1).timer_passes.saturating_sub(timer(s0).timer_passes);
+    let lateness = timer(s1).lateness_sum_hns.saturating_sub(timer(s0).lateness_sum_hns);
+    let mean_us = if passes == 0 { 0.0 } else { us(lateness) / passes as f64 };
+    println!("measured {seconds:.2} s, QPC {:.3} MHz", frequency as f64 / 1e6);
+    println!(
+        "the driver: the reader's packet {} frames; capture timer +{passes} passes, lateness mean {mean_us:.1} us over the window \
+         (max {:.1} us since the driver loaded); passes of a stream that isn't the reader +{}",
+        s1.reader_packet_frames,
+        us(timer(s1).lateness_max_hns),
+        s1.ring.not_reader_packets.saturating_sub(s0.ring.not_reader_packets)
+    );
+    println!(
+        "the ring over the window: underrun {} frames ({} packets with one), resyncs +{}; fill after the driver's latest pass {} \
+         frames",
+        w.underrun_end.saturating_sub(w.underrun_start),
+        s1.ring.underrun_packets.saturating_sub(s0.ring.underrun_packets),
+        s1.ring.resyncs.saturating_sub(s0.ring.resyncs),
+        s1.attached_write_frame.wrapping_sub(s1.attached_read_frame) as i64
+    );
+    match &r.fill {
+        Some(f) => println!(
+            "the feed: {} top-ups to {target} frames; the fill it found before one: min {}, p50 {}, p90 {}, max {} frames (p50 {:.2} ms)",
+            r.blocks,
+            f.min,
+            f.p50,
+            f.p90,
+            f.max,
+            ms(f.p50.max(0) as u64)
+        ),
+        None => println!("the feed: no top-ups in the window"),
+    }
+    let counts = &log.counts;
+    let timestamp_errors = log.receipts.items().iter().filter(|r| r.device_hns.is_none()).count();
+    println!(
+        "received (the whole run): {} packets ({} silent, {timestamp_errors} with a timestamp error), frames: {} carry a code, {} \
+         silent, {} neither; longest wait {:.1} ms",
+        log.packets,
+        log.silent_packets,
+        counts.signal,
+        counts.silent,
+        counts.corrupt,
+        log.longest_wait.as_secs_f64() * 1000.0
+    );
+    let none = "nothing measured".to_string();
+    println!("publication to host receipt (the QPC when GetBuffer returned): {}", r.host.as_ref().map_or(none.clone(), latency_text));
+    println!("publication to device receipt (GetBuffer's device QPC position): {}", r.device.as_ref().map_or(none, latency_text));
 }
 
 #[cfg(test)]
@@ -1441,7 +2714,7 @@ mod tests {
 
     /// verify's checks for a recording `r` between `before` and `after`, with nothing lost and no discontinuity.
     fn verify_failures(before: &Stats, after: &Stats, r: &CheckReport) -> Vec<&'static str> {
-        failed(&verify_checks(before, after, r, 0, 0))
+        failed(&verify_checks(before, after, r, &StreamSeen::default()))
     }
 
     #[test]
@@ -1470,7 +2743,7 @@ mod tests {
     fn verify_passes_a_clean_recording() {
         let before = reading(counters(3, 1_000_000, 50));
         let after = reading(counters(3, 1_000_000 + FRAMES + 960, 50));
-        let checks = verify_checks(&before, &after, &clean_recording(), 0, 0);
+        let checks = verify_checks(&before, &after, &clean_recording(), &StreamSeen::default());
         assert_eq!(checks.len(), 8);
         assert_eq!(failed(&checks), Vec::<&str>::new(), "{checks:?}");
         // Silence the driver counted as underruns passes, inside the signal or at its edges.
@@ -1528,8 +2801,9 @@ mod tests {
         assert_eq!(verify_failures(&before, &after, &CheckReport { gaps: 1, gap_frames: 5, ..r.clone() }), ["bit-exact and in order"]);
         assert_eq!(verify_failures(&before, &after, &CheckReport { repeats: 1, ..r.clone() }), ["bit-exact and in order"]);
         // One discontinuity, or frames the engine lost.
-        assert_eq!(failed(&verify_checks(&before, &after, &r, 0, 1)), ["the capture stream"]);
-        assert_eq!(failed(&verify_checks(&before, &after, &r, 10, 0)), ["the capture stream"]);
+        let seen = |lost_frames, discontinuities| StreamSeen { lost_frames, discontinuities, packet: 480 };
+        assert_eq!(failed(&verify_checks(&before, &after, &r, &seen(0, 1))), ["the capture stream"]);
+        assert_eq!(failed(&verify_checks(&before, &after, &r, &seen(10, 0))), ["the capture stream"]);
         // Nothing recorded.
         let none = verify_failures(&before, &before, &CheckReport::default());
         assert_eq!(none, ["the driver copied the recording", "signal", "bit-exact and in order"]);
@@ -1638,5 +2912,173 @@ mod tests {
         assert_eq!(packet_above_target(100, STATE_ATTACHED, 0), None);
         assert_eq!(packet_above_target(100, STATE_ATTACHED | STATE_FORMAT_MISMATCH, 1_323), None);
         assert_eq!(packet_above_target(100, 0, 480), None);
+    }
+
+    /// A secondary stream's recording: its silence is what the driver zero-filled for it (SecondaryUnderrunFrames), and the
+    /// slack at the edges is a packet of its own period when that is the larger.
+    #[test]
+    fn verify_allows_a_secondary_streams_underruns() {
+        let before = Stats { secondary_underrun_frames: 100, ..reading(counters(3, 1_000_000, 0)) };
+        let after = Stats { secondary_underrun_frames: 100 + 2_000, ..reading(counters(3, 1_000_000 + FRAMES, 0)) };
+        let r = CheckReport { signal_frames: FRAMES - 2_000, zeros_inside: 2_000, zero_runs_inside: 3, ..clean_recording() };
+        assert_eq!(verify_failures(&before, &after, &r), Vec::<&str>::new());
+        // The same silence with no secondary underruns counted fails.
+        let after_none = Stats { secondary_underrun_frames: 100, ..after };
+        assert_eq!(verify_failures(&before, &after_none, &r), ["silence inside the signal", "all the silence"]);
+        // A 128-frame reader and this stream at 480 frames: one of this stream's packets of slack at each end.
+        let small = |s: Stats| Stats { reader_packet_frames: 128, ..s };
+        let (b, a) = (small(reading(counters(3, 1_000_000, 0))), small(reading(counters(3, 1_000_000 + FRAMES, 0))));
+        let edges = CheckReport { signal_frames: FRAMES - 960, zeros_before_signal: 480, zeros_after_signal: 480, ..clean_recording() };
+        assert_eq!(failed(&verify_checks(&b, &a, &edges, &StreamSeen::default())), ["all the silence"], "the reader's 128 only");
+        let own = StreamSeen { packet: 480, ..Default::default() };
+        assert_eq!(failed(&verify_checks(&b, &a, &edges, &own)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn hresults_have_names() {
+        use windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_IN_USE;
+        assert_eq!(hresult::name(AUDCLNT_E_UNSUPPORTED_FORMAT), "AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008)");
+        assert_eq!(hresult::name(AUDCLNT_E_DEVICE_IN_USE), "AUDCLNT_E_DEVICE_IN_USE (0x8889000A)");
+        assert_eq!(hresult::name(HRESULT(0)), "S_OK (0x00000000)");
+        assert_eq!(hresult::name(HRESULT(1)), "S_FALSE (0x00000001)");
+        // A driver's STATUS_NOT_SUPPORTED as the I/O manager's Win32 error, or as the NTSTATUS itself.
+        assert_eq!(hresult::name(HRESULT(0x8007_0032_u32 as i32)), "HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) (0x80070032)");
+        assert_eq!(hresult::name(HRESULT(0xD000_00BB_u32 as i32)), "HRESULT_FROM_NT(STATUS_NOT_SUPPORTED) (0xD00000BB)");
+        // The fallback tables: a Win32 error and an NTSTATUS that NAMES doesn't hold.
+        assert_eq!(hresult::name(HRESULT(0x8007_048F_u32 as i32)), "HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) (0x8007048F)");
+        assert_eq!(hresult::name(HRESULT(0x9000_0011_u32 as i32)), "HRESULT_FROM_NT(STATUS_DEVICE_BUSY) (0x90000011)");
+        assert_eq!(hresult::name(E_FAIL), "E_FAIL (0x80004005)");
+        // Anything else: its value, and the system's text where it has one.
+        assert!(hresult::name(HRESULT(0x8899_1234_u32 as i32)).starts_with("0x88991234"));
+        // Every name is the constant's own, once.
+        for (i, (hr, name)) in hresult::NAMES.iter().enumerate() {
+            assert!(hresult::NAMES[i + 1..].iter().all(|(h, _)| h != hr), "{name} twice");
+        }
+        let r = Refusal { call: "Initialize", hr: AUDCLNT_E_UNSUPPORTED_FORMAT, text: None };
+        assert_eq!(r.to_string(), "Initialize returned AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008)");
+        let r = Refusal::at("Initialize", WasapiError::UnsupportedFormat);
+        assert!(r.to_string().starts_with("Initialize returned AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) ("), "{r}");
+    }
+
+    #[test]
+    fn the_formats_are_eight_bytes_a_frame() {
+        let f = Format::Float.wave();
+        assert_eq!((f.get_samplespersec(), f.get_nchannels(), f.get_bitspersample(), f.get_validbitspersample()), (48_000, 2, 32, 32));
+        assert!(matches!(f.get_subformat(), Ok(SampleType::Float)));
+        let p = Format::Pcm24.wave();
+        assert_eq!((p.get_bitspersample(), p.get_validbitspersample(), p.get_dwchannelmask()), (32, 24, 0b11));
+        assert!(matches!(p.get_subformat(), Ok(SampleType::Int)));
+        for w in [f, p] {
+            assert_eq!(w.get_blockalign(), protocol::FRAME_BYTES);
+        }
+        assert_eq!(describe_format(&Format::Pcm24.wave()), "48000 Hz, 2 ch, 24-in-32 PCM");
+        assert_eq!(describe_format(&Format::Float.wave()), "48000 Hz, 2 ch, 32-bit float");
+        assert_eq!((Format::parse("float"), Format::parse("pcm24")), (Ok(Format::Float), Ok(Format::Pcm24)));
+        assert!(Format::parse("pcm16").is_err());
+    }
+
+    #[test]
+    fn open_needs_a_device_a_share_mode_and_a_format() {
+        let open = |list: &[&str]| open_args(&args(list));
+        let a = open(&["--device", "Mic (X)", "--exclusive", "--format", "pcm24"]).unwrap();
+        let spec = StreamSpec { exclusive: true, format: Format::Pcm24, period_frames: None, mode: Mode::Default };
+        assert_eq!(a, OpenArgs { name: "Mic (X)".into(), render: false, spec, seconds: 10 });
+        let a = open(&[
+            "--render", "--shared", "--device", "Speakers", "--format", "float", "--period-frames", "128", "--mode", "raw", "--seconds",
+            "3",
+        ])
+        .unwrap();
+        let spec = StreamSpec { exclusive: false, format: Format::Float, period_frames: Some(128), mode: Mode::Raw };
+        assert_eq!(a, OpenArgs { name: "Speakers".into(), render: true, spec, seconds: 3 });
+        for (list, why) in [
+            (&["--exclusive", "--format", "float"][..], "--device NAME is required"),
+            (&["--device", "M", "--format", "float"], "one of --exclusive and --shared"),
+            (&["--device", "M", "--exclusive", "--shared", "--format", "float"], "one of --exclusive and --shared"),
+            (&["--device", "M", "--exclusive"], "--format float|pcm24 is required"),
+            (&["--device", "M", "--exclusive", "--format", "int16"], "float or pcm24"),
+            (&["--device", "M", "--exclusive", "--format", "float", "--mode", "comms"], "raw or default"),
+            (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "0"], "--period-frames 0"),
+            (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "48001"], "--period-frames 48001"),
+            (&["--device", "M", "--exclusive", "--format", "float", "--seconds", "0"], "--seconds 0"),
+        ] {
+            let e = open(list).unwrap_err();
+            assert!(e.contains(why), "{list:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn modes_default_per_command() {
+        let a = args(&[]);
+        let o = Opts::parse(&a, &["--mode", "--period-frames"], &[]).unwrap();
+        assert_eq!((o.mode(Mode::RawWhereOffered), o.period_frames()), (Ok(Mode::RawWhereOffered), Ok(None)));
+        let a = args(&["--mode", "default", "--period-frames", "160"]);
+        let o = Opts::parse(&a, &["--mode", "--period-frames"], &[]).unwrap();
+        assert_eq!((o.mode(Mode::RawWhereOffered), o.period_frames()), (Ok(Mode::Default), Ok(Some(160))));
+    }
+
+    #[test]
+    fn pcm_counts_find_silence_and_padding() {
+        let mut c = PcmCounts::default();
+        // A silent frame; a frame with sound and zero padding (0x7FFFFF00, positive full scale, then -1 as 0xFFFFFF00); a frame
+        // whose left sample's padding byte isn't zero.
+        let mut bytes = vec![0u8; 8];
+        bytes.extend(0x7FFF_FF00_u32.to_le_bytes());
+        bytes.extend(0xFFFF_FF00_u32.to_le_bytes());
+        bytes.extend(0x0000_0101_u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        c.count(&bytes);
+        assert_eq!(c, PcmCounts { silent_frames: 1, sound_frames: 2, nonzero_padding: 1 });
+    }
+
+    /// Synthetic logs on a 10 MHz QPC: the pre-fill, then a 480-frame block every 10 ms read 9 ms later, and a packet per
+    /// block received 1 ms after the read (the device stamping it a period earlier).
+    fn latency_logs(blocks_n: u64) -> (Vec<Block>, Vec<Receipt>, Vec<Run>) {
+        let mut blocks = vec![Block { qpc: 0, start: 0, end: 480, read_frame: 0 }];
+        let (mut receipts, mut runs) = (Vec::new(), Vec::new());
+        for i in 0..blocks_n {
+            let t = 100_000 * (i + 1);
+            if i > 0 {
+                blocks.push(Block { qpc: t, start: 480 * i, end: 480 * (i + 1), read_frame: 480 * i });
+            }
+            runs.push(Run { first: 480 * i, len: 480 });
+            receipts.push(Receipt { host_qpc: t + 100_000, device_hns: Some(t), frames: 480, first_run: i as u32, runs: 1 });
+        }
+        (blocks, receipts, runs)
+    }
+
+    #[test]
+    fn latency_reports_the_logs() {
+        let (blocks, receipts, runs) = latency_logs(100);
+        let r = latency_report(&blocks, &receipts, &runs, 10_000_000, 1_000_000, u64::MAX);
+        // Receipts from 1,000,000 ticks: packets 8 to 99 (92), every frame received 10 ms after its block (0 by the device).
+        assert_eq!((r.measured.packets, r.measured.frames, r.measured.skipped), (92, 92 * 480, 0));
+        let host = r.host.unwrap();
+        assert_eq!((host.p50, host.p99, host.max, host.count), (100_000, 100_000, 100_000, 92 * 480));
+        assert_eq!(r.device.unwrap().max, 0);
+        // Blocks 9 to 99 in the window, each topping up from an empty ring.
+        let fill = r.fill.unwrap();
+        assert_eq!((r.blocks, fill.min, fill.max), (91, 0, 0));
+        assert_eq!(r.continuity, Continuity::default());
+        let checks = latency_checks(&r, &FrameCounts::default(), [0; 3], 0, 0);
+        assert_eq!(failed(&checks), Vec::<&str>::new(), "{checks:?}");
+
+        // From the start the pre-fill is skipped, not measured.
+        let r0 = latency_report(&blocks, &receipts, &runs, 10_000_000, 0, u64::MAX);
+        assert_eq!((r0.measured.packets, r0.measured.skipped), (100, 480));
+
+        // A lost run, a corrupt frame, a dropped log entry, the engine's lost frames: each fails its check.
+        let mut gap = runs.clone();
+        gap[50].first += 10;
+        let r = latency_report(&blocks, &receipts, &gap, 10_000_000, 1_000_000, u64::MAX);
+        assert_eq!(failed(&latency_checks(&r, &FrameCounts::default(), [0; 3], 0, 0)), ["every frame once and in order"]);
+        let r = latency_report(&blocks, &receipts, &runs, 10_000_000, 1_000_000, u64::MAX);
+        let corrupt = FrameCounts { corrupt: 1, ..Default::default() };
+        assert_eq!(failed(&latency_checks(&r, &corrupt, [0; 3], 0, 0)), ["every frame the feed's"]);
+        assert_eq!(failed(&latency_checks(&r, &FrameCounts::default(), [0, 1, 0], 0, 0)), ["the logs held everything"]);
+        assert_eq!(failed(&latency_checks(&r, &FrameCounts::default(), [0; 3], 5, 0)), ["the capture stream"]);
+        // Nothing received after the window's start.
+        let r = latency_report(&blocks, &receipts, &runs, 10_000_000, u64::MAX, u64::MAX);
+        assert_eq!(failed(&latency_checks(&r, &FrameCounts::default(), [0; 3], 0, 0)), ["frames measured"]);
+        assert!(r.host.is_none() && r.device.is_none());
     }
 }
