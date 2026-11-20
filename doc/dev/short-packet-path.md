@@ -1,11 +1,9 @@
 # The short packet path: design and estimate (2026-11-20)
 
-**Status:** not built. This is our design and estimate (ours), pending the owner's decision: build it now or not. The idea
-comes from an outside review: a chain with no block-based stage could process each mic packet as it arrives instead of
-waiting for a 480-frame block. The owner (2026-11-20) said this is pre-release with no fixed contract: "If it's quick just
-do it and tick it off". It isn't quick. A correct version is about 750-1050 changed lines across about sixteen files, the
-core of it on the audio thread's hottest path, and it changes what the noise toggle does. So it goes back to the owner
-(Recommendation, below). Code references are to b41f0c3.
+**Status.** Deferred. The owner chose option B, the live switch, on 2026-11-20. The proposal came from an outside review.
+A chain with no block-based stage could process each mic packet as it arrives. The owner initially asked for this during
+the spike if it was quick. We estimate 950-1050 changed lines across fifteen files for B, including the audio thread's
+output path and the noise toggle. Code references are to b41f0c3.
 
 ## What it would save
 - **The block's fill wait, `BLOCK - packet`, for every sample.** Every sample in a block has the same latency: the block,
@@ -116,9 +114,10 @@ that check.
   does today (control.rs `restart_needed`):
   - The control thread needs the run's unit. `Opened` would carry it and `Desired` keep it beside `aec_built`, either as a
     new parameter or as a struct replacing `aec_built`. That touches 28 call sites, most of them tests.
-  - The cost: the app's main control becomes a stream restart in such a run. That is 200 ms of coalescing plus the
-    reopen (exclusive mic and output, the chain, the prefill, the warm-up): a dropout that the call app hears. Today the
-    same toggle is a click-free dip splice.
+  - The cost: the app's main control becomes a stream restart in such a run. The control thread waits 200 ms after the
+    latest change (`COALESCE`, control.rs), with the old run still playing, then stops and reopens the streams (exclusive
+    mic and output, the chain, the prefill, the warm-up). That stop-and-reopen is the dropout the call app hears; its
+    length isn't measured yet. Today the same toggle is a click-free dip splice.
   - Turning the filter off again doesn't restart: the run stays on blocks until its next start.
 - **B. A live switch, short to blocks, at a block boundary.** Back to units only at the next start.
   - The pipeline reads the controls before each unit. When a stage is wanted, it sends that unit faded out (3.33 ms),
@@ -177,13 +176,9 @@ the padding and clock calls on a shared output).
 - There are two paths through the hottest loop. The block path must stay bit for bit the same.
 - Shrinking the fixed target's spare is a separate decision (above). This design keeps it.
 
-## Recommendation (ours, pending the owner's decision)
-Whether to build it now is the owner's call. Ours is not now. It saves about 7 ms only in the bypass state, at the price of
-a second output path through the audio thread and a worse noise toggle in that state. We'd revisit it when either of these
-happens:
-- a stage that can run per packet exists (a TODO 17 effect, or a gate of its own); the unit work above is then its base;
-- the owner wants the bypass at minimum latency, for example a "direct" mode on our own virtual mic (TODO 19).
+## Decision (2026-11-20)
 
-If the owner says build: option B in one piece of work, with no line cap, on the facts contract and the ring sizing above.
-The toggle stays live, and the gap happens once a run. If the owner says not now, TODO 13 records that as the owner's
-decision.
+The owner chose B. The noise toggle keeps the streams open and switches from short packets to blocks once per run.
+The estimated saving today is about 7 ms in bypass with a 160-frame mic period. Implementation is deferred. We recommend
+revisiting it with a per-packet effect such as an EQ or standalone gate (TODO 17), or a low-latency direct mode for the
+virtual mic (TODO 19).
