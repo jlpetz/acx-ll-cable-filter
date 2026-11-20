@@ -115,7 +115,7 @@ pub struct Outcome {
 /// GetOverlappedResult ([`AttachError::pending`](crate::AttachError::pending)). The driver checks the input's magic and version
 /// before any size, so a client of another version always gets ERROR_REVISION_MISMATCH.
 #[rustfmt::skip]
-pub const ATTACH_REFUSALS: [Outcome; 9] = [
+pub const ATTACH_REFUSALS: [Outcome; 10] = [
     Outcome { ntstatus: 0xC000_0010, name: "STATUS_INVALID_DEVICE_REQUEST", win32: 1, meaning: "not from user mode" },
     Outcome { ntstatus: 0xC000_0059, name: "STATUS_REVISION_MISMATCH", win32: 1306,
               meaning: "the input's or the header's version isn't the driver's: it speaks another protocol version" },
@@ -132,9 +132,22 @@ pub const ATTACH_REFUSALS: [Outcome; 9] = [
               meaning: "the driver is going away: close every handle to the control device (an open handle keeps the driver loaded)" },
     Outcome { ntstatus: 0x8000_0011, name: "STATUS_DEVICE_BUSY", win32: 170,
               meaning: "another ring is attached (`stats` shows its process)" },
+    FORMAT_REFUSAL,
     Outcome { ntstatus: 0xC000_0120, name: "STATUS_CANCELLED", win32: 995,
               meaning: "the request was cancelled, or the handle closed, before the ring was published" },
 ];
+
+/// The refusal of a ring the capture endpoint can't play: a capture stream is open on it in a format other than 48 kHz float32
+/// stereo (a client that opened it in 24-in-32 PCM, say). The driver leaves that client alone and counts the refusal
+/// ([`RingStats::format_rejects`]). While a ring is attached the driver refuses the opposite order too: a capture stream created
+/// in another format ([`RingStats::refused_capture_opens`]; its client sees the failure from `IAudioClient::Initialize`).
+#[rustfmt::skip]
+pub const FORMAT_REFUSAL: Outcome = Outcome {
+    ntstatus: 0xC000_00BB, name: "STATUS_NOT_SUPPORTED", win32: 50,
+    meaning: "a capture stream is open in a format other than 48 kHz float32 stereo, so the ring couldn't be played: the driver \
+              leaves that client running; feed through the app's WASAPI output instead (24-in-32 PCM into the speaker endpoint, \
+              the loopback path), or close that client and attach again",
+};
 
 /// ATTACH failures DeviceIoControl returns at once, from before the driver saw the request (it never went pending): the I/O
 /// manager's checks, or a purged queue. ERROR_NOACCESS and ERROR_NO_SYSTEM_RESOURCES are refusals too, from GetOverlappedResult:
@@ -300,9 +313,14 @@ pub struct RingStats {
     pub resyncs: u64,
     /// Passes zero-filled because the capture stream wasn't 48 kHz float32 stereo.
     pub mismatch_packets: u64,
-    /// Passes of a second capture stream, zero-filled (one reader at a time).
+    /// Passes of a capture stream that isn't the reader (one reader at a time; [`Stats::secondary_frames_copied`] counts what
+    /// such streams were given of the ring's audio).
     pub not_reader_packets: u64,
-    pub reserved: [u64; 2],
+    /// ATTACHes refused with [`FORMAT_REFUSAL`]: a capture stream was open in a format other than 48 kHz float32 stereo.
+    pub format_rejects: u64,
+    /// Capture stream creations the driver refused because a ring was attached and the stream's format wasn't 48 kHz float32
+    /// stereo.
+    pub refused_capture_opens: u64,
 }
 
 /// `NF_VMIC_LOOPBACK_STATS`: the render-to-capture loopback ring's counters (Public.h, `LOOPBACK_RING`), widened.
@@ -347,7 +365,11 @@ pub struct Stats {
     pub reserved0: u32,
     pub ring: RingStats,
     pub loopback: LoopbackStats,
-    pub reserved1: [u64; 4],
+    /// Frames of the ring's audio delivered to capture streams other than the reader.
+    pub secondary_frames_copied: u64,
+    /// Frames such a stream zero-filled because the ring's audio for its position wasn't there.
+    pub secondary_underrun_frames: u64,
+    pub reserved1: [u64; 2],
     /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
     pub stream: [StreamStats; KINDS],
 }
@@ -394,6 +416,8 @@ const _: () = {
     assert!(offset_of!(RingStats, passes) == 56);
     assert!(offset_of!(RingStats, frames_copied) == 64);
     assert!(offset_of!(RingStats, not_reader_packets) == 104);
+    assert!(offset_of!(RingStats, format_rejects) == 112);
+    assert!(offset_of!(RingStats, refused_capture_opens) == 120);
 
     assert!(size_of::<LoopbackStats>() == 96);
     assert!(offset_of!(LoopbackStats, render_not_owner) == 80);
@@ -406,7 +430,9 @@ const _: () = {
     assert!(offset_of!(Stats, reader_packet_frames) == 56);
     assert!(offset_of!(Stats, ring) == 64);
     assert!(offset_of!(Stats, loopback) == 192);
-    assert!(offset_of!(Stats, reserved1) == 288);
+    assert!(offset_of!(Stats, secondary_frames_copied) == 288);
+    assert!(offset_of!(Stats, secondary_underrun_frames) == 296);
+    assert!(offset_of!(Stats, reserved1) == 304);
     assert!(offset_of!(Stats, stream) == 320);
 };
 
@@ -454,7 +480,8 @@ mod tests {
         use windows::Win32::Foundation::{
             NTSTATUS, RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION, STATUS_CANCELLED, STATUS_DATATYPE_MISALIGNMENT,
             STATUS_DEVICE_BUSY, STATUS_DEVICE_REMOVED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_BUFFER_SIZE,
-            STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_REVISION_MISMATCH,
+            STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
+            STATUS_REVISION_MISMATCH,
         };
         let named = [
             ("STATUS_ACCESS_DENIED", STATUS_ACCESS_DENIED),
@@ -467,6 +494,7 @@ mod tests {
             ("STATUS_INSUFFICIENT_RESOURCES", STATUS_INSUFFICIENT_RESOURCES),
             ("STATUS_DEVICE_REMOVED", STATUS_DEVICE_REMOVED),
             ("STATUS_DEVICE_BUSY", STATUS_DEVICE_BUSY),
+            ("STATUS_NOT_SUPPORTED", STATUS_NOT_SUPPORTED),
             ("STATUS_CANCELLED", STATUS_CANCELLED),
             ("STATUS_INVALID_DEVICE_STATE", STATUS_INVALID_DEVICE_STATE),
         ];
@@ -495,5 +523,20 @@ mod tests {
         );
         assert_eq!((ending(995).map(|o| o.name), ending(1617).map(|o| o.name)), (Some("STATUS_CANCELLED"), Some("STATUS_DEVICE_REMOVED")));
         assert_eq!((refusal(2, true), refusal(2, false), ending(87)), (None, None, None));
+        // The format refusal: ERROR_NOT_SUPPORTED, from GetOverlappedResult (a refusal goes pending first), listed right after
+        // STATUS_DEVICE_BUSY as nf_vmic.h lists it; never an ending.
+        assert_eq!((FORMAT_REFUSAL.win32, refusal(50, true)), (50, Some(&FORMAT_REFUSAL)));
+        let busy = ATTACH_REFUSALS.iter().position(|o| o.name == "STATUS_DEVICE_BUSY").unwrap();
+        assert_eq!(ATTACH_REFUSALS[busy + 1], FORMAT_REFUSAL);
+        assert_eq!(ending(50), None);
+    }
+
+    /// The new counters sit where nf_vmic.h's Reserved fields were, and the rest stays reserved.
+    #[test]
+    fn the_counters_replace_reserved_fields() {
+        assert_eq!((offset_of!(RingStats, format_rejects), offset_of!(RingStats, refused_capture_opens)), (112, 120));
+        assert_eq!((offset_of!(Stats, secondary_frames_copied), offset_of!(Stats, secondary_underrun_frames)), (288, 296));
+        assert_eq!(size_of_val(&Stats::default().reserved1), 16);
+        assert_eq!(offset_of!(Stats, reserved1) + 16, offset_of!(Stats, stream));
     }
 }

@@ -12,12 +12,16 @@
 //! - [`memory`]: [`RingMemory`] (the page-aligned ring, marked once attached until reset) and [`Writer`] (fills it and
 //!   publishes `write_frame`).
 //! - [`device`]: [`Device`] (open, STATS) and [`Attachment`] (the pending ATTACH; detached by cancelling it, with one wait).
+//! - [`latency`]: the arithmetic of the tool's latency mode: preallocated logs, a packet's frames decoded back to frame
+//!   numbers, publication-to-receipt latency per frame, and nearest-rank percentiles.
 //!
-//! The tool `nf-vmic-test` (src/bin) feeds, verifies, prints the statistics and kills feeders. Nothing in the tests opens the
-//! driver or an audio device: they run the writer against the model reader over real `VirtualAlloc` memory (4 KB pages).
+//! The tool `nf-vmic-test` (src/bin) feeds, verifies, prints the statistics, kills feeders, opens an endpoint in a chosen format
+//! (the format-refusal tests) and measures the ring's latency. Nothing in the tests opens the driver or an audio device: they
+//! run the writer against the model reader over real `VirtualAlloc` memory (4 KB pages).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod device;
+pub mod latency;
 pub mod memory;
 pub mod protocol;
 pub mod ring;

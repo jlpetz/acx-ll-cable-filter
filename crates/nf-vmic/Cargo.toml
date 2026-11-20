@@ -6,18 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# The spike's tool (TODO 19, spike check 4): feed, verify, stats, kill-test. `cargo build -p nf-vmic --release`.
+# The spike's tool (TODO 19, spike check 4): feed, verify, stats, kill-test, open, latency. `cargo build -p nf-vmic --release`.
 [[bin]]
 name = "nf-vmic-test"
 path = "src/bin/nf-vmic-test.rs"
 
 [dependencies]
-# The tool's verify and kill-test record the capture endpoint; the library itself doesn't use it.
+# The tool's verify, kill-test, open and latency open the endpoints; the library itself doesn't use it.
 wasapi.workspace = true
 # The library: Foundation, Security (CreateFileW's and CreateEventW's signatures), Storage_FileSystem (CreateFileW), System_IO
 # (DeviceIoControl, OVERLAPPED, CancelIoEx), System_Memory (VirtualAlloc), System_Threading (events). The tool: System_Threading
-# (the waitable timer, MMCSS), System_Console (feed's Ctrl+C handler), System_JobObjects (kill-test's job for its children), and
-# Media_Audio(_Endpoints), Com, Com_StructuredStorage and Variant for the endpoint volume (IMMDevice::Activate's signature).
+# (the waitable timer, MMCSS), System_Console (Ctrl+C handlers), System_JobObjects (kill-test's job for its children),
+# System_Performance (latency's QPC), and Media_Audio(_Endpoints), Com, Com_StructuredStorage and Variant for the endpoint volume
+# (IMMDevice::Activate's signature) and the raw capture and render clients (GetService, CoTaskMemFree).
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -27,6 +28,7 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    "Win32_System_Performance",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
