@@ -94,7 +94,8 @@ typedef struct _LOOPBACK_RING {
     // Counters for the spike, read with the debugger.
     ULONG           IdlePackets;            // capture packets zeroed (all or the end) with no render stream running
     ULONG           MismatchPackets;        // capture packets zeroed because the render and capture formats differ
-    ULONG           RefusedOpens;           // stream creations refused (LoopbackStreamOpen): another format open on the other circuit
+    ULONG           RefusedOpens;           // stream creations refused (LoopbackStreamOpen): another format open on the other circuit,
+                                            // or (not expected) no free format slot on this one
     ULONG           UnderrunPackets;        // capture packets zeroed at the end because the render audio was not there yet
     ULONGLONG       UnderrunFrames;
     ULONG           OverrunPackets;         // capture packets zeroed at the start because the ring had already overwritten them

@@ -35,7 +35,7 @@ days). The first capture packet of a run reported a QPC of 0. And `KSCONVERT_PER
 three times, so ScheduleNextPass and UpdatePosition read the clock three times per conversion: across a low-word wrap
 (every 2^32 ticks, about 7 minutes at 10 MHz) the words of two reads could make a time about 429 s off and stall the
 stream. Each conversion now takes one reading (`QpcToHns`), and GetPresentationPosition reports the position and its QPC
-from the same reading (the sample read the clock twice).
+from the same reading (the sample read it three times in UpdatePosition and once more for the QPC).
 
 ## Building and installing (an elevated Windows PowerShell)
 
