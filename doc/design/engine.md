@@ -67,7 +67,8 @@ Once, when the thread starts:
 1. `initialize_mta` (a failure fails each run it's given);
 2. `AvSetMmThreadCharacteristicsW("Pro Audio")` (record failure in the status and continue);
 3. **no FTZ/DAZ** (Rust treats a persistent MXCSR change as UB): instead add `nf_core::rt::Dither` at
-   1e-9 (about -180 dBFS) to every mic block and every reference block, zero-filled gaps included.
+   1e-9 (about -180 dBFS) to every mic block and every reference block, zero-filled gaps included; sonora 0.3.0 sets them inside
+   each of its own calls and restores them (sonora-nnnoiseless.md 1.11).
    That prevents sonora's denormal stall (sonora #34) and denormals in RNNoise's high-pass on exact
    digital silence;
 4. `audio::prepare_rt_thread()`: `nf_stages::warm_up_fft_thread()` first, so easyfft's leaked state
@@ -156,8 +157,8 @@ error and stop):
      `devices --check` do, before they stop);
    - publish `rt_heap_allocations = thread_scope_fallbacks() - baseline` (must stay 0; log once,
      from the control thread, if it grows) and `rt_pool_allocations_per_s` (the per-second growth of
-     `thread_scope_allocs()`; nonzero with AEC3, because sonora 0.2.0 allocates per block, served
-     O(1) from the locked pool).
+     `thread_scope_allocs()`; 0 with the built-in stages since sonora 0.3.0, whose AEC3 allocates
+     nothing per block; 0.2.0's made about 43 a block, served O(1) from the locked pool).
 
 Never allocate, lock, log or make blocking calls inside the loop:
 - Telemetry goes through atomics.

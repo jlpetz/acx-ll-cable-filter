@@ -16,7 +16,8 @@ Written from the registry sources on 2026-10-26. Path prefixes used below (all u
 `sonora` 0.2.0 depends on `sonora-aec3`, `sonora-agc2`, `sonora-common-audio`, `sonora-ns`,
 `sonora-simd` (all `0.2.0`) and `tracing 0.1` (`sonora-0.2.0/Cargo.toml`). `sonora-fft 0.2.0` comes in
 through `sonora-aec3`. All seven are built from the same git commit `a024d6ef` (`.cargo_vcs_info.json`).
-Our pins: `sonora = "=0.2.0"`, `nnnoiseless = { version = "=0.5.2", default-features = false }`.
+Our pins: `sonora = "=0.3.0"` since 2026-11-20 (Part 1 describes 0.2.0, the pin until then; 1.11 says what 0.3.0
+changed), `nnnoiseless = { version = "=0.5.2", default-features = false }`.
 
 Statements marked **(inferred)** come from reading the code, not from a test or measurement.
 Statements marked **(GitHub)** come from the upstream repo (issue or PR text), not from the 0.2.0 sources.
@@ -252,6 +253,7 @@ an `AtomicU32`. AEC3's clock-drift flag isn't exposed.
 That's about 43 allocations and frees per frame, with all-Rust `Vec`s through the global allocator.
 The render call itself doesn't allocate. Upstream PR #40 (open) makes steady-state AEC allocation-free.
 **(GitHub)** Until then, sonora on the DSP thread depends on our TLSF global-allocator router.
+**0.3.0 (released 2026-11-07; our pin since 2026-11-20) ships sonora #40: no allocation per block, measured (1.11).**
 
 Other per-call allocations, all off for us: the stereo downmix (`S/audio_buffer.rs:230`), AGC2
 (`S/gain_controller2.rs:110-111, 264, 313-331`), the residual echo detector queue
@@ -314,7 +316,7 @@ Nothing logs on the normal hot path.
     `DenormalDisabler`.
   - **0.2.0 has no denormal handling anywhere.** Grep for mxcsr, flush, denorm or subnormal finds
     nothing in any `sonora-*` crate.
-  - PR #38 (open) adds the guard. **(GitHub)**
+  - PR #38 (open) adds the guard. **(GitHub)** 0.3.0 has one, upstream's `DenormalDisabler` (1.11).
 - **Mitigation 1, defined behaviour:** add about ±1e-9 (−180 dBFS) of noise to every render sample,
   including zero-filled gaps, before `process_render_f32`. In FloatS16 that's about 3e-5, a normal float.
   Use a cheap xorshift with no allocation (skeleton in 3.1).
@@ -338,6 +340,33 @@ Nothing logs on the normal hot path.
   - Divergence detection itself is upstream logic (`A/subtractor_output_analyzer.rs:29-65`).
   - No release notes exist (the GitHub release body is empty). **0.2.0 contains no fix for the
     denormal stall.**
+
+### 1.11 What 0.3.0 changed (2026-11-20)
+
+0.3.0 (released 2026-11-07, git `1632d47c`; all seven `sonora-*` crates at 0.3.0) is the M145 port plus 15 later upstream
+changes up to M156. Our code compiled unchanged. Paths below are under `sonora-0.3.0/src` and `sonora-aec3-0.3.0/src`.
+
+- **Allocations (1.7):** sonora #40 makes echo cancellation allocation-free in steady state. Measured: AEC3 alone and the
+  chain with it make **0 allocations** from the first block after construction, over 12 s (`crates/nf-stages/tests/rt_no_alloc.rs`;
+  0.2.0: 43.5 a block). The filters' frequency and impulse responses are now sized for the longest filter at construction
+  (`subtractor.rs:150-164`), so the `resize`s in `adaptive_fir_filter.rs:271, 371` don't allocate. **(inferred)** for the
+  sizing; the count is measured.
+- **Denormals (1.10):** each `process_*` call holds a `DenormalDisabler` (`denormal_disabler.rs`, used in
+  `audio_processing_impl.rs:350, 388, 429, 478`): it sets MXCSR FTZ and DAZ unless both are already set and restores the saved word on
+  drop, also when unwinding. Its own docs state the caveats: formally undefined behaviour in Rust, LLVM may move float
+  operations across the guard, and code reached from inside the call (the global allocator, `tracing` subscribers, the
+  panic hook) runs with FTZ. Measured: the undithered zero-reference row went from 674 to 46 µs a block; the thread's
+  MXCSR is the same after the stage's blocks (`crates/nf-stages/tests/aec3.rs`, `aec3_leaves_the_thread_s_mxcsr_as_it_found_it`).
+- **`mul_add` (1.9):** without native FMA (`sonora_simd::NATIVE_FMA`, false at x86-64-v2) the biquads, the three-band filter
+  bank and `fft4g` use plain expressions (sonora #37). At our v3 baseline it is `true` and the code is unchanged.
+- **Render buffer:** the headroom fix for render-buffer underruns (upstream d460e60e19). We call render then capture once
+  each per block, so offline it never underruns.
+- **Config:** `AudioProcessingBuilder::echo_canceller3_config` (sonora #41, #47), with `EchoCanceller3Config` re-exported
+  from `sonora::config`; invalid configs are clamped with a `tracing::warn!` (`audio_processing_impl.rs:1327`). Unused by us.
+- **Logging:** besides 1.7's, `tracing::info!("Denormal disabler unsupported")` when the processor is built on a target
+  without FTZ (not ours). Nothing logs on the hot path.
+- **Output, measured:** bit-identical to 0.2.0 on our config (`tests/refactor_parity.rs`' 20 s golden, with and without AEC3),
+  the latency still 430 samples, and AEC3 p50 49.5 → 47.0 µs a block (`doc/dev/build-report.md` §12).
 
 ---
 

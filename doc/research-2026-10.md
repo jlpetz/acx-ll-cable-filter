@@ -73,12 +73,12 @@ Runtime notes:
 ## Echo cancellation
 
 - **`sonora`:** a pure-Rust port of WebRTC AEC3, BSD-3, with Windows CI.
-  - 0.2.0 (2026-07-29) is the M145 port. Main carries further fixes up to M156 (unreleased), including render-buffer headroom on underruns.
-  - **Open PRs:** #38 (denormal stall on silent reference, stacked on #36), #40 (allocation-free processing), #41 (custom AEC3 config).
-  - **Workaround until those merge:** FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference. The stall is mostly an Intel problem.
+  - 0.2.0 (2026-07-29) is the M145 port. Main carries further fixes up to M156 (unreleased), including render-buffer headroom on underruns. (2026-11-20: released as 0.3.0 on 2026-11-07, our pin; `doc/dev/api/sonora-nnnoiseless.md` 1.11.)
+  - **Open PRs:** sonora #38 (denormal stall on silent reference, stacked on sonora #36), sonora #40 (allocation-free processing), sonora #41 (custom AEC3 config). (All shipped in 0.3.0; the stall's fix is a per-call FTZ/DAZ guard.)
+  - **Workaround until those merge:** FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference. The stall is mostly an Intel problem. (Kept: the dither, and no FTZ/DAZ of our own; TODO 10.)
   - **Cost:** about 45 µs per 10 ms frame on an i9-14900K with denormals handled.
 - **AEC3 behaviour:** 10 ms frames and 4 ms internal blocks. The delay-estimation window is about 608 ms by default (our calculation from the code). It detects clock drift but doesn't resample.
-- **AEC3 latency:** at 48 kHz (sonora 0.2.0, `Rate48kHz`) the capture output lags the mic by 430 samples (8.96 ms), measured with an impulse and GCC-PHAT (`nf_stages::AEC3_LATENCY`, `crates/nf-stages/tests/aec3.rs`). Reading the code gave about 4.5 ms, which is too low (`doc/dev/api/sonora-nnnoiseless.md` 1.8).
+- **AEC3 latency:** at 48 kHz (sonora 0.2.0, `Rate48kHz`; 0.3.0 the same, 2026-11-20) the capture output lags the mic by 430 samples (8.96 ms), measured with an impulse and GCC-PHAT (`nf_stages::AEC3_LATENCY`, `crates/nf-stages/tests/aec3.rs`). Reading the code gave about 4.5 ms, which is too low (`doc/dev/api/sonora-nnnoiseless.md` 1.8).
 - **Ruled out:**
   - tonarino `webrtc-audio-processing` doesn't build on MSVC (PR #102 open).
   - SpeexDSP MDF has no delay estimator and is linear only.

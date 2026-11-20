@@ -795,3 +795,100 @@ calls the refusal's pause. `python tools/test_check_cpu_gate_asm.py`: 12 pass. `
 - The script follows every reference, so it over-approximates; its allowance is per function. A new allowance
   needs a reason that the code can't run before the gate.
 - Pinning the toolchain is the owner's call (above).
+
+## 12. sonora 0.3.0 (2026-11-20)
+
+The pin moved from `sonora = "=0.2.0"` to `"=0.3.0"` (released 2026-11-07). `cargo update -p sonora` moved all seven
+`sonora-*` crates to 0.3.0 and added no other package; our code compiled unchanged. Built and measured in a worktree from
+main at b41f0c3, its own `target/`, rustc 1.102.0-nightly 5f4effd57, on the dev box: everything below ran once on 0.2.0,
+then again on 0.3.0. Another session ran tests on the box meanwhile, so the timing alternates the two builds' exes.
+
+**Allocations** (`cargo test -p nf-stages --test rt_no_alloc -- --nocapture`, dev and release alike):
+
+| | 0.2.0 | 0.3.0 |
+|---|---|---|
+| AEC3 chain, blocks 50-450: mean a block | 43.5 | **0.0** |
+| the most in one block | 49 | 0 |
+| AEC3 chain and AEC3 alone, blocks 0-1200 (the new test) | | **0** |
+
+**Latency conformance** (`cargo test -p nf-stages --release --test aec3 --test conformance -- --nocapture`), the same on
+both: AEC3's impulse offset 430 at block phases 17, 301, 0 and 479, GCC-PHAT 429.972 samples at 40.0 dB; the chain's
+measured offset equals `chain.latency()` in all eight combinations (0 and 480 without AEC3, 430 and 910 with it).
+
+**Output:** bit-identical on our config. `tests/refactor_parity.rs` recorded with 0.2.0 (`NF_GOLDEN_WRITE=1`, dev) and
+compared on 0.3.0: both streams (`chain-rnnoise`, `chain-aec3-rnnoise`), 2,000 blocks each, bit for bit. `tests/aec3.rs`
+prints the same: ERLE after 3 s 45.3 and 47.7 dB (RT60 0.15 and 0.3), AEC3's own 18.1 and 13.6 dB, delay 36 ms; the near
+end kept -3.6 and -4.1 dB in double talk, -0.5 and -0.9 alone. Of 0.3.0's behaviour changes (its release notes), none
+reaches our config, by our reading: the input volume controller and AGC2 are off, our v3 build keeps the `mul_add` path,
+the dither keeps the signals out of the subnormal range where FTZ/DAZ would change a result, and one render call per
+capture call never underruns the render buffer.
+
+**The echo-path guard** (`cargo test -p nf-engine --release --lib the_echo_path_guard_holds_the_mic_for_an_early_echo --
+--ignored --nocapture`): passes on both, all 16 lines identical:
+
+| Scene | Echo | Near voice | Guard | Hold | AEC3's ERLE, last 20 s | Its delay | Far only |
+|---|---|---|---|---|---|---|---|
+| steady (target 12.0 ms) | 5 ms | no | off / on | 0 / 10 ms | 6.9 / 19.3 dB | 0 ms | 55.6 / 61.7 dB |
+| | | yes | off / on | 0 / 10 ms | 6.8 / 15.9 dB | 0 ms | 55.0 / 60.0 dB |
+| | 40 ms | no | off / on | 0 / 0 ms | 19.4 / 19.4 dB | 24 ms | 62.6 / 62.6 dB |
+| | | yes | off / on | 0 / 0 ms | 15.5 / 15.5 dB | 24 ms | 61.3 / 61.3 dB |
+| later (target 20.9 ms; 65 gaps, 1 drop) | 15 ms | no | off / on | 0 / 10 ms | 6.9 / 14.3 dB | 0 ms | 59.8 / 61.9 dB |
+| | | yes | off / on | 0 / 10 ms | 7.0 / 12.2 dB | 0 ms | 58.2 / 60.4 dB |
+| | 5 ms | no | off / on | 0 / 20 ms | 5.5 / 13.5 dB | 0 ms | 49.5 / 61.2 dB |
+| | | yes | off / on | 0 / 20 ms | 5.5 / 12.4 dB | 0 ms | 45.7 / 59.2 dB |
+
+**The offline AEC3 check** (`cargo test -p nf-engine --release --lib aec3_converges_on_the_traces -- --ignored
+--nocapture`, with the ten traces in `%LOCALAPPDATA%\noise-filter\traces`): all 120 lines (ten traces and five synthetic
+scenes, each silent and talking at 25/40/60/100 ms) identical. Near voice silent, live ERLE 6.6-16.1 dB (mean 13.2),
+steady 11.9-16.6 (14.4). It **fails on both, the same way:** `loopback-CABLE-B_Input-8` (2026-11-02, newer than TODO 10's
+analysis) at 40, 60 and 100 ms, live ERLE 10.3, 10.3 and 9.4 dB against steady 14.3, 14.5 and 14.7 (the check allows 3).
+Not from the bump; left for TODO 10.
+
+**Timing** (`tests/timing.rs`, the two builds' test exes run alternately, five times each; medians of the runs, µs a
+block; the third run of each, and the last of 0.2.0's chain row, were slowed by the other session's tests):
+
+| Row | p50 0.2.0 | p50 0.3.0 | change | p99 0.2.0 | p99 0.3.0 | mean 0.2.0 | mean 0.3.0 |
+|---|---|---|---|---|---|---|---|
+| RNNoise (noisy speech) | 35.1 | 34.9 | -1% | 45.9 | 45.2 | 35.7 | 35.5 |
+| RNNoise model alone | 34.6 | 34.0 | -2% | 45.6 | 47.6 | 35.2 | 34.6 |
+| floor + gate (NoisePost, auto gate) | 0.5 | 0.5 | 0% | 0.8 | 0.9 | 0.5 | 0.5 |
+| AEC3 (echo + near end + noise) | 49.5 | **47.0** | -5% | 75.9 | 63.8 | 49.9 | 47.3 |
+| AEC3, silent reference (dithered) | 45.3 | **43.2** | -5% | 63.2 | 51.7 | 41.6 | 39.0 |
+| sonora, zero reference, no dither | 674.3 | **45.9** | -93% | 816.9 | 55.2 | 585.3 | 41.5 |
+| chain: meters + AEC3 + RNNoise | 87.4 | **84.8** | -3% | 122.9 | 108.4 | 88.0 | 85.4 |
+| chain: meters + RNNoise | 35.8 | 36.9 | +3% | 51.0 | 52.8 | 37.4 | 37.8 |
+
+- AEC3's p50 in the four quiet runs: 49.0-50.0 µs on 0.2.0, 46.8-47.2 on 0.3.0. The RNNoise-only rows don't run sonora;
+  their spread is the box's.
+- The undithered zero reference no longer stalls: 0.3.0 sets MXCSR's FTZ and DAZ for each `process_*` call
+  (`DenormalDisabler`) and restores the thread's word on return. The engine still dithers, and sets no FTZ/DAZ itself.
+
+**Test changes**
+- nf-app `bench`'s test failed on 0.3.0 as it was: its `rows[3].allocations > 0` ("sonora 0.2.0 allocates per block; the
+  counter sees it") met `allocs 0 (0.0/block)`. Renamed `bench_times_each_row_and_no_row_allocates_once_warm`, it now
+  asserts 0 for every row, AEC3 and the chain with AEC3 included, and checks the counter itself on one `Vec` in the scope.
+  Stricter than before, and the counter is still proven live.
+- nf-stages `rt_no_alloc`: `an_aec3_chain_allocates_only_inside_sonora` (the chain's counts equal AEC3's alone, at most 100
+  in a block, blocks 50-450) passed on 0.3.0, but at 0 it guarded nothing. It became
+  `the_aec3_chain_does_not_allocate_after_build`: 0 in the chain and in AEC3 alone from the first block to 1,200, past
+  AEC3's initial state, through the gate modes and with the meters toggled.
+- nf-stages `aec3`: new `aec3_leaves_the_thread_s_mxcsr_as_it_found_it` (MXCSR's control bits the same after building the
+  stage and after 200 blocks on a speaking and then a silent reference, and a denormal product still nonzero). The FMA
+  test's comment says what 0.3.0 does without FMA.
+- No figure changed, so no other expectation moved.
+
+**Checks:** `cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` and the same with
+`--features nf-app/onnx` clean. `cargo test --workspace --no-fail-fast`: **815 passed, 0 failed, 30 ignored**, and the
+same with `--features nf-app/onnx` (on 0.2.0 before the change: 814, 0 and 30 in both; the +1 is the MXCSR test).
+`python todo_check.py` clean.
+
+**Docs:** TODO 10's entry and detail, TODO 1's pin line, `doc/dev/api/sonora-nnnoiseless.md` (new 1.11, and notes in 1.7
+and 1.10), `doc/design/engine.md` (the pool allocation rate), `doc/research-2026-10.md` (the latency holds), and the
+comments in `aec3.rs`, `bench.rs`, `lib.rs`, `telemetry.rs`, `rt_pool.rs`. CLAUDE.md's "Future exception" line is about
+ONNX Runtime's worker and stays true.
+
+**Left open**
+- The owner decides whether sonora's per-call FTZ/DAZ is acceptable (formally undefined behaviour in Rust, as its docs
+  say; scoped to its own calls, and tested not to persist). Our proposal: accept it, and keep the dither.
+- The render-buffer headroom fix (for underruns) can't show offline; live loopback gaps are where it would.
+- Nothing was run on audio devices.

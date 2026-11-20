@@ -263,7 +263,8 @@ pub fn aec3_silent_reference(sig: &Signals, count: Option<AllocCounter>) -> Resu
 
 /// For comparison: sonora in the stage's config fed an exact-zero reference with no dither, after
 /// 3 s of far-end speech so its filters hold energy that then decays (sonora #34's denormal stall,
-/// if this CPU has it).
+/// if this CPU has it: 674 µs a block on the dev box with sonora 0.2.0, 46 with 0.3.0, which sets
+/// FTZ and DAZ for each call).
 pub fn sonora_undithered(sig: &Signals, count: Option<AllocCounter>) -> BlockTimes {
     let mut apm = crate::aec3::build_apm();
     let mut scratch = [0.0f32; BLOCK];

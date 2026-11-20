@@ -18,7 +18,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Decided (owner, 2026-10-26): Windows 11 only; its own repo, outside TMR; public release is the intent; its own TODO list; CLAP hosting for post-effect plugins, with a published host profile, and the AEC and noise filter in the same format (#17; the owner's OK, 2026-11-02); large pages by default (#6); GTCRN dropped (#5); the FastEnhancer licence question waits until we get there (#5).
 - Owner's wish (tentative, 'should probably publish the spec'): a standard stage interface, published so others can add stages such as a voice changer (#3, #17).
 - Decided (owner, 2026-10-28): the x86-64-v3 CPU baseline, like TMR; both exes check the CPU first and refuse others (exit 5). TMR's commit rules, rustfmt settings and fmt-then-clippy routine (`CLAUDE.md`).
-- Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `sonora =0.2.0` (from crates.io again: the vendored `mul_add` patch went with the v3 baseline, #10), later `ort =2.0.0-rc.15`.
+- Pin exact versions: `wasapi =0.26.0`, `windows-reactor =0.100.0`, `sonora =0.3.0` (from crates.io: the vendored `mul_add` patch went with the v3 baseline; 0.3.0 since 2026-11-20, #10), later `ort =2.0.0-rc.15`.
 - The old pre-move copy at `C:\Users\Administrator\Downloads\TMR\noise-filter` was deleted 2026-11-02 (the owner's OK; it held only a TODO.md, `doc/` and `todo_check.py` from 2026-10-26).
 **Next**: start future sessions in this folder; keep the crate layout as the stage interface (#17) and model stages (#5) land.
 **Detail**: this entry; project rules in `CLAUDE.md`
@@ -115,12 +115,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 10. [aec] Echo cancellation (WebRTC AEC3 via `sonora`)
 **Priority**: High (phase 2) | **Status**: integrated in v0 (`Aec3Stage`). Live on the cables 2026-11-01: the reference timeline rebuilt (`reference.rs`: 450 gaps a minute to none, the echo path still), and the quality scene made causal, and a chain recorder added. With a calibrated, realistic echo delay (`quality --echo-delay`, default 25 ms) the echo drops 45-62 dB a far-only turn, as offline; an echo arriving sooner than the reference's lead (12-14 ms) after its tap cancels less (13 ms 45 dB, 10 ms 39, 5 ms 17, 0 ms 11). One earlier take, 14 dB, stays unexplained.
-- `sonora` 0.2.0 from crates.io again (2026-10-28): the owner's move to x86-64-v3 makes its `mul_add`s FMA instructions, so the vendored patch went (AEC3 91 µs a block at v2, 55 patched, 50 at v3); no FTZ/DAZ, ~1e-9 dither on the mic and reference instead. sonora #38/#40 (allocations) and sonora #41 (AEC3 config) are still unreleased. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
+- `sonora` =0.3.0 (2026-11-20): AEC3 allocates nothing per block (0.2.0: 43.5), its output bit-identical to 0.2.0's, 47 µs a block (49.5). It sets FTZ/DAZ for each call and restores MXCSR (tested). Proposed (ours, 2026-11-20), for the owner to decide: accept that per-call FTZ/DAZ (formally UB in Rust; scoped; tested not to persist), keep the ~1e-9 dither and set no FTZ/DAZ of our own. AEC3 config (sonora #41) shipped, unused. 10 ms frames; `MaxProcessingRate::Rate48kHz` (the default caps the chain at 16 kHz).
 - Residual echo: the noise model keeps leftover far-end echo (it's speech), so AEC3's suppressor stays on. One 10 ms frame clock for all stages.
 - CLAP-shaped (#17, the owner's call): the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: the echo-path guard (ours, 2026-11-03/04: the mic waits whole loopback periods only for an echo that comes before its reference, on staged trials; live a 5 ms echo's far-only turns 22 to 59 dB at a 20 ms wait, 10 ms at a 10 ms wait) on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2.
+**Next**: the echo-path guard (ours, 2026-11-03/04: the mic waits whole loopback periods only for an echo that comes before its reference, on staged trials; live a 5 ms echo's far-only turns 22 to 59 dB at a 20 ms wait, 10 ms at a 10 ms wait) on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2; the owner's call on sonora 0.3.0's per-call FTZ/DAZ.
 **Detail**: `doc/todo/10-aec.md`
 
 ---

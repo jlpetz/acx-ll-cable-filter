@@ -383,7 +383,8 @@ pub struct Telemetry {
     /// Allocations on the audio thread after warm-up that fell back to the system heap (must stay 0).
     pub rt_heap_allocations: AtomicU64,
     /// Allocations on the audio thread in the last second served from the locked pool (O(1) TLSF;
-    /// informational: sonora 0.2.0 makes about 43 per block until its PR #40).
+    /// informational: the built-in stages make none since sonora 0.3.0, whose AEC3 doesn't allocate; 0.2.0's made about
+    /// 43 a block).
     pub rt_pool_allocations_per_s: AtomicU64,
     /// Mic event waits that timed out (100 ms with no packet).
     pub stalls: AtomicU64,

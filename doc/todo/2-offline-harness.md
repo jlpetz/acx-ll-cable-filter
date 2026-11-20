@@ -129,7 +129,7 @@ fixtures are synthetic and built in memory (`nf_stages::synth`); WAVs go only to
   - none for the noise stage around a pure-delay model at every hop, its resets, extensions and params, nor for
     the re-blocker (nf-core);
   - none for RNNoise's extensions and params, AEC3's telemetry, per block, nor for the RNNoise chain (nf-stages);
-  - the AEC3 chain makes only sonora's own allocations.
+  - none for the AEC3 chain either, nor AEC3 alone, from the first block to 12 s (sonora 0.3.0, 2026-11-20, `the_aec3_chain_does_not_allocate_after_build`; on 0.2.0 it made only sonora's own, about 43 a block).
 - **On the fetched test audio** (`tests/test_audio.rs`, ignored; `NF_TEST_AUDIO` or the local cache):
   - the 10 `speech_*` takes, in cafe noise at 10 dB, through the chain: GCC-PHAT 479.99-480.00 against 480, the
     noise cut by 11.7-34.1 dB in pauses;

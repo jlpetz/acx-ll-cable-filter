@@ -1,5 +1,5 @@
-//! WebRTC AEC3 through sonora 0.2.0, at 48 kHz mono. Facts below cite
-//! doc/dev/api/sonora-nnnoiseless.md, Part 1.
+//! WebRTC AEC3 through sonora 0.3.0, at 48 kHz mono. Facts below cite
+//! doc/dev/api/sonora-nnnoiseless.md, Part 1 (written for 0.2.0; its 1.11 says what 0.3.0 changed).
 //!
 //! - **Config (1.4):** AEC3 on, sonora's noise suppressor and AGC off, and the high-pass on in
 //!   full band. `MaxProcessingRate::Rate48kHz` matters: the default (32 kHz) caps the capture path
@@ -9,16 +9,18 @@
 //! - **Per block (1.5):** render (the reference) first, then capture (the mic), 1:1. Both inputs are
 //!   sanitised first (`nf_core::dsp::sanitize_into`): sonora's `f32::clamp` to ±1 lets a NaN through, and it would
 //!   poison the filters.
-//! - **Denormals (1.10):** the reference is dithered at 1e-9 (about -180 dBFS) on every block, gaps
+//! - **Denormals (1.10, 1.11):** the reference is dithered at 1e-9 (about -180 dBFS) on every block, gaps
 //!   included. A silent reference otherwise decays AEC3's filter states into subnormals (sonora
-//!   #34): on the dev box an undithered zero reference costs 690 µs a block against 87 µs dithered
-//!   (`tests/timing.rs`). The engine dithers the mic.
+//!   #34): with sonora 0.2.0 an undithered zero reference cost 674 µs a block on the dev box against
+//!   45 µs dithered (`tests/timing.rs`). sonora 0.3.0 sets FTZ and DAZ for each call itself and
+//!   restores MXCSR on return (`tests/aec3.rs` checks it), which takes the undithered row to 46 µs; the
+//!   dither stays. The engine dithers the mic.
 //! - **Latency:** [`AEC3_LATENCY`], measured by the `stream_offset_is_aec3_latency` test. On voiced
 //!   speech the high-pass delays the strong low harmonics, which pulls a plain cross-correlation
 //!   about 30 samples late; GCC-PHAT, or an impulse, finds the stream offset.
 //! - **Allocation (1.3, 1.7):** `new` builds the whole AEC3 (about 300 KB in hundreds of blocks):
-//!   build it before real-time. `process` allocates about 43 small `Vec`s per block inside sonora
-//!   0.2.0 (upstream PR #40 removes them); under the engine they come from the real-time pool.
+//!   build it before real-time. `process` then allocates nothing (sonora 0.3.0, its PR #40; 0.2.0
+//!   made about 43 small `Vec`s a block), from the first block on (`tests/rt_no_alloc.rs`).
 //! - **Reset:** sonora has no reset, and rebuilding allocates as much as `new`, which the audio
 //!   thread mustn't do (1.6). `reset` runs one dithered-silent render and capture pair through AEC3
 //!   and discards the output. That flushes the mic audio AEC3 holds from before the stage stopped

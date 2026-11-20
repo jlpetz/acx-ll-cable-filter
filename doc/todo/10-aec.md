@@ -11,13 +11,31 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   - the `aec3` crate (RubyBit/aec3-rs 0.4.0; MIT OR BSD-3-Clause, with a LICENSE GitHub can't classify): its README calls it a work in progress, with an API expected to change.
 
 ## Getting a real-time-safe build
-- **0.2.0 vs main:** the release (2026-07-29) is the M145 port. Main has further upstream fixes up to M156, including render-buffer headroom on underruns, which matters for loopback gaps, and sonora #37 (fmaf ignoring FTZ under `+crt-static`).
-- **Open PRs:**
-  - sonora #38: denormal stall on a silent reference, stacked on sonora #36.
-  - sonora #40: allocation-free processing.
-  - sonora #41: custom AEC3 config. One downstream user needed it for double-talk tuning; it also exposes `num_filters` for a wider delay window.
-- **`mul_add` (sonora #37) no longer matters to us (2026-10-28):** the build moved to x86-64-v3, where each `mul_add` is one FMA instruction, so the exes call no `fmaf`. The vendored 0.2.0 with the AEC path's `mul_add`s as plain arithmetic (2026-10-26, AEC3 91 → 55 µs a block at v2) went with the move; crates.io's 0.2.0 takes about 50 µs at v3 (`doc/dev/build-report.md` §11).
-- **Plan:** vendor a fork of main with sonora #38 and #40 (and #41) merged. Until then, FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference, which zero-filled gaps make mandatory.
+- **sonora 0.3.0 (released 2026-11-07; pinned `=0.3.0` 2026-11-20):** the M145 port plus 15 later upstream changes up to
+  M156. For us: sonora #40 (echo cancellation allocates nothing in steady state), the render-buffer headroom fix on
+  underruns (upstream d460e60e19), a `DenormalDisabler` on every `process_*` call (sonora #34), sonora #37 (plain arithmetic
+  for `mul_add` where the build lacks FMA; our v3 build has it, so unchanged) and sonora #41/#47 (`echo_canceller3_config`,
+  which we don't use yet). Code written for 0.2.0 compiled unchanged. Measured on the dev box against 0.2.0 (the same
+  worktree, both builds; `doc/dev/build-report.md` §12):
+  - **Allocations:** 43.5 a block on average, 49 at most → **0**, from the first block after `build_chain` to 12 s, well past
+    AEC3's initial state (2.5 s of active far end), after which its filters grow from 12 to 13 partitions into buffers 0.3.0
+    sizes for 13 when it's built (`tests/rt_no_alloc.rs` now asserts 0; so does `bench`'s test, for every row).
+  - **Output:** bit-identical. `tests/refactor_parity.rs`' 20 s golden (with and without AEC3: echo, double talk, impulses
+    on a silent reference, NaN blocks, every toggle) recorded on 0.2.0 matches 0.3.0 bit for bit, and the offline echo tests
+    (`the_echo_path_guard_holds_the_mic_for_an_early_echo`, `aec3_converges_on_the_traces`, `tests/aec3.rs`) print the same
+    figures to the last digit. The latency is still 430 samples to the sample. Nothing here underruns the render buffer (one
+    render call per capture call), so the headroom fix doesn't show offline; it may live, after loopback gaps.
+  - **CPU:** AEC3 p50 49.5 → 47.0 µs a block, the chain with AEC3 87.4 → 84.8 (medians of 5 alternated runs). The
+    undithered zero-reference row, sonora #34's stall, went from 674 to 46 µs: sonora's own FTZ/DAZ.
+  - **FTZ/DAZ:** each call sets MXCSR's FTZ and DAZ bits unless both are already set and restores the thread's word on return, also on
+    a panic. sonora's docs call it formally undefined behaviour in Rust, as upstream's guard, nih-plug and `no_denormals`
+    are. It is scoped to sonora's calls; our rule is against a *persistent* change (nf-engine's `audio.rs`), and
+    `tests/aec3.rs` (`aec3_leaves_the_thread_s_mxcsr_as_it_found_it`) checks that nothing persists. Our proposal: keep the
+    dither all the same (defined behaviour, and it covers RNNoise and our own filters), and keep no FTZ/DAZ of our own.
+- **Before 0.3.0** (history): 0.2.0 (2026-07-29) was the M145 port, with no denormal handling and about 43 `Vec`s a block
+  (`doc/dev/api/sonora-nnnoiseless.md` 1.7, 1.10); sonora #38, #40 and #41 were open PRs then. The plan was to vendor a
+  fork of main with them merged; 0.3.0 made that unnecessary.
+- **`mul_add` (sonora #37) no longer matters to us (2026-10-28):** the build moved to x86-64-v3, where each `mul_add` is one FMA instruction, so the exes call no `fmaf`. The vendored 0.2.0 with the AEC path's `mul_add`s as plain arithmetic (2026-10-26, AEC3 91 → 55 µs a block at v2) went with the move; crates.io's 0.2.0 takes about 50 µs at v3 (`doc/dev/build-report.md` §11). 0.3.0 does the same itself where FMA is missing.
 - **One thread:** sonora's API takes `&mut self` for both render and capture, so one DSP thread owns the instance and feeds the reference frame before the matching mic frame.
 - **Full band:** set `MaxProcessingRate::Rate48kHz`. sonora's default (`Rate32kHz`, as in upstream WebRTC) caps the whole capture path at 16 kHz whatever noise model runs.
   - Rate48kHz routes audio through WebRTC's three-band filter bank (0-8/8-16/16-24 kHz). It's not perfect-reconstruction (~9.5 dB round-trip SNR), so A/B it against 32 kHz in #14.
@@ -39,7 +57,7 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   - Block the virtual cable, and our own monitor output, from being picked as the reference.
   - Warn when the noise filter is on without AEC while on speakers: Discord's own AEC then sees an echo path through a time-varying denoiser.
 - **Stats:** show AEC3's delay estimate and ERLE.
-- **Delay window:** the default delay-estimation window is about 608 ms (our calculation from the code). Bluetooth or USB speakers with large output latency may need a bigger window (custom config, sonora #41).
+- **Delay window:** the default delay-estimation window is about 608 ms (our calculation from the code). Bluetooth or USB speakers with large output latency may need a bigger window (custom config, sonora #41: `AudioProcessingBuilder::echo_canceller3_config` since 0.3.0).
 - **Reconvergence:** volume changes (loopback is pre-volume), render-side enhancement APOs and stalls all trigger it; one report took about a minute after a heavy stall.
 
 ## First live test (2026-11-01)
@@ -134,6 +152,9 @@ RT60 0.15 s at 25/40/60/100 ms behind the loopback by the traces' own stamps, ag
   change nothing; a bursty loopback drifting 300 ppm, raised once, ends 0.7-2.7 dB under steady.
 - The check still doesn't reproduce the live 1-5 dB: the reference path explains AEC3's own low ERLE, maybe not all of
   the live result (the quality test's measure, the live echo path's 96-116 ms).
+- 2026-11-20 (the sonora 0.3.0 trial, on 0.2.0 and 0.3.0 alike): with ten traces in the folder now, the check fails on
+  `loopback-CABLE-B_Input-8` (2026-11-02) at 40, 60 and 100 ms: AEC3's ERLE live 10.3, 10.3 and 9.4 dB against 14.3, 14.5
+  and 14.7 steady (it allows 3 dB). Not looked into yet.
 
 ### Live again (same day)
 - `quality --test echo --no-ns --seconds 60` with the fix: reference gaps 1 (was 450), 0 slips, 0 jumps, the lead 14.0 ms
