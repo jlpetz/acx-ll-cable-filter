@@ -14,8 +14,9 @@ the newest WDK 28000 has.
 ## Building and installing (an elevated Windows PowerShell)
 
 1. `scripts\Setup-TestSigning.ps1 [-Ems]`: a test certificate (`CN=Noise Filter Test Driver`), trusted, and test signing
-   on (Secure Boot must be off). Reboot once afterwards. `-Ems` also turns on Emergency Management Services for the EC2
-   serial console. Ported from TMR-MD's build.ps1.
+   on (Secure Boot must be off). Reboot once afterwards. `-Ems` would also turn on Emergency Management Services for the
+   EC2 serial console; the spike box runs without it (the owner: as few changes as possible). Ported from TMR-MD's
+   build.ps1.
 2. `scripts\Build-Driver.ps1`: MSBuild, then the package in `out\Release\AudioCodec`: the `.sys` signed, the catalog made
    by inf2cat for `10_GE_X64,Server2025_X64` and signed.
 3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
