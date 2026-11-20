@@ -39,8 +39,10 @@ Set-Content -Path $marker -Value "$PacketFrames" -NoNewline
 $savedCl = $env:CL
 if ($PacketFrames -ne 128) { $env:CL = "/DNF_PACKET_FRAMES#$PacketFrames /DNF_MIN_PACKET_PERIOD_HNS#10000" } else { $env:CL = $null }
 try {
+    # The INF's DriverVer date in UTC: inf2cat refuses one later than UTC today, and stampinf's default is the local date.
+    $infDate = (Get-Date).ToUniversalTime().ToString('MM/dd/yyyy', [Globalization.CultureInfo]::InvariantCulture)
     & $msbuild $Solution "-t:$target" "-p:Configuration=$Configuration" '-p:Platform=x64' '-p:SignMode=Off' `
-        '-p:SkipPackageVerification=true' '-p:ApiValidator_Enable=false' '-m' '-nologo' '-v:minimal'
+        '-p:SkipPackageVerification=true' '-p:ApiValidator_Enable=false' "-p:NfInfDate=$infDate" '-m' '-nologo' '-v:minimal'
     if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed.' }
 } finally {
     $env:CL = $savedCl

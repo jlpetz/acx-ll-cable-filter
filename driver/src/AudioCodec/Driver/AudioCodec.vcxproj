@@ -30,7 +30,11 @@
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="AudioCodec.inf" />
+    <!-- noise-filter: the INF's DriverVer date, if given (Build-Driver.ps1 passes today's UTC date: inf2cat refuses a date after
+         UTC today, which the WDK's default, the local date, is east of Greenwich after local midnight). -->
+    <Inf Include="AudioCodec.inf">
+      <DateStamp Condition="'$(NfInfDate)' != ''">$(NfInfDate)</DateStamp>
+    </Inf>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ACX_VERSION_MAJOR>1</ACX_VERSION_MAJOR>
