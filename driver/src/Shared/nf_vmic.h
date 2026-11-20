@@ -41,6 +41,11 @@ Abstract:
             the ring into system space.
           - STATUS_DEVICE_REMOVED (ERROR_DEVICE_REMOVED, 1617): the device is going away.
           - STATUS_DEVICE_BUSY (ERROR_BUSY, 170): another ring is attached.
+          - STATUS_NOT_SUPPORTED (ERROR_NOT_SUPPORTED, 50): a capture stream is open (created and not yet destroyed, running
+            or not) in a format other than 48 kHz float32 stereo: in practice an exclusive-mode client's, since shared-mode
+            streams run at the endpoint's device format. The driver leaves that client alone. The app should feed through its
+            WASAPI output instead (24-in-32 into the speaker endpoint, which the loopback carries to the microphone), or
+            ATTACH again once that stream has closed.
           - STATUS_CANCELLED (ERROR_OPERATION_ABORTED, 995): the request was cancelled, or the handle closed, before the ring was
             published.
 
@@ -77,12 +82,23 @@ The ring's rules:
       and in order; an underrun inserts silence and drops nothing; an app that keeps 0 <= fill <= capacity never sees a re-sync.
     - The capacity, and the fill the app keeps, must be at least one capture packet (PacketFrames: 480 frames for a shared
       stream's 10 ms period), or every pass underruns. NF_VMIC_MIN_CAPACITY_FRAMES holds two such packets.
-    - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one paused),
-      whatever its format. Another gets silence, counted in NF_VMIC_STATS only (NotReaderPackets).
+    - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one paused). Only
+      the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of the packets it
+      delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture stream running
+      in 48 kHz float32 stereo plays that copy a fixed lag behind: the reader's packet plus 1 ms and a frame. The audio
+      engine runs one device stream per processing mode, so a RAW client and a DEFAULT one make two capture streams, and
+      both hear the ring. The other streams' passes are counted in NF_VMIC_STATS only (NotReaderPackets,
+      SecondaryFramesCopied, SecondaryUnderrunFrames). A handoff (the reader pauses and another stream takes the slot)
+      can skip or repeat up to that lag once in the other streams, and leave a short gap of silence in them.
+    - While a ring is attached, creating a capture stream in any format other than 48 kHz float32 stereo fails with
+      STATUS_NOT_SUPPORTED (counted in RefusedCaptureOpens; an exclusive-mode client can retry in float32). An ATTACH while
+      such a stream is open fails the same way (counted in FormatRejects; the refusals above). The check and the publish (or
+      the record) are one locked step, so the two can't both succeed.
     - Frames are copied only while the stream holding the slot runs 48 kHz float32 stereo (the endpoint's device format, spike
-      check 3). Otherwise its packets are zero-filled and counted (MismatchPackets), State reads FORMAT_MISMATCH instead of
-      READING, and ReadFrame stays where it is. Passes and LastPassQpc count the slot holder's passes either way: a rising
-      Passes says a stream holds the slot, not that it reads. FramesCopied measures reading.
+      check 3). The refusals above leave this as a fallback, for a stream whose packets don't hold whole frames: its packets
+      are zero-filled and counted (MismatchPackets), State reads FORMAT_MISMATCH instead of READING, and ReadFrame stays
+      where it is. Passes and LastPassQpc count the slot holder's passes either way: a rising Passes says a stream holds the
+      slot, not that it reads. FramesCopied measures reading.
     - The driver copies the header once at ATTACH, checks the copy and keeps what it needs from it; it never reads line 0 or
       its own line back. Of the app's memory it reads only WriteFrame (every pass, untrusted) and the frames. It writes the
       header only while the ring is published, under its lock.
@@ -135,13 +151,22 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
       60     4  Reserved0
       64   128  Ring                     NF_VMIC_RING_STATS
      192    96  Loopback                 NF_VMIC_LOOPBACK_STATS (valid with NF_VMIC_STATS_LOOPBACK)
-     288    32  Reserved1
+     288     8  SecondaryFramesCopied    frames of the reader's copy delivered to capture streams other than the reader
+     296     8  SecondaryUnderrunFrames  frames such a stream zero-filled because the copy didn't hold its position
+     304    16  Reserved1
      320   256  Stream[2]                NF_VMIC_STREAM_STATS: [NF_VMIC_KIND_RENDER], [NF_VMIC_KIND_CAPTURE]
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
     header agree. While no stream holds the slot all three are 0. A stream in another format holds the slot without reading:
     FORMAT_MISMATCH, and PacketFrames in its own format's frames (0 if the driver can't count its packet in frames).
+
+    The other capture streams (the ring's rules): SecondaryFramesCopied counts frames copied from the reader's copy into their
+    packets, the reader's underrun silence included (that is what the reader delivered; the ring's UnderrunFrames counts it).
+    SecondaryUnderrunFrames counts frames they zero-filled because the copy didn't hold their position: no reader pass in
+    the ring's format has covered it yet (the start of an attachment, a handoff, a reader in another format), or their lag
+    and packet exceed the copy (0.68 s). A stream other than the reader in another format gets silence, counted in the
+    ring's MismatchPackets. Ring.NotReaderPackets counts all their passes.
 
     NF_VMIC_STREAM_STATS (128 bytes), per stream kind: TimerPasses (passes the stream's timer started), GlitchPasses (passes
     run at once because the next was already due: each is one glitch adjustment of the stream's time line), GlitchHns (their
@@ -266,9 +291,10 @@ typedef struct _NF_VMIC_RING_STATS {
     UINT64  UnderrunFrames;             //  72
     UINT64  UnderrunPackets;            //  80: passes with at least one underrun frame
     UINT64  Resyncs;                    //  88
-    UINT64  MismatchPackets;            //  96
-    UINT64  NotReaderPackets;           // 104: passes of a second capture stream, zero-filled
-    UINT64  Reserved[2];                // 112
+    UINT64  MismatchPackets;            //  96: packets zero-filled because the stream wasn't 48 kHz float32 stereo (any stream)
+    UINT64  NotReaderPackets;           // 104: passes of a capture stream other than the reader (served from the reader's copy)
+    UINT64  FormatRejects;              // 112: ATTACHes refused with STATUS_NOT_SUPPORTED (a capture stream open in another format)
+    UINT64  RefusedCaptureOpens;        // 120: capture stream creations refused while a ring was attached (not 48 kHz float32 stereo)
 } NF_VMIC_RING_STATS, *PNF_VMIC_RING_STATS;
 
 // The loopback ring's counters (Public.h, LOOPBACK_RING), widened to 64 bits.
@@ -302,7 +328,9 @@ typedef struct _NF_VMIC_STATS {
     UINT32                  Reserved0;                  //  60
     NF_VMIC_RING_STATS      Ring;                       //  64
     NF_VMIC_LOOPBACK_STATS  Loopback;                   // 192
-    UINT64                  Reserved1[4];               // 288
+    UINT64                  SecondaryFramesCopied;      // 288
+    UINT64                  SecondaryUnderrunFrames;    // 296
+    UINT64                  Reserved1[2];               // 304
     NF_VMIC_STREAM_STATS    Stream[NF_VMIC_KINDS];      // 320
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
@@ -321,10 +349,14 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_RING_HEADER, Passes) == 168);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_RING_HEADER, Reserved3) == NF_VMIC_DRIVER_LINE_OFFSET + NF_VMIC_LINE_BYTES);
 C_ASSERT(sizeof(NF_VMIC_STREAM_STATS) == 128);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STREAM_STATS, LatenessBuckets) == 64);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_RING_STATS, FormatRejects) == 112);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_RING_STATS, RefusedCaptureOpens) == 120);
 C_ASSERT(sizeof(NF_VMIC_RING_STATS) == 128);
 C_ASSERT(sizeof(NF_VMIC_LOOPBACK_STATS) == 96);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Ring) == 64);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Loopback) == 192);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryFramesCopied) == 288);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryUnderrunFrames) == 296);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Stream) == 320);
 C_ASSERT(sizeof(NF_VMIC_STATS) == 576);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
