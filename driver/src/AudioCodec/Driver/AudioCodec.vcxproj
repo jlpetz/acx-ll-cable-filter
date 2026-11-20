@@ -125,6 +125,8 @@
       <WppKernelMode>true</WppKernelMode>
       <AdditionalIncludeDirectories>$(SDK_INC_PATH);$(DDK_INC_PATH)\acx\km\$(ACX_VERSION_MAJOR).$(ACX_VERSION_MINOR);..\..\common;..\..\inc;..\..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- noise-filter (TODO 19): favour speed (/Ot); the WDK's Release default is /Os. -->
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
