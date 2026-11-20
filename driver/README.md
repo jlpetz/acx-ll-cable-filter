@@ -20,10 +20,10 @@ The loopback pair (spike check 7): what's played into the speaker endpoint comes
 non-paged ring on the device, under a spin lock; both streams on one QPC time line (the stream engine's own schedule), so
 the two ends never drift and need no fill control. The render pass copies the next packet once the client has released it
 (SetRenderPacket), else the one completing; the capture pass reads one packet a fixed 1 ms lag behind. Both endpoints offer
-the same two formats in the same order, 48 kHz float32 stereo and then 24-in-32 stereo, so their shared streams always match
-(mismatched formats would zero-fill). Windows takes the first as the device format, so the audio engine runs both ends in
-float32 and the filter's exclusive output writes float with no conversion. The integer format has to be listed too: with
-float32 alone, the circuits' interfaces were never enabled and no endpoints appeared (spike check 3). The sample's tone, WAV reader and
+48 kHz stereo with float32 first and signed 24-in-32 PCM second. On the Server 2025 spike Windows stored float32 on both
+endpoints and the filter opened exclusive float output. Float32 alone left both interfaces disabled. The loopback copies
+matching formats and emits silence if the two streams negotiate different formats. The [format validation checklist](../doc/todo/19-spike-2026-11-20.md#format-validation)
+covers the integer fallback and Windows 11. The sample's tone, WAV reader and
 SaveData are no longer called. Two of the sample's stream-engine bugs are fixed: UpdatePosition subtracted the glitch
 adjustment (time) from a byte position, and let the position pass the packet in progress (a Pause could then stall the
 next Run's timer for about 111 days); and the first capture packet of a run reported a QPC of 0.
