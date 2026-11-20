@@ -837,8 +837,6 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "sonora"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d461e6c9ad112f8728919387a4bc5639fd28631f2070171efad38676e907edd8"
 dependencies = [
  "sonora-aec3",
  "sonora-agc2",

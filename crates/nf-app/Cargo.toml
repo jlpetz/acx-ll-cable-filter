@@ -26,6 +26,8 @@ path = "src/launcher.rs"
 # (ahead of the CPU gate, which check_cpu_gate_asm.py can't see into), needs AVX2 and adds about 20 MB. The owner builds the
 # evaluation variant with `cargo build --release --features onnx`.
 onnx = ["nf-engine/onnx", "dep:nf-ort"]
+# sonora's per-call FTZ/DAZ (nf-stages' feature of that name, TODO 10). Off by default: the engine dithers instead.
+sonora-denormal-guard = ["nf-stages/sonora-denormal-guard"]
 
 [dependencies]
 nf-core.workspace = true

@@ -12,9 +12,10 @@
 //! - **Denormals (1.10, 1.11):** the reference is dithered at 1e-9 (about -180 dBFS) on every block, gaps
 //!   included. A silent reference otherwise decays AEC3's filter states into subnormals (sonora
 //!   #34): with sonora 0.2.0 an undithered zero reference cost 674 µs a block on the dev box against
-//!   45 µs dithered (`tests/timing.rs`). sonora 0.3.0 sets FTZ and DAZ for each call itself and
-//!   restores MXCSR on return (`tests/aec3.rs` checks it), which takes the undithered row to 46 µs; the
-//!   dither stays. The engine dithers the mic.
+//!   45 µs dithered (`tests/timing.rs`). The engine dithers the mic. sonora 0.3.0 sets FTZ and DAZ for each call
+//!   and restores MXCSR on return, which takes the undithered row to 46 µs; the vendored 0.3.0 does that only with
+//!   nf-stages' `sonora-denormal-guard` feature, off by default (TODO 10, vendor/README.md). `tests/mxcsr.rs` checks
+//!   MXCSR inside and after sonora's calls in both builds.
 //! - **Latency:** [`AEC3_LATENCY`], measured by the `stream_offset_is_aec3_latency` test. On voiced
 //!   speech the high-pass delays the strong low harmonics, which pulls a plain cross-correlation
 //!   about 30 samples late; GCC-PHAT, or an impulse, finds the stream offset.

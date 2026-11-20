@@ -17,6 +17,9 @@ members = [
     "crates/nf-vmic",
 ]
 default-members = ["crates/nf-app"]
+# The vendored crate is a patch, not a member: excluded, so cargo runs inside it (its own tests) instead of refusing
+# ("believes it's in a workspace").
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,6 +38,8 @@ nf-engine = { path = "crates/nf-engine" }
 nf-gui = { path = "crates/nf-gui" }
 # Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
 nnnoiseless = { version = "=0.5.2", default-features = false }
+# Patched below (vendor/README.md): its per-call FTZ/DAZ is the `denormal-guard` feature, off unless nf-stages'
+# `sonora-denormal-guard` is on.
 sonora = "=0.3.0"
 wasapi = "=0.26.0"
 windows-reactor = "=0.100.0"
@@ -61,3 +66,9 @@ debug = "line-tables-only"
 # nnnoiseless and sonora must stay real-time in debug builds (a debug nnnoiseless took ~36% of a core).
 [profile.dev.package."*"]
 opt-level = 3
+
+# sonora 0.3.0 as released, except that its FTZ/DAZ guard (set for each process_* call, sonora #34) is a cargo feature,
+# `denormal-guard`, off by default: nf-stages' `sonora-denormal-guard` turns it on (TODO 10). vendor/README.md has the
+# diff and how to drop the patch.
+[patch.crates-io]
+sonora = { path = "vendor/sonora-0.3.0" }

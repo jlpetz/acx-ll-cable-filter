@@ -15,6 +15,7 @@ use nf_core::config::{GateConfig, GateMode, ProcessingConfig};
 use nf_core::controls::ChainControls;
 use nf_core::dsp::noise_post::NoisePost;
 use nf_core::noise::NoiseModel;
+use nf_core::rt::Dither;
 use nf_core::stage::{Activation, ProcessIo, Stage, StageError};
 use nf_core::{BLOCK, Block, SAMPLE_RATE, db_to_lin};
 
@@ -263,13 +264,13 @@ pub fn aec3_silent_reference(sig: &Signals, count: Option<AllocCounter>) -> Resu
 
 /// For comparison: sonora in the stage's config fed an exact-zero reference with no dither, after
 /// 3 s of far-end speech so its filters hold energy that then decays (sonora #34's denormal stall,
-/// if this CPU has it: 674 µs a block on the dev box with sonora 0.2.0, 46 with 0.3.0, which sets
-/// FTZ and DAZ for each call).
+/// if this CPU has it: 674 µs a block on the dev box with sonora 0.2.0, 46 with 0.3.0's FTZ/DAZ guard,
+/// which the vendored 0.3.0 builds only with nf-stages' `sonora-denormal-guard`, TODO 10).
 pub fn sonora_undithered(sig: &Signals, count: Option<AllocCounter>) -> BlockTimes {
     let mut apm = crate::aec3::build_apm();
     let mut scratch = [0.0f32; BLOCK];
     let mut out = [0.0f32; BLOCK];
-    for b in 0..300.min(sig.blocks()) {
+    for b in 0..BEFORE_SILENCE.min(sig.blocks()) {
         let _ = apm.process_render_f32(&[&block(&sig.far, b)[..]], &mut [&mut scratch[..]]);
         let _ = apm.process_capture_f32(&[&block(&sig.mic, b)[..]], &mut [&mut out[..]]);
     }
@@ -278,6 +279,59 @@ pub fn sonora_undithered(sig: &Signals, count: Option<AllocCounter>) -> BlockTim
         let _ = apm.process_capture_f32(&[&block(&sig.noisy, b)[..]], &mut [&mut out[..]]);
         black_box(&out);
     })
+}
+
+/// The engine's dither on the mic and the reference blocks (nf-engine's `pipeline.rs`: `DITHER`, and its generator's seed),
+/// which the silence rows copy. The AEC3 stage then dithers the reference again with its own.
+const ENGINE_DITHER: f32 = 1e-9;
+const ENGINE_DITHER_SEED: u32 = 0x2545_F491;
+/// Blocks of the scene (far-end speech, its echo and the near end) run before a silence row's silence: 3 s, so the filters
+/// hold energy that then decays.
+const BEFORE_SILENCE: usize = 300;
+
+/// Sustained digital silence as the engine hands it to the chain: an exact-zero mic and reference, each block dithered by one
+/// generator, the mic's block and then the reference's, as `pipeline.rs` does.
+fn engine_silence(blocks: usize) -> (Vec<f32>, Vec<f32>) {
+    let (mut mic, mut reference) = (vec![0.0f32; blocks * BLOCK], vec![0.0f32; blocks * BLOCK]);
+    let mut dither = Dither::new(ENGINE_DITHER_SEED);
+    for (m, r) in mic.as_chunks_mut::<BLOCK>().0.iter_mut().zip(reference.as_chunks_mut::<BLOCK>().0) {
+        dither.apply(m, ENGINE_DITHER);
+        dither.apply(r, ENGINE_DITHER);
+    }
+    (mic, reference)
+}
+
+/// AEC3 in sustained silence (TODO 10: what sonora's FTZ/DAZ guard buys): after 3 s of the scene, an exact-zero mic and
+/// reference. With `engine_dither` they carry the engine's dither, as in the app; without it they are exact zeros, as a host
+/// other than our engine might send them, and only the stage's own dither on the reference is left.
+pub fn aec3_silence(sig: &Signals, engine_dither: bool, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
+    let (mic, reference) = if engine_dither { engine_silence(sig.blocks()) } else { (Vec::new(), Vec::new()) };
+    let mut s = Aec3Stage::new(controls(ProcessingConfig::default()))?;
+    s.activate(&Activation::HOST)?;
+    let mut out = [0.0f32; BLOCK];
+    for b in 0..BEFORE_SILENCE.min(sig.blocks()) {
+        s.process(ProcessIo::new(&[block(&sig.mic, b), block(&sig.far, b)], &mut out));
+    }
+    let name = if engine_dither { "AEC3, silence, engine's dither" } else { "AEC3, silence, stage's dither only" };
+    Ok(time_blocks(name, sig.blocks(), count, |b| {
+        s.process(ProcessIo::new(&[block(&mic, b), block(&reference, b)], &mut out));
+        black_box(&out);
+    }))
+}
+
+/// The chain with AEC3 (meters on, as the app builds it) in sustained silence: after 3 s of the scene, an exact-zero mic and
+/// reference with the engine's dither.
+pub fn chain_silence(sig: &Signals, count: Option<AllocCounter>) -> Result<BlockTimes, StageError> {
+    let (mic, reference) = engine_silence(sig.blocks());
+    let mut chain = build_chain(controls(ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() }), true)?;
+    let mut out = [0.0f32; BLOCK];
+    for b in 0..BEFORE_SILENCE.min(sig.blocks()) {
+        chain.process(block(&sig.mic, b), block(&sig.far, b), &mut out);
+    }
+    Ok(time_blocks("chain + AEC3, silence, engine's dither", sig.blocks(), count, |b| {
+        black_box(chain.process(block(&mic, b), block(&reference, b), &mut out));
+        black_box(&out);
+    }))
 }
 
 /// The chain as the app builds it (meters on), with or without AEC3. Without it the input is the
@@ -336,5 +390,21 @@ mod tests {
         assert!(s.noisy.iter().all(|&v| v == 0.5));
         assert_eq!(Signals::with_near(&[], 0.0).blocks(), 1);
         assert_eq!(block(&s.noisy, 99), &SILENT);
+    }
+
+    /// The engine's silence is its dither alone, on the mic and the reference (one generator, so the two differ), and the
+    /// silence rows time every block of it after the warm-up.
+    #[test]
+    fn silence_rows_time_dithered_zeros_after_the_warm_up() {
+        let (mic, reference) = engine_silence(3);
+        for x in [&mic, &reference] {
+            assert_eq!(x.len(), 3 * BLOCK);
+            assert!(x.iter().all(|v| v.abs() <= ENGINE_DITHER) && x.iter().any(|&v| v != 0.0), "dithered silence");
+        }
+        assert_ne!(mic, reference);
+        let sig = Signals::with_near(&[], 1.5);
+        for row in [aec3_silence(&sig, true, None), aec3_silence(&sig, false, None), chain_silence(&sig, None)] {
+            assert_eq!(row.expect("build").blocks(), sig.blocks() - WARM_UP);
+        }
     }
 }

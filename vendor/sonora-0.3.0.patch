@@ -1,0 +1,89 @@
+noise-filter's patch to crates.io sonora 0.3.0 (SHA-256 d461e6c9ad112f8728919387a4bc5639fd28631f2070171efad38676e907edd8):
+its FTZ/DAZ guard becomes the `denormal-guard` cargo feature, off by default (TODO 10, vendor/README.md). This is the
+whole difference between the released crate and vendor/sonora-0.3.0. Apply it from the unpacked crate's root with
+`patch -p1`.
+
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,6 +34,9 @@
+ repository = "https://github.com/dignifiedquire/sonora"
+ 
+ [features]
++# noise-filter vendor patch: FTZ/DAZ for each process_* call
++# (src/denormal_disabler.rs), off by default.
++denormal-guard = []
+ examples = [
+     "dep:anyhow",
+     "dep:clap",
+diff -ruN a/src/audio_processing.rs b/src/audio_processing.rs
+--- a/src/audio_processing.rs
++++ b/src/audio_processing.rs
+@@ -454,6 +454,10 @@
+ /// NEON (soft-float). There, near-silent input can make processing slower on
+ /// hardware with a subnormal penalty.
+ ///
++/// noise-filter vendor patch: all of the above needs the `denormal-guard`
++/// cargo feature, which is off by default. Without it no target flushes and
++/// no call changes the floating-point environment.
++///
+ /// # Usage
+ ///
+ /// 1. Create an instance via [`AudioProcessing::builder()`] or
+diff -ruN a/src/denormal_disabler.rs b/src/denormal_disabler.rs
+--- a/src/denormal_disabler.rs
++++ b/src/denormal_disabler.rs
+@@ -9,6 +9,12 @@
+ //! on a subnormal operand takes a microcode assist, which made AEC3 10-50x
+ //! slower while the render reference was silent (issue #34). Upstream hides
+ //! this with FTZ/DAZ; so does this guard.
++//!
++//! noise-filter vendor patch: the guard is built only with the
++//! `denormal-guard` cargo feature, which is off by default. Without it every
++//! target gets the no-op `imp` below, as a target without hardware
++//! flush-to-zero does: `is_supported()` is false and no call reads or writes
++//! MXCSR or FPCR.
+ 
+ use core::marker::PhantomData;
+ 
+@@ -102,6 +108,7 @@
+ }
+ 
+ #[cfg(all(
++    feature = "denormal-guard",
+     not(miri),
+     any(target_arch = "x86", target_arch = "x86_64"),
+     target_feature = "sse"
+@@ -161,7 +168,12 @@
+     }
+ }
+ 
+-#[cfg(all(not(miri), target_arch = "aarch64", target_feature = "neon"))]
++#[cfg(all(
++    feature = "denormal-guard",
++    not(miri),
++    target_arch = "aarch64",
++    target_feature = "neon"
++))]
+ mod imp {
+     use core::arch::asm;
+ 
+@@ -214,11 +226,17 @@
+ 
+ #[cfg(not(any(
+     all(
++        feature = "denormal-guard",
+         not(miri),
+         any(target_arch = "x86", target_arch = "x86_64"),
+         target_feature = "sse"
+     ),
+-    all(not(miri), target_arch = "aarch64", target_feature = "neon"),
++    all(
++        feature = "denormal-guard",
++        not(miri),
++        target_arch = "aarch64",
++        target_feature = "neon"
++    ),
+ )))]
+ mod imp {
+     // `u32`, not `()`: a unit word trips clippy `let_unit_value`/`unit_arg`.

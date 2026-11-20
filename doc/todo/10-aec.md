@@ -30,8 +30,9 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   - **FTZ/DAZ:** each call sets MXCSR's FTZ and DAZ bits unless both are already set and restores the thread's word on return, also on
     a panic. sonora's docs call it formally undefined behaviour in Rust, as upstream's guard, nih-plug and `no_denormals`
     are. It is scoped to sonora's calls; our rule is against a *persistent* change (nf-engine's `audio.rs`), and
-    `tests/aec3.rs` (`aec3_leaves_the_thread_s_mxcsr_as_it_found_it`) checks that nothing persists. Our proposal: keep the
-    dither all the same (defined behaviour, and it covers RNNoise and our own filters), and keep no FTZ/DAZ of our own.
+    `aec3_leaves_the_thread_s_mxcsr_as_it_found_it` (now in `tests/mxcsr.rs`) checks that nothing persists. Our proposal: keep
+    the dither all the same (defined behaviour, and it covers RNNoise and our own filters), and keep no FTZ/DAZ of our own.
+    Since 2026-11-20 the guard is a cargo feature of a vendored 0.3.0, off by default: the next section.
 - **Before 0.3.0** (history): 0.2.0 (2026-07-29) was the M145 port, with no denormal handling and about 43 `Vec`s a block
   (`doc/dev/api/sonora-nnnoiseless.md` 1.7, 1.10); sonora #38, #40 and #41 were open PRs then. The plan was to vendor a
   fork of main with them merged; 0.3.0 made that unnecessary.
@@ -40,6 +41,55 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
 - **Full band:** set `MaxProcessingRate::Rate48kHz`. sonora's default (`Rate32kHz`, as in upstream WebRTC) caps the whole capture path at 16 kHz whatever noise model runs.
   - Rate48kHz routes audio through WebRTC's three-band filter bank (0-8/8-16/16-24 kHz). It's not perfect-reconstruction (~9.5 dB round-trip SNR), so A/B it against 32 kHz in #14.
   - AEC3 runs its linear filter on the bottom band only. Above 8 kHz it applies one scalar gain plus comfort noise, so leftover far-end speech above 8 kHz is handled coarsely, whatever the noise model's rate.
+
+## sonora's FTZ/DAZ guard, switchable (2026-11-20)
+- **The owner (2026-11-20):** agnostic; "if there is a benefit in their implementation maybe we make it switchable".
+- **Built:** `vendor/sonora-0.3.0` is the released crate with the guard behind a `denormal-guard` feature, off by default,
+  wired in by `[patch.crates-io]` (the diff is `vendor/sonora-0.3.0.patch`, three files; `vendor/README.md`). Only `sonora`
+  holds the guard; the other six sonora crates come from crates.io as before. Either build is one flag: nf-stages'
+  `sonora-denormal-guard`, which nf-app forwards (`cargo build --release --features sonora-denormal-guard`).
+- **Tested both ways:** `tests/mxcsr.rs` reads MXCSR inside sonora's four entry points (0x1f80 without the guard, 0x9fc0 with
+  it) and after them (the caller's word, both ways). `tests/refactor_parity.rs` is bit-identical to crates.io's 0.3.0 in both
+  builds, `rt_no_alloc` counts 0, and the workspace suites pass in both (855 passed each).
+- **Measured** (`doc/dev/build-report.md` §13: `tests/timing.rs`' `silence_costs`; 3 s of the scene, then 29 s timed of an
+  exact-zero mic and reference; medians of 9 quiet runs a build, ABBA order; µs a block, off / on):
+
+  | Row | p50 | p99 | max |
+  |---|---|---|---|
+  | AEC3, silence, the engine's dither (the app) | 47.2 / 46.2 | 56.9 / 55.9 | 116.6 / 123.2 |
+  | chain with AEC3, silence, the engine's dither (the app) | 66.4 / 65.5 | 77.0 / 76.5 | 139.2 / 192.6 |
+  | AEC3, silence, the mic undithered (only the stage's reference dither) | 388.0 / 46.1 | 465.2 / 56.0 | 749.5 / 132.1 |
+  | control: sonora, zero reference, no dither | 668.5 / 45.7 | 714.0 / 54.5 | 879.0 / 88.5 |
+  | AEC3 with signal (echo, near end, noise) | 47.0 / 47.1 | 63.3 / 64.4 | 115.1 / 97.9 |
+
+  With our dither the guard buys about 1 µs a block (2%) in sustained silence, consistently (the runs' p50 ranges don't
+  overlap), and nothing with signal; no subnormal is left in sonora's state then. The max column is the VM's jitter in both.
+- **Proposal (ours, for the owner):** keep the default off, as built. The app dithers the mic and the reference, so the guard
+  would buy it 1 µs a block for formally undefined behaviour in every sonora call. The guard earns its keep only where the
+  dither doesn't reach: an undithered zero mic stalls the stage at 388 µs a block without it. So if the stage goes to other
+  hosts (#17), it should dither its mic input as it already does its reference (about 0.1 µs a block; it moves the output by
+  rounding, so the parity golden would be re-recorded), or that build turns the guard on. The offline `process` command
+  doesn't dither either, so a WAV with digital silence runs at the slow rate there without the guard (still about 25 times real
+  time). Ask upstream for an opt-out (below), and drop the vendored copy if they add one.
+- **Draft upstream request (not posted; the owner's call).** Title: "Feature request: a cargo feature to build without the
+  per-call FTZ/DAZ guard". Body:
+
+  > Thank you for 0.3.0: the allocation-free echo canceller (sonora #40) and the `DenormalDisabler` (sonora #34) fix the
+  > silent-reference stall for every caller. We would like to be able to build without the guard. Rust documents a changed
+  > MXCSR as undefined behaviour while Rust code runs, even when it is restored (the `core::arch` docs for `_mm_setcsr`), and
+  > the guard's own docs list what that means: float operations may move across it, and the global allocator, `tracing`
+  > subscribers and the panic hook run under FTZ. Our app keeps its signals out of the subnormal range by defined means
+  > instead, with about ±1e-9 of dither on the capture and render inputs, the other fix measured in sonora #34. With that, the
+  > guard saves us about 1 µs per 10 ms block (AEC3 at 48 kHz in sustained silence, 46.2 against 47.2 µs, x86-64) and nothing
+  > while there is signal, and the output is bit-identical either way.
+  >
+  > Proposal: a default-on feature, say `denormal-guard`. Without it `DenormalDisabler` compiles to the no-op variant the crate
+  > already has for targets without hardware flush-to-zero, so `is_supported()` is false and nothing else changes. The tests
+  > already check against `is_supported()`, so they hold either way. Default-on keeps today's behaviour for everyone else;
+  > callers who dither would set `default-features = false`. We carry this as a small patch (the `cfg` of the three `imp`
+  > modules, the feature and a doc paragraph) and would be glad to send it as a PR.
+
+  When posting, write sonora's own numbers bare (its issue 34 and PR 40), so that GitHub links them.
 
 ## As a stage (proposal, #17, awaiting the owner)
 - A CLAP-shaped stage (#17): main input = mic, second (non-main) input port = speaker reference,

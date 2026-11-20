@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# sonora's FTZ/DAZ guard (TODO 10): MXCSR's FTZ and DAZ set for the length of each sonora call and restored after it, as sonora
+# 0.3.0 ships it. Off by default: the reference and the mic are dithered instead, and Rust calls a changed MXCSR undefined
+# behaviour even when restored. The vendored crate (vendor/README.md) builds the guard only with this. nf-app forwards it.
+sonora-denormal-guard = ["sonora/denormal-guard"]
+
 [dependencies]
 nf-core.workspace = true
 nnnoiseless.workspace = true

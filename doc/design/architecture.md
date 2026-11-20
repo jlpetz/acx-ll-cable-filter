@@ -19,7 +19,7 @@ included. It is built to take more noise models later without touching the engin
 - Fixed format inside the app: **48 kHz, mono, f32, 480-frame (10 ms) blocks** (`nf_core::BLOCK`).
   Devices are converted at the edge: channel downmix or upmix, plus WASAPI autoconvert when a
   device doesn't run at 48 kHz.
-- **One audio thread** (MMCSS "Pro Audio", real-time allocator scope; no FTZ/DAZ of our own (sonora 0.3.0 sets both for the length of each of its calls and restores MXCSR; `tests/aec3.rs`), the mic and
+- **One audio thread** (MMCSS "Pro Audio", real-time allocator scope; no FTZ/DAZ of our own (sonora 0.3.0's guard, both for the length of each of its calls, is built only with nf-stages' `sonora-denormal-guard`, off by default: TODO 10, `vendor/README.md`, `tests/mxcsr.rs`), the mic and
   reference blocks are dithered at about -180 dBFS instead), kept between runs and driven by the
   mic's capture events. For each complete mic block:
   1. read the loopback reference (keep-alive render keeps it flowing) into the reference FIFO,

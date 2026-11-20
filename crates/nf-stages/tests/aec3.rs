@@ -200,31 +200,4 @@ fn the_build_has_fma_for_sonoras_mul_add() {
     const { assert!(cfg!(target_feature = "fma"), "no FMA: sonora's mul_add path is off (.cargo/config.toml)") }
 }
 
-/// The calling thread's MXCSR.
-fn mxcsr() -> u32 {
-    let mut v = 0u32;
-    // SAFETY: `stmxcsr` stores the 32-bit MXCSR into `v`, a live local; it reads no memory and changes no flags.
-    unsafe { std::arch::asm!("stmxcsr [{}]", in(reg) &raw mut v, options(nostack, preserves_flags)) };
-    v
-}
-
-/// sonora 0.3.0 sets FTZ and DAZ for the length of each `process_*` call (upstream's `DenormalDisabler`) and restores the
-/// thread's MXCSR before the call returns. Nothing may leave them set (no persistent FTZ/DAZ: nf-engine's `audio.rs`), so
-/// after the stage's blocks, on a speaking and then a silent reference, the thread's control bits are as they were and a
-/// denormal survives.
-#[test]
-fn aec3_leaves_the_thread_s_mxcsr_as_it_found_it() {
-    // Without the status flags, which ordinary arithmetic sets.
-    const CONTROL: u32 = !0x3f;
-    let before = mxcsr();
-    let far = speech_like(100 * BLOCK, Voice::LOW, 7).samples;
-    let mic = scaled(&delayed(&far, 1920), 0.4);
-    let mut s = aec3();
-    let built = mxcsr();
-    run_stage(&mut s, &mic, Some(&far));
-    run_stage(&mut s, &mic, Some(&vec![0.0; mic.len()]));
-    let after = mxcsr();
-    assert_eq!((built & CONTROL, after & CONTROL), (before & CONTROL, before & CONTROL), "MXCSR {before:#06x}, {built:#06x}, {after:#06x}");
-    let tiny = std::hint::black_box(1e-38f32);
-    assert!(std::hint::black_box(tiny * 0.01) > 0.0, "a denormal product flushed to 0");
-}
+// The MXCSR checks (sonora's FTZ/DAZ guard, on or off) are in `tests/mxcsr.rs`: they need a global allocator of their own.
