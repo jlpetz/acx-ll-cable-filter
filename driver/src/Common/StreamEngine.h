@@ -569,6 +569,8 @@ protected:
 
     // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
     BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied
+    ULONGLONG       m_AppOtherEnd;      // where this stream's latest pass as another stream ended, on the copy's time line
+    BOOLEAN         m_AppOtherValid;    // m_AppOtherEnd is from this run: a handoff to this stream counts what it skips
 
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
     __declspec(noinline)

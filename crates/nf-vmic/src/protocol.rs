@@ -340,7 +340,9 @@ pub struct LoopbackStats {
     pub render_late_packets: u64,
     pub render_lost_packets: u64,
     pub render_not_owner: u64,
-    pub reserved: u64,
+    /// Stream creations the loopback refused: a format other than one open on the other circuit, or (not expected) no free
+    /// format slot on its own. Like every loopback counter, the first-installed device's only.
+    pub refused_opens: u64,
 }
 
 /// `NF_VMIC_STATS`: STATS's output.
@@ -371,7 +373,11 @@ pub struct Stats {
     pub secondary_frames_copied: u64,
     /// Frames such a stream zero-filled because the ring's audio for its position wasn't there.
     pub secondary_underrun_frames: u64,
-    pub reserved1: [u64; 2],
+    /// Times a capture stream that was playing the driver's copy took the reader slot another stream had held (a handoff).
+    pub reader_handoffs: u64,
+    /// The copy's frames such a stream never delivered: what the copy held past its place (a handoff's one-time skip; the last
+    /// reader's underrun silence there included).
+    pub handoff_skipped_frames: u64,
     /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
     pub stream: [StreamStats; KINDS],
 }
@@ -423,6 +429,7 @@ const _: () = {
 
     assert!(size_of::<LoopbackStats>() == 96);
     assert!(offset_of!(LoopbackStats, render_not_owner) == 80);
+    assert!(offset_of!(LoopbackStats, refused_opens) == 88);
 
     assert!(size_of::<Stats>() == 576);
     assert!(offset_of!(Stats, qpc_frequency) == 16);
@@ -434,7 +441,8 @@ const _: () = {
     assert!(offset_of!(Stats, loopback) == 192);
     assert!(offset_of!(Stats, secondary_frames_copied) == 288);
     assert!(offset_of!(Stats, secondary_underrun_frames) == 296);
-    assert!(offset_of!(Stats, reserved1) == 304);
+    assert!(offset_of!(Stats, reader_handoffs) == 304);
+    assert!(offset_of!(Stats, handoff_skipped_frames) == 312);
     assert!(offset_of!(Stats, stream) == 320);
 };
 
@@ -533,12 +541,12 @@ mod tests {
         assert_eq!(ending(50), None);
     }
 
-    /// The new counters sit where nf_vmic.h's Reserved fields were, and the rest stays reserved.
+    /// The new counters sit where nf_vmic.h's Reserved fields were.
     #[test]
     fn the_counters_replace_reserved_fields() {
         assert_eq!((offset_of!(RingStats, format_rejects), offset_of!(RingStats, refused_capture_opens)), (112, 120));
         assert_eq!((offset_of!(Stats, secondary_frames_copied), offset_of!(Stats, secondary_underrun_frames)), (288, 296));
-        assert_eq!(size_of_val(&Stats::default().reserved1), 16);
-        assert_eq!(offset_of!(Stats, reserved1) + 16, offset_of!(Stats, stream));
+        assert_eq!((offset_of!(Stats, reader_handoffs), offset_of!(Stats, handoff_skipped_frames)), (304, 312));
+        assert_eq!(offset_of!(Stats, handoff_skipped_frames) + 8, offset_of!(Stats, stream));
     }
 }

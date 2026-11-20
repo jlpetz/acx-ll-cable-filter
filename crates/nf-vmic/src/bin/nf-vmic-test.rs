@@ -993,6 +993,11 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         a.format_rejects.saturating_sub(b.format_rejects),
         a.refused_capture_opens.saturating_sub(b.refused_capture_opens)
     );
+    println!(
+        "  reader handoffs +{}, skipping +{} frames of the ring's audio",
+        after.reader_handoffs.saturating_sub(before.reader_handoffs),
+        after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames)
+    );
     for (index, left, right) in &r.first_corrupt {
         let (l, rt) = (f32::from_bits(*left), f32::from_bits(*right));
         println!("  corrupt at frame {index}: left {left:#010x} ({l}), right {right:#010x} ({rt})");
@@ -1032,6 +1037,14 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     let underrun = reader_underrun + secondary_underrun;
     let underrun_text = format!("{underrun} frames (the reader {reader_underrun}, secondary streams {secondary_underrun})");
     let silence = r.zeros_before_signal + r.zeros_inside + r.zeros_after_signal;
+    // A handoff skips once (the owner, 2026-11-20): gaps are allowed only for handoffs the driver counted over the recording, at
+    // most one each, and only if they lost exactly the frames it counted as skipped. The counts are for every stream and the
+    // driver can't say which stream took the slot (a client's engine period needn't be its device stream's packet: a DEFAULT
+    // client told 3.33 ms ran 480-frame packets), so the exact match is what ties a gap to a handoff: a bystander's own
+    // discontinuity, or a gap for any other reason, would have to equal the taker's skip to the frame.
+    let handoffs = after.reader_handoffs.saturating_sub(before.reader_handoffs);
+    let skipped = after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames);
+    let gaps_ok = r.gaps == 0 || (r.gaps <= handoffs && r.gap_frames == skipped);
     vec![
         Check {
             ok: is_reading(before),
@@ -1090,10 +1103,12 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
         Check {
-            ok: r.is_clean(),
+            ok: r.signal_frames > 0 && r.repeats == 0 && r.corrupt_frames == 0 && gaps_ok,
             name: "bit-exact and in order",
             detail: format!(
-                "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one",
+                "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one; reader \
+                 handoffs over the recording {handoffs} ({skipped} frames skipped by the driver's count: gaps are allowed only \
+                 for those, one each, losing exactly that many frames)",
                 r.gaps, r.gap_frames, r.repeats, r.repeat_frames, r.corrupt_frames, r.first_code, r.last_code, r.steps_ok
             ),
         },
@@ -1522,6 +1537,10 @@ fn print_stats(s: &Stats) {
         "  streams that aren't the reader: {} passes; given the ring's audio {} frames, zero-filled {} frames",
         r.not_reader_packets, s.secondary_frames_copied, s.secondary_underrun_frames
     );
+    println!(
+        "  reader handoffs {} (a stream took the slot another had held), skipping {} frames of the ring's audio",
+        s.reader_handoffs, s.handoff_skipped_frames
+    );
     if s.flags & STATS_LOOPBACK != 0 {
         let l = &s.loopback;
         println!(
@@ -1532,6 +1551,7 @@ fn print_stats(s: &Stats) {
             "  capture anchors {}, render restarts {}, gap fills {}, late packets {}, lost packets {}, second render stream {}",
             l.capture_anchors, l.render_restarts, l.render_gap_fills, l.render_late_packets, l.render_lost_packets, l.render_not_owner
         );
+        println!("  stream creations refused {} (a format other than one open on the other endpoint)", l.refused_opens);
     } else {
         println!("loopback: no device");
     }
@@ -2084,34 +2104,40 @@ fn open(args: &[String]) -> Result<Verdict, String> {
     }
 }
 
-/// Who refused open's stream, as the driver's RefusedCaptureOpens says: read just before the open and just after the call
-/// that failed.
+/// Who refused open's stream, as the driver's counters say (RefusedCaptureOpens for the app ring's rule, the loopback's
+/// RefusedOpens for its own): read just before the open and just after the call that failed.
 #[derive(Debug, PartialEq, Eq)]
 enum Refuser {
-    /// It rose by this much: the driver refused a capture stream because a ring was attached and the stream's format wasn't
-    /// 48 kHz float32 stereo.
+    /// RefusedCaptureOpens rose by this much: the driver refused a capture stream because a ring was attached and the stream's
+    /// format wasn't 48 kHz float32 stereo.
     Driver(u64),
-    /// It didn't rise: something other than that rule refused it.
-    NotTheRingRule,
+    /// The loopback's RefusedOpens rose by this much: the driver refused the stream because the other endpoint has a stream
+    /// open in another format.
+    Loopback(u64),
+    /// Neither rose: something other than the driver's two rules refused it.
+    NotTheDriver,
     /// The statistics can't say, for this reason.
     Unknown(&'static str),
 }
 
 fn refuser(render: bool, before: Option<&Stats>, after: Option<&Stats>) -> Refuser {
-    if render {
-        return Refuser::Unknown("the driver counts no refused render opens in its statistics");
-    }
-    match (before, after) {
-        (Some(b), Some(a)) => match a.ring.refused_capture_opens.saturating_sub(b.ring.refused_capture_opens) {
-            0 => Refuser::NotTheRingRule,
-            n => Refuser::Driver(n),
-        },
-        _ => Refuser::Unknown("no driver statistics from before the open and after it"),
+    let (Some(b), Some(a)) = (before, after) else {
+        return Refuser::Unknown("no driver statistics from before the open and after it");
+    };
+    // The capture side checks the app ring's rule first (CaptureStreamOpen), then the loopback's; a render stream meets only
+    // the loopback's.
+    let ring = if render { 0 } else { a.ring.refused_capture_opens.saturating_sub(b.ring.refused_capture_opens) };
+    let both = a.flags & b.flags & STATS_LOOPBACK != 0;
+    let loopback = if both { a.loopback.refused_opens.saturating_sub(b.loopback.refused_opens) } else { 0 };
+    match (ring, loopback) {
+        (0, 0) => Refuser::NotTheDriver,
+        (0, n) => Refuser::Loopback(n),
+        (n, _) => Refuser::Driver(n),
     }
 }
 
-/// open's verdict and outcome line for a refusal: exit 1 only where the driver's counter shows its app ring format rule
-/// refused the stream; any other refusal exits 4.
+/// open's verdict and outcome line for a refusal: exit 1 only where the driver's counters show one of its format rules (the
+/// app ring's or the loopback's) refused the stream; any other refusal exits 4.
 fn refusal_outcome(r: &Refusal, kind: &str, who: &Refuser) -> (Verdict, String) {
     match who {
         Refuser::Driver(n) => (
@@ -2121,13 +2147,20 @@ fn refusal_outcome(r: &Refusal, kind: &str, who: &Refuser) -> (Verdict, String) 
                  stereo): {r}; the {kind} stream never ran"
             ),
         ),
-        Refuser::NotTheRingRule => (
+        Refuser::Loopback(n) => (
+            Verdict::Fail,
+            format!(
+                "OUTCOME: REFUSED BY THE DRIVER (the loopback's RefusedOpens +{n}: the other endpoint has a stream open in another \
+                 format): {r}; the {kind} stream never ran"
+            ),
+        ),
+        Refuser::NotTheDriver => (
             Verdict::RefusedElsewhere,
             format!(
-                "OUTCOME: REFUSED, not by the driver's app ring rule (RefusedCaptureOpens +0): {r}; the {kind} stream never ran. \
-                 Something else refused it: another client holding the device (AUDCLNT_E_DEVICE_IN_USE), the period asked for, \
-                 the engine, or the driver's loopback rule (a render stream open in another format, which its statistics don't \
-                 count)"
+                "OUTCOME: REFUSED, not by the driver's format rules (RefusedCaptureOpens and the loopback's RefusedOpens +0): {r}; \
+                 the {kind} stream never ran. Something else refused it: another client holding the device \
+                 (AUDCLNT_E_DEVICE_IN_USE), the period asked for, the engine, or, on a device of the driver other than the first \
+                 installed, its loopback rule (STATS carries only the first device's loopback counters)"
             ),
         ),
         Refuser::Unknown(why) => {
@@ -2836,7 +2869,7 @@ mod tests {
 
     // ---- the verdicts, on synthetic statistics ----
 
-    use nf_vmic::protocol::RingStats;
+    use nf_vmic::protocol::{LoopbackStats, RingStats};
 
     const PID: u32 = 4242;
     /// Ten seconds at 48 kHz.
@@ -2963,6 +2996,17 @@ mod tests {
         assert_eq!(verify_failures(&before, &after, &corrupt), ["bit-exact and in order"]);
         assert_eq!(verify_failures(&before, &after, &CheckReport { gaps: 1, gap_frames: 5, ..r.clone() }), ["bit-exact and in order"]);
         assert_eq!(verify_failures(&before, &after, &CheckReport { repeats: 1, ..r.clone() }), ["bit-exact and in order"]);
+        // A handoff the driver counted allows one gap losing exactly its skip; any other gap still fails.
+        let handed = Stats { reader_handoffs: 1, handoff_skipped_frames: 449, ..after };
+        let gap = |gaps, gap_frames| CheckReport { gaps, gap_frames, ..r.clone() };
+        assert_eq!(verify_failures(&before, &handed, &gap(1, 449)), Vec::<&str>::new(), "the counted skip");
+        assert_eq!(verify_failures(&before, &handed, &gap(1, 450)), ["bit-exact and in order"], "larger than counted");
+        assert_eq!(verify_failures(&before, &handed, &gap(1, 215)), ["bit-exact and in order"], "not the counted skip");
+        assert_eq!(verify_failures(&before, &handed, &gap(2, 449)), ["bit-exact and in order"], "two gaps, one handoff");
+        assert_eq!(verify_failures(&before, &handed, &CheckReport { repeats: 1, ..r.clone() }), ["bit-exact and in order"]);
+        assert_eq!(verify_failures(&before, &after, &gap(1, 0)), ["bit-exact and in order"], "a gap with no handoff");
+        let two = Stats { reader_handoffs: 2, handoff_skipped_frames: 781, ..after };
+        assert_eq!(verify_failures(&before, &two, &gap(2, 781)), Vec::<&str>::new(), "two handoffs, both skips");
         // One discontinuity, or frames the engine lost.
         let seen = |lost_frames, discontinuities| StreamSeen { lost_frames, discontinuities, packet: 480 };
         assert_eq!(failed(&verify_checks(&before, &after, &r, &seen(0, 1))), ["the capture stream"]);
@@ -3270,16 +3314,26 @@ mod tests {
         assert_eq!(slot_holder(STATE_ATTACHED, 128), Some(128));
     }
 
-    /// open's refusals: exit 1 only where RefusedCaptureOpens rose over the open; any other refusal exits 4.
+    /// open's refusals: exit 1 only where RefusedCaptureOpens or the loopback's RefusedOpens rose over the open; any other
+    /// refusal exits 4.
     #[test]
     fn a_refusal_is_the_drivers_only_where_its_counter_rose() {
-        let with = |refused_capture_opens| Stats { ring: RingStats { refused_capture_opens, ..Default::default() }, ..Default::default() };
-        let (b, rose, same) = (with(7), with(8), with(7));
+        let with = |refused_capture_opens, refused_opens| Stats {
+            flags: STATS_LOOPBACK,
+            ring: RingStats { refused_capture_opens, ..Default::default() },
+            loopback: LoopbackStats { refused_opens, ..Default::default() },
+            ..Default::default()
+        };
+        let (b, rose, same, lb) = (with(7, 3), with(8, 3), with(7, 3), with(7, 4));
         assert_eq!(refuser(false, Some(&b), Some(&rose)), Refuser::Driver(1));
-        assert_eq!(refuser(false, Some(&b), Some(&same)), Refuser::NotTheRingRule);
+        assert_eq!(refuser(false, Some(&b), Some(&same)), Refuser::NotTheDriver);
+        assert_eq!(refuser(false, Some(&b), Some(&lb)), Refuser::Loopback(1));
+        assert_eq!(refuser(true, Some(&b), Some(&lb)), Refuser::Loopback(1), "a render stream meets the loopback's rule");
+        assert_eq!(refuser(true, Some(&b), Some(&rose)), Refuser::NotTheDriver, "the ring's rule is the capture side's only");
+        let no_device = Stats { flags: 0, ..lb };
+        assert_eq!(refuser(false, Some(&b), Some(&no_device)), Refuser::NotTheDriver, "no loopback counters without the device");
         assert!(matches!(refuser(false, None, Some(&rose)), Refuser::Unknown(_)));
         assert!(matches!(refuser(false, Some(&b), None), Refuser::Unknown(_)));
-        assert!(matches!(refuser(true, Some(&b), Some(&rose)), Refuser::Unknown(_)), "no render refusals are counted");
 
         let r = Refusal { call: "Initialize", hr: AUDCLNT_E_UNSUPPORTED_FORMAT, text: None };
         let (v, line) = refusal_outcome(&r, "capture", &Refuser::Driver(1));
@@ -3287,11 +3341,14 @@ mod tests {
         assert!(line.starts_with("OUTCOME: REFUSED BY THE DRIVER (RefusedCaptureOpens +1"), "{line}");
         assert!(line.contains("Initialize returned AUDCLNT_E_UNSUPPORTED_FORMAT"), "{line}");
         let in_use = Refusal { call: "Initialize", hr: windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_IN_USE, text: None };
-        let (v, line) = refusal_outcome(&in_use, "capture", &Refuser::NotTheRingRule);
+        let (v, line) = refusal_outcome(&in_use, "capture", &Refuser::NotTheDriver);
         assert_eq!(v, Verdict::RefusedElsewhere);
-        let expect =
-            "OUTCOME: REFUSED, not by the driver's app ring rule (RefusedCaptureOpens +0): Initialize returned AUDCLNT_E_DEVICE_IN_USE";
+        let expect = "OUTCOME: REFUSED, not by the driver's format rules (RefusedCaptureOpens and the loopback's RefusedOpens +0): \
+                      Initialize returned AUDCLNT_E_DEVICE_IN_USE";
         assert!(line.starts_with(expect), "{line}");
+        let (v, line) = refusal_outcome(&r, "render", &Refuser::Loopback(1));
+        assert_eq!(v, Verdict::Fail);
+        assert!(line.starts_with("OUTCOME: REFUSED BY THE DRIVER (the loopback's RefusedOpens +1"), "{line}");
         let start = Refusal { call: "Start", hr: E_FAIL, text: None };
         let (v, line) = refusal_outcome(&start, "render", &Refuser::Unknown("why"));
         assert_eq!(

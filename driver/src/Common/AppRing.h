@@ -38,10 +38,11 @@ Environment:
 // The latest gaps in the reader's copy (NF_APP_RING.HistoryGaps): silence the copy holds where the reader's time line jumped
 // later (a glitch adjustment, a handoff), which the other streams count as underruns, not as the ring's audio. A whole reader
 // packet follows each gap, so at most (its packet + its timer's lateness + the lag) / the reader's packet + 1 gaps end after
-// the start of another stream's read: 11 for a 10 ms stream (lateness under 10 ms) beside a 2 ms reader (the shortest packet,
-// PacketSize.cpp) whose time line jumps at every pass. Should more than 16 do, the older ones' silence counts as copied.
+// the start of another stream's read: 11 for a 10 ms stream (lateness under 10 ms) beside a 2 ms reader (the default build's
+// shortest packet, PacketSize.cpp) whose time line jumps at every pass, 22 beside a 1 ms one (the 96-frame trial build's floor).
+// Should more than 32 do, the older ones' silence counts as copied.
 //
-#define NF_APP_HISTORY_GAPS     16u
+#define NF_APP_HISTORY_GAPS     32u
 
 typedef struct _NF_APP_HISTORY_GAP {
     ULONGLONG               From;                   // [From, End), frames on the time line; [0, 0) when unused
@@ -101,6 +102,8 @@ typedef struct _NF_APP_RING {
     NF_VMIC_RING_STATS      Stats;                  // cumulative since the driver loaded
     ULONGLONG               SecondaryFramesCopied;  // NF_VMIC_STATS's, cumulative too
     ULONGLONG               SecondaryUnderrunFrames;
+    ULONGLONG               ReaderHandoffs;         // NF_VMIC_STATS's: a stream playing the copy took the slot another held
+    ULONGLONG               HandoffSkippedFrames;   // the copy's frames such a stream never delivered
 
     BOOLEAN                 Removing;               // the control device is being deleted: no new attachment
 

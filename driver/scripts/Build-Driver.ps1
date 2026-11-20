@@ -9,22 +9,42 @@
     2. The package: the stamped INF and the .sys, the .sys signed with our test certificate, the catalog made by inf2cat
        for Windows 11 24H2 and Server 2025 (KMDF 1.35's floor), and signed.
     -NoSign skips the signing (a build check only).
+    -PacketFrames 96 builds the 96-frame trial (TODO 19): NF_PACKET_FRAMES 96 and a 1 ms floor (PacketSize.cpp), passed to
+    cl.exe through the CL environment variable. The packet size is kept in out\<Configuration>\packet-frames.txt, and a build
+    whose size differs from the last one rebuilds everything (MSBuild doesn't see the CL variable change).
 
 .EXAMPLE
     .\Build-Driver.ps1
+.EXAMPLE
+    .\Build-Driver.ps1 -PacketFrames 96
 #>
 param(
     [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release',
+    [ValidateSet(96, 128)][int]$PacketFrames = 128,
     [switch]$NoSign
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 
-Write-Step "Build ($Configuration, x64)"
+Write-Step "Build ($Configuration, x64, $PacketFrames-frame packets)"
 $msbuild = Find-MSBuild
-& $msbuild $Solution "-p:Configuration=$Configuration" '-p:Platform=x64' '-p:SignMode=Off' '-p:SkipPackageVerification=true' `
-    '-p:ApiValidator_Enable=false' '-m' '-nologo' '-v:minimal'
-if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed.' }
+$marker = Join-Path $DriverRoot "out\$Configuration\packet-frames.txt"
+# A missing marker is unknown (out\ may have been cleared while the intermediates in src\ remain): rebuild. The marker names the
+# size before MSBuild runs, so a build that fails or is stopped part way leaves it naming the size its objects may hold, and
+# the next build of the other size rebuilds.
+$last = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '' }
+$target = if ($last -ne "$PacketFrames") { 'Rebuild' } else { 'Build' }
+New-Item -ItemType Directory -Force -Path (Split-Path $marker) | Out-Null
+Set-Content -Path $marker -Value "$PacketFrames" -NoNewline
+$savedCl = $env:CL
+if ($PacketFrames -ne 128) { $env:CL = "/DNF_PACKET_FRAMES#$PacketFrames /DNF_MIN_PACKET_PERIOD_HNS#10000" } else { $env:CL = $null }
+try {
+    & $msbuild $Solution "-t:$target" "-p:Configuration=$Configuration" '-p:Platform=x64' '-p:SignMode=Off' `
+        '-p:SkipPackageVerification=true' '-p:ApiValidator_Enable=false' '-m' '-nologo' '-v:minimal'
+    if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed.' }
+} finally {
+    $env:CL = $savedCl
+}
 
 $built = Join-Path $ProjectDir "x64\$Configuration"
 $pkg = Join-Path $DriverRoot "out\$Configuration\$PackageName"

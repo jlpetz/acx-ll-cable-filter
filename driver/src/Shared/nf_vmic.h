@@ -89,8 +89,11 @@ The ring's rules:
       capture stream can run at once: the microphones of two of the driver's devices share the one app ring, and the audio
       engine can open a device stream per processing mode should the capture pin list more than RAW (it lists only RAW).
       The other streams' passes are counted in NF_VMIC_STATS only (NotReaderPackets, SecondaryFramesCopied,
-      SecondaryUnderrunFrames). A handoff (the reader pauses and another stream takes the slot) can skip or repeat up to
-      that lag once in the other streams, and leave a short gap of silence in them. A jump in a stream's time line (a late
+      SecondaryUnderrunFrames). A handoff (the reader pauses and another stream takes the slot) skips once: the new reader
+      starts at ReadFrame, so the audio the copy held past its own place (up to the reader's packet, the lag and its own
+      packet: 449 frames seen with a 160-frame reader and a 480-frame stream) never reaches it, counted in ReaderHandoffs and
+      HandoffSkippedFrames (the owner, 2026-11-20: a one-time skip for now; a gapless handoff is a follow-up). Any other
+      stream can skip or repeat up to the lag once then and get a short gap of silence. A jump in a stream's time line (a late
       timer's glitch adjustment, Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses) moves the copy's audio by its length: the
       reader's inserts that much silence in the other streams (its own output doesn't show it), another stream's skips
       that much of the copy.
@@ -157,7 +160,9 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
      192    96  Loopback                 NF_VMIC_LOOPBACK_STATS (valid with NF_VMIC_STATS_LOOPBACK)
      288     8  SecondaryFramesCopied    frames of the ring's audio delivered to capture streams other than the reader
      296     8  SecondaryUnderrunFrames  frames such a stream zero-filled because the ring's audio for its position wasn't there
-     304    16  Reserved1
+     304     8  ReaderHandoffs           times a capture stream that was playing the copy took the slot another stream held
+     312     8  HandoffSkippedFrames     the copy's frames such a stream never delivered: what the copy held past its place
+                                         (the last reader's underrun silence there included; its recorded gaps not)
      320   256  Stream[2]                NF_VMIC_STREAM_STATS: [NF_VMIC_KIND_RENDER], [NF_VMIC_KIND_CAPTURE]
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
@@ -319,7 +324,8 @@ typedef struct _NF_VMIC_LOOPBACK_STATS {
     UINT64  RenderLatePackets;          //  64
     UINT64  RenderLostPackets;          //  72
     UINT64  RenderNotOwner;             //  80
-    UINT64  Reserved;                   //  88
+    UINT64  RefusedOpens;               //  88: stream creations the loopback refused: a format other than one open on the other
+                                        //      circuit, or (not expected) no free format slot on its own
 } NF_VMIC_LOOPBACK_STATS, *PNF_VMIC_LOOPBACK_STATS;
 
 typedef struct _NF_VMIC_STATS {
@@ -339,7 +345,8 @@ typedef struct _NF_VMIC_STATS {
     NF_VMIC_LOOPBACK_STATS  Loopback;                   // 192
     UINT64                  SecondaryFramesCopied;      // 288
     UINT64                  SecondaryUnderrunFrames;    // 296
-    UINT64                  Reserved1[2];               // 304
+    UINT64                  ReaderHandoffs;             // 304
+    UINT64                  HandoffSkippedFrames;       // 312
     NF_VMIC_STREAM_STATS    Stream[NF_VMIC_KINDS];      // 320
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
@@ -366,6 +373,8 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Ring) == 64);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Loopback) == 192);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryFramesCopied) == 288);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryUnderrunFrames) == 296);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, ReaderHandoffs) == 304);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, HandoffSkippedFrames) == 312);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Stream) == 320);
 C_ASSERT(sizeof(NF_VMIC_STATS) == 576);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);

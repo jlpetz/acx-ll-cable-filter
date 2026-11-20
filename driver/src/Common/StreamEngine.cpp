@@ -1617,7 +1617,9 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_LbLagFrames(0),
     m_LbAnchorLead(0),
     m_LbReadBase(0),
-    m_AppFormatOk(FALSE)
+    m_AppFormatOk(FALSE),
+    m_AppOtherEnd(0),
+    m_AppOtherValid(FALSE)
 {
     PAGED_CODE();
 
@@ -1761,6 +1763,7 @@ CCaptureStreamEngine::Run()
         // packets of exactly that format (nf_vmic.h). m_LbFormat.Valid adds whole frames in a packet and the byte clock.
         //
         m_AppFormatOk = (m_LbFormat.Valid && AppRingFormatIs(&m_LbFormat)) ? TRUE : FALSE;
+        m_AppOtherValid = FALSE;
     }
 
     return CStreamEngine::Run();
@@ -2032,7 +2035,8 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     if (ring->Header == NULL)
     {
-        // No app ring attached: the loopback serves this pass.
+        // No app ring attached: the loopback serves this pass. A place in an earlier attachment's copy means nothing now.
+        m_AppOtherValid = FALSE;
         KeReleaseSpinLock(&ring->Lock, oldIrql);
         return FALSE;
     }
@@ -2043,6 +2047,45 @@ CCaptureStreamEngine::AppRingCapturePass(
     {
         // The first stream to run after ATTACH (or after the last reader paused) holds the reader slot, whatever its format.
         ring->Reader = this;
+        if (ring->AttachPasses != 0 && m_AppOtherValid)
+        {
+            //
+            // A handoff: this stream played the copy as another stream during this run and now takes the slot another stream
+            // held (the owner, 2026-11-20: a one-time skip, a gapless handoff later). It starts at ReadFrame, where the last
+            // reader's delivery ended (the copy's HistoryEnd), so what the copy held past this stream's place never reaches it:
+            // counted, from the copy's valid start at the earliest (as AppRingOtherPass reads it: nothing before a new run or
+            // past the copy's length was audio this stream would have had), less the copy's recorded gaps there (silence no
+            // reader delivered). The reader's own underrun silence in that span counts too: the copy holds it as delivered.
+            //
+            ring->ReaderHandoffs++;
+            if (ring->HistoryValid)
+            {
+                ULONGLONG   validLo = (ring->HistoryEnd - ring->HistoryFrom > NF_APP_HISTORY_FRAMES) ?
+                                      ring->HistoryEnd - NF_APP_HISTORY_FRAMES : ring->HistoryFrom;
+                ULONGLONG   start = MAX(m_AppOtherEnd, validLo);
+                ULONG       i;
+
+                if (ring->HistoryEnd > start)
+                {
+                    ULONGLONG skipped = ring->HistoryEnd - start;
+
+                    // The gaps are disjoint and lie inside the copy's run, so their overlaps with [start, HistoryEnd) add up
+                    // to no more than skipped.
+                    for (i = 0; i < NF_APP_HISTORY_GAPS; i++)
+                    {
+                        ULONGLONG   lo = MAX(start, ring->HistoryGaps[i].From);
+                        ULONGLONG   hi = MIN(ring->HistoryEnd, ring->HistoryGaps[i].End);
+
+                        if (hi > lo)
+                        {
+                            skipped -= hi - lo;
+                        }
+                    }
+                    ring->HandoffSkippedFrames += skipped;
+                }
+            }
+        }
+        m_AppOtherValid = FALSE;
     }
     else if (ring->Reader != this)
     {
@@ -2174,6 +2217,7 @@ CCaptureStreamEngine::AppRingOtherPass(
         // Raw copies only into 48 kHz float32 stereo packets (the fallback: CaptureStreamOpen refuses other formats while a
         // ring is attached).
         ring->Stats.MismatchPackets++;
+        m_AppOtherValid = FALSE;
         RtlZeroMemory(PacketBuffer, PacketSize);
         return;
     }
@@ -2228,6 +2272,10 @@ CCaptureStreamEngine::AppRingOtherPass(
 
     ring->SecondaryFramesCopied += (copyHi - copyLo) - gapFrames;
     ring->SecondaryUnderrunFrames += m_LbPacketFrames - (copyHi - copyLo) + gapFrames;
+
+    // Where this stream is in the copy, for the skip a handoff to it counts (AppRingCapturePass).
+    m_AppOtherEnd = readEnd;
+    m_AppOtherValid = TRUE;
 }
 
 _Use_decl_annotations_

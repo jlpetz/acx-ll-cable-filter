@@ -71,7 +71,8 @@ ring's lock, with the loopback's lock nested inside it at stream creation. Share
    EC2 serial console; the spike box runs without it (the owner: as few changes as possible). Ported from TMR-MD's
    build.ps1.
 2. `scripts\Build-Driver.ps1`: MSBuild, then the package in `out\Release\AudioCodec`: the `.sys` signed, the catalog made
-   by inf2cat for `10_GE_X64,Server2025_X64` and signed.
+   by inf2cat for `10_GE_X64,Server2025_X64` and signed. `-PacketFrames 96` builds the 96-frame trial (a 1 ms floor); a
+   build of the other size rebuilds everything.
 3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
 4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
 5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts

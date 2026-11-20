@@ -55,8 +55,15 @@ Environment:
 // NF_PACKET_FRAMES: the packet, which is one engine period (two packets per WaveRT buffer), offered to RAW and DEFAULT
 // streams. 128 frames: 2.667 ms at 48 kHz, 2.902 ms at 44.1 kHz. It is the inbox HDAudio driver's minimum.
 //
+// Both can be set at build time for a trial (Build-Driver.ps1 -PacketFrames 96 defines NF_PACKET_FRAMES 96 and a 1 ms floor,
+// NF_MIN_PACKET_PERIOD_HNS 10000, through the CL environment variable); the C_ASSERTs below keep the floor under the packet.
+//
+#ifndef NF_MIN_PACKET_PERIOD_HNS
 #define NF_MIN_PACKET_PERIOD_HNS    (2 * HNSTIME_PER_MILLISECOND)
+#endif
+#ifndef NF_PACKET_FRAMES
 #define NF_PACKET_FRAMES            128
+#endif
 
 C_ASSERT((ULONGLONG)NF_PACKET_FRAMES * 10000000ULL / 48000 > (ULONGLONG)NF_MIN_PACKET_PERIOD_HNS);
 C_ASSERT((ULONGLONG)NF_PACKET_FRAMES * 10000000ULL / 44100 > (ULONGLONG)NF_MIN_PACKET_PERIOD_HNS);
@@ -74,7 +81,7 @@ C_ASSERT(sizeof(NF_PACKETSIZE_CONSTRAINTS) ==
 
 static const NF_PACKETSIZE_CONSTRAINTS s_PacketSizeConstraints = {
     {
-        NF_MIN_PACKET_PERIOD_HNS,                       // MinPacketPeriodInHns: 20000 hns (2 ms)
+        NF_MIN_PACKET_PERIOD_HNS,                       // MinPacketPeriodInHns: 20000 hns (2 ms) by default
         FILE_BYTE_ALIGNMENT,                            // PacketSizeFileAlignment: none (no DMA; the CPU copies packets)
         0,                                              // MaxPacketSizeInBytes: no maximum (AllocateRtPackets takes any size)
         2,                                              // NumProcessingModeConstraints
