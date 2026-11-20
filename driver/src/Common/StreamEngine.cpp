@@ -368,7 +368,7 @@ CStreamEngine::Pause()
     WdfTimerStop(m_NotificationTimer, TRUE);
 
     // Save the position we paused at.
-    UpdatePosition();
+    UpdatePosition(KeQueryPerformanceCounter(NULL));
 
     m_CurrentState = AcxStreamStatePause;
     status = STATUS_SUCCESS;
@@ -414,7 +414,7 @@ CStreamEngine::Run()
     // start of the stream.
     //
     qpcStart = KeQueryPerformanceCounter(NULL);
-    m_StartTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, qpcStart);
+    m_StartTime = QpcToHns(qpcStart);
     m_StartPosition = m_Position;
 
     // noise-filter (TODO 19): the run's first packet starts now. StreamPassCallback moves this to m_LastPacketStart, which
@@ -449,9 +449,11 @@ CStreamEngine::GetPresentationPosition(
 
     blockAlign = AcxDataFormatGetBlockAlign(m_StreamFormat);
 
-    // Update the position based on the current time
-    UpdatePosition();
+    // Update the position based on the current time. noise-filter (TODO 19): the position and the QPC reported with it come
+    // from one clock reading; the sample read the clock in UpdatePosition and again for the QPC, so the pair was off by the
+    // time between the two reads.
     qpc = KeQueryPerformanceCounter(NULL);
+    UpdatePosition(qpc);
 
     *PositionInBlocks = m_Position / blockAlign;
     *QPCPosition = (ULONGLONG)qpc.QuadPart;
@@ -623,6 +625,7 @@ CStreamEngine::ScheduleNextPass()
     ULONGLONG nextPacketTimeFromLastPauseHns = 0;
     ULONGLONG nextPacketTime = 0;
     ULONGLONG currentTime;
+    LARGE_INTEGER qpc;
     BOOLEAN inTimerQueue = FALSE;
 
     // Get the number of bytes per second from our stored stream format
@@ -641,7 +644,9 @@ CStreamEngine::ScheduleNextPass()
     // Next packet time is Time @ resume from Pause, offset for lost time due to glitch, with next packet time added
     nextPacketTime = m_StartTime + m_GlitchAdjust + nextPacketTimeFromLastPauseHns;
 
-    currentTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, KeQueryPerformanceCounter(NULL));
+    // noise-filter (TODO 19): one clock reading, converted (QpcToHns).
+    qpc = KeQueryPerformanceCounter(NULL);
+    currentTime = QpcToHns(qpc);
 
     // Determine how long we want to wait, in HNS. Negative since it's a relative wait
     delay = -(LONGLONG)(nextPacketTime - currentTime);
@@ -668,7 +673,9 @@ CStreamEngine::ScheduleNextPass()
 
 _Use_decl_annotations_
 VOID
-CStreamEngine::UpdatePosition()
+CStreamEngine::UpdatePosition(
+    LARGE_INTEGER   Qpc
+)
 {
     ULONGLONG currentTime;
     ULONG bytesPerSecond;
@@ -678,7 +685,7 @@ CStreamEngine::UpdatePosition()
         return;
     }
     bytesPerSecond = GetBytesPerSecond();
-    currentTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, KeQueryPerformanceCounter(NULL));
+    currentTime = QpcToHns(Qpc);
 
     //
     // noise-filter (TODO 19): two fixes to the sample's position.
@@ -705,6 +712,23 @@ CStreamEngine::GetBytesPerSecond()
     bytesPerSecond = AcxDataFormatGetAverageBytesPerSec(m_StreamFormat);
 
     return bytesPerSecond;
+}
+
+//
+// noise-filter (TODO 19): a QPC reading in 100 ns units. KSCONVERT_PERFORMANCE_TIME (ks.h:2361) names its PerformanceTime
+// argument three times (HighPart twice, LowPart once), and the sample handed it KeQueryPerformanceCounter(NULL) in
+// ScheduleNextPass and UpdatePosition: three clock reads per conversion (three calls in the release StreamEngine.obj). Across
+// a low-word wrap (every 2^32 ticks: about 7 minutes at 10 MHz) the high word of one read could meet the low word of another,
+// a time about 429 s off; ScheduleNextPass then armed its timer that far out (directly, or after a glitch adjustment that
+// size), and the stream stalled. Every conversion takes one reading, passed here by value.
+//
+_Use_decl_annotations_
+ULONGLONG
+CStreamEngine::QpcToHns(
+    LARGE_INTEGER   Qpc
+)
+{
+    return KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, Qpc);
 }
 
 _Use_decl_annotations_

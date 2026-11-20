@@ -287,10 +287,21 @@ protected:
     VOID
     ScheduleNextPass();
 
+    // noise-filter (TODO 19): the position at Qpc, one clock reading the caller took (so GetPresentationPosition can report
+    // that same reading as the position's QPC).
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID
-    UpdatePosition();
+    UpdatePosition(
+        _In_    LARGE_INTEGER   Qpc
+        );
+
+    // noise-filter (TODO 19): one QPC reading in 100 ns units (StreamEngine.cpp says why it takes a snapshot).
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    QpcToHns(
+        _In_    LARGE_INTEGER   Qpc
+        );
 
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)
