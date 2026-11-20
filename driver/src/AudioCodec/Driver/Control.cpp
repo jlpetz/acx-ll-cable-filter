@@ -224,6 +224,11 @@ NfVmic_CountReject(
     {
         g_NfAppRing.Stats.BusyRejects++;
     }
+    else if (Status == STATUS_NOT_SUPPORTED)
+    {
+        // NfVmic_Attach's one source of it: a capture stream open in another format.
+        g_NfAppRing.Stats.FormatRejects++;
+    }
     else if (Status != STATUS_CANCELLED && Status != STATUS_DEVICE_REMOVED)
     {
         g_NfAppRing.Stats.InvalidRejects++;
@@ -413,6 +418,17 @@ NfVmic_Attach(
     }
 
     //
+    // A capture stream open in a format other than the ring's would hold the reader slot and get only zeros, so the conflict
+    // shows here instead (nf_vmic.h). CaptureStreamOpen (StreamEngine.cpp) counts such a stream under this lock and refuses
+    // one while a ring is published, which happens under this lock too: the check and the publish below are one step.
+    //
+    if (ring->OtherFormatCaptureOpens != 0)
+    {
+        status = STATUS_NOT_SUPPORTED;
+        goto rejectLocked;
+    }
+
+    //
     // The handle's cleanup may have run already. IRP_MJ_CLEANUP comes when the last handle to the file object closes, even
     // while this request (which holds a reference to the file object, not a handle) is still on its way here, and KMDF then
     // calls NfVmic_EvtFileCleanup, which found nothing published; the framework's flush of the file's requests after it covers
@@ -453,6 +469,12 @@ NfVmic_Attach(
     ring->AttachPasses = 0;
     ring->AttachFramesCopied = 0;
     ring->AttachUnderrunFrames = 0;
+    ring->HistoryValid = FALSE;
+    ring->HistoryLeadFrames = 0;
+    ring->HistoryFrom = 0;
+    ring->HistoryEnd = 0;
+    ring->HistoryGapNext = 0;
+    RtlZeroMemory(ring->HistoryGaps, sizeof(ring->HistoryGaps));
     ring->Stats.Attaches++;
 
     // The driver's line, zeroed, then ATTACHED: the app's sign, with ERROR_IO_PENDING, that the ring is live.
@@ -513,6 +535,8 @@ NfVmic_Stats(
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
 
     out->Ring = ring->Stats;
+    out->SecondaryFramesCopied = ring->SecondaryFramesCopied;
+    out->SecondaryUnderrunFrames = ring->SecondaryUnderrunFrames;
     if (ring->Header != NULL)
     {
         out->Flags |= NF_VMIC_STATS_ATTACHED;

@@ -146,6 +146,29 @@ LoopbackStreamClose(
     _In_    const LOOPBACK_FORMAT * Format
 );
 
+//
+// noise-filter (TODO 19, spike check 4): the capture circuit's creation-time checks, the loopback's and the app ring's, in one
+// step under both locks (AppRing.h has the order). Refuses (STATUS_NOT_SUPPORTED) a format other than 48 kHz float32 stereo
+// while an app ring is attached, counted in RefusedCaptureOpens; else LoopbackStreamOpen's check and record (Ring: NULL if
+// the device has none), and a stream in another format counted in OtherFormatCaptureOpens, which ATTACH refuses while it
+// isn't 0. CaptureStreamClose gives both records back. noinline for the reason above.
+//
+__declspec(noinline)
+__drv_maxIRQL(DISPATCH_LEVEL)
+NTSTATUS
+CaptureStreamOpen(
+    _In_opt_    PLOOPBACK_RING          Ring,
+    _In_        const LOOPBACK_FORMAT * Format
+);
+
+__declspec(noinline)
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+CaptureStreamClose(
+    _In_opt_    PLOOPBACK_RING          Ring,
+    _In_        const LOOPBACK_FORMAT * Format
+);
+
 
 class CStreamEngine
 {
@@ -284,12 +307,13 @@ public:
         m_ToneFrequency = ToneFrequency;
     }
 
-    // noise-filter (TODO 19): takes over the record LoopbackStreamOpen made for this stream; the destructor gives it back.
+    // noise-filter (TODO 19): takes over the record LoopbackStreamOpen (Render) or CaptureStreamOpen made for this stream; the
+    // destructor gives it back.
     __drv_maxIRQL(PASSIVE_LEVEL)
     PAGED_CODE_SEG
     VOID
     LoopbackAdoptOpen(
-        _In_    PLOOPBACK_RING          Ring,
+        _In_opt_ PLOOPBACK_RING         Ring,
         _In_    BOOLEAN                 Render,
         _In_    const LOOPBACK_FORMAT * Format
         );
@@ -323,7 +347,8 @@ protected:
     ULONG               m_LbRingFrames;     // LOOPBACK_RING_BYTES in frames
     ULONGLONG           m_LbAnchor;         // ring frame of this stream's byte position 0 on its current time line
     BOOLEAN             m_LbAnchorValid;
-    PLOOPBACK_RING      m_LbOpenRing;       // the ring this stream is counted open in (LoopbackAdoptOpen), or NULL
+    BOOLEAN             m_LbOpen;           // this stream holds an open record (LoopbackAdoptOpen)
+    PLOOPBACK_RING      m_LbOpenRing;       // the ring it is counted open in, or NULL (a capture stream on a device without one)
     BOOLEAN             m_LbOpenRender;
     LOOPBACK_FORMAT     m_LbOpenFormat;
 
@@ -561,6 +586,16 @@ protected:
     __drv_maxIRQL(DISPATCH_LEVEL)
     BOOLEAN
     AppRingCapturePass(
+        _In_                            ULONG   Packet,
+        _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
+        _In_                            ULONG   PacketSize
+        );
+
+    // The pass of a stream that isn't the reader: the reader's copy, a fixed lag behind. App ring lock held (AppRingCapturePass).
+    __drv_requiresIRQL(DISPATCH_LEVEL)
+    VOID
+    AppRingOtherPass(
+        _In_                            ULONG   Packet,
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
         );

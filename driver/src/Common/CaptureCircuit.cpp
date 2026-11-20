@@ -701,21 +701,21 @@ Return Value:
     CCaptureStreamEngine *          streamEngine = nullptr;
     CODEC_CAPTURE_CIRCUIT_CONTEXT * circuitCtx;
     CODEC_PIN_CONTEXT *             pinCtx;
-    PLOOPBACK_RING                  lbRing;
-    PLOOPBACK_RING                  lbOpen = nullptr;
+    PLOOPBACK_RING                  lbRing = nullptr;
+    bool                            lbOpen = false;
     LOOPBACK_FORMAT                 lbFormat = {};
 
-    auto streamEngineScope = scope_exit([&streamEngine, &lbOpen, &lbFormat]() {
+    auto streamEngineScope = scope_exit([&streamEngine, &lbRing, &lbOpen, &lbFormat]() {
 
         if (streamEngine)
         {
             delete streamEngine;
         }
 
-        // noise-filter (TODO 19): a creation that fails after LoopbackStreamOpen gives the record back.
-        if (lbOpen != nullptr)
+        // noise-filter (TODO 19): a creation that fails after CaptureStreamOpen gives the records back.
+        if (lbOpen)
         {
-            LoopbackStreamClose(lbOpen, FALSE, &lbFormat);
+            CaptureStreamClose(lbRing, &lbFormat);
         }
 
         });
@@ -765,17 +765,15 @@ Return Value:
     AcxStreamInitSetAcxRtStreamSupportsNotifications(StreamInit);
 
     //
-    // noise-filter (TODO 19): refuse a format other than one the render circuit has open (LoopbackStreamOpen), so the
-    // client can retry with that format rather than open onto a loopback that only zero-fills. Before the stream exists, so
-    // a refusal leaves nothing to undo; the stream engine takes the record over below.
+    // noise-filter (TODO 19): refuse a format other than one the render circuit has open, or, while an app ring is attached
+    // (spike check 4), any format but the ring's 48 kHz float32 stereo (CaptureStreamOpen, StreamEngine.cpp), so the client
+    // can retry with that format rather than open onto a loopback or a ring that only zero-fills. Before the stream exists, so
+    // a refusal leaves nothing to undo; the stream engine takes the records over below.
     //
     lbRing = LoopbackRingOfCircuit(Circuit);
-    if (lbRing != nullptr)
-    {
-        LoopbackFormatOf(StreamFormat, &lbFormat);
-        RETURN_NTSTATUS_IF_FAILED(LoopbackStreamOpen(lbRing, FALSE, &lbFormat));
-        lbOpen = lbRing;
-    }
+    LoopbackFormatOf(StreamFormat, &lbFormat);
+    RETURN_NTSTATUS_IF_FAILED(CaptureStreamOpen(lbRing, &lbFormat));
+    lbOpen = true;
 
     //
     // Create the stream.
@@ -794,11 +792,8 @@ Return Value:
     streamEngine = new (POOL_FLAG_NON_PAGED, DeviceDriverTag) CCaptureStreamEngine(stream, StreamFormat);
     RETURN_NTSTATUS_IF_TRUE(streamEngine == nullptr, STATUS_INSUFFICIENT_RESOURCES);
 
-    if (lbOpen != nullptr)
-    {
-        streamEngine->LoopbackAdoptOpen(lbOpen, FALSE, &lbFormat);
-        lbOpen = nullptr;
-    }
+    streamEngine->LoopbackAdoptOpen(lbRing, FALSE, &lbFormat);
+    lbOpen = false;
 
     streamCtx->StreamEngine = (PVOID)streamEngine;
  

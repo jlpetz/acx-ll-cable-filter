@@ -87,7 +87,9 @@ typedef struct _LOOPBACK_RING {
     ULONGLONG       WritePos;
 
     // Written at stream creation and destruction (LoopbackStreamOpen, LoopbackStreamClose): the formats open on each circuit,
-    // so a stream in a format other than one open on the other circuit is refused (STATUS_NOT_SUPPORTED).
+    // so a stream in a format other than one open on the other circuit is refused (STATUS_NOT_SUPPORTED). The capture
+    // circuit's go through CaptureStreamOpen and CaptureStreamClose, which hold the app ring's lock around this one's
+    // (AppRing.h has the order).
     LOOPBACK_OPEN   RenderOpen[LOOPBACK_OPEN_FORMATS];
     LOOPBACK_OPEN   CaptureOpen[LOOPBACK_OPEN_FORMATS];
 

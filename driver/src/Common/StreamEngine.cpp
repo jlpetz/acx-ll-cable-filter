@@ -76,6 +76,7 @@ CStreamEngine::CStreamEngine(
     m_LbRingFrames = 0;
     m_LbAnchor = 0;
     m_LbAnchorValid = FALSE;
+    m_LbOpen = FALSE;
     m_LbOpenRing = NULL;
     m_LbOpenRender = FALSE;
     RtlZeroMemory(&m_LbOpenFormat, sizeof(m_LbOpenFormat));
@@ -97,10 +98,19 @@ CStreamEngine::~CStreamEngine()
 {
     PAGED_CODE();
 
-    // noise-filter (TODO 19): this stream is no longer open on its circuit (LoopbackStreamOpen's record).
-    if (m_LbOpenRing != NULL)
+    // noise-filter (TODO 19): this stream is no longer open on its circuit (the record LoopbackStreamOpen or, for a capture
+    // stream, CaptureStreamOpen made).
+    if (m_LbOpen)
     {
-        LoopbackStreamClose(m_LbOpenRing, m_LbOpenRender, &m_LbOpenFormat);
+        if (m_LbOpenRender)
+        {
+            LoopbackStreamClose(m_LbOpenRing, TRUE, &m_LbOpenFormat);
+        }
+        else
+        {
+            CaptureStreamClose(m_LbOpenRing, &m_LbOpenFormat);
+        }
+        m_LbOpen = FALSE;
         m_LbOpenRing = NULL;
     }
 }
@@ -116,6 +126,7 @@ CStreamEngine::LoopbackAdoptOpen(
 {
     PAGED_CODE();
 
+    m_LbOpen = TRUE;
     m_LbOpenRing = Ring;
     m_LbOpenRender = Render;
     m_LbOpenFormat = *Format;
@@ -844,6 +855,22 @@ LoopbackFormatEqual(
     return (A->Valid && B->Valid && LoopbackFormatSame(A, B)) ? TRUE : FALSE;
 }
 
+// noise-filter (TODO 19, spike check 4): the app ring's format (nf_vmic.h), 48 kHz float32 stereo in 8-byte frames. Valid not
+// looked at: the creation-time check has no packet size yet, and Run adds Valid itself (m_AppFormatOk).
+static
+BOOLEAN
+AppRingFormatIs(
+    _In_ const LOOPBACK_FORMAT* Format
+)
+{
+    return (Format->SampleRate == NF_VMIC_SAMPLE_RATE &&
+            Format->Channels == NF_VMIC_CHANNELS &&
+            Format->BitsPerSample == 32 &&
+            Format->ValidBitsPerSample == 32 &&
+            Format->BlockAlign == NF_VMIC_FRAME_BYTES &&
+            IsEqualGUID(Format->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) ? TRUE : FALSE;
+}
+
 _Use_decl_annotations_
 PLOOPBACK_RING
 LoopbackRingOfCircuit(
@@ -977,11 +1004,85 @@ LoopbackStreamClose(
     DBG_UNREFERENCED_LOCAL_VARIABLE(found);
 }
 
-// Writes Frames frames from Source (NULL: zeros) at ring frame Frame, splitting at the wrap. Ring lock held.
+//
+// noise-filter (TODO 19, spike check 4): the app ring is a separate attachment from the loopback, so a capture stream in
+// 24-in-32 could otherwise take the reader slot of an attached ring and get only zeros (AppRingCapturePass's mismatch
+// branch). Each refusal makes the conflict visible at open time instead, whichever came first: here a capture stream while a
+// ring is attached, in NfVmic_Attach (Control.cpp) an ATTACH while such a stream is open. Both decide under the app ring's
+// lock, and this records the stream under it, so a non-float open and an ATTACH can't both get through. The loopback's check
+// and record (LoopbackStreamOpen) run inside, under its own lock: the app ring's, then the loopback's, the one order
+// (AppRing.h). Shared-mode streams run at the device format (float32), so in practice this refuses exclusive-mode clients.
+//
+_Use_decl_annotations_
+NTSTATUS
+CaptureStreamOpen(
+    PLOOPBACK_RING          Ring,
+    const LOOPBACK_FORMAT * Format
+)
+{
+    PNF_APP_RING    app = &g_NfAppRing;
+    BOOLEAN         ringFormat = AppRingFormatIs(Format);
+    NTSTATUS        status = STATUS_SUCCESS;
+    KIRQL           oldIrql;
+
+    KeAcquireSpinLock(&app->Lock, &oldIrql);
+
+    if (!ringFormat && app->Header != NULL)
+    {
+        app->Stats.RefusedCaptureOpens++;
+        status = STATUS_NOT_SUPPORTED;
+    }
+    else
+    {
+        if (Ring != NULL)
+        {
+            status = LoopbackStreamOpen(Ring, FALSE, Format);
+        }
+        if (NT_SUCCESS(status) && !ringFormat)
+        {
+            app->OtherFormatCaptureOpens++;
+        }
+    }
+
+    KeReleaseSpinLock(&app->Lock, oldIrql);
+
+    return status;
+}
+
+_Use_decl_annotations_
+VOID
+CaptureStreamClose(
+    PLOOPBACK_RING          Ring,
+    const LOOPBACK_FORMAT * Format
+)
+{
+    PNF_APP_RING    app = &g_NfAppRing;
+    KIRQL           oldIrql;
+
+    KeAcquireSpinLock(&app->Lock, &oldIrql);
+
+    if (Ring != NULL)
+    {
+        LoopbackStreamClose(Ring, FALSE, Format);
+    }
+    if (!AppRingFormatIs(Format))
+    {
+        ASSERT(app->OtherFormatCaptureOpens != 0);
+        if (app->OtherFormatCaptureOpens != 0)
+        {
+            app->OtherFormatCaptureOpens--;
+        }
+    }
+
+    KeReleaseSpinLock(&app->Lock, oldIrql);
+}
+
+// Writes Frames frames from Source (NULL: zeros) at ring frame Frame, splitting at the wrap. The lock of the ring that Buffer
+// is held (a LOOPBACK_RING's, or the app ring's for g_NfAppHistory).
 static
 VOID
 LoopbackRingWrite(
-    _In_        PLOOPBACK_RING  Ring,
+    _In_        PUCHAR          Buffer,
     _In_        ULONG           RingFrames,
     _In_        ULONG           BlockAlign,
     _In_        ULONGLONG       Frame,
@@ -994,7 +1095,7 @@ LoopbackRingWrite(
         ULONG   index = (ULONG)(Frame % RingFrames);
         ULONG   chunk = (ULONG)MIN(Frames, (ULONGLONG)(RingFrames - index));
         SIZE_T  bytes = (SIZE_T)chunk * BlockAlign;
-        PBYTE   dest = Ring->Buffer + (SIZE_T)index * BlockAlign;
+        PBYTE   dest = Buffer + (SIZE_T)index * BlockAlign;
 
         if (Source != NULL)
         {
@@ -1011,11 +1112,11 @@ LoopbackRingWrite(
     }
 }
 
-// Reads Frames frames at ring frame Frame into Dest, splitting at the wrap. Ring lock held.
+// Reads Frames frames at ring frame Frame into Dest, splitting at the wrap. The lock of the ring that Buffer is held.
 static
 VOID
 LoopbackRingRead(
-    _In_                                    PLOOPBACK_RING  Ring,
+    _In_                                    const UCHAR*    Buffer,
     _In_                                    ULONG           RingFrames,
     _In_                                    ULONG           BlockAlign,
     _In_                                    ULONGLONG       Frame,
@@ -1029,7 +1130,7 @@ LoopbackRingRead(
         ULONG   chunk = (ULONG)MIN(Frames, (ULONGLONG)(RingFrames - index));
         SIZE_T  bytes = (SIZE_T)chunk * BlockAlign;
 
-        RtlCopyMemory(Dest, Ring->Buffer + (SIZE_T)index * BlockAlign, bytes);
+        RtlCopyMemory(Dest, Buffer + (SIZE_T)index * BlockAlign, bytes);
 
         Dest += bytes;
         Frame += chunk;
@@ -1401,7 +1502,7 @@ CRenderStreamEngine::LoopbackRenderPass(
 
         if (sameRun && next >= ring->WritePos && next - ring->WritePos <= maxGap)
         {
-            LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL, next - ring->WritePos);
+            LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL, next - ring->WritePos);
             ring->RenderGapFills++;
         }
         else
@@ -1424,7 +1525,8 @@ CRenderStreamEngine::LoopbackRenderPass(
         ULONG       lost = current - m_LbNextPacket;
         ULONGLONG   lostFrames = (ULONGLONG)lost * m_LbPacketFrames;
 
-        LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL, MIN(lostFrames, (ULONGLONG)m_LbRingFrames));
+        LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL,
+                          MIN(lostFrames, (ULONGLONG)m_LbRingFrames));
         ring->WritePos += lostFrames;
         ring->RenderLostPackets += lost;
         m_LbNextPacket = current;
@@ -1450,7 +1552,7 @@ CRenderStreamEngine::LoopbackRenderPass(
             ring->RenderLatePackets++;
         }
 
-        LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, packetBuffer, m_LbPacketFrames);
+        LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, packetBuffer, m_LbPacketFrames);
         ring->WritePos += m_LbPacketFrames;
         m_LbNextPacket++;
         copied = TRUE;
@@ -1622,7 +1724,7 @@ CCaptureStreamEngine::ProcessPacket()
     // loopback pair (spike check 7). Both in place of the sample's tone generator and WAV reader (m_ToneGenerator.GenerateSine,
     // m_WaveReader.ReadWaveData).
     //
-    if (!AppRingCapturePass(packetBuffer, m_PacketSize))
+    if (!AppRingCapturePass(currentPacket, packetBuffer, m_PacketSize))
     {
         LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
     }
@@ -1651,13 +1753,7 @@ CCaptureStreamEngine::Run()
         // noise-filter (TODO 19, spike check 4): the app ring holds 48 kHz float32 stereo frames and is copied raw, so only into
         // packets of exactly that format (nf_vmic.h). m_LbFormat.Valid adds whole frames in a packet and the byte clock.
         //
-        m_AppFormatOk = (m_LbFormat.Valid &&
-                         m_LbFormat.SampleRate == NF_VMIC_SAMPLE_RATE &&
-                         m_LbFormat.Channels == NF_VMIC_CHANNELS &&
-                         m_LbFormat.BitsPerSample == 32 &&
-                         m_LbFormat.ValidBitsPerSample == 32 &&
-                         m_LbFormat.BlockAlign == NF_VMIC_FRAME_BYTES &&
-                         IsEqualGUID(m_LbFormat.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) ? TRUE : FALSE;
+        m_AppFormatOk = (m_LbFormat.Valid && AppRingFormatIs(&m_LbFormat)) ? TRUE : FALSE;
     }
 
     return CStreamEngine::Run();
@@ -1748,7 +1844,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
     }
     if (copyHi > copyLo)
     {
-        LoopbackRingRead(ring, m_LbRingFrames, blockAlign, copyLo,
+        LoopbackRingRead(ring->Buffer, m_LbRingFrames, blockAlign, copyLo,
                          PacketBuffer + (SIZE_T)(copyLo - readStart) * blockAlign, copyHi - copyLo);
     }
     if (readEnd > copyHi)
@@ -1810,8 +1906,71 @@ CCaptureStreamEngine::Pause()
 // the frames copied, a whole packet when the ring holds it, so every frame the app writes comes out once and in order, and an
 // underrun inserts silence without dropping anything. write_frame is the one value read back from the app's memory (every
 // pass) and is never trusted: a fill below 0 or above the capacity re-syncs, counted. Raw copies only into 48 kHz float32
-// stereo packets. All under the ring's lock, held for one packet's copy; nothing allocates.
+// stereo packets. All under the ring's lock, held for one packet's copy (two for the reader); nothing allocates.
 //
+// One stream reads the app's ring (the reader); the audio engine runs one device stream per processing mode, so others can
+// be running too. The reader also writes each packet it delivers into the driver's copy (g_NfAppHistory) at its frames on the
+// stream engine's QPC time line, and every other stream reads that copy at its own place on the time line, a fixed lag
+// behind: the reader writes a packet at the pass that ends it, so the copy holds the time line up to that pass, a packet and
+// a late timer behind now at worst. The lag is the reader's packet (NF_APP_RING.HistoryLeadFrames) plus LOOPBACK_LAG_HNS and
+// a frame (m_LbLagFrames), as the loopback's capture side reads a render stream that copies its packets as they complete.
+// Every time line is the same QPC clock at the same nominal rate, so nothing drifts and no fill control is needed. The app's
+// protocol doesn't change: one ReadFrame, paced by the reader.
+//
+
+//
+// Part of the reader's packet into the copy: Frames frames from Source (NULL: silence) at time-line frame Frame. Ring lock
+// held, ring published, called by the reader in the ring's format, with the packet's parts in order. Its own consecutive
+// packets append. A time line that moved later by a little (a reader handoff, a late timer's glitch adjustment) leaves a gap,
+// zeroed and recorded (HistoryGaps); by more than LOOPBACK_MAX_GAP_HNS, a new run. A new reader's first packet can start
+// before the last one's end: only what the copy doesn't hold yet is written.
+//
+static
+VOID
+AppRingHistoryWrite(
+    _In_                                                PNF_APP_RING    Ring,
+    _In_                                                ULONGLONG       Frame,
+    _In_reads_bytes_opt_(Frames * NF_VMIC_FRAME_BYTES)  const BYTE*     Source,
+    _In_                                                ULONG           Frames
+)
+{
+    ULONGLONG   maxGap = LoopbackHnsToFrames(LOOPBACK_MAX_GAP_HNS, NF_VMIC_SAMPLE_RATE);
+    ULONGLONG   end = Frame + Frames;
+    ULONGLONG   from;
+
+    if (!Ring->HistoryValid || (Frame > Ring->HistoryEnd && Frame - Ring->HistoryEnd > maxGap))
+    {
+        Ring->HistoryFrom = Frame;
+        Ring->HistoryEnd = Frame;
+        Ring->HistoryValid = TRUE;
+        Ring->HistoryGapNext = 0;
+        RtlZeroMemory(Ring->HistoryGaps, sizeof(Ring->HistoryGaps));
+    }
+    if (Frame > Ring->HistoryEnd)
+    {
+        // Recorded (AppRing.h), so the other streams count this silence as an underrun: no reader delivered it.
+        PNF_APP_HISTORY_GAP gap = &Ring->HistoryGaps[Ring->HistoryGapNext % NF_APP_HISTORY_GAPS];
+
+        LoopbackRingWrite(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, Ring->HistoryEnd, NULL, Frame - Ring->HistoryEnd);
+        gap->From = Ring->HistoryEnd;
+        gap->End = Frame;
+        Ring->HistoryGapNext++;
+        Ring->HistoryEnd = Frame;
+    }
+
+    if (end > Ring->HistoryEnd)
+    {
+        // Frame <= HistoryEnd here. Of a packet longer than the copy, only its last NF_APP_HISTORY_FRAMES can be read back.
+        from = MAX(Frame, Ring->HistoryEnd);
+        if (end - from > NF_APP_HISTORY_FRAMES)
+        {
+            from = end - NF_APP_HISTORY_FRAMES;
+        }
+        LoopbackRingWrite(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, from,
+                          (Source != NULL) ? Source + (SIZE_T)(from - Frame) * NF_VMIC_FRAME_BYTES : NULL, end - from);
+        Ring->HistoryEnd = end;
+    }
+}
 
 //
 // This attachment's counters and the reader's state into the header's driver line, and the state and packet kept for STATS
@@ -1844,6 +2003,7 @@ AppRingStoreCounters(
 _Use_decl_annotations_
 BOOLEAN
 CCaptureStreamEngine::AppRingCapturePass(
+    ULONG   Packet,
     PBYTE   PacketBuffer,
     ULONG   PacketSize
 )
@@ -1858,6 +2018,7 @@ CCaptureStreamEngine::AppRingCapturePass(
     ULONGLONG       writeFrame;
     ULONGLONG       readFrame;
     ULONGLONG       fill;
+    ULONGLONG       frame;
     ULONGLONG       qpc;
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
@@ -1878,10 +2039,10 @@ CCaptureStreamEngine::AppRingCapturePass(
     }
     else if (ring->Reader != this)
     {
-        // One reader at a time: a second capture stream gets silence, and the ring's position stays the first one's.
+        // One reader at a time: another capture stream plays the reader's copy, and the ring's position stays the reader's.
         ring->Stats.NotReaderPackets++;
+        AppRingOtherPass(Packet, PacketBuffer, PacketSize);
         KeReleaseSpinLock(&ring->Lock, oldIrql);
-        RtlZeroMemory(PacketBuffer, PacketSize);
         return TRUE;
     }
 
@@ -1926,18 +2087,25 @@ CCaptureStreamEngine::AppRingCapturePass(
         ring->AttachResyncs++;
     }
 
+    //
+    // Each part of the packet goes into the reader's copy too, at its frames on this stream's time line, from the same source
+    // (the app's frames, or silence): not read back from PacketBuffer, which this stream's client can see and write.
+    //
     copyFrames = (ULONG)MIN(fill, (ULONGLONG)packetFrames);
+    frame = LoopbackAnchor() + (ULONGLONG)Packet * packetFrames;
     if (copyFrames != 0)
     {
         // At most two runs, to the ring's end and then from its start; the capacity is a power of two (checked at ATTACH).
         index = (ULONG)(readFrame & (capacity - 1));
         first = MIN(copyFrames, capacity - index);
         RtlCopyMemory(PacketBuffer, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, (SIZE_T)first * NF_VMIC_FRAME_BYTES);
+        AppRingHistoryWrite(ring, frame, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, first);
         if (copyFrames > first)
         {
             RtlCopyMemory(PacketBuffer + (SIZE_T)first * NF_VMIC_FRAME_BYTES,
                           ring->Data,
                           (SIZE_T)(copyFrames - first) * NF_VMIC_FRAME_BYTES);
+            AppRingHistoryWrite(ring, frame + first, ring->Data, copyFrames - first);
         }
     }
     if (copyFrames < packetFrames)
@@ -1945,10 +2113,12 @@ CCaptureStreamEngine::AppRingCapturePass(
         // An underrun: what the app hasn't written yet is silence. read_frame stops at write_frame: nothing is skipped.
         RtlZeroMemory(PacketBuffer + (SIZE_T)copyFrames * NF_VMIC_FRAME_BYTES,
                       (SIZE_T)(packetFrames - copyFrames) * NF_VMIC_FRAME_BYTES);
+        AppRingHistoryWrite(ring, frame + copyFrames, NULL, packetFrames - copyFrames);
         ring->Stats.UnderrunPackets++;
         ring->Stats.UnderrunFrames += packetFrames - copyFrames;
         ring->AttachUnderrunFrames += packetFrames - copyFrames;
     }
+    ring->HistoryLeadFrames = packetFrames;
 
     readFrame += copyFrames;
     ring->ReadFrame = readFrame;
@@ -1965,6 +2135,92 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     KeReleaseSpinLock(&ring->Lock, oldIrql);
     return TRUE;
+}
+
+//
+// A stream that isn't the reader reads the reader's copy, as LoopbackCapturePass reads the loopback ring: from its own place
+// on the time line, the lag and the reader's packet behind. That place moves only with its time line (Run, a glitch
+// adjustment) or the reader's packet (a handoff), so between those it advances exactly a packet a pass and plays the reader's
+// audio continuously. What the copy doesn't hold (not yet written, or already overwritten) is silence, and so is what it
+// holds for a gap in the reader's time line: both counted as underruns.
+//
+_Use_decl_annotations_
+VOID
+CCaptureStreamEngine::AppRingOtherPass(
+    ULONG   Packet,
+    PBYTE   PacketBuffer,
+    ULONG   PacketSize
+)
+{
+    PNF_APP_RING    ring = &g_NfAppRing;
+    ULONGLONG       readStart;
+    ULONGLONG       readEnd;
+    ULONGLONG       validLo = 0;
+    ULONGLONG       validHi = 0;
+    ULONGLONG       copyLo;
+    ULONGLONG       copyHi;
+    ULONGLONG       gapFrames = 0;
+    ULONG           i;
+
+    if (!m_AppFormatOk || m_LbPacketFrames == 0 || (ULONGLONG)m_LbPacketFrames * NF_VMIC_FRAME_BYTES != PacketSize)
+    {
+        // Raw copies only into 48 kHz float32 stereo packets (the fallback: CaptureStreamOpen refuses other formats while a
+        // ring is attached).
+        ring->Stats.MismatchPackets++;
+        RtlZeroMemory(PacketBuffer, PacketSize);
+        return;
+    }
+
+    // m_LbLagFrames: LOOPBACK_LAG_HNS and a frame (Run; m_AppFormatOk implies m_LbFormat.Valid, which sets it).
+    readStart = LoopbackAnchor() - m_LbLagFrames - ring->HistoryLeadFrames + (ULONGLONG)Packet * m_LbPacketFrames;
+    readEnd = readStart + m_LbPacketFrames;
+
+    if (ring->HistoryValid)
+    {
+        validHi = ring->HistoryEnd;
+        validLo = (validHi - ring->HistoryFrom > NF_APP_HISTORY_FRAMES) ? validHi - NF_APP_HISTORY_FRAMES : ring->HistoryFrom;
+    }
+
+    copyLo = MAX(readStart, validLo);
+    copyHi = MIN(readEnd, validHi);
+    if (copyLo >= copyHi)
+    {
+        copyLo = readEnd;
+        copyHi = readEnd;
+    }
+
+    if (copyLo > readStart)
+    {
+        RtlZeroMemory(PacketBuffer, (SIZE_T)(copyLo - readStart) * NF_VMIC_FRAME_BYTES);
+    }
+    if (copyHi > copyLo)
+    {
+        LoopbackRingRead(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, copyLo,
+                         PacketBuffer + (SIZE_T)(copyLo - readStart) * NF_VMIC_FRAME_BYTES, copyHi - copyLo);
+    }
+    if (readEnd > copyHi)
+    {
+        RtlZeroMemory(PacketBuffer + (SIZE_T)(copyHi - readStart) * NF_VMIC_FRAME_BYTES, (SIZE_T)(readEnd - copyHi) * NF_VMIC_FRAME_BYTES);
+    }
+
+    //
+    // What the copy holds for a gap in the reader's time line is silence no reader delivered: an underrun here, not the ring's
+    // audio. The gaps are disjoint (HistoryEnd only grows within a run, and a new run clears them), so their overlaps with
+    // [copyLo, copyHi) add up to no more than it; an empty copy (copyLo == copyHi) meets none.
+    //
+    for (i = 0; i < NF_APP_HISTORY_GAPS; i++)
+    {
+        ULONGLONG   lo = MAX(copyLo, ring->HistoryGaps[i].From);
+        ULONGLONG   hi = MIN(copyHi, ring->HistoryGaps[i].End);
+
+        if (hi > lo)
+        {
+            gapFrames += hi - lo;
+        }
+    }
+
+    ring->SecondaryFramesCopied += (copyHi - copyLo) - gapFrames;
+    ring->SecondaryUnderrunFrames += m_LbPacketFrames - (copyHi - copyLo) + gapFrames;
 }
 
 _Use_decl_annotations_

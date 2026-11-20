@@ -30,11 +30,36 @@ Environment:
 #define NF_APP_DETACH_CLEANUP   1
 #define NF_APP_DETACH_REMOVAL   2
 
+// The reader's copy for the other capture streams (g_NfAppHistory): 2^15 frames of 48 kHz float32 stereo, 683 ms, 256 KiB.
+#define NF_APP_HISTORY_FRAMES   32768u
+#define NF_APP_HISTORY_BYTES    (NF_APP_HISTORY_FRAMES * NF_VMIC_FRAME_BYTES)
+
+//
+// The latest gaps in the reader's copy (NF_APP_RING.HistoryGaps): silence the copy holds where the reader's time line jumped
+// later (a glitch adjustment, a handoff), which the other streams count as underruns, not as the ring's audio. A whole reader
+// packet follows each gap, so at most (its packet + its timer's lateness + the lag) / the reader's packet + 1 gaps end after
+// the start of another stream's read: 11 for a 10 ms stream (lateness under 10 ms) beside a 2 ms reader (the shortest packet,
+// PacketSize.cpp) whose time line jumps at every pass. Should more than 16 do, the older ones' silence counts as copied.
+//
+#define NF_APP_HISTORY_GAPS     16u
+
+typedef struct _NF_APP_HISTORY_GAP {
+    ULONGLONG               From;                   // [From, End), frames on the time line; [0, 0) when unused
+    ULONGLONG               End;
+} NF_APP_HISTORY_GAP, *PNF_APP_HISTORY_GAP;
+
 //
 // The one app ring. A global (non-paged .bss, zeroed by the loader) rather than either device's context: the capture streams
 // (under the PnP device) and the control device's callbacks both reach it, and it outlives both, since the image stays loaded
-// while any device object exists. Every field is guarded by Lock, a spin lock: the capture timer's DPC and the cancel routine
-// take it at DISPATCH_LEVEL. Lock order: Lock, then Loopback->Lock (NF_VMIC_IOCTL_STATS only); nothing takes them the other way.
+// while any device object exists. Every field, and g_NfAppHistory, is guarded by Lock, a spin lock: the capture timer's DPC and
+// the cancel routine take it at DISPATCH_LEVEL.
+//
+// Lock order: Lock, then a LOOPBACK_RING's Lock (Public.h); nothing takes them the other way. Two paths nest them:
+// NF_VMIC_IOCTL_STATS (Loopback's counters), and a capture stream's creation and destruction (CaptureStreamOpen and
+// CaptureStreamClose, StreamEngine.cpp), which check and record the stream's format in both under the two locks at once.
+// The loopback's records of what is open are the CaptureOpen and RenderOpen slots in each device's LOOPBACK_RING, under that
+// ring's lock. The app ring keeps its own count of capture streams open in another format (OtherFormatCaptureOpens), across
+// every device, since any device's capture stream reads the one app ring: ATTACH checks it under Lock alone.
 //
 typedef struct _NF_APP_RING {
     KSPIN_LOCK              Lock;                   // KeInitializeSpinLock in NfVmic_DriverInit
@@ -57,7 +82,25 @@ typedef struct _NF_APP_RING {
     ULONGLONG               AttachFramesCopied;
     ULONGLONG               AttachUnderrunFrames;
 
+    //
+    // The reader's copy (g_NfAppHistory), reset at ATTACH: the packets the reader delivered, each at its frames on the QPC
+    // time line (as LOOPBACK_RING's positions: frame n is n / 48000 s of QPC time, in slot n & (NF_APP_HISTORY_FRAMES - 1)).
+    // The other capture streams read it HistoryLeadFrames plus 1 ms and a frame behind their own place on that time line.
+    //
+    BOOLEAN                 HistoryValid;           // a reader in the ring's format has written since ATTACH
+    ULONG                   HistoryLeadFrames;      // the packet of the reader that wrote last, in frames (0: none yet)
+    ULONGLONG               HistoryFrom;            // [HistoryFrom, HistoryEnd) is the current run (only its last
+    ULONGLONG               HistoryEnd;             // NF_APP_HISTORY_FRAMES held)
+    ULONG                   HistoryGapNext;         // the entry of HistoryGaps the next gap fills (modulo NF_APP_HISTORY_GAPS)
+    NF_APP_HISTORY_GAP      HistoryGaps[NF_APP_HISTORY_GAPS];   // the current run's latest gaps, cleared with each new run
+
+    // Capture streams open (EvtCircuitCreateStream to the stream engine's destruction) in a format other than the ring's, on
+    // every device: ATTACH is refused while this isn't 0, and no such stream is created while a ring is attached.
+    ULONG                   OtherFormatCaptureOpens;
+
     NF_VMIC_RING_STATS      Stats;                  // cumulative since the driver loaded
+    ULONGLONG               SecondaryFramesCopied;  // NF_VMIC_STATS's, cumulative too
+    ULONGLONG               SecondaryUnderrunFrames;
 
     BOOLEAN                 Removing;               // the control device is being deleted: no new attachment
 
@@ -68,6 +111,7 @@ typedef struct _NF_APP_RING {
 } NF_APP_RING, *PNF_APP_RING;
 
 extern NF_APP_RING              g_NfAppRing;
+extern UCHAR                    g_NfAppHistory[NF_APP_HISTORY_BYTES];   // non-paged .bss; under g_NfAppRing.Lock
 extern NF_VMIC_STREAM_STATS     g_NfStreamStats[NF_VMIC_KINDS];     // interlocked access only
 
 //

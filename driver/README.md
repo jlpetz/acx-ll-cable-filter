@@ -49,6 +49,21 @@ statistics and kills feeders. The statistics IOCTL also carries each stream kind
 Only SYSTEM and Administrators may open it for the spike: letting unelevated users in first needs attachments tied to a
 session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for the same reason as above.
 
+Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
+others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, in the image's .data) on the same QPC
+time line, the reader's packet plus 1 ms behind (`SecondaryFramesCopied`; `SecondaryUnderrunFrames` counts the silence
+they get where no reader delivered, a jump in the reader's time line included). More than one can run if two of the
+driver's devices are installed (their microphones share the one ring), or should the capture pin list a mode besides RAW
+(the audio engine can open a device stream per mode); with one device and RAW only, a second stream isn't known to
+occur, so this is defensive until a live test makes one.
+
+The ring is raw float32, so a conflict with another format shows at open time, both ways: while a ring is attached, a
+capture stream in another format is refused at creation (STATUS_NOT_SUPPORTED, `RefusedCaptureOpens`), and an ATTACH
+while one is open fails with ERROR_NOT_SUPPORTED (`FormatRejects`); the app then feeds through its WASAPI output instead
+(24-in-32 into the speaker endpoint, the loopback path). Each check and its publish or record are one step under the app
+ring's lock, with the loopback's lock nested inside it at stream creation. Shared-mode streams run at the device format
+(float32), so the refusals meet exclusive-mode clients only; the mismatch zero-fill stays as the fallback.
+
 ## Building and installing (an elevated Windows PowerShell)
 
 1. `scripts\Setup-TestSigning.ps1 [-Ems]`: a test certificate (`CN=Noise Filter Test Driver`), trusted, and test signing

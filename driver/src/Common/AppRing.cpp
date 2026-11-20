@@ -22,6 +22,7 @@ Environment:
 #include "AppRing.h"
 
 NF_APP_RING             g_NfAppRing;
+DECLSPEC_CACHEALIGN UCHAR g_NfAppHistory[NF_APP_HISTORY_BYTES];
 NF_VMIC_STREAM_STATS    g_NfStreamStats[NF_VMIC_KINDS];
 
 static
