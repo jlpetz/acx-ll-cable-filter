@@ -274,7 +274,17 @@ Live (`quality --test echo --echo-delay D`, 150 s, the exclusive mic, an 18 ms l
 Left: the quality report's echo-delay line can quote a turn's lead from before the hold when the hold changes mid-take
 (the turns measured are right); real speakers in phase 2 (TODO 13).
 
-## Dither and FTZ/DAZ (2026-11-20, open)
+## Dither and FTZ/DAZ (2026-11-20, open; the matrix ran 2026-11-21)
+**Results:** `doc/dev/dither-matrix-2026-11-21.md` (the harness and raw data on branch `worktree-wf_4989e0ed-c97-3`, d0f6095 and
+90bb776, beside the vendored guard switch). In short:
+- a clean mic stalls RNNoise 10x after speech (p99 481 against 47 us) in either guard build, and degrades UL-UNAS's output
+  after silence;
+- with today's dither the guard changes no output bit and saves nothing measurable;
+- 24-bit output already reaches exact zero in every chain, float32 never does.
+
+Ours, for the owner: keep the dither while a filter runs, turn the guard off, no mic dither in bypass, and later an end stage
+that writes exact zeros once the tails have finished (TODO 17).
+
 The mic and reference blocks get a ~1e-9 dither (`pipeline.rs:40`, `DITHER`): it keeps AEC3's and RNNoise's filters (and our
 gate and floor) out of denormal range on exact digital silence, without FTZ/DAZ. sonora 0.3.0 also sets FTZ/DAZ inside each of
 its calls. The mic dither travels through the chain to the cable, so digital silence comes out about -180 dBFS, not zero, once
