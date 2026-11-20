@@ -25,6 +25,7 @@ Environment:
 #include <ksmedia.h>
 #include "streamengine.h"
 #include "DriverSettings.h"
+#include "PacketSize.h"
 
 #ifndef __INTELLISENSE__
 #include "device.tmh"
@@ -158,6 +159,18 @@ Return Value:
     devCtx->ExcludeD3Cold = WdfFalse;
 
     //
+    // noise-filter (TODO 19): the loopback ring, allocated once for the device's life so that no stream allocates at
+    // DISPATCH_LEVEL; freed in Codec_EvtDeviceContextCleanup. ExAllocatePool2 zeroes it.
+    //
+    RtlZeroMemory(&devCtx->Loopback, sizeof(devCtx->Loopback));
+    KeInitializeSpinLock(&devCtx->Loopback.Lock);
+    devCtx->Loopback.Buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, LOOPBACK_RING_BYTES, DeviceDriverTag);
+    if (devCtx->Loopback.Buffer == nullptr)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
     // The driver calls this DDI in its AddDevice callback after creating the PnP
     // device. ACX uses this call to apply any post device settings.
     //
@@ -251,8 +264,27 @@ Return Value:
     ASSERT(devCtx->Render);
     RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Render));
 
+    //
+    // noise-filter (TODO 19, check 2): publish the packet-size constraints on each circuit's KSCATEGORY_AUDIO
+    // interface here. The circuit's symbolic link is valid once the circuit is added (single-circuit endpoint), and the
+    // circuit is not visible until D0, so the property is in place before the interface is enabled.
+    //
+    // A failure costs only the small periods (the engine stays at its 10 ms default), so it is reported and the start
+    // goes on; failing here would also leave the capture circuit unadded for EvtDeviceReleaseHardware to remove.
+    //
+    NTSTATUS publish = PublishPacketSizeConstraints(devCtx->Render);
+    if (!NT_SUCCESS(publish))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: render packet-size constraints not set (0x%08X)\n", publish);
+    }
+
     ASSERT(devCtx->Capture);
     RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture));
+    publish = PublishPacketSizeConstraints(devCtx->Capture);
+    if (!NT_SUCCESS(publish))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: capture packet-size constraints not set (0x%08X)\n", publish);
+    }
 
     return status;
 }
@@ -431,6 +463,26 @@ Return Value:
     device = (WDFDEVICE)WdfDevice;
     devCtx = GetCodecDeviceContext(device);
     ASSERT(devCtx != nullptr);
+
+    //
+    // noise-filter (TODO 19): free the loopback ring. The streams are gone by now (inference: they descend from the device
+    // and are cleaned up first, and each stopped its timer in ReleaseHardware); the DPC paths check Buffer under the lock.
+    //
+    if (devCtx->Loopback.Buffer != nullptr)
+    {
+        KIRQL   oldIrql;
+        PUCHAR  buffer;
+
+        KeAcquireSpinLock(&devCtx->Loopback.Lock, &oldIrql);
+        buffer = devCtx->Loopback.Buffer;
+        devCtx->Loopback.Buffer = nullptr;
+        devCtx->Loopback.Owner = nullptr;
+        devCtx->Loopback.RenderActive = FALSE;
+        devCtx->Loopback.RenderFormat.Valid = FALSE;
+        KeReleaseSpinLock(&devCtx->Loopback.Lock, oldIrql);
+
+        ExFreePoolWithTag(buffer, DeviceDriverTag);
+    }
 
     if (devCtx->Capture)
     {

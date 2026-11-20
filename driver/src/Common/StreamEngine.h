@@ -13,6 +13,15 @@
 #define DEFAULT_FREQUENCY 220
 #define LOOPBACK_FREQUENCY 500
 
+// noise-filter (TODO 19): the loopback pair's timing.
+// The capture side reads this far behind the render side's presentation time line: the budget for a render timer that fires
+// late while the capture timer is on time (high-resolution timers fire late, never early; up to about 1 ms per Learn as the
+// base study read it; spike check 5 measures it on the box). The capture side adds one frame for integer rounding.
+#define LOOPBACK_LAG_HNS        (1 * HNSTIME_PER_MILLISECOND)
+// A render time line that moves later by up to this much (resume, a late timer's glitch adjustment) keeps its ring run and
+// zeros the gap; a longer move starts a new run.
+#define LOOPBACK_MAX_GAP_HNS    (100 * HNSTIME_PER_MILLISECOND)
+
 // Stream callbacks shared between Capture and Render
 
 VOID
@@ -252,6 +261,14 @@ protected:
     CSimPeakMeter       m_PeakMeter;
     CSimPeakMeter*      m_pCircuitPeakmeter;
 
+    // noise-filter (TODO 19): the device's loopback ring and this stream's place on its time line.
+    PLOOPBACK_RING      m_Loopback;         // in the WDFDEVICE's context; NULL if the device has none
+    LOOPBACK_FORMAT     m_LbFormat;         // this stream's format, snapshotted at Run
+    ULONG               m_LbPacketFrames;   // m_PacketSize in frames
+    ULONG               m_LbRingFrames;     // LOOPBACK_RING_BYTES in frames
+    ULONGLONG           m_LbAnchor;         // ring frame of this stream's byte position 0 on its current time line
+    BOOLEAN             m_LbAnchorValid;
+
     static
     __drv_maxIRQL(DISPATCH_LEVEL)
     _Function_class_(EVT_WDF_TIMER)
@@ -284,6 +301,15 @@ protected:
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID
     ProcessPacket() = 0;
+
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    VOID
+    LoopbackSetFormat();
+
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    LoopbackAnchor();
 };
 
 class CRenderStreamEngine : public CStreamEngine
@@ -332,8 +358,50 @@ public:
         _In_    ULONG           EosPacketLength
         );
 
+    virtual
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    NTSTATUS
+    Run();
+
+    virtual
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    NTSTATUS
+    Pause();
+
 protected:
     CSaveData m_SaveData;
+
+    // noise-filter (TODO 19): the render half of the loopback pair.
+    ULONG               m_LbNextPacket;     // the next render packet to copy into the ring
+    volatile LONG64     m_LbReleased;       // (1 << 32) | newest packet the client released (SetRenderPacket); 0: none since Stop
+
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    BOOLEAN
+    LoopbackReleased(
+        _In_    ULONG           Packet
+        );
+
+    // noinline: called from PAGE code (Run, Pause, ReleaseHardware, the destructor) and takes the ring's spin lock. Inlined
+    // into a PAGE function, its locked region would be pageable code running at DISPATCH_LEVEL (a bugcheck once paged out,
+    // and at once under Driver Verifier).
+    __declspec(noinline)
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    VOID
+    LoopbackRenderPass(
+        _In_    BOOLEAN         AtRun
+        );
+
+    // noinline: called from PAGE code (Run, Pause, ReleaseHardware, the destructor) and takes the ring's spin lock. Inlined
+    // into a PAGE function, its locked region would be pageable code running at DISPATCH_LEVEL (a bugcheck once paged out,
+    // and at once under Driver Verifier).
+    __declspec(noinline)
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    VOID
+    LoopbackRenderStop(
+        _In_    BOOLEAN         ReleaseOwnership
+        );
 
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)
@@ -377,12 +445,33 @@ public:
         _Out_   BOOLEAN       * MoreData
         );
 
+    virtual
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    NTSTATUS
+    Run();
+
 protected:
     ToneGenerator   m_ToneGenerator;
     CWaveReader     m_WaveReader;
     DWORD           m_EnableWaveCapture;
     UNICODE_STRING  m_HostCaptureFileName;
     UNICODE_STRING  m_LoopbackCaptureFileName;
+
+    // noise-filter (TODO 19): the capture half of the loopback pair.
+    ULONG           m_LbLagFrames;      // LOOPBACK_LAG_HNS in frames, rounded up, plus one
+    ULONG           m_LbAnchorLead;     // the render lead (LOOPBACK_RING.RenderLeadFrames) the anchor was made with
+    ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
+
+    // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
+    __declspec(noinline)
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    VOID
+    LoopbackCapturePass(
+        _In_                            ULONG   Packet,
+        _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
+        _In_                            ULONG   PacketSize
+        );
 
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)

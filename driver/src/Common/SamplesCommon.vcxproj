@@ -150,6 +150,7 @@
   <ItemGroup>
     <ClInclude Include="NewDelete.h" />
     <ClInclude Include="CircuitHelper.h" />
+    <ClInclude Include="PacketSize.h" />
     <ClInclude Include="KeywordDetector.h" />
     <ClInclude Include="Private.h" />
     <ClInclude Include="Public.h" />
@@ -165,6 +166,7 @@
     <ClCompile Include="NewDelete.cpp" />
     <ClCompile Include="captureCircuit.cpp" />
     <ClCompile Include="CircuitHelper.cpp" />
+    <ClCompile Include="PacketSize.cpp" />
     <ClCompile Include="KeywordDetector.cpp" />
     <ClCompile Include="renderCircuit.cpp" />
     <ClCompile Include="SaveData.cpp" />

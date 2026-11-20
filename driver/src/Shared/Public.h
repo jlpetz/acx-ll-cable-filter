@@ -46,12 +46,59 @@ extern RECORDER_LOG g_AudioDspLog;
 extern RECORDER_LOG g_AudioDspMcLog;
 
 //
+// noise-filter (TODO 19, spike check 7): the render-to-capture loopback ring.
+//
+// One per device, in the device context (WDF contexts are non-paged), so it outlives either stream. Positions are frames on
+// one QPC time line shared by both streams: ring frame n holds the audio presented at n / SampleRate seconds of QPC time,
+// stored at byte (n % RingFrames) * BlockAlign. Every field is guarded by Lock, which both streams' timer DPCs and their
+// PASSIVE_LEVEL state changes take.
+//
+#define LOOPBACK_RING_BYTES (48000 * 8 * 2)     // 768,000 bytes: whole frames for block aligns 1-4, 6, 8, 12, 16 and 24
+
+typedef struct _LOOPBACK_FORMAT {
+    BOOLEAN         Valid;                  // byte clock == rate * block align; ring and packets hold whole frames
+    USHORT          Channels;
+    ULONG           SampleRate;
+    ULONG           BitsPerSample;
+    ULONG           ValidBitsPerSample;
+    ULONG           BlockAlign;
+    GUID            SubFormat;
+} LOOPBACK_FORMAT, *PLOOPBACK_FORMAT;
+
+typedef struct _LOOPBACK_RING {
+    KSPIN_LOCK      Lock;
+    PUCHAR          Buffer;                 // LOOPBACK_RING_BYTES, non-paged: Codec_EvtBusDeviceAdd to Codec_EvtDeviceContextCleanup
+
+    // Written by the render stream that owns the ring (the first one to run).
+    PVOID           Owner;                  // that CRenderStreamEngine, or NULL
+    LOOPBACK_FORMAT RenderFormat;           // the last owner's format (kept after it stops, so its tail can still be read)
+    BOOLEAN         RenderActive;           // the owner is running and has written in this run
+    ULONG           RenderLeadFrames;       // 0: packets copied as released (a period early); else a packet: copied as they complete
+    ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
+    ULONGLONG       WritePos;
+
+    // Counters for the spike, read with the debugger.
+    ULONG           IdlePackets;            // capture packets zeroed (all or the end) with no render stream running
+    ULONG           MismatchPackets;        // capture packets zeroed because the render and capture formats differ
+    ULONG           UnderrunPackets;        // capture packets zeroed at the end because the render audio was not there yet
+    ULONGLONG       UnderrunFrames;
+    ULONG           OverrunPackets;         // capture packets zeroed at the start because the ring had already overwritten them
+    ULONG           CaptureAnchors;         // capture read position (re)anchored: Run, glitch adjustment, render lead change
+    ULONG           RenderRestarts;         // render runs started (claim, or a time line jump too long to zero)
+    ULONG           RenderGapFills;         // render time line moved by a short gap (resume, glitch adjustment), zeroed
+    ULONG           RenderLatePackets;      // render packets copied as they completed: the client released them too late
+    ULONG           RenderLostPackets;      // render packets gone from the buffer before they were copied (zeroed; not expected)
+    ULONG           RenderNotOwner;         // passes of a second render stream (not looped back)
+} LOOPBACK_RING, *PLOOPBACK_RING;
+
+//
 // Define CODEC device context.
 //
 typedef struct _CODEC_DEVICE_CONTEXT {
     ACXCIRCUIT      Render;
     ACXCIRCUIT      Capture;
     WDF_TRI_STATE   ExcludeD3Cold;
+    LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
 } CODEC_DEVICE_CONTEXT, * PCODEC_DEVICE_CONTEXT;
 
 //

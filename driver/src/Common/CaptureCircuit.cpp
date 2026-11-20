@@ -332,8 +332,7 @@ Capture_AllocateSupportedFormats(
     UNREFERENCED_PARAMETER(CodecCapturePinCount);
 
     NTSTATUS status = STATUS_SUCCESS;
-    ACXDATAFORMAT formatPcm44100c1;
-    ACXDATAFORMAT formatPcm48000c1;
+    ACXDATAFORMAT formatPcm48000c2;
     ACXDATAFORMATLIST formatList;
 
     WDF_OBJECT_ATTRIBUTES attributes;
@@ -344,8 +343,11 @@ Capture_AllocateSupportedFormats(
     // Allocate the formats this circuit supports.
     //
 
-    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm44100c1, Circuit, Device, &formatPcm44100c1));
-    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c1, Circuit, Device, &formatPcm48000c1));
+    //
+    // noise-filter (TODO 19): the render endpoint's one format (Render_AllocateSupportedFormats): 48 kHz 16-bit stereo, so the
+    // loopback pair matches. The jack below already maps two channels (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT).
+    //
+    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c2, Circuit, Device, &formatPcm48000c2));
 
     ///////////////////////////////////////////////////////////
     //
@@ -365,8 +367,7 @@ Capture_AllocateSupportedFormats(
     // The driver uses this DDI to add data formats to the raw
     // processing mode list associated with the current circuit.
     //
-    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm44100c1));
-    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm48000c1));
+    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm48000c2));
 
     return status;
 }

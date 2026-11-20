@@ -5,11 +5,25 @@ Our own root-enumerated virtual mic (option D), started from Microsoft's ACX **A
 there (doc/todo/19-driver-base-2026-10-28.md has the plan and the spike's checks).
 
 **Licence.** The files under `src/` derive from the sample, which is MS-PL (`LICENSE-MS-PL.txt`): they stay MS-PL (its
-section 3(D)). The scripts are ours, under the repo's licence.
+section 3(D)). The scripts are ours, under the repo's licence. `src/Common/PacketSize.{h,cpp}` are ported from
+microsoft/low-latency-audio (MIT, `LICENSE-MIT-low-latency-audio.txt`) and keep its Microsoft and Yamaha notices.
 
 **What changed from the sample** (the first commit after the import shows it): KMDF 1.35 (Windows 11 24H2 / Server 2025,
 build 26100, and up: the owner, 2026-11-20) in both projects, and the INF's OS floor 10.0...26100 to match. ACX stays 1.1,
 the newest WDK 28000 has.
+
+Packet sizes (spike check 2): both circuits publish `DEVPKEY_KsAudio_PacketSize_Constraints2` on their KSCATEGORY_AUDIO
+interface right after `AcxDeviceAddCircuit`: a 2 ms floor, 128-frame RAW and DEFAULT packets, no alignment, no maximum.
+A failure to publish is reported (DbgPrintEx) and leaves the default 10 ms periods; it doesn't fail the device.
+
+The loopback pair (spike check 7): what's played into the speaker endpoint comes out of the microphone endpoint. A 768 KB
+non-paged ring on the device, under a spin lock; both streams on one QPC time line (the stream engine's own schedule), so
+the two ends never drift and need no fill control. The render pass copies the next packet once the client has released it
+(SetRenderPacket), else the one completing; the capture pass reads one packet a fixed 1 ms lag behind. Both endpoints offer
+only 48 kHz 16-bit stereo, so the formats always match (other formats would zero-fill). The sample's tone, WAV reader and
+SaveData are no longer called. Two of the sample's stream-engine bugs are fixed: UpdatePosition subtracted the glitch
+adjustment (time) from a byte position, and let the position pass the packet in progress (a Pause could then stall the
+next Run's timer for about 111 days); and the first capture packet of a run reported a QPC of 0.
 
 ## Building and installing (an elevated Windows PowerShell)
 

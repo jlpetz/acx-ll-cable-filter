@@ -60,6 +60,29 @@ CStreamEngine::CStreamEngine(
 
     KeQueryPerformanceCounter(&m_PerformanceCounterFrequency);
     RtlZeroMemory(m_Packets, sizeof(m_Packets));
+
+    //
+    // noise-filter (TODO 19): find the device's loopback ring. The stream's circuit belongs to our one WDFDEVICE
+    // (AcxStreamGetCircuit, acxstreams.h:839; AcxCircuitGetWdfDevice, acxcircuit.h:1290; both up to DISPATCH_LEVEL).
+    // The pointer is kept: the device context outlives the stream (inference: the stream descends from the device).
+    //
+    m_Loopback = NULL;
+    RtlZeroMemory(&m_LbFormat, sizeof(m_LbFormat));
+    m_LbPacketFrames = 0;
+    m_LbRingFrames = 0;
+    m_LbAnchor = 0;
+    m_LbAnchorValid = FALSE;
+
+    {
+        ACXCIRCUIT              circuit = AcxStreamGetCircuit(Stream);
+        WDFDEVICE               device = (circuit != NULL) ? AcxCircuitGetWdfDevice(circuit) : NULL;
+        PCODEC_DEVICE_CONTEXT   devCtx = (device != NULL) ? GetCodecDeviceContext(device) : NULL;
+
+        if (devCtx != NULL)
+        {
+            m_Loopback = &devCtx->Loopback;
+        }
+    }
 }
 
 _Use_decl_annotations_
@@ -360,6 +383,7 @@ NTSTATUS
 CStreamEngine::Run()
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
+    LARGE_INTEGER qpcStart;
 
     PAGED_CODE();
 
@@ -389,8 +413,14 @@ CStreamEngine::Run()
     // us to continue scheduling packet completions correctly, while still reporting absolute position from the
     // start of the stream.
     //
-    m_StartTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, KeQueryPerformanceCounter(NULL));
+    qpcStart = KeQueryPerformanceCounter(NULL);
+    m_StartTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, qpcStart);
     m_StartPosition = m_Position;
+
+    // noise-filter (TODO 19): the run's first packet starts now. StreamPassCallback moves this to m_LastPacketStart, which
+    // GetCapturePacket reports as the packet's QPC; left as it was (0 from the constructor, or the last pass before a
+    // Pause), the first packet of every run had the wrong capture time.
+    InterlockedExchange64(&m_CurrentPacketStart.QuadPart, qpcStart.QuadPart);
 
     // Reset time we've lost to glitches
     m_GlitchAdjust = 0;
@@ -650,8 +680,20 @@ CStreamEngine::UpdatePosition()
     bytesPerSecond = GetBytesPerSecond();
     currentTime = KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, KeQueryPerformanceCounter(NULL));
 
-    // Update position
-    m_Position = m_StartPosition - m_GlitchAdjust + (currentTime - m_StartTime) * bytesPerSecond / HNS_PER_SEC;
+    //
+    // noise-filter (TODO 19): two fixes to the sample's position.
+    // - The glitch adjustment is time (100 ns units, ScheduleNextPass adds it to the schedule), so it comes off the elapsed
+    //   time; the sample subtracted it from the byte position, leaving the position about 0.98 x G bytes behind the packets
+    //   (0.5 s after 10 ms of lateness at 192,000 B/s), which a Pause and Run then turned into a half-second stall.
+    // - The position stays within the packet in progress: no packet past it has completed. A Pause that cancels a pass still
+    //   queued past its due time would otherwise store a position beyond it, and the next Run's ScheduleNextPass would
+    //   underflow (nextPacketStartPosition - m_StartPosition) and arm the timer about 111 days out.
+    //
+    ULONGLONG elapsed = currentTime - m_StartTime;
+    elapsed = (elapsed > m_GlitchAdjust) ? elapsed - m_GlitchAdjust : 0;
+    ULONGLONG position = m_StartPosition + elapsed * bytesPerSecond / HNS_PER_SEC;
+    ULONGLONG packetEnd = ((ULONGLONG)m_CurrentPacket + 1) * m_PacketSize;
+    m_Position = MIN(position, packetEnd);
 }
 
 _Use_decl_annotations_
@@ -682,6 +724,155 @@ CStreamEngine::GetCurrentPacket(
     return STATUS_SUCCESS;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+//
+// noise-filter (TODO 19, spike check 7): the render-to-capture loopback pair.
+//
+// The render pass copies each packet into the device's ring at the frame its own time line presents it; the capture pass
+// copies one packet from the frame its own time line captures, minus a fixed lag. Both time lines are ScheduleNextPass's
+// (absolute QPC, nominal rate), so the two ends stay locked with no drift and no fill-level control. All integer; nothing
+// allocates; all shared state is under the ring's spin lock (held for one packet copy).
+//
+
+static
+ULONGLONG
+LoopbackHnsToFrames(
+    _In_ ULONGLONG  Hns,
+    _In_ ULONG      SampleRate
+)
+{
+    // Split so the product cannot overflow (100 ns QPC time since boot times 48000 would after about 14 months).
+    return (Hns / HNS_PER_SEC) * SampleRate + ((Hns % HNS_PER_SEC) * SampleRate) / HNS_PER_SEC;
+}
+
+static
+BOOLEAN
+LoopbackFormatEqual(
+    _In_ const LOOPBACK_FORMAT* A,
+    _In_ const LOOPBACK_FORMAT* B
+)
+{
+    return (A->Valid &&
+            B->Valid &&
+            A->SampleRate == B->SampleRate &&
+            A->Channels == B->Channels &&
+            A->BitsPerSample == B->BitsPerSample &&
+            A->ValidBitsPerSample == B->ValidBitsPerSample &&
+            A->BlockAlign == B->BlockAlign &&
+            RtlEqualMemory(&A->SubFormat, &B->SubFormat, sizeof(GUID))) ? TRUE : FALSE;
+}
+
+// Writes Frames frames from Source (NULL: zeros) at ring frame Frame, splitting at the wrap. Ring lock held.
+static
+VOID
+LoopbackRingWrite(
+    _In_        PLOOPBACK_RING  Ring,
+    _In_        ULONG           RingFrames,
+    _In_        ULONG           BlockAlign,
+    _In_        ULONGLONG       Frame,
+    _In_opt_    const BYTE*     Source,
+    _In_        ULONGLONG       Frames
+)
+{
+    while (Frames != 0)
+    {
+        ULONG   index = (ULONG)(Frame % RingFrames);
+        ULONG   chunk = (ULONG)MIN(Frames, (ULONGLONG)(RingFrames - index));
+        SIZE_T  bytes = (SIZE_T)chunk * BlockAlign;
+        PBYTE   dest = Ring->Buffer + (SIZE_T)index * BlockAlign;
+
+        if (Source != NULL)
+        {
+            RtlCopyMemory(dest, Source, bytes);
+            Source += bytes;
+        }
+        else
+        {
+            RtlZeroMemory(dest, bytes);
+        }
+
+        Frame += chunk;
+        Frames -= chunk;
+    }
+}
+
+// Reads Frames frames at ring frame Frame into Dest, splitting at the wrap. Ring lock held.
+static
+VOID
+LoopbackRingRead(
+    _In_                                    PLOOPBACK_RING  Ring,
+    _In_                                    ULONG           RingFrames,
+    _In_                                    ULONG           BlockAlign,
+    _In_                                    ULONGLONG       Frame,
+    _Out_writes_bytes_(Frames * BlockAlign) PBYTE           Dest,
+    _In_                                    ULONGLONG       Frames
+)
+{
+    while (Frames != 0)
+    {
+        ULONG   index = (ULONG)(Frame % RingFrames);
+        ULONG   chunk = (ULONG)MIN(Frames, (ULONGLONG)(RingFrames - index));
+        SIZE_T  bytes = (SIZE_T)chunk * BlockAlign;
+
+        RtlCopyMemory(Dest, Ring->Buffer + (SIZE_T)index * BlockAlign, bytes);
+
+        Dest += bytes;
+        Frame += chunk;
+        Frames -= chunk;
+    }
+}
+
+_Use_decl_annotations_
+PAGED_CODE_SEG
+VOID
+CStreamEngine::LoopbackSetFormat()
+{
+    LOOPBACK_FORMAT format;
+    BOOLEAN         valid;
+
+    PAGED_CODE();
+
+    RtlZeroMemory(&format, sizeof(format));
+
+    format.SampleRate = AcxDataFormatGetSampleRate(m_StreamFormat);
+    format.Channels = AcxDataFormatGetChannelsCount(m_StreamFormat);
+    format.BitsPerSample = AcxDataFormatGetBitsPerSample(m_StreamFormat);
+    format.ValidBitsPerSample = AcxDataFormatGetValidBitsPerSample(m_StreamFormat);
+    format.BlockAlign = AcxDataFormatGetBlockAlign(m_StreamFormat);
+    format.SubFormat = AcxDataFormatGetSubFormat(m_StreamFormat);
+
+    //
+    // The ring's positions are frames on the QPC time line, so this stream's byte clock (GetBytesPerSecond, which
+    // ScheduleNextPass paces the timer by) must be exactly rate * block align, and the ring and the packets must hold whole
+    // frames. Anything else stays out of the loopback (the capture side zero-fills and counts a mismatch).
+    //
+    valid = (m_Loopback != NULL &&
+             format.SampleRate != 0 &&
+             format.BlockAlign != 0 &&
+             GetBytesPerSecond() == format.SampleRate * format.BlockAlign &&
+             LOOPBACK_RING_BYTES % format.BlockAlign == 0 &&
+             m_PacketSize != 0 &&
+             m_PacketSize % format.BlockAlign == 0) ? TRUE : FALSE;
+
+    format.Valid = valid;
+    m_LbFormat = format;
+    m_LbPacketFrames = valid ? m_PacketSize / format.BlockAlign : 0;
+    m_LbRingFrames = valid ? LOOPBACK_RING_BYTES / format.BlockAlign : 0;
+}
+
+_Use_decl_annotations_
+ULONGLONG
+CStreamEngine::LoopbackAnchor()
+{
+    //
+    // ScheduleNextPass puts this stream's byte position b at time m_StartTime + m_GlitchAdjust + (b - m_StartPosition) / bytes
+    // per second (100 ns units). Ring frame n is time n / SampleRate, so b lands on ring frame
+    // HnsToFrames(m_StartTime + m_GlitchAdjust) + (b - m_StartPosition) / BlockAlign; this returns that for b = 0 (to within
+    // a frame of rounding). It changes only when the time line does: Run, or a glitch adjustment.
+    //
+    return LoopbackHnsToFrames(m_StartTime + m_GlitchAdjust, m_LbFormat.SampleRate) - m_StartPosition / m_LbFormat.BlockAlign;
+}
+
 _Use_decl_annotations_
 PAGED_CODE_SEG
 CRenderStreamEngine::CRenderStreamEngine(
@@ -691,7 +882,9 @@ CRenderStreamEngine::CRenderStreamEngine(
     _In_    CSimPeakMeter * CircuitPeakmeter
 
 )
-    : CStreamEngine(Stream, StreamFormat, Offload, CircuitPeakmeter)
+    : CStreamEngine(Stream, StreamFormat, Offload, CircuitPeakmeter),
+    m_LbNextPacket(0),
+    m_LbReleased(0)
 {
     PAGED_CODE();
 }
@@ -701,6 +894,9 @@ PAGED_CODE_SEG
 CRenderStreamEngine::~CRenderStreamEngine()
 {
     PAGED_CODE();
+
+    // noise-filter (TODO 19): give the ring up if ReleaseHardware did not.
+    LoopbackRenderStop(TRUE);
 }
 
 _Use_decl_annotations_
@@ -708,39 +904,13 @@ PAGED_CODE_SEG
 NTSTATUS
 CRenderStreamEngine::PrepareHardware()
 {
-    NTSTATUS status = STATUS_SUCCESS;
-
     PAGED_CODE();
 
-    status = CStreamEngine::PrepareHardware();
-    if (!NT_SUCCESS(status))
-    {
-        goto exit;
-    }
-
-    status = m_SaveData.SetDataFormat((PKSDATAFORMAT)AcxDataFormatGetKsDataFormat(m_StreamFormat));
-    if (!NT_SUCCESS(status))
-    {
-        status = STATUS_SUCCESS;
-        goto exit;
-    }
-
-    status = m_SaveData.Initialize(m_Offload);
-    if (!NT_SUCCESS(status))
-    {
-        status = STATUS_SUCCESS;
-        goto exit;
-    }
-
-    status = m_SaveData.SetMaxWriteSize(m_PacketSize * m_PacketsCount * 16);
-    if (!NT_SUCCESS(status))
-    {
-        status = STATUS_SUCCESS;
-        goto exit;
-    }
-
-exit:
-    return status;
+    //
+    // noise-filter (TODO 19): the render data goes to the device's loopback ring (LoopbackRenderPass), so the sample's
+    // SaveData sink is no longer set up (m_SaveData.SetDataFormat, Initialize, SetMaxWriteSize).
+    //
+    return CStreamEngine::PrepareHardware();
 }
 
 _Use_decl_annotations_
@@ -748,12 +918,22 @@ PAGED_CODE_SEG
 NTSTATUS
 CRenderStreamEngine::ReleaseHardware()
 {
+    NTSTATUS status;
+
     PAGED_CODE();
 
-    m_SaveData.WaitAllWorkItems();
-    m_SaveData.Cleanup();
+    //
+    // noise-filter (TODO 19): no SaveData sink to drain (m_SaveData.WaitAllWorkItems, Cleanup). The base stops and deletes
+    // the timer, flushes queued DPCs and resets the packet count to 0, so no pass runs while the loopback state resets.
+    //
+    status = CStreamEngine::ReleaseHardware();
 
-    return CStreamEngine::ReleaseHardware();
+    LoopbackRenderStop(TRUE);
+    InterlockedExchange64(&m_LbReleased, 0);
+    m_LbNextPacket = 0;
+    m_LbAnchorValid = FALSE;
+
+    return status;
 }
 
 _Use_decl_annotations_
@@ -843,6 +1023,21 @@ CRenderStreamEngine::SetRenderPacket(
         status = STATUS_DATA_OVERRUN;
     }
 
+    //
+    // noise-filter (TODO 19): remember the newest packet the client has finished writing, for the loopback's look-ahead
+    // (LoopbackRenderPass). A late one (Packet <= currentPacket, e.g. a pre-roll of packet 0 before Run) counts too: its data
+    // is in the buffer. One writer: the client's property calls on this stream (inference: ACX serialises them).
+    //
+    if (status != STATUS_DATA_OVERRUN)
+    {
+        LONG64 released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+
+        if (released == 0 || (LONG)(Packet - (ULONG)released) > 0)
+        {
+            InterlockedExchange64(&m_LbReleased, ((LONG64)1 << 32) | Packet);
+        }
+    }
+
     return status;
 }
 
@@ -850,21 +1045,247 @@ _Use_decl_annotations_
 VOID
 CRenderStreamEngine::ProcessPacket()
 {
-    ULONG currentPacket;
-    ULONG packetIndex;
-    PBYTE packetBuffer;
+    //
+    // noise-filter (TODO 19): the render half of the loopback pair, in place of the sample's m_SaveData.WriteData.
+    //
+    LoopbackRenderPass(FALSE);
+}
 
-    currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+_Use_decl_annotations_
+PAGED_CODE_SEG
+NTSTATUS
+CRenderStreamEngine::Run()
+{
+    NTSTATUS status;
 
-    packetIndex = currentPacket % m_PacketsCount;
-    packetBuffer = (PBYTE)m_Packets[packetIndex];
-    // Packet 0 starts at an offset if the size isn't a multiple of page_size
-    if (packetIndex == 0)
+    PAGED_CODE();
+
+    if (m_CurrentState == AcxStreamStatePause)
     {
-        packetBuffer += m_FirstPacketOffset;
+        // The timer is stopped in Pause, so no pass reads these while they change. The packets exist by now (inference: ACX
+        // normally allocates them before PrepareHardware, Learn acx-streaming, and a client cannot start without them).
+        LoopbackSetFormat();
     }
 
-    m_SaveData.WriteData(packetBuffer, m_PacketSize);
+    status = CStreamEngine::Run();
+
+    if (NT_SUCCESS(status))
+    {
+        // Copy the packet the client pre-rolled before Start, if it released it, so the first packet is in the ring before
+        // its presentation time too. Serialised with the first timer pass by the ring's lock.
+        LoopbackRenderPass(TRUE);
+    }
+
+    return status;
+}
+
+_Use_decl_annotations_
+PAGED_CODE_SEG
+NTSTATUS
+CRenderStreamEngine::Pause()
+{
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    status = CStreamEngine::Pause();
+
+    if (NT_SUCCESS(status))
+    {
+        // The timer has stopped (WdfTimerStop waits for its callback): the capture side reads what is left, then idles.
+        LoopbackRenderStop(FALSE);
+    }
+
+    return status;
+}
+
+_Use_decl_annotations_
+BOOLEAN
+CRenderStreamEngine::LoopbackReleased(
+    ULONG Packet
+)
+{
+    LONG64 released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+
+    return (released != 0 && (LONG)((ULONG)released - Packet) >= 0) ? TRUE : FALSE;
+}
+
+_Use_decl_annotations_
+VOID
+CRenderStreamEngine::LoopbackRenderPass(
+    BOOLEAN AtRun
+)
+{
+    PLOOPBACK_RING  ring = m_Loopback;
+    KIRQL           oldIrql;
+    ULONG           current;
+    ULONG           endPacket;
+    ULONGLONG       anchor;
+    BOOLEAN         lookAhead;
+    BOOLEAN         copied = FALSE;
+
+    if (ring == NULL || !m_LbFormat.Valid)
+    {
+        return;
+    }
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Buffer == NULL)
+    {
+        goto exit;
+    }
+
+    if (ring->Owner == NULL)
+    {
+        // Claim the ring: a new run, in this stream's format.
+        ring->Owner = this;
+        ring->RenderFormat = m_LbFormat;
+        ring->RenderActive = FALSE;
+        ring->ValidFrom = 0;
+        ring->WritePos = 0;
+        m_LbAnchorValid = FALSE;
+    }
+    else if (ring->Owner != this)
+    {
+        ring->RenderNotOwner++;
+        goto exit;
+    }
+
+    //
+    // Which packets are final. In the two-packet event-driven mode the client writes packet k+1 while the driver streams
+    // packet k and says so with SetRenderPacket(k+1) (Learn, EVT_ACX_STREAM_SET_RENDER_PACKET); it writes k+2 into k's half
+    // only after AcxRtStreamNotifyPacketComplete(k), which StreamPassCallback calls after this pass. So at the pass completing
+    // k, packet k is final and k+1 is final once released: copying it now puts it in the ring a period before it is
+    // presented. Without SetRenderPacket in this run (or in one-packet mode) each packet is copied as it completes.
+    //
+    lookAhead = (m_PacketsCount == MAX_PACKET_COUNT && InterlockedCompareExchange64(&m_LbReleased, 0, 0) != 0) ? TRUE : FALSE;
+    current = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    if (AtRun)
+    {
+        // Before the first pass only the current packet is in play: the client's pre-roll.
+        endPacket = (lookAhead && LoopbackReleased(current)) ? current + 1 : current;
+    }
+    else
+    {
+        // ProcessPacket runs before the packet count moves on, so current is the completing packet.
+        endPacket = (lookAhead && LoopbackReleased(current + 1)) ? current + 2 : current + 1;
+    }
+
+    //
+    // Anchor this stream on the ring's time line, again whenever its own time line moves (Run after Pause, or a late timer's
+    // glitch adjustment in ScheduleNextPass). A short move later keeps the run and zeros the gap; anything else starts a new
+    // run at the oldest packet still in the buffer.
+    //
+    anchor = LoopbackAnchor();
+    if (!m_LbAnchorValid || anchor != m_LbAnchor)
+    {
+        ULONGLONG   next;
+        ULONGLONG   maxGap = LoopbackHnsToFrames(LOOPBACK_MAX_GAP_HNS, m_LbFormat.SampleRate);
+        BOOLEAN     sameRun = m_LbAnchorValid;
+
+        if (!sameRun && (LONG)(current - m_LbNextPacket) > 0)
+        {
+            m_LbNextPacket = current;
+        }
+
+        next = anchor + (ULONGLONG)m_LbNextPacket * m_LbPacketFrames;
+
+        if (sameRun && next >= ring->WritePos && next - ring->WritePos <= maxGap)
+        {
+            LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL, next - ring->WritePos);
+            ring->RenderGapFills++;
+        }
+        else
+        {
+            ring->ValidFrom = next;
+            ring->RenderRestarts++;
+        }
+
+        ring->WritePos = next;
+        m_LbAnchor = anchor;
+        m_LbAnchorValid = TRUE;
+    }
+
+    //
+    // Packets that left the buffer uncopied (not expected: every packet gets a pass, even in ScheduleNextPass's glitch
+    // path): zeros, to keep the time line.
+    //
+    if ((LONG)(current - m_LbNextPacket) > 0)
+    {
+        ULONG       lost = current - m_LbNextPacket;
+        ULONGLONG   lostFrames = (ULONGLONG)lost * m_LbPacketFrames;
+
+        LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL, MIN(lostFrames, (ULONGLONG)m_LbRingFrames));
+        ring->WritePos += lostFrames;
+        ring->RenderLostPackets += lost;
+        m_LbNextPacket = current;
+    }
+
+    //
+    // Copy the final packets not yet copied, in order, each at its place on the time line.
+    //
+    while ((LONG)(endPacket - m_LbNextPacket) > 0)
+    {
+        ULONG   packetIndex = m_LbNextPacket % m_PacketsCount;
+        PBYTE   packetBuffer = (PBYTE)m_Packets[packetIndex];
+
+        // Packet 0 starts at an offset if the size isn't a multiple of page_size
+        if (packetIndex == 0)
+        {
+            packetBuffer += m_FirstPacketOffset;
+        }
+
+        if (lookAhead && !AtRun && m_LbNextPacket == current)
+        {
+            // Released too late to go a period early: the capture side may run short on it.
+            ring->RenderLatePackets++;
+        }
+
+        LoopbackRingWrite(ring, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, packetBuffer, m_LbPacketFrames);
+        ring->WritePos += m_LbPacketFrames;
+        m_LbNextPacket++;
+        copied = TRUE;
+    }
+
+    ring->RenderLeadFrames = lookAhead ? 0 : m_LbPacketFrames;
+    if (copied)
+    {
+        ring->RenderActive = TRUE;
+    }
+
+exit:
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
+}
+
+_Use_decl_annotations_
+VOID
+CRenderStreamEngine::LoopbackRenderStop(
+    BOOLEAN ReleaseOwnership
+)
+{
+    PLOOPBACK_RING  ring = m_Loopback;
+    KIRQL           oldIrql;
+
+    if (ring == NULL)
+    {
+        return;
+    }
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Owner == this)
+    {
+        ring->RenderActive = FALSE;
+
+        if (ReleaseOwnership)
+        {
+            // RenderFormat and the valid range stay, so the capture side can still read the tail; the next claim resets them.
+            ring->Owner = NULL;
+        }
+    }
+
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
 }
 
 
@@ -875,7 +1296,10 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     _In_    ACXDATAFORMAT   StreamFormat
 )
     : CStreamEngine(Stream, StreamFormat, FALSE, NULL),
-    m_EnableWaveCapture(0)
+    m_EnableWaveCapture(0),
+    m_LbLagFrames(0),
+    m_LbAnchorLead(0),
+    m_LbReadBase(0)
 {
     PAGED_CODE();
 
@@ -901,44 +1325,14 @@ PAGED_CODE_SEG
 NTSTATUS
 CCaptureStreamEngine::PrepareHardware()
 {
-    NTSTATUS                status = STATUS_SUCCESS;
-    PWAVEFORMATEXTENSIBLE   pwfext = NULL;
-
     PAGED_CODE();
 
-    status = CStreamEngine::PrepareHardware();
-    if (!NT_SUCCESS(status))
-    {
-        goto exit;
-    }
-
-    (void)ReadRegistrySettings();
-
-    pwfext = (PWAVEFORMATEXTENSIBLE)AcxDataFormatGetWaveFormatExtensible(m_StreamFormat);
-    if (pwfext == NULL)
-    {
-        // Cannot initialize reader or generator with a format that's not understood
-        status = STATUS_NO_MATCH;
-        ASSERT(FALSE);
-        goto exit;
-    }
-
-    if (m_EnableWaveCapture)
-    {
-        status = m_WaveReader.Init(pwfext, &m_HostCaptureFileName);
-        if (!NT_SUCCESS(status))
-        {
-            m_EnableWaveCapture = FALSE;
-        }
-    }
-
-    if (!m_EnableWaveCapture)
-    {
-        status = m_ToneGenerator.Init(m_ToneFrequency, pwfext);
-    }
-
-exit:
-    return status;
+    //
+    // noise-filter (TODO 19): the capture data comes from the device's loopback ring (LoopbackCapturePass), so the sample's
+    // tone generator and WAV reader are no longer set up (ReadRegistrySettings, m_WaveReader.Init, m_ToneGenerator.Init).
+    // m_EnableWaveCapture stays 0, so ReleaseHardware waits for no WAV work items.
+    //
+    return CStreamEngine::PrepareHardware();
 }
 
 _Use_decl_annotations_
@@ -1000,14 +1394,149 @@ CCaptureStreamEngine::ProcessPacket()
         packetBuffer += m_FirstPacketOffset;
     }
 
-    if (m_EnableWaveCapture)
+    //
+    // noise-filter (TODO 19): the capture half of the loopback pair, in place of the sample's tone generator and WAV reader
+    // (m_ToneGenerator.GenerateSine, m_WaveReader.ReadWaveData).
+    //
+    LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
+}
+
+_Use_decl_annotations_
+PAGED_CODE_SEG
+NTSTATUS
+CCaptureStreamEngine::Run()
+{
+    PAGED_CODE();
+
+    if (m_CurrentState == AcxStreamStatePause)
     {
-        m_WaveReader.ReadWaveData(packetBuffer, m_PacketSize);
+        // The timer is stopped in Pause, so no pass reads these while they change.
+        LoopbackSetFormat();
+
+        // The lag behind the render time line: LOOPBACK_LAG_HNS rounded up to whole frames, plus one for rounding.
+        m_LbLagFrames = m_LbFormat.Valid ?
+            (ULONG)(((ULONGLONG)LOOPBACK_LAG_HNS * m_LbFormat.SampleRate + HNS_PER_SEC - 1) / HNS_PER_SEC) + 1 : 0;
+
+        // Anchor again at the first pass: Run gives this stream a new time line (m_StartTime).
+        m_LbAnchorValid = FALSE;
     }
-    else
+
+    return CStreamEngine::Run();
+}
+
+_Use_decl_annotations_
+VOID
+CCaptureStreamEngine::LoopbackCapturePass(
+    ULONG   Packet,
+    PBYTE   PacketBuffer,
+    ULONG   PacketSize
+)
+{
+    PLOOPBACK_RING  ring = m_Loopback;
+    KIRQL           oldIrql;
+    ULONG           blockAlign = m_LbFormat.BlockAlign;
+    ULONGLONG       anchor;
+    ULONGLONG       readStart;
+    ULONGLONG       readEnd;
+    ULONGLONG       validLo;
+    ULONGLONG       validHi;
+    ULONGLONG       copyLo;
+    ULONGLONG       copyHi;
+
+    if (ring == NULL)
     {
-        m_ToneGenerator.GenerateSine(packetBuffer, m_PacketSize);
+        RtlZeroMemory(PacketBuffer, PacketSize);
+        return;
     }
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Buffer == NULL || !ring->RenderFormat.Valid)
+    {
+        // No render stream has run since the device started (or the device is going away).
+        ring->IdlePackets++;
+        goto zero;
+    }
+
+    if (!LoopbackFormatEqual(&m_LbFormat, &ring->RenderFormat))
+    {
+        // Raw bytes only between identical formats; no conversion in the kernel.
+        ring->MismatchPackets++;
+        goto zero;
+    }
+
+    //
+    // Anchor the read position the lag (plus the render side's lead) behind this stream's own place on the ring's time line,
+    // again whenever that moves (Run, a late timer's glitch adjustment) or the render lead changes. Between anchors it
+    // advances exactly one packet a pass. An underrun or an overrun does not move it: the time line is right, the audio was
+    // just not (or no longer) there.
+    //
+    anchor = LoopbackAnchor();
+    if (!m_LbAnchorValid || anchor != m_LbAnchor || ring->RenderLeadFrames != m_LbAnchorLead)
+    {
+        m_LbAnchor = anchor;
+        m_LbAnchorLead = ring->RenderLeadFrames;
+        m_LbReadBase = anchor - m_LbLagFrames - m_LbAnchorLead;
+        m_LbAnchorValid = TRUE;
+        ring->CaptureAnchors++;
+    }
+
+    readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
+    readEnd = readStart + m_LbPacketFrames;
+
+    // The audio the ring still holds of the current render run.
+    validHi = ring->WritePos;
+    validLo = ring->ValidFrom;
+    if (validHi - validLo > m_LbRingFrames)
+    {
+        validLo = validHi - m_LbRingFrames;
+    }
+
+    copyLo = MAX(readStart, validLo);
+    copyHi = MIN(readEnd, validHi);
+    if (copyLo >= copyHi)
+    {
+        copyLo = readEnd;
+        copyHi = readEnd;
+    }
+
+    if (copyLo > readStart)
+    {
+        RtlZeroMemory(PacketBuffer, (SIZE_T)(copyLo - readStart) * blockAlign);
+    }
+    if (copyHi > copyLo)
+    {
+        LoopbackRingRead(ring, m_LbRingFrames, blockAlign, copyLo,
+                         PacketBuffer + (SIZE_T)(copyLo - readStart) * blockAlign, copyHi - copyLo);
+    }
+    if (readEnd > copyHi)
+    {
+        RtlZeroMemory(PacketBuffer + (SIZE_T)(copyHi - readStart) * blockAlign, (SIZE_T)(readEnd - copyHi) * blockAlign);
+    }
+
+    if (readEnd > validHi)
+    {
+        if (ring->RenderActive)
+        {
+            ring->UnderrunPackets++;
+            ring->UnderrunFrames += readEnd - MAX(readStart, validHi);
+        }
+        else
+        {
+            ring->IdlePackets++;
+        }
+    }
+    if (readStart < validLo && validLo > ring->ValidFrom)
+    {
+        ring->OverrunPackets++;
+    }
+
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
+    return;
+
+zero:
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
+    RtlZeroMemory(PacketBuffer, PacketSize);
 }
 
 _Use_decl_annotations_

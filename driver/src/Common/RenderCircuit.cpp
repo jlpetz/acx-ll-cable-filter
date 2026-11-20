@@ -302,7 +302,6 @@ Render_AllocateSupportedFormats(
     UNREFERENCED_PARAMETER(CodecRenderPinCount);
 
     NTSTATUS status = STATUS_SUCCESS;
-    ACXDATAFORMAT formatPcm44100c2;
     ACXDATAFORMAT formatPcm48000c2;
     ACXDATAFORMATLIST formatList;
 
@@ -314,7 +313,11 @@ Render_AllocateSupportedFormats(
     // Allocate the formats this circuit supports.
     //
 
-    RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm44100c2, Circuit, Device, &formatPcm44100c2));
+    //
+    // noise-filter (TODO 19): one format, the same on both endpoints (Capture_AllocateSupportedFormats), so the loopback
+    // pair's two streams always match and raw bytes can be copied. The sample's 44.1 kHz entry, listed first, is gone
+    // (check 1 found the endpoints running at 44.1 kHz).
+    //
     RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c2, Circuit, Device, &formatPcm48000c2));
 
     ///////////////////////////////////////////////////////////
@@ -335,7 +338,6 @@ Render_AllocateSupportedFormats(
     // The driver uses this DDI to add data formats to the raw
     // processing mode list associated with the current circuit.
     //
-    RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm44100c2));
     RETURN_NTSTATUS_IF_FAILED(AcxDataFormatListAddDataFormat(formatList, formatPcm48000c2));
 
     return status;
