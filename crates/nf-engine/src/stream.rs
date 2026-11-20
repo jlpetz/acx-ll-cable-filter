@@ -59,6 +59,8 @@ pub(crate) fn sample_format(f: &WaveFormat) -> Option<SampleFormat> {
         (SampleType::Float, 32) => Some(SampleFormat::F32),
         (SampleType::Int, 16) => Some(SampleFormat::I16),
         (SampleType::Int, 24) => Some(SampleFormat::I24),
+        // 24 valid bits in a 32-bit container is its own encoding (convert.rs: the low byte padding, written as zero).
+        (SampleType::Int, 32) if f.get_validbitspersample() == 24 => Some(SampleFormat::I24In32),
         (SampleType::Int, 32) => Some(SampleFormat::I32),
         _ => None,
     }
@@ -910,7 +912,9 @@ mod tests {
         assert_eq!(sample_format(&f), Some(SampleFormat::F32));
 
         let s24 = WaveFormat::new(32, 24, &SampleType::Int, 48_000, 2, None);
-        assert_eq!(sample_format(&s24), Some(SampleFormat::I32), "24-in-32 reads as i32");
+        assert_eq!(sample_format(&s24), Some(SampleFormat::I24In32), "24-in-32: its own encoding");
+        let s32 = WaveFormat::new(32, 32, &SampleType::Int, 48_000, 2, None);
+        assert_eq!(sample_format(&s32), Some(SampleFormat::I32));
     }
 
     #[test]
@@ -947,7 +951,7 @@ mod tests {
         }
         assert_eq!(sample_format(&c[0].0), Some(SampleFormat::F32));
         assert_eq!((c[1].0.get_bitspersample(), c[1].0.get_validbitspersample()), (32, 24));
-        assert_eq!(sample_format(&c[1].0), Some(SampleFormat::I32), "24-in-32 is written as i32");
+        assert_eq!(sample_format(&c[1].0), Some(SampleFormat::I24In32), "24-in-32: the low byte padding, written as zero");
         assert_eq!(sample_format(&c[2].0), Some(SampleFormat::I16));
     }
 

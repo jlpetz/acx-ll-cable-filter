@@ -25,7 +25,11 @@ pub(crate) enum SampleFormat {
     I16,
     /// Packed 3-byte samples.
     I24,
-    /// 32-bit integers, including 24-in-32 (valid bits in the high bytes).
+    /// 24 valid bits in a 32-bit container: the sample in the high three bytes, the low byte padding. Written with the low
+    /// byte zero (full scale is 0x7FFFFF00, as WAVEFORMATEXTENSIBLE's layout has it), read with it ignored. Treated as plain
+    /// 32-bit integers before, it was written at 32-bit scale: +1.0 as 0x7FFFFFFF and the padding byte rarely zero.
+    I24In32,
+    /// 32-bit integers, all 32 bits valid.
     I32,
 }
 
@@ -34,7 +38,7 @@ impl SampleFormat {
         match self {
             SampleFormat::I16 => 2,
             SampleFormat::I24 => 3,
-            SampleFormat::F32 | SampleFormat::I32 => 4,
+            SampleFormat::F32 | SampleFormat::I24In32 | SampleFormat::I32 => 4,
         }
     }
 }
@@ -65,6 +69,7 @@ pub(crate) fn to_mono(format: SampleFormat, channels: usize, src: &[u8], dst: &m
         (SampleFormat::F32, c) => downmix_generic::<4>(c, src, dst, f32::from_le_bytes),
         (SampleFormat::I16, c) => downmix_generic::<2>(c, src, dst, |b| i16::from_le_bytes(b) as f32 * I16_SCALE),
         (SampleFormat::I24, c) => downmix_generic::<3>(c, src, dst, |b| i32::from_le_bytes([0, b[0], b[1], b[2]]) as f32 * I32_SCALE),
+        (SampleFormat::I24In32, c) => downmix_generic::<4>(c, src, dst, |b| (i32::from_le_bytes(b) & !0xFF) as f32 * I32_SCALE),
         (SampleFormat::I32, c) => downmix_generic::<4>(c, src, dst, |b| i32::from_le_bytes(b) as f32 * I32_SCALE),
     }
     frames
@@ -93,6 +98,7 @@ pub(crate) fn from_mono(format: SampleFormat, channels: usize, src: &[f32], dst:
             let b = (scaled(x, I24_FULL) as i32).min(8_388_607).to_le_bytes();
             [b[0], b[1], b[2]]
         }),
+        (SampleFormat::I24In32, c) => upmix_generic::<4>(c, src, dst, |x| ((scaled(x, I24_FULL) as i32).min(8_388_607) << 8).to_le_bytes()),
         (SampleFormat::I32, c) => upmix_generic::<4>(c, src, dst, |x| (scaled(x, I32_FULL) as i32).to_le_bytes()),
     }
     frames
@@ -336,7 +342,7 @@ mod tests {
         from_mono(SampleFormat::I24, 1, &[1.0, -1.0], &mut b24);
         assert_eq!(b24, [0xFF, 0xFF, 0x7F, 0x00, 0x00, 0x80], "24-bit: the top step, and -full scale exactly");
 
-        for fmt in [SampleFormat::I16, SampleFormat::I24, SampleFormat::I32, SampleFormat::F32] {
+        for fmt in [SampleFormat::I16, SampleFormat::I24, SampleFormat::I24In32, SampleFormat::I32, SampleFormat::F32] {
             let src = [0.5f32, -0.25, 0.0];
             let mut bytes = vec![0u8; src.len() * fmt.bytes() * 3];
             from_mono(fmt, 3, &src, &mut bytes);
@@ -346,6 +352,33 @@ mod tests {
                 assert!((a - b).abs() < 1e-4, "{fmt:?}: {a} vs {b}");
             }
         }
+    }
+
+    /// 24-in-32 (our driver's integer format; most hardware's): the 24-bit value in the high three bytes and the padding
+    /// byte zero, so +1.0 is 0x7FFFFF00 (it was 0x7FFFFFFF, at 32-bit scale) and +0.1 has no stray low byte (it was
+    /// 0x0CCCCCD0); every 24-bit value read and written again comes back exactly; a padding byte read is ignored.
+    #[test]
+    fn twenty_four_in_thirty_two_keeps_the_padding_byte_zero() {
+        let mut b = [0u8; 12];
+        from_mono(SampleFormat::I24In32, 1, &[1.0, -1.0, 0.1], &mut b);
+        let v: Vec<u32> = b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+        assert_eq!(v[..2], [0x7FFF_FF00, 0x8000_0000]);
+        assert_eq!(v[2], ((0.1f32 * I24_FULL).round_ties_even() as u32) << 8);
+        assert_eq!(v[2] & 0xFF, 0, "no stray low byte");
+        let all24: Vec<i32> = (-8_388_608..8_388_608).step_by(991).chain([8_388_607]).collect();
+        for ch in [1usize, 2] {
+            let bytes: Vec<u8> = all24.iter().flat_map(|v| std::iter::repeat_n((v << 8).to_le_bytes(), ch)).flatten().collect();
+            let mut mono = vec![0.0f32; all24.len()];
+            to_mono(SampleFormat::I24In32, ch, &bytes, &mut mono);
+            let mut out = vec![0u8; bytes.len()];
+            from_mono(SampleFormat::I24In32, ch, &mono, &mut out);
+            assert!(out == bytes, "{ch} ch: a 24-in-32 sample changed on the way through");
+        }
+        let mut noisy = [0u8; 4];
+        noisy.copy_from_slice(&((1_000i32 << 8) | 0x7F).to_le_bytes());
+        let mut back = [0.0f32];
+        to_mono(SampleFormat::I24In32, 1, &noisy, &mut back);
+        assert_eq!(back[0], (1_000i32 << 8) as f32 * I32_SCALE, "the padding byte is ignored");
     }
 
     /// Exclusive mode's 16-bit path (VB-CABLE takes nothing else there): every 16-bit value read from a device and written
