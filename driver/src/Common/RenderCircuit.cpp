@@ -320,8 +320,8 @@ Render_AllocateSupportedFormats(
     // in float32 and the filter's exclusive output writes float with no conversion), and 24-in-32 after it. The integer
     // format has to be there: with float32 alone the circuit's KSCATEGORY_AUDIO interfaces were never enabled and no
     // endpoints appeared, silently (no event, the device OK; 2026-11-20). Both endpoints list the same formats in the
-    // same order, so their shared streams always match and the loopback copies raw bytes; an exclusive client that
-    // picks 24-in-32 on one end only gets zeros from the loopback (counted).
+    // same order, so their shared streams always match and the loopback copies raw bytes; a stream in a format other than
+    // one open on the other end is refused at creation (STATUS_NOT_SUPPORTED, LoopbackStreamOpen).
     //
     RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Float48000c2, Circuit, Device, &formatFloat48000c2));
     RETURN_NTSTATUS_IF_FAILED(AllocateFormat(Pcm48000c2_24in32, Circuit, Device, &formatPcm48000c2_24in32));
@@ -710,10 +710,19 @@ Return Value:
     PCODEC_PIN_CONTEXT              pinCtx;
     ACX_PIN_TYPE                    pinType;
     CODEC_RENDER_CIRCUIT_CONTEXT*   circuitCtx;
+    PLOOPBACK_RING                  lbRing;
+    PLOOPBACK_RING                  lbOpen = nullptr;
+    LOOPBACK_FORMAT                 lbFormat = {};
 
-    auto streamEngineScope = scope_exit([&renderStreamEngine]() {
+    auto streamEngineScope = scope_exit([&renderStreamEngine, &lbOpen, &lbFormat]() {
 
         delete renderStreamEngine;
+
+        // noise-filter (TODO 19): a creation that fails after LoopbackStreamOpen gives the record back.
+        if (lbOpen != nullptr)
+        {
+            LoopbackStreamClose(lbOpen, TRUE, &lbFormat);
+        }
 
         });
 
@@ -766,6 +775,19 @@ Return Value:
     AcxStreamInitSetAcxRtStreamSupportsNotifications(StreamInit);
 
     //
+    // noise-filter (TODO 19): refuse a format other than one the capture circuit has open (LoopbackStreamOpen), so the
+    // client can retry with that format rather than open onto a loopback that only zero-fills. Before the stream exists, so
+    // a refusal leaves nothing to undo; the stream engine takes the record over below.
+    //
+    lbRing = LoopbackRingOfCircuit(Circuit);
+    if (lbRing != nullptr)
+    {
+        LoopbackFormatOf(StreamFormat, &lbFormat);
+        RETURN_NTSTATUS_IF_FAILED(LoopbackStreamOpen(lbRing, TRUE, &lbFormat));
+        lbOpen = lbRing;
+    }
+
+    //
     // Create the stream.
     //
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, STREAMENGINE_CONTEXT);
@@ -778,6 +800,12 @@ Return Value:
     //
     renderStreamEngine = new (POOL_FLAG_NON_PAGED, DeviceDriverTag) CRenderStreamEngine(stream, StreamFormat, FALSE, NULL);
     RETURN_NTSTATUS_IF_TRUE(renderStreamEngine == nullptr, STATUS_INSUFFICIENT_RESOURCES);
+
+    if (lbOpen != nullptr)
+    {
+        renderStreamEngine->LoopbackAdoptOpen(lbOpen, TRUE, &lbFormat);
+        lbOpen = nullptr;
+    }
 
     streamCtx = GetStreamEngineContext(stream);
     ASSERT(streamCtx);

@@ -63,25 +63,22 @@ CStreamEngine::CStreamEngine(
 
     //
     // noise-filter (TODO 19): find the device's loopback ring. The stream's circuit belongs to our one WDFDEVICE
-    // (AcxStreamGetCircuit, acxstreams.h:839; AcxCircuitGetWdfDevice, acxcircuit.h:1290; both up to DISPATCH_LEVEL).
-    // The pointer is kept: the device context outlives the stream (inference: the stream descends from the device).
+    // (AcxStreamGetCircuit, acxstreams.h:839, up to DISPATCH_LEVEL; then LoopbackRingOfCircuit). The pointer is kept: the
+    // device context outlives the stream (inference: the stream descends from the device).
     //
-    m_Loopback = NULL;
     RtlZeroMemory(&m_LbFormat, sizeof(m_LbFormat));
     m_LbPacketFrames = 0;
     m_LbRingFrames = 0;
     m_LbAnchor = 0;
     m_LbAnchorValid = FALSE;
+    m_LbOpenRing = NULL;
+    m_LbOpenRender = FALSE;
+    RtlZeroMemory(&m_LbOpenFormat, sizeof(m_LbOpenFormat));
 
     {
-        ACXCIRCUIT              circuit = AcxStreamGetCircuit(Stream);
-        WDFDEVICE               device = (circuit != NULL) ? AcxCircuitGetWdfDevice(circuit) : NULL;
-        PCODEC_DEVICE_CONTEXT   devCtx = (device != NULL) ? GetCodecDeviceContext(device) : NULL;
+        ACXCIRCUIT circuit = AcxStreamGetCircuit(Stream);
 
-        if (devCtx != NULL)
-        {
-            m_Loopback = &devCtx->Loopback;
-        }
+        m_Loopback = (circuit != NULL) ? LoopbackRingOfCircuit(circuit) : NULL;
     }
 }
 
@@ -90,6 +87,29 @@ PAGED_CODE_SEG
 CStreamEngine::~CStreamEngine()
 {
     PAGED_CODE();
+
+    // noise-filter (TODO 19): this stream is no longer open on its circuit (LoopbackStreamOpen's record).
+    if (m_LbOpenRing != NULL)
+    {
+        LoopbackStreamClose(m_LbOpenRing, m_LbOpenRender, &m_LbOpenFormat);
+        m_LbOpenRing = NULL;
+    }
+}
+
+_Use_decl_annotations_
+PAGED_CODE_SEG
+VOID
+CStreamEngine::LoopbackAdoptOpen(
+    PLOOPBACK_RING          Ring,
+    BOOLEAN                 Render,
+    const LOOPBACK_FORMAT * Format
+)
+{
+    PAGED_CODE();
+
+    m_LbOpenRing = Ring;
+    m_LbOpenRender = Render;
+    m_LbOpenFormat = *Format;
 }
 
 _Use_decl_annotations_
@@ -769,6 +789,22 @@ LoopbackHnsToFrames(
     return (Hns / HNS_PER_SEC) * SampleRate + ((Hns % HNS_PER_SEC) * SampleRate) / HNS_PER_SEC;
 }
 
+// The same sample layout (Valid not compared).
+static
+BOOLEAN
+LoopbackFormatSame(
+    _In_ const LOOPBACK_FORMAT* A,
+    _In_ const LOOPBACK_FORMAT* B
+)
+{
+    return (A->SampleRate == B->SampleRate &&
+            A->Channels == B->Channels &&
+            A->BitsPerSample == B->BitsPerSample &&
+            A->ValidBitsPerSample == B->ValidBitsPerSample &&
+            A->BlockAlign == B->BlockAlign &&
+            RtlEqualMemory(&A->SubFormat, &B->SubFormat, sizeof(GUID))) ? TRUE : FALSE;
+}
+
 static
 BOOLEAN
 LoopbackFormatEqual(
@@ -776,14 +812,140 @@ LoopbackFormatEqual(
     _In_ const LOOPBACK_FORMAT* B
 )
 {
-    return (A->Valid &&
-            B->Valid &&
-            A->SampleRate == B->SampleRate &&
-            A->Channels == B->Channels &&
-            A->BitsPerSample == B->BitsPerSample &&
-            A->ValidBitsPerSample == B->ValidBitsPerSample &&
-            A->BlockAlign == B->BlockAlign &&
-            RtlEqualMemory(&A->SubFormat, &B->SubFormat, sizeof(GUID))) ? TRUE : FALSE;
+    return (A->Valid && B->Valid && LoopbackFormatSame(A, B)) ? TRUE : FALSE;
+}
+
+_Use_decl_annotations_
+PLOOPBACK_RING
+LoopbackRingOfCircuit(
+    ACXCIRCUIT  Circuit
+)
+{
+    // AcxCircuitGetWdfDevice: acxcircuit.h:1290, up to DISPATCH_LEVEL.
+    WDFDEVICE               device = AcxCircuitGetWdfDevice(Circuit);
+    PCODEC_DEVICE_CONTEXT   devCtx = (device != NULL) ? GetCodecDeviceContext(device) : NULL;
+
+    return (devCtx != NULL) ? &devCtx->Loopback : NULL;
+}
+
+_Use_decl_annotations_
+VOID
+LoopbackFormatOf(
+    ACXDATAFORMAT       DataFormat,
+    PLOOPBACK_FORMAT    Format
+)
+{
+    RtlZeroMemory(Format, sizeof(*Format));
+
+    // The AcxDataFormatGet* calls: acxdataformat.h, up to DISPATCH_LEVEL.
+    Format->SampleRate = AcxDataFormatGetSampleRate(DataFormat);
+    Format->Channels = AcxDataFormatGetChannelsCount(DataFormat);
+    Format->BitsPerSample = AcxDataFormatGetBitsPerSample(DataFormat);
+    Format->ValidBitsPerSample = AcxDataFormatGetValidBitsPerSample(DataFormat);
+    Format->BlockAlign = AcxDataFormatGetBlockAlign(DataFormat);
+    Format->SubFormat = AcxDataFormatGetSubFormat(DataFormat);
+}
+
+//
+// The creation-time check. The loopback copies raw bytes, so a render and a capture stream in different formats would give the
+// capture client silence (LoopbackCapturePass's zero-fill, counted in MismatchPackets) while both opened successfully. Instead
+// the second of the two is refused here, at creation, so its client can retry with the format the other end has. The check
+// and the record are one locked step, so two creations on the two circuits cannot both pass with different formats.
+//
+_Use_decl_annotations_
+NTSTATUS
+LoopbackStreamOpen(
+    PLOOPBACK_RING          Ring,
+    BOOLEAN                 Render,
+    const LOOPBACK_FORMAT * Format
+)
+{
+    PLOOPBACK_OPEN  own = Render ? Ring->RenderOpen : Ring->CaptureOpen;
+    PLOOPBACK_OPEN  other = Render ? Ring->CaptureOpen : Ring->RenderOpen;
+    PLOOPBACK_OPEN  slot = NULL;
+    NTSTATUS        status = STATUS_SUCCESS;
+    KIRQL           oldIrql;
+    ULONG           i;
+
+    KeAcquireSpinLock(&Ring->Lock, &oldIrql);
+
+    for (i = 0; i < LOOPBACK_OPEN_FORMATS; i++)
+    {
+        if (other[i].Count != 0 && !LoopbackFormatSame(&other[i].Format, Format))
+        {
+            status = STATUS_NOT_SUPPORTED;
+            goto exit;
+        }
+    }
+
+    // This format's slot on this circuit, else a free one.
+    for (i = 0; i < LOOPBACK_OPEN_FORMATS; i++)
+    {
+        if (own[i].Count != 0 && LoopbackFormatSame(&own[i].Format, Format))
+        {
+            slot = &own[i];
+            break;
+        }
+        if (own[i].Count == 0 && slot == NULL)
+        {
+            slot = &own[i];
+        }
+    }
+
+    if (slot == NULL)
+    {
+        // More formats open on this circuit at once than it lists (not expected: ACX takes only listed formats).
+        status = STATUS_NOT_SUPPORTED;
+        goto exit;
+    }
+
+    if (slot->Count == 0)
+    {
+        slot->Format = *Format;
+    }
+    slot->Count++;
+
+exit:
+    if (!NT_SUCCESS(status))
+    {
+        Ring->RefusedOpens++;
+    }
+
+    KeReleaseSpinLock(&Ring->Lock, oldIrql);
+
+    return status;
+}
+
+_Use_decl_annotations_
+VOID
+LoopbackStreamClose(
+    PLOOPBACK_RING          Ring,
+    BOOLEAN                 Render,
+    const LOOPBACK_FORMAT * Format
+)
+{
+    PLOOPBACK_OPEN  own = Render ? Ring->RenderOpen : Ring->CaptureOpen;
+    BOOLEAN         found = FALSE;
+    KIRQL           oldIrql;
+    ULONG           i;
+
+    KeAcquireSpinLock(&Ring->Lock, &oldIrql);
+
+    for (i = 0; i < LOOPBACK_OPEN_FORMATS; i++)
+    {
+        if (own[i].Count != 0 && LoopbackFormatSame(&own[i].Format, Format))
+        {
+            own[i].Count--;
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&Ring->Lock, oldIrql);
+
+    // Every close matches an open (LoopbackAdoptOpen, or the creating callback's own clean-up).
+    ASSERT(found);
+    DBG_UNREFERENCED_LOCAL_VARIABLE(found);
 }
 
 // Writes Frames frames from Source (NULL: zeros) at ring frame Frame, splitting at the wrap. Ring lock held.
@@ -856,14 +1018,7 @@ CStreamEngine::LoopbackSetFormat()
 
     PAGED_CODE();
 
-    RtlZeroMemory(&format, sizeof(format));
-
-    format.SampleRate = AcxDataFormatGetSampleRate(m_StreamFormat);
-    format.Channels = AcxDataFormatGetChannelsCount(m_StreamFormat);
-    format.BitsPerSample = AcxDataFormatGetBitsPerSample(m_StreamFormat);
-    format.ValidBitsPerSample = AcxDataFormatGetValidBitsPerSample(m_StreamFormat);
-    format.BlockAlign = AcxDataFormatGetBlockAlign(m_StreamFormat);
-    format.SubFormat = AcxDataFormatGetSubFormat(m_StreamFormat);
+    LoopbackFormatOf(m_StreamFormat, &format);
 
     //
     // The ring's positions are frames on the QPC time line, so this stream's byte clock (GetBytesPerSecond, which
@@ -1484,7 +1639,10 @@ CCaptureStreamEngine::LoopbackCapturePass(
 
     if (!LoopbackFormatEqual(&m_LbFormat, &ring->RenderFormat))
     {
-        // Raw bytes only between identical formats; no conversion in the kernel.
+        // Raw bytes only between identical formats; no conversion in the kernel. Creation refuses a format the other circuit
+        // has open (LoopbackStreamOpen), so this zero-fill is the fallback for what that leaves: the tail of a render run whose
+        // stream has closed (RenderFormat is kept) read in another format before a new render stream claims the ring, or a
+        // stream that failed LoopbackSetFormat's checks.
         ring->MismatchPackets++;
         goto zero;
     }
