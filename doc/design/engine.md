@@ -67,7 +67,8 @@ Once, when the thread starts:
 1. `initialize_mta` (a failure fails each run it's given);
 2. `AvSetMmThreadCharacteristicsW("Pro Audio")` (record failure in the status and continue);
 3. **no FTZ/DAZ** (Rust treats a persistent MXCSR change as UB): instead add `nf_core::rt::Dither` at
-   1e-9 (about -180 dBFS) to every mic block and every reference block, zero-filled gaps included.
+   1e-9 (about -180 dBFS) to every mic block and every reference block, zero-filled gaps included; sonora 0.3.0 sets them inside
+   each of its own calls and restores them (sonora-nnnoiseless.md 1.11).
    That prevents sonora's denormal stall (sonora #34) and denormals in RNNoise's high-pass on exact
    digital silence;
 4. `audio::prepare_rt_thread()`: `nf_stages::warm_up_fft_thread()` first, so easyfft's leaked state

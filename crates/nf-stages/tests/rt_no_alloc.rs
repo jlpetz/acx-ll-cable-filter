@@ -190,7 +190,7 @@ fn the_aec3_chain_does_not_allocate_after_build() {
     // sonora 0.3.0's echo canceller allocates nothing per block (its PR #40; 0.2.0 made about 43). Its filters' buffers are
     // sized for the longest filter when it's built, so their growth (12 to 13 partitions) once AEC3 leaves its initial state
     // (2.5 s of active far end) allocates nothing either: the count runs from the first block to 12 s, through every gate
-    // mode and with the meters on and off, as in the RNNoise test.
+    // mode and with the meters on and off.
     let s = signals(6);
     let c = controls(ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() });
     let mut chain = build_chain(c.clone(), true).expect("chain");

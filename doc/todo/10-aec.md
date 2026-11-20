@@ -27,7 +27,7 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
     render call per capture call), so the headroom fix doesn't show offline; it may live, after loopback gaps.
   - **CPU:** AEC3 p50 49.5 → 47.0 µs a block, the chain with AEC3 87.4 → 84.8 (medians of 5 alternated runs). The
     undithered zero-reference row, sonora #34's stall, went from 674 to 46 µs: sonora's own FTZ/DAZ.
-  - **FTZ/DAZ:** each call sets MXCSR's FTZ and DAZ bits if they're clear and restores the thread's word on return, also on
+  - **FTZ/DAZ:** each call sets MXCSR's FTZ and DAZ bits unless both are already set and restores the thread's word on return, also on
     a panic. sonora's docs call it formally undefined behaviour in Rust, as upstream's guard, nih-plug and `no_denormals`
     are. It is scoped to sonora's calls; our rule is against a *persistent* change (nf-engine's `audio.rs`), and
     `tests/aec3.rs` (`aec3_leaves_the_thread_s_mxcsr_as_it_found_it`) checks that nothing persists. Our proposal: keep the

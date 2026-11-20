@@ -253,7 +253,7 @@ an `AtomicU32`. AEC3's clock-drift flag isn't exposed.
 That's about 43 allocations and frees per frame, with all-Rust `Vec`s through the global allocator.
 The render call itself doesn't allocate. Upstream PR #40 (open) makes steady-state AEC allocation-free.
 **(GitHub)** Until then, sonora on the DSP thread depends on our TLSF global-allocator router.
-**0.3.0 (2026-11-20) ships PR #40: no allocation per block, measured (1.11).**
+**0.3.0 (released 2026-11-07; our pin since 2026-11-20) ships sonora #40: no allocation per block, measured (1.11).**
 
 Other per-call allocations, all off for us: the stereo downmix (`S/audio_buffer.rs:230`), AGC2
 (`S/gain_controller2.rs:110-111, 264, 313-331`), the residual echo detector queue
@@ -352,7 +352,7 @@ changes up to M156. Our code compiled unchanged. Paths below are under `sonora-0
   (`subtractor.rs:150-164`), so the `resize`s in `adaptive_fir_filter.rs:271, 371` don't allocate. **(inferred)** for the
   sizing; the count is measured.
 - **Denormals (1.10):** each `process_*` call holds a `DenormalDisabler` (`denormal_disabler.rs`, used in
-  `audio_processing_impl.rs:350, 388, 429, 478`): it sets MXCSR FTZ and DAZ if they're clear and restores the saved word on
+  `audio_processing_impl.rs:350, 388, 429, 478`): it sets MXCSR FTZ and DAZ unless both are already set and restores the saved word on
   drop, also when unwinding. Its own docs state the caveats: formally undefined behaviour in Rust, LLVM may move float
   operations across the guard, and code reached from inside the call (the global allocator, `tracing` subscribers, the
   panic hook) runs with FTZ. Measured: the undithered zero-reference row went from 674 to 46 µs a block; the thread's
