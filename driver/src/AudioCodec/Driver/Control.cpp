@@ -473,6 +473,8 @@ NfVmic_Attach(
     ring->HistoryLeadFrames = 0;
     ring->HistoryFrom = 0;
     ring->HistoryEnd = 0;
+    ring->HistoryGapNext = 0;
+    RtlZeroMemory(ring->HistoryGaps, sizeof(ring->HistoryGaps));
     ring->Stats.Attaches++;
 
     // The driver's line, zeroed, then ATTACHED: the app's sign, with ERROR_IO_PENDING, that the ring is live.

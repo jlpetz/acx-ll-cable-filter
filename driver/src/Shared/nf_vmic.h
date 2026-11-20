@@ -85,11 +85,15 @@ The ring's rules:
     - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one paused). Only
       the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of the packets it
       delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture stream running
-      in 48 kHz float32 stereo plays that copy a fixed lag behind: the reader's packet plus 1 ms and a frame. The audio
-      engine runs one device stream per processing mode, so a RAW client and a DEFAULT one make two capture streams, and
-      both hear the ring. The other streams' passes are counted in NF_VMIC_STATS only (NotReaderPackets,
-      SecondaryFramesCopied, SecondaryUnderrunFrames). A handoff (the reader pauses and another stream takes the slot)
-      can skip or repeat up to that lag once in the other streams, and leave a short gap of silence in them.
+      in 48 kHz float32 stereo plays that copy a fixed lag behind: the reader's packet plus 1 ms and a frame. More than one
+      capture stream can run at once: the microphones of two of the driver's devices share the one app ring, and the audio
+      engine can open a device stream per processing mode should the capture pin list more than RAW (it lists only RAW).
+      The other streams' passes are counted in NF_VMIC_STATS only (NotReaderPackets, SecondaryFramesCopied,
+      SecondaryUnderrunFrames). A handoff (the reader pauses and another stream takes the slot) can skip or repeat up to
+      that lag once in the other streams, and leave a short gap of silence in them. A jump in a stream's time line (a late
+      timer's glitch adjustment, Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses) moves the copy's audio by its length: the
+      reader's inserts that much silence in the other streams (its own output doesn't show it), another stream's skips
+      that much of the copy.
     - While a ring is attached, creating a capture stream in any format other than 48 kHz float32 stereo fails with
       STATUS_NOT_SUPPORTED (counted in RefusedCaptureOpens; an exclusive-mode client can retry in float32). An ATTACH while
       such a stream is open fails the same way (counted in FormatRejects; the refusals above). The check and the publish (or
@@ -151,8 +155,8 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
       60     4  Reserved0
       64   128  Ring                     NF_VMIC_RING_STATS
      192    96  Loopback                 NF_VMIC_LOOPBACK_STATS (valid with NF_VMIC_STATS_LOOPBACK)
-     288     8  SecondaryFramesCopied    frames of the reader's copy delivered to capture streams other than the reader
-     296     8  SecondaryUnderrunFrames  frames such a stream zero-filled because the copy didn't hold its position
+     288     8  SecondaryFramesCopied    frames of the ring's audio delivered to capture streams other than the reader
+     296     8  SecondaryUnderrunFrames  frames such a stream zero-filled because the ring's audio for its position wasn't there
      304    16  Reserved1
      320   256  Stream[2]                NF_VMIC_STREAM_STATS: [NF_VMIC_KIND_RENDER], [NF_VMIC_KIND_CAPTURE]
 
@@ -161,12 +165,15 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
     header agree. While no stream holds the slot all three are 0. A stream in another format holds the slot without reading:
     FORMAT_MISMATCH, and PacketFrames in its own format's frames (0 if the driver can't count its packet in frames).
 
-    The other capture streams (the ring's rules): SecondaryFramesCopied counts frames copied from the reader's copy into their
-    packets, the reader's underrun silence included (that is what the reader delivered; the ring's UnderrunFrames counts it).
-    SecondaryUnderrunFrames counts frames they zero-filled because the copy didn't hold their position: no reader pass in
-    the ring's format has covered it yet (the start of an attachment, a handoff, a reader in another format), or their lag
-    and packet exceed the copy (0.68 s). A stream other than the reader in another format gets silence, counted in the
-    ring's MismatchPackets. Ring.NotReaderPackets counts all their passes.
+    The other capture streams (the ring's rules): SecondaryFramesCopied counts frames the reader delivered, copied into
+    their packets from the reader's copy, its underrun silence included (the ring's UnderrunFrames counts that).
+    SecondaryUnderrunFrames counts the frames of silence they got because no reader delivered audio for their position: no
+    reader pass in the ring's format has reached it yet (the start of an attachment, a reader in another format), the
+    reader's time line jumped past it (a handoff, or a glitch adjustment: the copy holds silence there), or their lag and
+    packet exceed the copy (0.68 s). The driver remembers the latest 16 such jumps, which covers a 10 ms stream beside a
+    2 ms reader that jumps at every pass; beyond that, the older ones' silence counts as copied. A stream other than the
+    reader in another format gets silence, counted in the ring's MismatchPackets. Ring.NotReaderPackets counts all their
+    passes.
 
     NF_VMIC_STREAM_STATS (128 bytes), per stream kind: TimerPasses (passes the stream's timer started), GlitchPasses (passes
     run at once because the next was already due: each is one glitch adjustment of the stream's time line), GlitchHns (their

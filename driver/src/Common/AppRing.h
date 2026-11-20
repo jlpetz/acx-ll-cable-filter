@@ -35,6 +35,20 @@ Environment:
 #define NF_APP_HISTORY_BYTES    (NF_APP_HISTORY_FRAMES * NF_VMIC_FRAME_BYTES)
 
 //
+// The latest gaps in the reader's copy (NF_APP_RING.HistoryGaps): silence the copy holds where the reader's time line jumped
+// later (a glitch adjustment, a handoff), which the other streams count as underruns, not as the ring's audio. A whole reader
+// packet follows each gap, so at most (its packet + its timer's lateness + the lag) / the reader's packet + 1 gaps end after
+// the start of another stream's read: 11 for a 10 ms stream (lateness under 10 ms) beside a 2 ms reader (the shortest packet,
+// PacketSize.cpp) whose time line jumps at every pass. Should more than 16 do, the older ones' silence counts as copied.
+//
+#define NF_APP_HISTORY_GAPS     16u
+
+typedef struct _NF_APP_HISTORY_GAP {
+    ULONGLONG               From;                   // [From, End), frames on the time line; [0, 0) when unused
+    ULONGLONG               End;
+} NF_APP_HISTORY_GAP, *PNF_APP_HISTORY_GAP;
+
+//
 // The one app ring. A global (non-paged .bss, zeroed by the loader) rather than either device's context: the capture streams
 // (under the PnP device) and the control device's callbacks both reach it, and it outlives both, since the image stays loaded
 // while any device object exists. Every field, and g_NfAppHistory, is guarded by Lock, a spin lock: the capture timer's DPC and
@@ -77,6 +91,8 @@ typedef struct _NF_APP_RING {
     ULONG                   HistoryLeadFrames;      // the packet of the reader that wrote last, in frames (0: none yet)
     ULONGLONG               HistoryFrom;            // [HistoryFrom, HistoryEnd) is the current run (only its last
     ULONGLONG               HistoryEnd;             // NF_APP_HISTORY_FRAMES held)
+    ULONG                   HistoryGapNext;         // the entry of HistoryGaps the next gap fills (modulo NF_APP_HISTORY_GAPS)
+    NF_APP_HISTORY_GAP      HistoryGaps[NF_APP_HISTORY_GAPS];   // the current run's latest gaps, cleared with each new run
 
     // Capture streams open (EvtCircuitCreateStream to the stream engine's destruction) in a format other than the ring's, on
     // every device: ATTACH is refused while this isn't 0, and no such stream is created while a ring is attached.
