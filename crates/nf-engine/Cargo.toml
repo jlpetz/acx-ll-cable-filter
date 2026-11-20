@@ -41,3 +41,7 @@ windows = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Time",
 ] }
+
+[dev-dependencies]
+# tests/dither_matrix (TODO 10): its JSON lines.
+serde_json.workspace = true

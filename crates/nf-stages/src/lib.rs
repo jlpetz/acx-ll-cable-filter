@@ -27,6 +27,10 @@ pub mod synth;
 pub use aec3::{AEC3_DESCRIPTOR, AEC3_LATENCY, Aec3Stage};
 pub use rnnoise::{MAKER_POLL, RNNOISE_INFO, RNNOISE_LATENCY, RnnoiseModel, SPARES, rnnoise_stage};
 
+/// Whether sonora's FTZ/DAZ guard is built in (this crate's `sonora-denormal-guard` feature, TODO 10), for a harness in a crate
+/// that can't see this crate's features (nf-engine's `tests/dither_matrix`).
+pub const SONORA_DENORMAL_GUARD: bool = cfg!(feature = "sonora-denormal-guard");
+
 /// Builds this thread's easyfft state (FFT planners and scratch, which easyfft leaks per thread by
 /// design) so it lands on the system heap rather than the locked pool. Call it on the audio thread
 /// *before* `nf_mem::RtScope::enter()`; the noise stage's `activate` still warms up, but then finds the

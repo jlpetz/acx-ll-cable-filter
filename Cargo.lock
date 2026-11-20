@@ -366,6 +366,7 @@ dependencies = [
  "nf-ort",
  "nf-stages",
  "rtrb",
+ "serde_json",
  "wasapi",
  "windows",
 ]
