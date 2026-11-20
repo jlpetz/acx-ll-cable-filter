@@ -78,7 +78,7 @@ Runtime notes:
   - **Workaround until those merge:** FTZ/DAZ on the DSP thread plus ~1e-9 dither on the reference. The stall is mostly an Intel problem.
   - **Cost:** about 45 µs per 10 ms frame on an i9-14900K with denormals handled.
 - **AEC3 behaviour:** 10 ms frames and 4 ms internal blocks. The delay-estimation window is about 608 ms by default (our calculation from the code). It detects clock drift but doesn't resample.
-- **AEC3 latency:** at 48 kHz (sonora 0.2.0, `Rate48kHz`) the capture output lags the mic by 430 samples (8.96 ms), measured with an impulse and GCC-PHAT (`nf_stages::AEC3_LATENCY`, `crates/nf-stages/tests/aec3.rs`). Reading the code gave about 4.5 ms, which is too low (`doc/dev/api/sonora-nnnoiseless.md` 1.8).
+- **AEC3 latency:** at 48 kHz (sonora 0.2.0, `Rate48kHz`; 0.3.0 the same, 2026-11-20) the capture output lags the mic by 430 samples (8.96 ms), measured with an impulse and GCC-PHAT (`nf_stages::AEC3_LATENCY`, `crates/nf-stages/tests/aec3.rs`). Reading the code gave about 4.5 ms, which is too low (`doc/dev/api/sonora-nnnoiseless.md` 1.8).
 - **Ruled out:**
   - tonarino `webrtc-audio-processing` doesn't build on MSVC (PR #102 open).
   - SpeexDSP MDF has no delay estimator and is linear only.

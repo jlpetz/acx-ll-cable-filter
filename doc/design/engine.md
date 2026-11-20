@@ -156,8 +156,8 @@ error and stop):
      `devices --check` do, before they stop);
    - publish `rt_heap_allocations = thread_scope_fallbacks() - baseline` (must stay 0; log once,
      from the control thread, if it grows) and `rt_pool_allocations_per_s` (the per-second growth of
-     `thread_scope_allocs()`; nonzero with AEC3, because sonora 0.2.0 allocates per block, served
-     O(1) from the locked pool).
+     `thread_scope_allocs()`; 0 with the built-in stages since sonora 0.3.0, whose AEC3 allocates
+     nothing per block; 0.2.0's made about 43 a block, served O(1) from the locked pool).
 
 Never allocate, lock, log or make blocking calls inside the loop:
 - Telemetry goes through atomics.
