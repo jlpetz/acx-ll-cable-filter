@@ -501,6 +501,14 @@ handling. Our reading (the owner's go for items 2 and 3, 2026-11-03):
     built 2026-11-03. It measures rather than predicts, so it holds whatever the stamps mean. Live on the cables
     (2026-11-04) a 5 ms echo's far-only turns went from 22 to 59 dB at a 20 ms wait, a 10 ms echo's to 59 dB at 10 ms.
 
+## Short packet path (2026-11-20, ours, pending the owner)
+An outside review proposed processing each mic packet as it arrives, instead of in 480-frame blocks, when no stage is
+block-bound: echo cancelling and the noise filter both off. It saves the block's fill wait (6.67 ms with a 3.33 ms mic),
+but only in that bypass state. Not built: it isn't quick (the owner: "If it's quick just do it and tick it off"). It is
+about 750-850 changed lines with a restart at the noise toggle (option A), or 950-1050 with a live switch (option B), and
+the toggle gets worse in that state either way. Our recommendation is not now; the owner decides. The design, the
+estimate and the risks: `doc/dev/short-packet-path.md`.
+
 ## Precedents
 - **RTL Utility 1.0.13:** free; a train of narrow impulses plus correlation. Its guide warns WASAPI
   shared-mode results are often invalid from its CLI.

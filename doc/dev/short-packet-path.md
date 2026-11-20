@@ -1,16 +1,19 @@
 # The short packet path: design and estimate (2026-11-20)
 
-**Status:** not built. This is our design and estimate (ours, not yet the owner's) for the owner to decide on. The idea comes
-from an outside review: a chain with no block-based stage could process each mic packet as it arrives instead of waiting
-for a 480-frame block. The owner (2026-11-20) said this is pre-release with no fixed contract, "if it's quick just do it".
-It isn't quick. A correct version is about 650-950 changed lines across seven files on the audio thread's hottest path, and
-it changes what the noise toggle does. The task's limit was about 500 lines. Code references are to b41f0c3.
+**Status:** not built. This is our design and estimate (ours), pending the owner's decision: build it now or not. The idea
+comes from an outside review: a chain with no block-based stage could process each mic packet as it arrives instead of
+waiting for a 480-frame block. The owner (2026-11-20) said this is pre-release with no fixed contract: "If it's quick just
+do it and tick it off". It isn't quick. A correct version is about 750-1050 changed lines across about sixteen files, the
+core of it on the audio thread's hottest path, and it changes what the noise toggle does. So it goes back to the owner
+(Recommendation, below). Code references are to b41f0c3.
 
 ## What it would save
 - **The block's fill wait, `BLOCK - packet`, for every sample.** Every sample in a block has the same latency: the block,
   plus mic delivery, the output queue and the render side. Processing per packet replaces the block with the packet. The
-  saving is 6.67 ms with a 160-frame (3.33 ms) mic, which is the exclusive mic on our driver and on HDAudio. It is 8 ms at
-  96 frames, 7.5 ms at 120 and 5 ms at 240. A 10 ms mic (shared mode by default, VB-CABLE) saves nothing. In the budget
+  saving is 6.67 ms with a 160-frame (3.33 ms) mic, which is the exclusive mic (the default) on our driver, on HDAudio and
+  on VB-CABLE's capture side. It is 8 ms at 96 frames, 7.5 ms at 120 and 5 ms at 240. A 10 ms mic saves nothing: a shared
+  mic at the engine's default period, such as VB-CABLE with `--no-exclusive-mic`. If VB-CABLE's capture refuses 3.33 ms
+  and falls back to its 3 ms minimum (144 frames), the unit stays 480 and it saves nothing either. In the budget
   (budget.rs) this is the **wait**: a block's first sample waits two more 160-frame packets, and that becomes the unit's own
   work (µs). Mic delivery and the queue stay as they are. Against the spike's settled run through our pair (readout 20.4 ms,
   doc/todo/19-spike-2026-11-20.md check 7), it is about a third of the readout. That figure is an estimate to measure.
@@ -20,8 +23,9 @@ it changes what the noise toggle does. The task's limit was about 500 lines. Cod
   (engine.md, "The output target"). The adaptive target (on by default) already removes the spare by measurement: with
   the exclusive output and steady 3.33 ms packets it comes down from 14 ms to 5 in the simulations. A short path could also
   shrink the fixed target's spare to a packet. That would save another 6.67 ms during a run's first four minutes, with
-  `--no-adaptive-output`, and after three strikes. But it would cut the late-wake allowance from 10 ms to 3.33 ms, where
-  the soak's misses were 8-13.5 ms. We don't recommend it.
+  `--no-adaptive-output`, and after three strikes. But it would cut the late-wake allowance from 10 ms to 3.33 ms. The
+  soak's miss was a block 8 ms or more late (about 10 in the simulations), and the fixed target rides out blocks up to
+  13.5 ms late (out_target.rs). We don't recommend it.
 
 ## When it applies, and how often
 Only with **no block-bound stage**: echo cancelling off and the noise filter off.
@@ -49,8 +53,10 @@ host profile fixes 480 for every stage).
 **The unit, chosen at the run's start** (audio.rs `run`): the mic's period in frames when all three of these hold:
 - AEC is off. That means no AEC stage, no loopback, no echo-path guard and no hold.
 - The noise filter is off.
-- The period is under 480 and divides 480. `exclusive_period` picks such periods: 96, 120, 160 and 240. A device whose
-  minimum is past every divisor (125 frames) or a 144-frame one keeps 480.
+- The period is under 480 and divides 480. `exclusive_period` picks the smallest such period from the device's minimum
+  (never under 2 ms) up to its default: 96, 120, 160 or 240. A device with no divisor from its minimum up to its default
+  runs at its minimum (125 frames when both are 2.6 ms, 144 when both are 3 ms), and so does a refused period's fallback
+  (VB-CABLE's capture at 3 ms). Such a device keeps its period, and the unit stays 480.
 
 Otherwise the unit is 480. **At 480 every path below has to reduce to today's code bit for bit.** The existing tests are
 that check.
@@ -73,8 +79,11 @@ that check.
   widens to lengths within one of each other and at most `BLOCK + 1`. The cubic path already takes any `n >= 2`.
 - **Adaptive target:** its mean's coefficient and `WARM_UP` (300 blocks, 3 s) move to per-write. The window, the trial and
   the walk are per second and don't change. The fixed target keeps its block (above).
-- **`FillOffset`:** per-write readings. `OFFSET_RING` (32) then spans 107 ms instead of 320 ms, still several periods of
-  any device. Keep it, or use 96 for the same span.
+- **`FillOffset`:** per-write readings. A re-anchor compares the median of the last `OFFSET_RING` readings before it with
+  the median of as many after it. The ring is sized to a whole phase cycle of a 1024-frame device period against the
+  writes, not to a time span: lcm(1024, unit) / unit readings. That is 32 at 96, 160 and 480 (today's 32), but 64 at 240
+  and 128 at 120. Make the ring 128 long, with the length used set at the run's start (32 at 480, so the block path is
+  unchanged), or limit the unit to 96 and 160. We'd take the first.
 - **Readout and budget:** at the block's first unit only. The readout's window stays 100 blocks (1 s).
 
 **Per block (everything else), at the block's last unit, on the assembled block:**
@@ -82,9 +91,22 @@ that check.
   away: while every slot is off it equals what already went out. Its report gives the meters, and its state (`prev_in`,
   the delay lines, the drains) stays as it is today.
 - The tap, the chain recorder and the flight recorder get the mic, the reference and the output as sent.
-- `ChainBlock`'s facts come from the block's first unit: head, capture time, budget, and its `OutputFacts`, with zeros,
-  drops and slips summed over the block's units. `OutputFacts::slip` can then read ±2 or ±3, which is a contract change
-  for clock_fit.rs, the CSV and the flight analyser.
+- `ChainBlock`'s facts come from the block's first unit: head, capture time and budget.
+- **The output's facts** (`OutputFacts`, one a block, read by the CSV, the flight recorder and clock_fit.rs) keep today's
+  contract if a block's facts cover the writes since the block before's first one:
+  - `index`, `padding`, `pending`, `fill`, `target` and the clock reading come from the block's first unit.
+  - The events of the block before's later units and of this block's first unit are this block's: `zeros`, `dropped` and
+    `silence` summed, `underrun`, `late` and `reanchored` OR-ed. `silence`, `underrun` and `late` are documented that way
+    already ("since the block before"); `zeros` and `dropped` ("at this block") get the same words. A unit's zeros and
+    drops go into the stream before its index, so summing a block's own later units into it would break the index rule.
+    Carried forward, the index still moves by the last block's length plus this block's `zeros` less its `dropped`.
+    clock_fit.rs then breaks the output's line, and adds the silence, at the step where it happened.
+  - `slip` and `skipped` describe the block's own samples. At most one slip falls in any block's units (the 1500 ppm limit
+    is 0.72 slips per 480 samples, whatever the step), so `slip` keeps its -1..=1 range. A unit can be dropped alone, so
+    `skipped` becomes the block's frames dropped (u32, not a bool). A block's length is then 480 + `slip` - `skipped`:
+    479-481 with nothing dropped.
+  - Underruns and deficits are counted once a block, as `render_underruns` is today, so the facts still add up to the
+    counters. A dry spell over a block's three writes is one underrun.
 - Thread facts (`process_us` summed), `block_us`, `publish_block`, `blocks += 1`, and `second_due` on block boundaries.
 - The audio loop counts **blocks** a wake, not units, in `count_wake_blocks`. That count is what the automatic model depth
   remembers about a mic.
@@ -116,10 +138,11 @@ path, so every stage still sees 480-frame blocks.
 | nf-core `dsp/slip.rs` | `produced(n)`, the wider contract; tests at 160 | 15 + 30 |
 | nf-core `dsp/drift.rs` | `with_step`; the existing simulation at a 160 step (±50/300/1000 ppm: within ±1 ms, slip rate within 5%) | 15 + 40 |
 | nf-engine `out_target.rs` | per-write coefficient and warm-up | 10 + 10 |
-| nf-engine `pipeline.rs` | the unit, the per-unit and per-block split, `push_output` on a slice, facts summed, `second_due` | 170 |
-| nf-engine `pipeline/tests/short.rs` (new) | see below | 250 |
+| nf-engine `pipeline.rs` | the unit, the per-unit and per-block split, `push_output` on a slice, the output's facts carried forward and counted once a block, the ring's length, `second_due` | 190 |
+| nf-engine `pipeline/tests/short.rs` (new) | see below | 300 |
 | nf-engine `audio.rs` | choose the unit, the drift's step, blocks a wake | 25 |
 | nf-engine `control.rs`, `api.rs`, telemetry | option A: the unit in the control thread, the restart rule, the status | 25 + 28 call sites + 30 |
+| the facts' readers: nf-engine `api.rs`, `csv.rs`, `flight.rs`, `recorder.rs`, `pipeline/tests/budget.rs`; nf-app `commands/quality.rs` | `skipped` a frame count: the contract's docs, the CSV's column and its docs, the flight recorder's drop trigger, the facts test's sums, the tests' struct literals. clock_fit.rs reads `silence`, `underrun` and `reanchored` as now, and doesn't change | 50 |
 | docs | engine.md, TODO 13's detail | 40 |
 
 The new tests (`pipeline/tests/short.rs`), all on the existing fakes:
@@ -128,12 +151,14 @@ The new tests (`pipeline/tests/short.rs`), all on the existing fakes:
 - the tap and recorder items equal the block path's;
 - statistics come once every 100 blocks;
 - 10 simulated minutes at ±300 ppm into a jittered exclusive-like sink, with no underruns and the adaptive target settling;
-- a late wake.
+- a late wake;
+- `the_output_facts_follow_the_stream_block_for_block`'s cases at a 160-frame unit, with a unit dropped alone among them;
+- a re-anchor at a 120-frame unit against a 1024-frame device, which needs the ring's full 128.
 
 **Totals:**
-- **Option A:** about 650-700 changed lines, 1.5-2 days.
-- **Option B:** instead of A's control-side work, about 150 lines in the pipeline and 100 of splice tests. About 850-950
-  lines, 2.5-3 days.
+- **Option A:** about 750-850 changed lines across sixteen files, 2-2.5 days.
+- **Option B:** instead of A's control-side work (the unit in the control thread and its 28 call sites; control.rs drops
+  out), about 150 lines in the pipeline and 100 of splice tests. About 950-1050 lines across fifteen files, 3-3.5 days.
 
 Either option also needs the owner's live checks, since the dev box says nothing about real devices: the exclusive mic at
 3.33 ms into the exclusive output, on our driver and on VB-CABLE. Check underruns, slips, the readout, and CPU (three times
@@ -144,16 +169,21 @@ the padding and clock calls on a shared output).
   300 times a second instead of 100 (performance/F3's concern), and underruns are found per write.
 - The drift loop's discrete step changes. The continuous loop is the same, but the noise per reading falls with smaller
   writes. The 23 s / ±1 ms tuning has to be re-simulated at 160.
-- Per-block facts now summarise three writes (`OutputFacts::slip` up to ±3, an underrun once a write). The CSV,
-  clock_fit.rs and the flight analyser read them.
+- A block's output facts now summarise three writes, and their events are those since the block before's first write
+  (above). `skipped` becomes a frame count, which changes the CSV's column. Getting the carry wrong breaks the index rule
+  or puts an unbroken step into clock_fit.rs's output line, which skews the fitted drift. The facts test at a 160-frame
+  unit is the check.
 - The noise toggle becomes a restart (A) or a 7 ms gap (B) where today it's a dip splice.
 - There are two paths through the hottest loop. The block path must stay bit for bit the same.
 - Shrinking the fixed target's spare is a separate decision (above). This design keeps it.
 
-## Recommendation (ours)
-Don't build it now. It saves about 7 ms only in the bypass state, at the price of a second output path through the audio
-thread and a worse noise toggle in that state. Revisit it when either of these happens:
+## Recommendation (ours, pending the owner's decision)
+Whether to build it now is the owner's call. Ours is not now. It saves about 7 ms only in the bypass state, at the price of
+a second output path through the audio thread and a worse noise toggle in that state. We'd revisit it when either of these
+happens:
 - a stage that can run per packet exists (a TODO 17 effect, or a gate of its own); the unit work above is then its base;
 - the owner wants the bypass at minimum latency, for example a "direct" mode on our own virtual mic (TODO 19).
 
-If it's built, start with option B: the toggle stays live, and the gap happens once a run.
+If the owner says build: option B in one piece of work, with no line cap, on the facts contract and the ring sizing above.
+The toggle stays live, and the gap happens once a run. If the owner says not now, TODO 13 records that as the owner's
+decision.
