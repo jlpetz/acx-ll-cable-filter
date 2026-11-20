@@ -4,20 +4,29 @@
 //! write it publishes: the frames, and the QPC just after it stored `write_frame`. The capture thread logs a [`Receipt`] for
 //! every packet: the QPC when GetBuffer returned (the host's receipt time) and GetBuffer's device QPC position (the time the
 //! endpoint gives for the packet's first frame, in 100 ns units), with the packet's signal frames as [`Run`]s of consecutive
-//! frame numbers ([`split_runs`] decodes each frame's code back to its frame number, [`unwrap_code`]).
+//! frame numbers, each with its place in the packet ([`split_runs`] decodes each frame's code back to its frame number,
+//! [`unwrap_code`]).
 //!
-//! Both receipt times are the packet's: a frame's latency is its packet's receipt time minus the publication time of the block
-//! that held it, and every frame counts once ([`latencies`] weights each (packet, block) pair by the frames they share). The
-//! percentiles are nearest-rank over those frames ([`percentile`]). The device time can come out below the publication time:
-//! a driver may stamp a packet with the time its first frame was due rather than the time it filled the packet.
+//! A frame's host latency is its packet's receipt time minus the publication time of the block that held it: the whole packet
+//! arrives at once. Its device latency is its own device time minus that publication: the packet's first frame's time plus the
+//! frame's place in the packet at 48 kHz. Every frame counts once ([`latencies`] weights each (packet, block) pair by the frames
+//! they share, and times the device's frames one by one, or on a long run in groups stamped at each group's centre,
+//! [`device_group`]). The percentiles are nearest-rank over those frames ([`percentile`]). The device latency can come out
+//! negative: the device time is when the frame was due on the endpoint's time line, and a driver fills a packet when it ends
+//! (this one copies a packet from the ring at the pass that completes it, a period after its first frame was due).
 //!
 //! Everything the threads do per block or per packet here ([`Log::push`], [`split_runs`]) allocates nothing: the logs are
 //! sized before the run starts. The analysis runs after the threads have stopped.
 
+use crate::protocol::SAMPLE_RATE;
 use crate::signal::{self, CODE_MODULUS};
 
 /// 100 ns units per second.
 pub const HNS_PER_SECOND: u64 = 10_000_000;
+
+/// The most device samples [`latencies`] makes: it times the device's frames one by one up to this many frames (43.7 s), and in
+/// groups beyond ([`device_group`]), so the analysis of a run as long as 600 s holds at most 32 MB of them.
+pub const DEVICE_SAMPLES_MAX: u64 = 1 << 21;
 
 /// A log of fixed capacity, allocated up front: [`Self::push`] never allocates; once the log is full it counts what it drops.
 #[derive(Debug)]
@@ -92,11 +101,12 @@ pub struct Receipt {
     pub runs: u32,
 }
 
-/// Frames `[first, first + len)` of the signal, consecutive in one packet.
+/// Frames `[first, first + len)` of the signal, consecutive in one packet, the first of them `offset` frames into the packet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Run {
     pub first: u64,
     pub len: u32,
+    pub offset: u32,
 }
 
 impl Run {
@@ -137,12 +147,12 @@ impl FrameCounts {
 }
 
 /// Splits one packet's frames into runs of consecutive signal frames, decoding each frame's code back to its frame number
-/// ([`unwrap_code`] against `written`), and hands each run to `emit` in order. Silence and corrupt frames end a run. Allocates
-/// nothing.
+/// ([`unwrap_code`] against `written`), and hands each run to `emit` in order, with its first frame's place in the packet.
+/// Silence and corrupt frames end a run. Allocates nothing.
 pub fn split_runs(frames: impl IntoIterator<Item = [f32; 2]>, written: u64, mut emit: impl FnMut(Run)) -> FrameCounts {
     let mut counts = FrameCounts::default();
     let mut run: Option<Run> = None;
-    for f in frames {
+    for (offset, f) in (0u32..).zip(frames) {
         let Some(k) = signal::decode(f) else {
             if signal::is_silence(f) {
                 counts.silent += 1;
@@ -165,7 +175,7 @@ pub fn split_runs(frames: impl IntoIterator<Item = [f32; 2]>, written: u64, mut 
             emit(r);
         }
         match unwrap_code(k, written) {
-            Some(n) => run = Some(Run { first: n, len: 1 }),
+            Some(n) => run = Some(Run { first: n, len: 1, offset }),
             None => counts.unmatched += 1,
         }
     }
@@ -217,13 +227,32 @@ pub fn qpc_to_hns(qpc: u64, frequency: u64) -> i64 {
     (u128::from(qpc) * u128::from(HNS_PER_SECOND) / u128::from(frequency.max(1))) as i64
 }
 
+/// A device time `half_frames` half frames after a packet's first frame, at 48 kHz, in 100 ns units rounded to nearest (half
+/// frames, so that a group of frames can be stamped at its centre).
+fn half_frames_to_hns(half_frames: u64) -> i64 {
+    let den = 2 * u64::from(SAMPLE_RATE);
+    ((u128::from(half_frames) * u128::from(HNS_PER_SECOND) + u128::from(den / 2)) / u128::from(den)) as i64
+}
+
+/// Frames per device sample for `frames` frames to time: 1 (each frame its own sample) up to [`DEVICE_SAMPLES_MAX`] frames, else
+/// the smallest power of two that keeps the samples within it.
+pub fn device_group(frames: u64) -> u32 {
+    frames.div_ceil(DEVICE_SAMPLES_MAX).max(1).next_power_of_two() as u32
+}
+
 /// The latencies of a run, per receipt time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Latencies {
-    /// Host receipt (the QPC when GetBuffer returned) minus publication.
+    /// Host receipt (the QPC when GetBuffer returned, the whole packet's) minus publication, a sample per (packet, block) pair.
     pub host: Vec<Weighted>,
-    /// Device receipt (GetBuffer's device QPC position) minus publication, for the receipts whose position is valid.
+    /// The frame's device time (GetBuffer's device QPC position, its packet's first frame's, plus the frame's place in the
+    /// packet at 48 kHz) minus publication, for the receipts whose position is valid: a sample per `device_group` frames (or
+    /// fewer, at the end of a (packet, block) pair), stamped at its frames' centre.
     pub device: Vec<Weighted>,
+    /// Frames per device sample: 1 where each frame was timed alone ([`device_group`]). A group's frames are each within
+    /// (`device_group` - 1) / 2 frames of its stamp, so each percentile is within that of the frame-by-frame one, and the
+    /// mean within rounding.
+    pub device_group: u32,
     /// Receipts at or after the window's start, and the signal frames they carried that were measured.
     pub packets: u64,
     pub frames: u64,
@@ -235,9 +264,20 @@ pub struct Latencies {
 
 /// Every received frame's latency, for both receipt times. `receipts` and `runs` are the capture thread's logs; `blocks` the
 /// feed's (in order: each block starts where the last ended); `qpc_frequency` the QPC's. Receipts whose host time is before
-/// `from_qpc` (the warm-up) aren't measured, nor are frames of the first `skip_blocks` blocks.
+/// `from_qpc` (the warm-up) aren't measured, nor are frames of the first `skip_blocks` blocks. The device's frames are timed
+/// one by one, or in groups where the receipts hold more than [`DEVICE_SAMPLES_MAX`] frames ([`device_group`]).
 pub fn latencies(blocks: &[Block], receipts: &[Receipt], runs: &[Run], qpc_frequency: u64, from_qpc: u64, skip_blocks: usize) -> Latencies {
-    let mut l = Latencies::default();
+    let frames = receipts.iter().filter(|r| r.host_qpc >= from_qpc).map(|r| u64::from(r.frames)).sum();
+    latencies_grouped(blocks, receipts, runs, qpc_frequency, from_qpc, skip_blocks, device_group(frames))
+}
+
+/// [`latencies`], with the device's frames timed in groups of `group` (at least 1).
+pub fn latencies_grouped(
+    blocks: &[Block], receipts: &[Receipt], runs: &[Run], qpc_frequency: u64, from_qpc: u64, skip_blocks: usize, group: u32,
+) -> Latencies {
+    let group = group.max(1);
+    let mut l = Latencies { device_group: group, ..Default::default() };
+    let group = u64::from(group);
     for r in receipts.iter().filter(|r| r.host_qpc >= from_qpc) {
         l.packets += 1;
         let host_hns = qpc_to_hns(r.host_qpc, qpc_frequency);
@@ -262,7 +302,14 @@ pub fn latencies(blocks: &[Block], receipts: &[Receipt], runs: &[Run], qpc_frequ
                     let published = qpc_to_hns(b.qpc, qpc_frequency);
                     l.host.push(Weighted { value: host_hns - published, weight: shared });
                     if let Some(device_hns) = r.device_hns {
-                        l.device.push(Weighted { value: device_hns as i64 - published, weight: shared });
+                        // Frame n's place in its packet: the run's first frame's, plus n's place in the run.
+                        let (mut offset, mut left) = (u64::from(run.offset) + (n - run.first), shared);
+                        while left > 0 {
+                            let k = left.min(group);
+                            let at = device_hns as i64 + half_frames_to_hns(2 * offset + k - 1);
+                            l.device.push(Weighted { value: at - published, weight: k });
+                            (offset, left) = (offset + k, left - k);
+                        }
                     }
                     l.frames += shared;
                 }
@@ -326,7 +373,7 @@ pub fn summarize(samples: &mut [Weighted]) -> Option<Summary> {
 /// Packets to log room for: `seconds` at 48 kHz in packets of at least `min_packet` frames, with a second's margin. Used to
 /// size the logs before the run.
 pub fn packets_for(seconds: u64, min_packet: u32) -> usize {
-    let rate = u64::from(crate::protocol::SAMPLE_RATE);
+    let rate = u64::from(SAMPLE_RATE);
     ((seconds + 1) * rate).div_ceil(u64::from(min_packet.max(1))) as usize
 }
 
@@ -334,6 +381,10 @@ pub fn packets_for(seconds: u64, min_packet: u32) -> usize {
 mod tests {
     use super::*;
     use crate::signal::frame;
+
+    const fn run(first: u64, len: u32, offset: u32) -> Run {
+        Run { first, len, offset }
+    }
 
     #[test]
     fn a_log_never_grows() {
@@ -383,7 +434,7 @@ mod tests {
         frames.extend([silence; 3]);
         frames.extend((110..115).map(frame));
         let (runs, counts) = runs_of(frames, 2000);
-        assert_eq!(runs, [Run { first: 100, len: 10 }, Run { first: 110, len: 5 }]);
+        assert_eq!(runs, [run(100, 10, 0), run(110, 5, 13)], "the second run starts 13 frames into the packet");
         assert_eq!(counts, FrameCounts { signal: 15, silent: 3, corrupt: 0, unmatched: 0 });
         assert_eq!(continuity(&runs), Continuity::default());
 
@@ -393,14 +444,14 @@ mod tests {
         frames.push([0.25, 0.25]);
         frames.extend((12..14).map(frame));
         let (runs, counts) = runs_of(frames, 100);
-        assert_eq!(runs, [Run { first: 0, len: 4 }, Run { first: 10, len: 2 }, Run { first: 12, len: 2 }]);
+        assert_eq!(runs, [run(0, 4, 0), run(10, 2, 4), run(12, 2, 7)]);
         assert_eq!((counts.signal, counts.corrupt), (8, 1));
         assert_eq!(continuity(&runs), Continuity { gaps: 1, gap_frames: 6, ..Default::default() });
 
         // Across the code's wrap the run goes on (frame numbers, not codes).
         let m = CODE_MODULUS;
         let (runs, _) = runs_of((m - 2..m + 2).map(frame).collect(), m + 100);
-        assert_eq!(runs, [Run { first: m - 2, len: 4 }]);
+        assert_eq!(runs, [run(m - 2, 4, 0)]);
 
         // A code not written yet is unmatched, and starts no run.
         let (runs, counts) = runs_of(vec![frame(500)], 100);
@@ -409,7 +460,7 @@ mod tests {
 
     #[test]
     fn repeats_are_seen() {
-        let runs = [Run { first: 0, len: 10 }, Run { first: 5, len: 10 }, Run { first: 15, len: 1 }, Run { first: 20, len: 1 }];
+        let runs = [run(0, 10, 0), run(5, 10, 0), run(15, 1, 0), run(20, 1, 0)];
         assert_eq!(continuity(&runs), Continuity { gaps: 1, gap_frames: 4, repeats: 1, repeat_frames: 5 });
         assert_eq!(continuity(&[]), Continuity::default());
     }
@@ -457,8 +508,38 @@ mod tests {
         assert_eq!((s.min, s.p50, s.max, s.mean), (-40, -40, 15, -12));
     }
 
-    /// Two blocks and two packets on a 10 MHz QPC: every frame's latency is its packet's receipt time minus its block's
-    /// publication, frames weighted; the pre-fill and the warm-up aren't measured.
+    /// Every measured frame's device latency, one by one, in floating point: the reference [`latencies`] is checked against.
+    /// The QPC is 10 MHz (ticks are 100 ns units).
+    fn device_one_by_one(blocks: &[Block], receipts: &[Receipt], runs: &[Run], skip_blocks: usize) -> Vec<i64> {
+        let mut v = Vec::new();
+        for r in receipts {
+            let Some(device) = r.device_hns else { continue };
+            for run in &runs[r.first_run as usize..][..r.runs as usize] {
+                for i in 0..u64::from(run.len) {
+                    let n = run.first + i;
+                    let Some(b) = blocks.iter().position(|b| (b.start..b.end).contains(&n)) else { continue };
+                    if b >= skip_blocks {
+                        // Frame n is i frames after the run's first, which is run.offset frames into the packet.
+                        let due = device as f64 + (u64::from(run.offset) + i) as f64 * 1e7 / 48_000.0;
+                        v.push(due.round() as i64 - blocks[b].qpc as i64);
+                    }
+                }
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// Weighted samples spelled out one value per frame, sorted.
+    fn spelled_out(samples: &[Weighted]) -> Vec<i64> {
+        let mut v: Vec<i64> = samples.iter().flat_map(|s| std::iter::repeat_n(s.value, s.weight as usize)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Four blocks and three packets on a 10 MHz QPC: every frame's host latency is its packet's receipt time minus its block's
+    /// publication; its device latency is its own device time (the packet's first frame's, plus its place in the packet) minus
+    /// that publication. Frames are weighted; the pre-fill and the warm-up aren't measured.
     #[test]
     fn latencies_pair_frames_with_their_blocks() {
         let blocks = [
@@ -469,10 +550,11 @@ mod tests {
             Block { qpc: 210_000, start: 1200, end: 1440, read_frame: 960 },
         ];
         let runs = [
-            Run { first: 0, len: 480 },
-            // The second packet: 960..1440, which spans the last two blocks.
-            Run { first: 480, len: 480 },
-            Run { first: 960, len: 480 },
+            run(0, 480, 0),
+            // The second packet starts with 3 frames of silence (an underrun), so its run starts 3 frames in.
+            run(480, 477, 3),
+            // The third packet: 957..1437, which spans the last three blocks.
+            run(957, 480, 0),
         ];
         let receipts = [
             Receipt { host_qpc: 50_000, device_hns: Some(40_000), frames: 480, first_run: 0, runs: 1 },
@@ -480,31 +562,75 @@ mod tests {
             Receipt { host_qpc: 300_000, device_hns: Some(190_000), frames: 480, first_run: 2, runs: 1 },
         ];
         let l = latencies(&blocks, &receipts, &runs, 10_000_000, 0, 1);
-        assert_eq!((l.packets, l.frames, l.skipped, l.unpublished), (3, 960, 480, 0));
-        assert_eq!(l.host, [Weighted { value: 90_000, weight: 480 }, Weighted { value: 100_000, weight: 240 }, Weighted {
-            value: 90_000,
-            weight: 240
-        },]);
-        assert_eq!(l.device, [Weighted { value: -10_000, weight: 480 }, Weighted { value: -10_000, weight: 240 }, Weighted {
-            value: -20_000,
-            weight: 240
-        },]);
-        let mut host = l.host.clone();
-        let s = summarize(&mut host).unwrap();
-        assert_eq!((s.count, s.p50, s.p90, s.max), (960, 90_000, 100_000, 100_000));
+        assert_eq!((l.packets, l.frames, l.skipped, l.unpublished, l.device_group), (3, 957, 480, 0, 1));
+        let host = [(90_000, 477), (200_000, 3), (100_000, 240), (90_000, 237)];
+        assert_eq!(l.host, host.map(|(value, weight)| Weighted { value, weight }));
+        // Each frame alone: frame 480, 3 frames into its packet, was due 625 (3 x 208.33) after the packet's first frame; frame
+        // 956, 479 frames in, 99,792 after it; the last frame, 1436, 479 frames into the third packet, likewise.
+        assert_eq!(
+            (l.device.len(), l.device[0], l.device[476]),
+            (957, Weighted { value: -9_375, weight: 1 }, Weighted { value: -10_000 + 99_792, weight: 1 })
+        );
+        assert_eq!(l.device.last(), Some(&Weighted { value: 190_000 + 99_792 - 210_000, weight: 1 }));
+        assert_eq!(spelled_out(&l.device), device_one_by_one(&blocks, &receipts, &runs, 1));
+        let mut h = l.host.clone();
+        let s = summarize(&mut h).unwrap();
+        assert_eq!((s.count, s.p50, s.p90, s.max), (957, 90_000, 100_000, 200_000));
+
+        // In groups as big as the pairs: one sample per (packet, block) pair, at its frames' centre: 241 frames in (3 + 238)
+        // for the second packet's; 1, 122.5 and 361 frames in for the third's.
+        let g = latencies_grouped(&blocks, &receipts, &runs, 10_000_000, 0, 1, 480);
+        let device = [(40_208, 477), (90_208, 3), (15_521, 240), (55_208, 237)];
+        assert_eq!((g.device_group, &g.host), (480, &l.host));
+        assert_eq!(g.device, device.map(|(value, weight)| Weighted { value, weight }));
 
         // The warm-up: receipts before t=200,000 ticks aren't measured.
         let l = latencies(&blocks, &receipts, &runs, 10_000_000, 200_000, 1);
         assert_eq!((l.packets, l.frames, l.skipped), (1, 480, 0));
         // A 2 MHz QPC: the same ticks are five times the time.
         let l = latencies(&blocks, &receipts[1..2], &runs, 2_000_000, 0, 1);
-        assert_eq!(l.host, [Weighted { value: 450_000, weight: 480 }]);
+        assert_eq!(l.host, [Weighted { value: 450_000, weight: 477 }]);
+    }
+
+    /// Grouped device samples against the frames one by one: every percentile within half a group, the mean within rounding.
+    #[test]
+    fn device_groups_stay_within_half_a_group() {
+        // 40 packets of 480 frames, a block each, the device stamping each packet a varying time from its block's publication;
+        // every fifth packet's run starts after 7 frames of silence.
+        let mut blocks = vec![];
+        let (mut receipts, mut runs) = (vec![], vec![]);
+        let mut next = 0;
+        for i in 0..40u64 {
+            let offset = if i % 5 == 0 { 7 } else { 0 };
+            let len = 480 - offset;
+            blocks.push(Block { qpc: 1_000_000 * i, start: next, end: next + u64::from(len), read_frame: 0 });
+            runs.push(run(next, len, offset));
+            let device = 1_000_000 * i + 37_000 * (i % 7);
+            receipts.push(Receipt { host_qpc: device + 200_000, device_hns: Some(device), frames: 480, first_run: i as u32, runs: 1 });
+            next += u64::from(len);
+        }
+        let exact = device_one_by_one(&blocks, &receipts, &runs, 0);
+        let mut one = latencies_grouped(&blocks, &receipts, &runs, 10_000_000, 0, 0, 1).device;
+        assert_eq!(spelled_out(&one), exact);
+        let one = summarize(&mut one).unwrap();
+        for group in [2, 16, 64] {
+            let mut g = latencies_grouped(&blocks, &receipts, &runs, 10_000_000, 0, 0, group).device;
+            assert!(g.len() <= exact.len().div_ceil(group as usize) + receipts.len(), "group {group}: {} samples", g.len());
+            let s = summarize(&mut g).unwrap();
+            // Half a group, in 100 ns units, and a unit for rounding.
+            let bound = (i64::from(group) - 1) * 10_000_000 / 96_000 + 1;
+            for (a, b) in [(s.min, one.min), (s.p50, one.p50), (s.p90, one.p90), (s.p99, one.p99), (s.max, one.max)] {
+                assert!((a - b).abs() <= bound, "group {group}: {a} against {b} (bound {bound})");
+            }
+            assert!((s.mean - one.mean).abs() <= 1, "group {group}: mean {} against {}", s.mean, one.mean);
+            assert_eq!(s.count, one.count);
+        }
     }
 
     #[test]
     fn frames_no_block_holds_are_counted() {
         let blocks = [Block { qpc: 0, start: 0, end: 100, read_frame: 0 }, Block { qpc: 10, start: 200, end: 300, read_frame: 100 }];
-        let runs = [Run { first: 50, len: 300 }];
+        let runs = [run(50, 300, 0)];
         let receipts = [Receipt { host_qpc: 1_000, device_hns: None, frames: 300, first_run: 0, runs: 1 }];
         let l = latencies(&blocks, &receipts, &runs, 10_000_000, 0, 0);
         // 50..100 in block 0, 100..200 in none, 200..300 in block 1, 300..350 past the last.
@@ -515,6 +641,16 @@ mod tests {
         // A receipt whose runs run past the log is clamped, not a panic.
         let bad = [Receipt { first_run: 1, runs: 5, ..receipts[0] }];
         assert_eq!(latencies(&blocks, &bad, &runs, 10_000_000, 0, 0).frames, 0);
+    }
+
+    #[test]
+    fn device_groups_keep_the_samples_bounded() {
+        assert_eq!((device_group(0), device_group(1), device_group(DEVICE_SAMPLES_MAX)), (1, 1, 1));
+        assert_eq!((device_group(DEVICE_SAMPLES_MAX + 1), device_group(4 * DEVICE_SAMPLES_MAX)), (2, 4));
+        // latency's default 10 s, frame by frame; its longest, 600 s, in groups of 16 (0.16 ms either side of a group's stamp).
+        assert_eq!((device_group(10 * 48_000), device_group(600 * 48_000)), (1, 16));
+        let hns = [0, 1, 2, 96_000].map(half_frames_to_hns);
+        assert_eq!(hns, [0, 104, 208, 10_000_000], "half a frame is 104.17, a frame 208.33");
     }
 
     #[test]
