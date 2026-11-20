@@ -123,10 +123,11 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       whether the counter rules the driver's ring rule out (another client holding the device, a bad period, the engine)
       or can't tell (no driver statistics, or a render endpoint). 3: it opened and started, then stopped running.
   nf-vmic-test latency [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N] [--mode raw|default]
-                       [--device NAME]
+                       [--device NAME] [--exclusive]
       In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192)
       as feed does, and record the capture endpoint (shared, float32 stereo 48 kHz; --mode and --period-frames as for
-      verify). After a 1 s warm-up, for N seconds (default 10, at most 600), time every frame from the store of write_frame
+      verify; --exclusive: an exclusive event-driven stream, --period-frames its period, so the device times are the
+      driver's own packet stamps rather than the shared engine's). After a 1 s warm-up, for N seconds (default 10, at most 600), time every frame from the store of write_frame
       that published it to its receipt: by the host's QPC when GetBuffer returned its packet, and by its device time
       (GetBuffer's device QPC position, its packet's first frame's, plus its place in the packet): p50, p90, p99 and max
       in ms for each, with the fill the feed found before each top-up, the underruns and the period granted. Stop any
@@ -2527,12 +2528,17 @@ fn latency_feed(
 
 fn latency(args: &[String]) -> Result<Verdict, String> {
     let valued = ["--seconds", "--target", "--capacity", "--period-frames", "--mode", "--device"];
-    let o = Opts::parse(args, &valued, &[])?;
+    let o = Opts::parse(args, &valued, &["--exclusive"])?;
     let seconds: u64 = o.value("--seconds", 10)?;
     let target: u64 = o.value("--target", 960)?;
     let capacity: u32 = o.value("--capacity", 8192)?;
     let name: String = o.value("--device", ENDPOINT.to_string())?;
-    let spec = StreamSpec { period_frames: o.period_frames()?, mode: o.mode(Mode::RawWhereOffered)?, ..StreamSpec::SHARED_FLOAT };
+    let spec = StreamSpec {
+        exclusive: o.flag("--exclusive"),
+        period_frames: o.period_frames()?,
+        mode: o.mode(Mode::RawWhereOffered)?,
+        ..StreamSpec::SHARED_FLOAT
+    };
     if !(1..=LATENCY_MAX_SECONDS).contains(&seconds) {
         return Err(format!("--seconds {seconds}: from 1 to {LATENCY_MAX_SECONDS}"));
     }
