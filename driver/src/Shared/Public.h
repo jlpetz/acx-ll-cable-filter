@@ -51,7 +51,7 @@ extern RECORDER_LOG g_AudioDspMcLog;
 // One per device, in the device context (WDF contexts are non-paged), so it outlives either stream. Positions are frames on
 // one QPC time line shared by both streams: ring frame n holds the audio presented at n / SampleRate seconds of QPC time,
 // stored at byte (n % RingFrames) * BlockAlign. Every field is guarded by Lock, which both streams' timer DPCs and their
-// PASSIVE_LEVEL state changes take.
+// PASSIVE_LEVEL state changes, creation and destruction take.
 //
 #define LOOPBACK_RING_BYTES (48000 * 8 * 2)     // 768,000 bytes: whole frames for block aligns 1-4, 6, 8, 12, 16 and 24
 
@@ -65,6 +65,15 @@ typedef struct _LOOPBACK_FORMAT {
     GUID            SubFormat;
 } LOOPBACK_FORMAT, *PLOOPBACK_FORMAT;
 
+// The streams open on one circuit (EvtCircuitCreateStream to the stream engine's destruction) in one format. Each circuit
+// lists two formats, so two slots per circuit cover every format it can have open at once.
+#define LOOPBACK_OPEN_FORMATS 2
+
+typedef struct _LOOPBACK_OPEN {
+    ULONG           Count;                  // 0: the slot is free
+    LOOPBACK_FORMAT Format;                 // Valid unused (it needs the packet size, known only at Run)
+} LOOPBACK_OPEN, *PLOOPBACK_OPEN;
+
 typedef struct _LOOPBACK_RING {
     KSPIN_LOCK      Lock;
     PUCHAR          Buffer;                 // LOOPBACK_RING_BYTES, non-paged: Codec_EvtBusDeviceAdd to Codec_EvtDeviceContextCleanup
@@ -77,9 +86,16 @@ typedef struct _LOOPBACK_RING {
     ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
     ULONGLONG       WritePos;
 
+    // Written at stream creation and destruction (LoopbackStreamOpen, LoopbackStreamClose): the formats open on each circuit,
+    // so a stream in a format other than one open on the other circuit is refused (STATUS_NOT_SUPPORTED).
+    LOOPBACK_OPEN   RenderOpen[LOOPBACK_OPEN_FORMATS];
+    LOOPBACK_OPEN   CaptureOpen[LOOPBACK_OPEN_FORMATS];
+
     // Counters for the spike, read with the debugger.
     ULONG           IdlePackets;            // capture packets zeroed (all or the end) with no render stream running
     ULONG           MismatchPackets;        // capture packets zeroed because the render and capture formats differ
+    ULONG           RefusedOpens;           // stream creations refused (LoopbackStreamOpen): another format open on the other circuit,
+                                            // or (not expected) no free format slot on this one
     ULONG           UnderrunPackets;        // capture packets zeroed at the end because the render audio was not there yet
     ULONGLONG       UnderrunFrames;
     ULONG           OverrunPackets;         // capture packets zeroed at the start because the ring had already overwritten them

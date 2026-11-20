@@ -101,6 +101,51 @@ EvtStreamGetPresentationPosition(
     _Out_ PULONGLONG        QPCPosition
 );
 
+//
+// noise-filter (TODO 19): the loopback pair's creation-time format check (StreamEngine.cpp). A circuit's
+// EvtCircuitCreateStream calls LoopbackStreamOpen before it creates the stream; the stream engine takes the record over
+// (CStreamEngine::LoopbackAdoptOpen) and its destructor gives it back with LoopbackStreamClose.
+//
+
+// The loopback ring of the device a circuit belongs to, or NULL.
+__drv_maxIRQL(DISPATCH_LEVEL)
+PLOOPBACK_RING
+LoopbackRingOfCircuit(
+    _In_    ACXCIRCUIT          Circuit
+);
+
+// A stream format's loopback fields (Valid left FALSE: it needs the packet size, known only at Run).
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+LoopbackFormatOf(
+    _In_    ACXDATAFORMAT       DataFormat,
+    _Out_   PLOOPBACK_FORMAT    Format
+);
+
+// noinline (both): called from PAGE code (the circuits' EvtCircuitCreateStream, the stream engine's destructor) and they
+// take the ring's spin lock. Inlined into a PAGE function, the locked region would be pageable code running at
+// DISPATCH_LEVEL (a bugcheck once paged out, and at once under Driver Verifier).
+//
+// Counts a stream in on its circuit (Render: the render circuit, else the capture circuit), or refuses it with
+// STATUS_NOT_SUPPORTED while the other circuit has a stream open in a different format.
+__declspec(noinline)
+__drv_maxIRQL(DISPATCH_LEVEL)
+NTSTATUS
+LoopbackStreamOpen(
+    _In_    PLOOPBACK_RING          Ring,
+    _In_    BOOLEAN                 Render,
+    _In_    const LOOPBACK_FORMAT * Format
+);
+
+__declspec(noinline)
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+LoopbackStreamClose(
+    _In_    PLOOPBACK_RING          Ring,
+    _In_    BOOLEAN                 Render,
+    _In_    const LOOPBACK_FORMAT * Format
+);
+
 
 class CStreamEngine
 {
@@ -239,6 +284,16 @@ public:
         m_ToneFrequency = ToneFrequency;
     }
 
+    // noise-filter (TODO 19): takes over the record LoopbackStreamOpen made for this stream; the destructor gives it back.
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    VOID
+    LoopbackAdoptOpen(
+        _In_    PLOOPBACK_RING          Ring,
+        _In_    BOOLEAN                 Render,
+        _In_    const LOOPBACK_FORMAT * Format
+        );
+
 protected:
     PVOID               m_Packets[MAX_PACKET_COUNT];
     ULONG               m_PacketsCount;
@@ -268,6 +323,9 @@ protected:
     ULONG               m_LbRingFrames;     // LOOPBACK_RING_BYTES in frames
     ULONGLONG           m_LbAnchor;         // ring frame of this stream's byte position 0 on its current time line
     BOOLEAN             m_LbAnchorValid;
+    PLOOPBACK_RING      m_LbOpenRing;       // the ring this stream is counted open in (LoopbackAdoptOpen), or NULL
+    BOOLEAN             m_LbOpenRender;
+    LOOPBACK_FORMAT     m_LbOpenFormat;
 
     // noise-filter (TODO 19, spike check 5): the timer statistics (AppRing.h).
     ULONG               m_StatsKind;        // NF_VMIC_KIND_RENDER or NF_VMIC_KIND_CAPTURE: the NF_VMIC_STREAM_STATS it counts in
@@ -291,10 +349,21 @@ protected:
     VOID
     ScheduleNextPass();
 
+    // noise-filter (TODO 19): the position at Qpc, one clock reading the caller took (so GetPresentationPosition can report
+    // that same reading as the position's QPC).
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID
-    UpdatePosition();
+    UpdatePosition(
+        _In_    LARGE_INTEGER   Qpc
+        );
+
+    // noise-filter (TODO 19): one QPC reading in 100 ns units (StreamEngine.cpp says why it takes a snapshot).
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    QpcToHns(
+        _In_    LARGE_INTEGER   Qpc
+        );
 
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)
