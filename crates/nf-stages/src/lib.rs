@@ -41,8 +41,8 @@ pub fn warm_up_fft_thread() {
 /// apart (engine.md, "The chain recorder").
 ///
 /// Allocates: call it before real-time, on the thread that will run the chain. Activation warms up
-/// easyfft's per-thread FFT state there, so `Chain::process` then doesn't allocate on that thread
-/// (sonora's own per-block allocations aside, see [`Aec3Stage`]).
+/// easyfft's per-thread FFT state there, so `Chain::process` then doesn't allocate on that thread,
+/// with AEC3 in it or not (see [`Aec3Stage`]).
 pub fn build_chain(controls: Arc<ChainControls>, with_aec: bool) -> Result<Chain, StageError> {
     let noise: Box<dyn Stage> = Box::new(rnnoise_stage(controls.clone())?);
     build_chain_with(controls, with_aec, noise)

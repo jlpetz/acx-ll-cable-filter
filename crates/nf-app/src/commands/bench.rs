@@ -31,7 +31,7 @@ pub fn bench(args: &BenchArgs) -> Result<(), Failure> {
     }
     say!(
         "allocs: allocations after the warm-up, inside the real-time scope. The noise stage, its model, its floor and gate, \
-         and a chain without AEC3 make none; sonora 0.2.0 makes about 43 a block (served by the locked pool in the app)."
+         AEC3 (sonora 0.3.0) and the chain make none."
     );
     Ok(())
 }
@@ -133,7 +133,7 @@ mod tests {
     /// The real global allocator (main.rs's `RtAllocator`) counts the scope's allocations, with no
     /// pool installed (they fall back to the system heap, and still count).
     #[test]
-    fn bench_times_each_row_and_the_noise_rows_allocate_nothing_once_warm() {
+    fn bench_times_each_row_and_no_row_allocates_once_warm() {
         let dir = crate::test_dir("bench");
         let path = dir.join("near.wav");
         let near: Vec<f32> = (0..24_000).map(|i| ((i as f32) * 0.03).sin() * 0.1).collect();
@@ -149,17 +149,21 @@ mod tests {
                 assert_eq!(r.blocks(), 100, "{}", r.name);
                 assert!(r.p50() > 0.0 && r.p50() <= r.p99() && r.p99() <= r.max(), "{}", r.line());
             }
-            // The noise stage, its model alone, and its floor and gate: nothing once warm.
-            for r in &rows[..3] {
+            // The noise stage, its model alone, its floor and gate, AEC3 and the chain, with AEC3 or without: nothing once
+            // warm (sonora 0.3.0; 0.2.0 made about 43 a block).
+            for r in &rows {
                 assert_eq!(r.allocations, Some(0), "{}", r.line());
             }
-            if !aec {
-                assert_eq!(rows[4].allocations, Some(0), "{}", rows[4].line());
-            }
-            // sonora 0.2.0 allocates per block; the counter sees it
-            assert!(rows[3].allocations.is_some_and(|a| a > 0), "{}", rows[3].line());
         }
         let _ = std::fs::remove_dir_all(dir);
+        // And the counter sees the scope's allocations: sonora 0.2.0's AEC3 row showed it until 0.3.0 allocated nothing.
+        let seen = {
+            let _scope = nf_mem::RtScope::enter();
+            let a0 = nf_mem::thread_scope_allocs();
+            drop(std::hint::black_box(vec![0u8; 64]));
+            nf_mem::thread_scope_allocs() - a0
+        };
+        assert_eq!(seen, 1, "the scope's counter missed an allocation");
     }
 
     #[test]

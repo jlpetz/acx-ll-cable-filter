@@ -139,8 +139,9 @@ fn a_thread_that_skips_the_warm_up_leaks_easyfft_state_into_the_pool() {
 
 #[test]
 fn a_whole_chain_start_with_aec3_gives_the_pool_back_too() {
-    // What the engine builds on each start: AEC3 (about 300 KB, and sonora's per-block Vecs) and
-    // RNNoise, run with a far end and its echo. sonora keeps no per-thread state.
+    // What the engine builds on each start: AEC3 (about 300 KB; sonora 0.3.0 allocates nothing per
+    // block, 0.2.0 made Vecs) and RNNoise, run with a far end and its echo. sonora keeps no
+    // per-thread state.
     let _g = setup();
     let controls = controls();
     let mic = input();

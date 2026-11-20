@@ -33,7 +33,7 @@ nf-engine = { path = "crates/nf-engine" }
 nf-gui = { path = "crates/nf-gui" }
 # Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
 nnnoiseless = { version = "=0.5.2", default-features = false }
-sonora = "=0.2.0"
+sonora = "=0.3.0"
 wasapi = "=0.26.0"
 windows-reactor = "=0.100.0"
 # ONNX Runtime 1.31.0 (TODO 1, 5). Only nf-ort links it, and nf-engine and nf-app only with their `onnx` feature. No

@@ -1,8 +1,8 @@
 //! The real-time rule (CLAUDE.md) for the stages: after `build_chain` (which warms up the calling
-//! thread), the RNNoise chain's per-block processing makes no heap allocation, and an AEC3 chain
-//! makes only sonora 0.2.0's own (sonora-nnnoiseless.md 1.7; upstream PR #40 removes them). The
-//! per-block reads of the stages' extensions and params (the speech probability, the gain, AEC3's
-//! telemetry, `param_value` and `set_param`) make none either.
+//! thread), a chain's per-block processing makes no heap allocation, with AEC3 in it or not (sonora
+//! 0.3.0 allocates nothing per block; 0.2.0 made about 43, sonora-nnnoiseless.md 1.7). The per-block
+//! reads of the stages' extensions and params (the speech probability, the gain, AEC3's telemetry,
+//! `param_value` and `set_param`) make none either.
 //!
 //! A counting global allocator (this test binary only) counts per thread, so tests running in
 //! parallel don't disturb each other. Same pattern as nf-core's `tests/rt_no_alloc.rs`.
@@ -186,35 +186,34 @@ fn rnnoise_resets_never_allocate() {
 }
 
 #[test]
-fn an_aec3_chain_allocates_only_inside_sonora() {
+fn the_aec3_chain_does_not_allocate_after_build() {
+    // sonora 0.3.0's echo canceller allocates nothing per block (its PR #40; 0.2.0 made about 43). Its filters' buffers are
+    // sized for the longest filter when it's built, so their growth (12 to 13 partitions) once AEC3 leaves its initial state
+    // (2.5 s of active far end) allocates nothing either: the count runs from the first block to 12 s, through every gate
+    // mode and with the meters on and off, as in the RNNoise test.
     let s = signals(6);
-    let cfg = ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() };
-    let mut chain = build_chain(controls(cfg.clone()), true).expect("chain");
-    // The same blocks through AEC3 alone: the chain (and RNNoise in it) must add nothing.
+    let c = controls(ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() });
+    let mut chain = build_chain(c.clone(), true).expect("chain");
+    let gates = [GateMode::Off, GateMode::Static, GateMode::Auto].map(|mode| GateConfig { mode, ..GateConfig::default() });
+    let counts = per_block(&mut chain, &s, 0..1200, |b| {
+        c.noise.gate.apply(&gates[b / 50 % 3]);
+        c.meters_enabled.store(b % 13 != 0, Relaxed);
+    });
+    let total: usize = counts.iter().sum();
+    eprintln!("AEC3 chain: {total} allocations in its first {} blocks", counts.len());
+    assert_eq!(total, 0, "allocations in the AEC3 chain: {:?}", counts.iter().enumerate().filter(|c| *c.1 > 0).collect::<Vec<_>>());
+    // The same blocks through AEC3 alone, on a stage of its own.
     let mut aec = aec3();
     let mut out = [0.0f32; BLOCK];
-    let warm = 50;
-    let _ = per_block(&mut chain, &s, 0..warm, |_| {});
-    for b in 0..warm {
-        let (m, r) = s.block(b);
-        aec.process(ProcessIo::new(&[m, r], &mut out));
-    }
-    let chain_counts = per_block(&mut chain, &s, warm..warm + 400, |_| {});
-    let aec_counts: Vec<usize> = (warm..warm + 400)
+    let alone: usize = (0..1200)
         .map(|b| {
             let (m, r) = s.block(b);
             allocations_in(|| {
                 aec.process(ProcessIo::new(&[m, r], &mut out));
             })
         })
-        .collect();
-    let mean = chain_counts.iter().sum::<usize>() as f64 / chain_counts.len() as f64;
-    let max = chain_counts.iter().copied().max().unwrap_or(0);
-    eprintln!("AEC3 chain: {mean:.1} allocations per block on average, {max} at most (sonora 0.2.0)");
-    assert_eq!(chain_counts, aec_counts, "the chain and RNNoise add allocations of their own");
-    // A guard, not a target: sonora's known per-block Vecs are ~43 (a Rate32kHz config would add
-    // a full-band copy per frame).
-    assert!(max <= 100, "{max} allocations in one block");
+        .sum();
+    assert_eq!(alone, 0, "allocations in AEC3 alone");
 }
 
 #[test]
