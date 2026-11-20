@@ -18,9 +18,12 @@ masks, so the approach depends on the model:
 - **Floor:** static (the user sets a threshold), or auto (track the noise floor; tunable rise and
   fall rates).
 - **Envelope:** attack/release and hold, no lookahead, so no added latency.
-- **Detector:** RNNoise's VAD probability, or the model's gain energy. The gate is the noise stage's last step,
-  after AEC and the model and before any effects (#17). With a third-party denoiser, a level-based
-  gate runs right after it.
+- The gate measures the level after the dry signal is mixed into the denoised audio, before the effects (TODO 17).
+  A model's speech probability can also hold the gate open. A third-party denoiser without that signal can use the
+  level detector alone. By default the gate is off.
+- For the effects host (TODO 17), we propose reusing this gate when denoising is off. A gate-only chain can use
+  the level detector directly. With denoising on, apply the gate once and preserve the existing settings.
+  Try quiet word endings and pauses with AGC2 both on and off to hear whether the gain brings room noise back up.
 
 ## Input level meter (owner's request)
 - **What it shows:**

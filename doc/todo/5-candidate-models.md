@@ -127,6 +127,18 @@ Mean noise cut in the pauses (dB, the noise as mixed against the output a latenc
 - GCC-PHAT on every take: the chain's latency (480.00, 2400.00) within 0.01 sample at 41-53 dB.
 - These are level measures, not listening: the WAVs go to `NF_STAGES_WAV_DIR` for the owner's ears.
 
+## Sonora noise suppression comparison
+
+The owner requested Sonora's WebRTC noise suppressor as a comparison point (2026-11-20). Our AEC3 stage disables
+`noise_suppression`. The pinned Sonora 0.3.0 offers four strengths. Start with its default, `Moderate`.
+[Sonora's suppression settings](https://github.com/dignifiedquire/sonora/blob/sonora-v0.3.0/crates/sonora/src/config.rs#L188-L216)
+
+Run Sonora NS, RNNoise and UL-UNAS separately on the same 48 kHz clean/noisy pairs in the offline Lab (TODO 14).
+Keep the dry mix identical and turn off AEC, the gate and automatic gain for this comparison. Listen for the ends of
+quiet words and score both speech quality and noise left in pauses on the fan, keyboard and café recordings. Measure
+sample delay, p99 time per 10 ms block and audio-thread allocations (TODO 2). For the speaker use case, repeat with
+the same recorded AEC3 output feeding each denoiser.
+
 ## Open
 - Listening (the owner), and TODO 14's A/B: the high-band policy (`model`, `zero`, `pass`), and the top-bin fold
   (`Spectral::set_fold(8)`, off by default; `doc/todo/3-model-spec.md`, P3).

@@ -64,6 +64,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - DeepFilterNet3: standard weights plausibly open; _ll is a bigger model (9.7M params) with weaker evidence. Opt-in only.
 - Open (owner): does dropping GTCRN over its patent filings also cover UL-UNAS, which probably shares the family? Until answered, UL-UNAS stays the next integration.
 - RNNoise (#4) is the fallback. Choose by #13 and #14 on the owner's own mic, not by paper scores.
+- Compare Sonora's WebRTC noise suppressor with RNNoise and UL-UNAS on the same Lab clips (#14), one denoiser per run (owner request, 2026-11-20).
 - Live A/B on the cables (8cb6913): 8-19 dB more noise cut in pauses, speech alike, app path 64.5 ms at depth 1 (auto with the exclusive mic, b53a965) against RNNoise's 34.4. The Lab (357 clips, e374c2c): DNSMOS OVRL +0.26 [+0.12, +0.41], SIGMOS OVRL +0.68 [+0.54, +0.82].
 **Next**: the owner's patent answer and a listen (WAVs in the VM's `Downloads\nf-quality\ab-*`); a lower-latency candidate (FastEnhancer, or our 10 ms-hop retrain, #7).
 **Detail**: `doc/todo/5-candidate-models.md`; `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
@@ -131,7 +132,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Gate: static or auto threshold, hold, linear-in-dB attack/release, no lookahead. Auto follows a smoothed level of the model's output.
 - Our call (2026-10-26, not the owner's): "hold open on speech (VAD)" defaults to off. RNNoise's VAD fires on 87-100% of pure-noise blocks, which held the Auto gate open.
 - Open: at the default 6 dB margin, RNNoise's residual bursts sometimes open the gate (9-12 dB measured better, speech effect at those margins not measured); some gaps take 0.7-2 s to close after a talk spurt.
-**Next**: tune the margin and rise rates on real recordings in the Lab (#14).
+**Next**: tune the margin and rise rates on real recordings in the Lab (#14). Evaluate using the existing gate on its own with denoising off (#17).
 **Detail**: `doc/todo/11-floor-gate-meter.md`
 
 ---
@@ -191,6 +192,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Every stage is CLAP-shaped. The AEC takes the mic on its main input and the speaker reference on a second input port (CLAP allows one main input plus non-main ones, the sidechain convention). The noise filter is a stage that loads model packs (#3), with the floor and gate inside it and a namespaced extension publishing its speech probability. Effects (a voice changer) come after.
 - Our own stages run in-process through the same Rust interface (no FFI). They can also be exported as `.clap` files (and VST3 via clap-wrapper) for other hosts. Third-party plugins run in an fx-host process (shared memory, a watchdog that passes clean audio through on a miss, editors as its own windows).
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
+- EQ, voice changers and automatic gain control are in scope (owner, 2026-11-20). Evaluate Sonora AGC2 as an optional app effect that can run with AEC and denoising off.
 **Next**: recheck CLAP's headers before the .clap export (doc/todo/17's list); a lock-free queue for stages' own params with the GUI (#15) or the first effect.
 **Detail**: `doc/todo/17-post-effects.md`
 

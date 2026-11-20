@@ -36,6 +36,19 @@ No universal plugin system fits this case, so the app should provide one: a stan
 published so that others can add stages after AEC and noise suppression, e.g. a voice changer.
 Publishing is tentative ('should probably publish the spec').
 
+## Optional automatic gain control
+
+The owner put automatic gain control alongside EQ and voice changers in scope (2026-11-20). Our proposal is a
+separately switchable app effect using Sonora AGC2. Someone using headphones should be able to select it with AEC
+off, with any selected denoiser or on its own. TODO 11 covers the existing gate and the proposed gate-only mode.
+
+Start with AGC2's adaptive digital gain and peak limiter. Set `adaptive_digital` explicitly and leave
+`input_volume_controller` off so the level adjustment applies to the cable feed. Start after the optional denoiser
+and gate. Compare gain on and off on quiet speech followed by loud speech, a sudden peak and a pause with room tone.
+Check the speech level, peak clipping and any audible rise in background noise. Include AGC2 in TODO 10's digital
+silence check. Measure the added sample delay, p99 block time and audio-thread allocations with the offline harness (TODO 2).
+[Sonora 0.3.0 gain controls](https://github.com/dignifiedquire/sonora/blob/sonora-v0.3.0/crates/sonora/src/config.rs#L216-L250)
+
 ## Effects details (CLAP chosen by the owner, 2026-10-26)
 - **Models (our proposal, part of #17, awaiting the owner):** our own declarative model-pack spec (#3).
 - **Effects:** don't invent a binary plugin ABI. No plugins would exist for it on day one, and CLAP
