@@ -17,6 +17,7 @@ Environment:
 --*/
 
 #include "public.h"
+#include "AppRing.h"
 #include "cpp_utils.h"
 
 #ifndef __INTELLISENSE__
@@ -124,6 +125,12 @@ Return Value:
     // object. ACX uses this call to apply any post driver settings.
     //
     RETURN_NTSTATUS_IF_FAILED(AcxDriverInitialize(driver, &acxCfg));
+
+    //
+    // noise-filter (TODO 19, spike check 4): the app ring's spin lock and the control device's wait lock, before any device
+    // exists (Control.cpp). After AcxDriverInitialize, which the sample calls straight after WdfDriverCreate.
+    //
+    RETURN_NTSTATUS_IF_FAILED(NfVmic_DriverInit(driver));
 
     return status;
 }

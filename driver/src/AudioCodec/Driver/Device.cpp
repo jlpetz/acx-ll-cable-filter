@@ -26,6 +26,7 @@ Environment:
 #include "streamengine.h"
 #include "DriverSettings.h"
 #include "PacketSize.h"
+#include "AppRing.h"
 
 #ifndef __INTELLISENSE__
 #include "device.tmh"
@@ -120,8 +121,6 @@ Return Value:
 
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(Driver);
-
     //
     // The driver calls this DDI in its AddDevice callback before creating the PnP device.
     // ACX uses this call to add default/standard settings for the device to be created.
@@ -157,6 +156,7 @@ Return Value:
     devCtx->Render = nullptr;
     devCtx->Capture = nullptr;
     devCtx->ExcludeD3Cold = WdfFalse;
+    devCtx->VmicRegistered = FALSE;
 
     //
     // noise-filter (TODO 19): the loopback ring, allocated once for the device's life so that no stream allocates at
@@ -169,6 +169,14 @@ Return Value:
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    //
+    // noise-filter (TODO 19, spike check 4): register with the app feed: the first device makes its control device
+    // (NoiseFilterVmic), and the last one's context cleanup deletes it. A failure there costs only the app feed; it is
+    // reported and the device goes on. From here on this device's cleanup must unregister, whatever fails later.
+    //
+    NfVmic_DeviceAdd(Driver, device, &devCtx->Loopback);
+    devCtx->VmicRegistered = TRUE;
 
     //
     // The driver calls this DDI in its AddDevice callback after creating the PnP
@@ -463,6 +471,18 @@ Return Value:
     device = (WDFDEVICE)WdfDevice;
     devCtx = GetCodecDeviceContext(device);
     ASSERT(devCtx != nullptr);
+
+    //
+    // noise-filter (TODO 19, spike check 4): first, while the loopback ring that STATS reads from is still here: stop STATS
+    // reading it and, with the last device, end any app ring and delete the control device. Learn: a driver with both kinds
+    // deletes its control device itself, at PASSIVE_LEVEL, after the framework has deleted its PnP devices, which this
+    // callback is how it learns (wdf/using-control-device-objects).
+    //
+    if (devCtx->VmicRegistered)
+    {
+        NfVmic_DeviceCleanup(device);
+        devCtx->VmicRegistered = FALSE;
+    }
 
     //
     // noise-filter (TODO 19): free the loopback ring. The streams are gone by now (inference: they descend from the device

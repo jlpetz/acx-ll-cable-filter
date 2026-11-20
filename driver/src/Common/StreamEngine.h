@@ -269,6 +269,10 @@ protected:
     ULONGLONG           m_LbAnchor;         // ring frame of this stream's byte position 0 on its current time line
     BOOLEAN             m_LbAnchorValid;
 
+    // noise-filter (TODO 19, spike check 5): the timer statistics (AppRing.h).
+    ULONG               m_StatsKind;        // NF_VMIC_KIND_RENDER or NF_VMIC_KIND_CAPTURE: the NF_VMIC_STREAM_STATS it counts in
+    ULONGLONG           m_ArmedHns;         // the time ScheduleNextPass armed the timer for (its schedule's 100 ns units)
+
     static
     __drv_maxIRQL(DISPATCH_LEVEL)
     _Function_class_(EVT_WDF_TIMER)
@@ -451,6 +455,12 @@ public:
     NTSTATUS
     Run();
 
+    virtual
+    __drv_maxIRQL(PASSIVE_LEVEL)
+    PAGED_CODE_SEG
+    NTSTATUS
+    Pause();
+
 protected:
     ToneGenerator   m_ToneGenerator;
     CWaveReader     m_WaveReader;
@@ -463,6 +473,9 @@ protected:
     ULONG           m_LbAnchorLead;     // the render lead (LOOPBACK_RING.RenderLeadFrames) the anchor was made with
     ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
+    // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
+    BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied
+
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
     __declspec(noinline)
     __drv_maxIRQL(DISPATCH_LEVEL)
@@ -472,6 +485,23 @@ protected:
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
         );
+
+    // noinline: takes the app ring's spin lock; out of line as LoopbackCapturePass is. TRUE: an app ring was attached and this
+    // pass was served from it (audio or silence); FALSE: none attached, so the loopback serves the pass.
+    __declspec(noinline)
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    BOOLEAN
+    AppRingCapturePass(
+        _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
+        _In_                            ULONG   PacketSize
+        );
+
+    // noinline: called from PAGE code (Pause, ReleaseHardware, the destructor) and takes the app ring's spin lock. Inlined
+    // into a PAGE function, its locked region would be pageable code at DISPATCH_LEVEL.
+    __declspec(noinline)
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    VOID
+    AppRingReaderStop();
 
     virtual
     __drv_maxIRQL(DISPATCH_LEVEL)

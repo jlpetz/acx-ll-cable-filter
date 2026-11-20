@@ -7,6 +7,8 @@ there (doc/todo/19-driver-base-2026-10-28.md has the plan and the spike's checks
 **Licence.** The files under `src/` derive from the sample, which is MS-PL (`LICENSE-MS-PL.txt`): they stay MS-PL (its
 section 3(D)). The scripts are ours, under the repo's licence. `src/Common/PacketSize.{h,cpp}` are ported from
 microsoft/low-latency-audio (MIT, `LICENSE-MIT-low-latency-audio.txt`) and keep its Microsoft and Yamaha notices.
+`src/Shared/nf_vmic.h`, `src/Common/AppRing.{h,cpp}` and `src/AudioCodec/Driver/Control.cpp` are ours, not the sample's:
+MIT OR Apache-2.0, so the Rust mirror of the protocol stays under the repo's licence (our proposal; the owner to confirm).
 
 **What changed from the sample** (the first commit after the import shows it): KMDF 1.35 (Windows 11 24H2 / Server 2025,
 build 26100, and up: the owner, 2026-11-20) in both projects, and the INF's OS floor 10.0...26100 to match. ACX stays 1.1,
@@ -27,6 +29,16 @@ covers the integer fallback and Windows 11. The sample's tone, WAV reader and
 SaveData are no longer called. Two of the sample's stream-engine bugs are fixed: UpdatePosition subtracted the glitch
 adjustment (time) from a byte position, and let the position pass the packet in progress (a Pause could then stall the
 next Run's timer for about 111 days); and the first capture packet of a run reported a QPC of 0.
+
+The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
+(page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
+plays it instead of the loopback, frame for frame. The request ends with ERROR_OPERATION_ABORTED (a cancel, the issuing thread
+or process exiting, or the handle closed) or ERROR_DEVICE_REMOVED (the device is going away: the app must then close every
+handle, since an open handle on the control device keeps the driver loaded). `src/Shared/nf_vmic.h` has the protocol, every
+ATTACH outcome and the ring's rules; `crates/nf-vmic` mirrors it, and its `nf-vmic-test` feeds, verifies, prints the
+statistics and kills feeders. The statistics IOCTL also carries each stream kind's timer lateness histogram (spike check 5).
+Only SYSTEM and Administrators may open it for the spike: letting unelevated users in first needs attachments tied to a
+session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for the same reason as above.
 
 ## Building and installing (an elevated Windows PowerShell)
 

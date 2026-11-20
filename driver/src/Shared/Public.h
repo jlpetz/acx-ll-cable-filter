@@ -99,6 +99,7 @@ typedef struct _CODEC_DEVICE_CONTEXT {
     ACXCIRCUIT      Capture;
     WDF_TRI_STATE   ExcludeD3Cold;
     LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
+    BOOLEAN         VmicRegistered;         // noise-filter (TODO 19, spike check 4): NfVmic_DeviceAdd ran; the cleanup undoes it
 } CODEC_DEVICE_CONTEXT, * PCODEC_DEVICE_CONTEXT;
 
 //

@@ -26,7 +26,12 @@ Environment:
 #include <ks.h>
 #include <mmsystem.h>
 #include <ksmedia.h>
+// noise-filter (TODO 19, spike check 4): KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, which ksmedia.h defines only after mmreg.h (and
+// private.h includes it first). NOBITMAP as Inc\AudioFormats.h has it: no BITMAPINFOHEADER in kernel mode.
+#define NOBITMAP
+#include <mmreg.h>
 #include "streamengine.h"
+#include "AppRing.h"
 
 #ifndef __INTELLISENSE__
 #include "streamengine.tmh"
@@ -72,6 +77,10 @@ CStreamEngine::CStreamEngine(
     m_LbRingFrames = 0;
     m_LbAnchor = 0;
     m_LbAnchorValid = FALSE;
+
+    // noise-filter (TODO 19, spike check 5): the timer statistics. CCaptureStreamEngine's constructor makes it a capture stream.
+    m_StatsKind = NF_VMIC_KIND_RENDER;
+    m_ArmedHns = 0;
 
     {
         ACXCIRCUIT              circuit = AcxStreamGetCircuit(Stream);
@@ -427,6 +436,9 @@ CStreamEngine::Run()
 
     ScheduleNextPass();
 
+    // noise-filter (TODO 19, spike check 5): counted per stream kind (NF_VMIC_IOCTL_STATS).
+    NfVmicRecordRun(m_StatsKind);
+
     m_CurrentState = AcxStreamStateRun;
     status = STATUS_SUCCESS;
 
@@ -581,6 +593,18 @@ CStreamEngine::s_EvtStreamPassCallback(
     timerCtx = GetStreamTimerContext(Timer);
     This = timerCtx->StreamEngine;
 
+    //
+    // noise-filter (TODO 19, spike check 5): how late the timer fired: this pass's time (the schedule's units,
+    // KSCONVERT_PERFORMANCE_TIME of the QPC) minus the time ScheduleNextPass armed it for. Timer-fired passes only: the ones
+    // ScheduleNextPass runs at once count as glitch adjustments instead.
+    //
+    {
+        LARGE_INTEGER   qpc = KeQueryPerformanceCounter(NULL);
+        ULONGLONG       now = KSCONVERT_PERFORMANCE_TIME(This->m_PerformanceCounterFrequency.QuadPart, qpc);
+
+        NfVmicRecordTimerPass(This->m_StatsKind, (LONGLONG)(now - This->m_ArmedHns));
+    }
+
     // Call the StreamPassCallback for the engine
     This->StreamPassCallback();
 }
@@ -654,10 +678,16 @@ CStreamEngine::ScheduleNextPass()
         // Update the glitch adjustment and set the new delay.
         m_GlitchAdjust += delay;
 
+        // noise-filter (TODO 19, spike check 5): counted, with the time it moved the stream's time line.
+        NfVmicRecordGlitch(m_StatsKind, (ULONGLONG)delay);
+
         StreamPassCallback();
 
         return;
     }
+
+    // noise-filter (TODO 19, spike check 5): the time this pass is due, for its lateness (s_EvtStreamPassCallback).
+    m_ArmedHns = nextPacketTime;
 
     // Start the timer for our next pass! Note the timer isn't periodic.
     inTimerQueue = WdfTimerStart(m_NotificationTimer, delay);
@@ -1299,9 +1329,13 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_EnableWaveCapture(0),
     m_LbLagFrames(0),
     m_LbAnchorLead(0),
-    m_LbReadBase(0)
+    m_LbReadBase(0),
+    m_AppFormatOk(FALSE)
 {
     PAGED_CODE();
+
+    // noise-filter (TODO 19, spike check 5): this stream's timer counts as a capture stream's (NF_VMIC_IOCTL_STATS).
+    m_StatsKind = NF_VMIC_KIND_CAPTURE;
 
     m_CurrentPacketStart.QuadPart = 0;
     m_LastPacketStart.QuadPart = 0;
@@ -1315,6 +1349,9 @@ PAGED_CODE_SEG
 CCaptureStreamEngine::~CCaptureStreamEngine()
 {
     PAGED_CODE();
+
+    // noise-filter (TODO 19, spike check 4): give the app ring's reader slot up if Pause and ReleaseHardware did not.
+    AppRingReaderStop();
 
     RtlFreeUnicodeString(&m_HostCaptureFileName);
     RtlFreeUnicodeString(&m_LoopbackCaptureFileName);
@@ -1340,6 +1377,8 @@ PAGED_CODE_SEG
 NTSTATUS
 CCaptureStreamEngine::ReleaseHardware()
 {
+    NTSTATUS status;
+
     PAGED_CODE();
 
     if (m_EnableWaveCapture)
@@ -1347,7 +1386,13 @@ CCaptureStreamEngine::ReleaseHardware()
         m_WaveReader.WaitAllWorkItems();
     }
 
-    return CStreamEngine::ReleaseHardware();
+    status = CStreamEngine::ReleaseHardware();
+
+    // noise-filter (TODO 19, spike check 4): the timer is gone (the base deleted it and flushed queued DPCs): give the app
+    // ring's reader slot up.
+    AppRingReaderStop();
+
+    return status;
 }
 
 _Use_decl_annotations_
@@ -1395,10 +1440,14 @@ CCaptureStreamEngine::ProcessPacket()
     }
 
     //
-    // noise-filter (TODO 19): the capture half of the loopback pair, in place of the sample's tone generator and WAV reader
-    // (m_ToneGenerator.GenerateSine, m_WaveReader.ReadWaveData).
+    // noise-filter (TODO 19): an attached app ring (spike check 4) serves the pass first; without one, the capture half of the
+    // loopback pair (spike check 7). Both in place of the sample's tone generator and WAV reader (m_ToneGenerator.GenerateSine,
+    // m_WaveReader.ReadWaveData).
     //
-    LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
+    if (!AppRingCapturePass(packetBuffer, m_PacketSize))
+    {
+        LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
+    }
 }
 
 _Use_decl_annotations_
@@ -1419,6 +1468,18 @@ CCaptureStreamEngine::Run()
 
         // Anchor again at the first pass: Run gives this stream a new time line (m_StartTime).
         m_LbAnchorValid = FALSE;
+
+        //
+        // noise-filter (TODO 19, spike check 4): the app ring holds 48 kHz float32 stereo frames and is copied raw, so only into
+        // packets of exactly that format (nf_vmic.h). m_LbFormat.Valid adds whole frames in a packet and the byte clock.
+        //
+        m_AppFormatOk = (m_LbFormat.Valid &&
+                         m_LbFormat.SampleRate == NF_VMIC_SAMPLE_RATE &&
+                         m_LbFormat.Channels == NF_VMIC_CHANNELS &&
+                         m_LbFormat.BitsPerSample == 32 &&
+                         m_LbFormat.ValidBitsPerSample == 32 &&
+                         m_LbFormat.BlockAlign == NF_VMIC_FRAME_BYTES &&
+                         IsEqualGUID(m_LbFormat.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) ? TRUE : FALSE;
     }
 
     return CStreamEngine::Run();
@@ -1537,6 +1598,216 @@ CCaptureStreamEngine::LoopbackCapturePass(
 zero:
     KeReleaseSpinLock(&ring->Lock, oldIrql);
     RtlZeroMemory(PacketBuffer, PacketSize);
+}
+
+_Use_decl_annotations_
+PAGED_CODE_SEG
+NTSTATUS
+CCaptureStreamEngine::Pause()
+{
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    status = CStreamEngine::Pause();
+
+    if (NT_SUCCESS(status))
+    {
+        // noise-filter (TODO 19, spike check 4): the timer has stopped (WdfTimerStop waits for its callback). Give the app
+        // ring's reader slot up: the next stream to run, this one or another, reads on from the ring's read_frame.
+        AppRingReaderStop();
+    }
+
+    return status;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// noise-filter (TODO 19, spike check 4): the app-fed capture ring. Shared\nf_vmic.h has the rules, Common\AppRing.h the state.
+//
+// An attached app ring serves every capture pass ahead of the loopback. The read is sample-continuous: read_frame advances by
+// the frames copied, a whole packet when the ring holds it, so every frame the app writes comes out once and in order, and an
+// underrun inserts silence without dropping anything. write_frame is the one value read back from the app's memory (every
+// pass) and is never trusted: a fill below 0 or above the capacity re-syncs, counted. Raw copies only into 48 kHz float32
+// stereo packets. All under the ring's lock, held for one packet's copy; nothing allocates.
+//
+
+//
+// This attachment's counters and the reader's state into the header's driver line, and the state and packet kept for STATS
+// (ReaderState, ReaderPacketFrames), so the two never disagree. Ring lock held, ring published, called by the reader.
+//
+static
+VOID
+AppRingStoreCounters(
+    _In_ PNF_APP_RING   Ring,
+    _In_ ULONG          State,
+    _In_ ULONG          PacketFrames,
+    _In_ ULONGLONG      Qpc
+)
+{
+    PNF_VMIC_RING_HEADER header = Ring->Header;
+
+    Ring->ReaderState = State;
+    Ring->ReaderPacketFrames = PacketFrames;
+
+    NfVmicStore64(&header->FramesCopied, Ring->AttachFramesCopied);
+    NfVmicStore64(&header->UnderrunFrames, Ring->AttachUnderrunFrames);
+    NfVmicStore32(&header->Resyncs, Ring->AttachResyncs);
+    NfVmicStore32(&header->MismatchPackets, Ring->AttachMismatchPackets);
+    NfVmicStore32(&header->State, State);
+    NfVmicStore32(&header->PacketFrames, PacketFrames);
+    NfVmicStore64(&header->Passes, Ring->AttachPasses);
+    NfVmicStore64(&header->LastPassQpc, Qpc);
+}
+
+_Use_decl_annotations_
+BOOLEAN
+CCaptureStreamEngine::AppRingCapturePass(
+    PBYTE   PacketBuffer,
+    ULONG   PacketSize
+)
+{
+    PNF_APP_RING    ring = &g_NfAppRing;
+    KIRQL           oldIrql;
+    ULONG           packetFrames;
+    ULONG           capacity;
+    ULONG           copyFrames;
+    ULONG           index;
+    ULONG           first;
+    ULONGLONG       writeFrame;
+    ULONGLONG       readFrame;
+    ULONGLONG       fill;
+    ULONGLONG       qpc;
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Header == NULL)
+    {
+        // No app ring attached: the loopback serves this pass.
+        KeReleaseSpinLock(&ring->Lock, oldIrql);
+        return FALSE;
+    }
+
+    ring->Stats.Passes++;
+
+    if (ring->Reader == NULL)
+    {
+        // The first stream to run after ATTACH (or after the last reader paused) holds the reader slot, whatever its format.
+        ring->Reader = this;
+    }
+    else if (ring->Reader != this)
+    {
+        // One reader at a time: a second capture stream gets silence, and the ring's position stays the first one's.
+        ring->Stats.NotReaderPackets++;
+        KeReleaseSpinLock(&ring->Lock, oldIrql);
+        RtlZeroMemory(PacketBuffer, PacketSize);
+        return TRUE;
+    }
+
+    // Every pass of the slot holder, FORMAT_MISMATCH ones too (the header's Passes and LastPassQpc); FramesCopied measures reading.
+    ring->AttachPasses++;
+    qpc = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
+
+    //
+    // m_AppFormatOk includes the loopback's check that the packet holds whole frames (Run, LoopbackSetFormat), so
+    // m_LbPacketFrames * NF_VMIC_FRAME_BYTES == PacketSize; it is checked again here because the copy below is bounded by
+    // m_LbPacketFrames and must stay inside PacketBuffer whatever changed since Run.
+    //
+    if (!m_AppFormatOk || m_LbPacketFrames == 0 || (ULONGLONG)m_LbPacketFrames * NF_VMIC_FRAME_BYTES != PacketSize)
+    {
+        //
+        // Raw copies only into 48 kHz float32 stereo packets: silence, counted, and read_frame stays where it is. The slot stays
+        // held, shown as FORMAT_MISMATCH (not READING), with this stream's packet in its own format's frames (0 when
+        // LoopbackSetFormat found the format unusable).
+        //
+        ring->Stats.MismatchPackets++;
+        ring->AttachMismatchPackets++;
+        AppRingStoreCounters(ring, NF_VMIC_STATE_ATTACHED | NF_VMIC_STATE_FORMAT_MISMATCH, m_LbPacketFrames, qpc);
+        KeReleaseSpinLock(&ring->Lock, oldIrql);
+        RtlZeroMemory(PacketBuffer, PacketSize);
+        return TRUE;
+    }
+
+    packetFrames = m_LbPacketFrames;
+    capacity = ring->CapacityFrames;
+
+    // The one value read back from the app's memory, untrusted. Acquire: the frames before it are written.
+    writeFrame = NfVmicLoadAcquire64(&ring->Header->WriteFrame);
+    readFrame = ring->ReadFrame;
+
+    // Unsigned: a write_frame behind read_frame shows as a fill far above the capacity, so one test catches both.
+    fill = writeFrame - readFrame;
+    if (fill > capacity)
+    {
+        readFrame = writeFrame;
+        fill = 0;
+        ring->Stats.Resyncs++;
+        ring->AttachResyncs++;
+    }
+
+    copyFrames = (ULONG)MIN(fill, (ULONGLONG)packetFrames);
+    if (copyFrames != 0)
+    {
+        // At most two runs, to the ring's end and then from its start; the capacity is a power of two (checked at ATTACH).
+        index = (ULONG)(readFrame & (capacity - 1));
+        first = MIN(copyFrames, capacity - index);
+        RtlCopyMemory(PacketBuffer, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, (SIZE_T)first * NF_VMIC_FRAME_BYTES);
+        if (copyFrames > first)
+        {
+            RtlCopyMemory(PacketBuffer + (SIZE_T)first * NF_VMIC_FRAME_BYTES,
+                          ring->Data,
+                          (SIZE_T)(copyFrames - first) * NF_VMIC_FRAME_BYTES);
+        }
+    }
+    if (copyFrames < packetFrames)
+    {
+        // An underrun: what the app hasn't written yet is silence. read_frame stops at write_frame: nothing is skipped.
+        RtlZeroMemory(PacketBuffer + (SIZE_T)copyFrames * NF_VMIC_FRAME_BYTES,
+                      (SIZE_T)(packetFrames - copyFrames) * NF_VMIC_FRAME_BYTES);
+        ring->Stats.UnderrunPackets++;
+        ring->Stats.UnderrunFrames += packetFrames - copyFrames;
+        ring->AttachUnderrunFrames += packetFrames - copyFrames;
+    }
+
+    readFrame += copyFrames;
+    ring->ReadFrame = readFrame;
+    ring->LastWriteSeen = writeFrame;
+    ring->Stats.FramesCopied += copyFrames;
+    ring->AttachFramesCopied += copyFrames;
+
+    //
+    // The counters, then read_frame with release ordering: once the app sees it, the copy is done and those slots are free.
+    // READING whether or not the ring held a whole packet: an underrun is still a pass served from the ring.
+    //
+    AppRingStoreCounters(ring, NF_VMIC_STATE_ATTACHED | NF_VMIC_STATE_READING, packetFrames, qpc);
+    NfVmicStoreRelease64(&ring->Header->ReadFrame, readFrame);
+
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
+    return TRUE;
+}
+
+_Use_decl_annotations_
+VOID
+CCaptureStreamEngine::AppRingReaderStop()
+{
+    PNF_APP_RING    ring = &g_NfAppRing;
+    KIRQL           oldIrql;
+
+    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    if (ring->Reader == this)
+    {
+        ring->Reader = NULL;
+        ring->ReaderState = 0;
+        ring->ReaderPacketFrames = 0;
+        if (ring->Header != NULL)
+        {
+            NfVmicStore32(&ring->Header->State, NF_VMIC_STATE_ATTACHED);
+            NfVmicStore32(&ring->Header->PacketFrames, 0);
+        }
+    }
+
+    KeReleaseSpinLock(&ring->Lock, oldIrql);
 }
 
 _Use_decl_annotations_

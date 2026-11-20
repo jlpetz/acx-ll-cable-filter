@@ -3,6 +3,7 @@
 # memory, the real-time allocator), nf-stages (RNNoise, AEC3), nf-ort (ONNX model packs through ONNX
 # Runtime: the only crate that links it, TODO 5), nf-engine (WASAPI, threads, clocks, latency), nf-gui
 # (the Reactor window), nf-app (the exe: window by default, CLI subcommands).
+# nf-vmic (the virtual mic driver's app-feed protocol, and nf-vmic-test, its spike tool: TODO 19).
 [workspace]
 resolver = "3"
 members = [
@@ -13,6 +14,7 @@ members = [
     "crates/nf-engine",
     "crates/nf-gui",
     "crates/nf-app",
+    "crates/nf-vmic",
 ]
 default-members = ["crates/nf-app"]
 

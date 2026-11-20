@@ -1,0 +1,499 @@
+//! The driver's protocol, mirrored from `driver/src/Shared/nf_vmic.h`: the same constants, and the same layouts, checked against
+//! the header's offsets at compile time. Change both together, and bump [`VERSION`] on any change to a layout or a rule; the
+//! header's comment has the rules.
+
+use std::mem::{offset_of, size_of};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+
+/// `NF_VMIC_MAGIC`: "NFVM" in memory order.
+pub const MAGIC: u32 = 0x4D56_464E;
+/// `NF_VMIC_VERSION`.
+pub const VERSION: u32 = 1;
+/// `NF_VMIC_USER_PATH`: the control device, opened from user mode.
+pub const USER_PATH: &str = r"\\.\NoiseFilterVmic";
+
+const FILE_DEVICE_UNKNOWN: u32 = 0x22;
+const METHOD_BUFFERED: u32 = 0;
+const METHOD_OUT_DIRECT: u32 = 2;
+const FILE_READ_ACCESS: u32 = 1;
+const FILE_WRITE_ACCESS: u32 = 2;
+
+/// winioctl.h's `CTL_CODE`.
+const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
+    (device_type << 16) | (access << 14) | (function << 2) | method
+}
+
+/// `NF_VMIC_IOCTL_ATTACH`: input an [`AttachIn`], output the ring ([`ring_bytes`] long, starting on a page boundary); pending
+/// while attached. [`ATTACH_REFUSALS`], [`ATTACH_FAILURES_AT_ONCE`] and [`ATTACH_ENDINGS`] list how it completes.
+pub const IOCTL_ATTACH: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
+/// `NF_VMIC_IOCTL_STATS`: no input; output a [`Stats`].
+pub const IOCTL_STATS: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS);
+const _: () = assert!(IOCTL_ATTACH == 0x0022_E002 && IOCTL_STATS == 0x0022_6004);
+
+/// The ring's format: the capture endpoint's device format (spike check 3).
+pub const SAMPLE_RATE: u32 = 48_000;
+pub const CHANNELS: u16 = 2;
+/// `NF_VMIC_FORMAT_FLOAT32`: IEEE 754 binary32, interleaved left, right.
+pub const FORMAT_FLOAT32: u16 = 1;
+pub const FRAME_BYTES: u32 = 8;
+/// The header's size; the frames follow it.
+pub const HEADER_BYTES: u32 = 256;
+/// `NF_VMIC_DRIVER_LINE_OFFSET`: line 2, the driver's.
+pub const DRIVER_LINE_OFFSET: u32 = 128;
+/// `NF_VMIC_LINE_BYTES`: the header's four lines.
+pub const LINE_BYTES: u32 = 64;
+/// The ring's capacity: a power of two from 1024 frames (21.3 ms: two 480-frame packets, a shared stream's 10 ms period) to
+/// 2^18 (5.46 s, 2 MiB). The capacity, and the fill the app keeps, must be at least one capture packet
+/// ([`RingHeader::packet_frames`], [`Stats::reader_packet_frames`]), or every pass underruns.
+pub const MIN_CAPACITY_FRAMES: u32 = 1024;
+pub const MAX_CAPACITY_FRAMES: u32 = 1 << 18;
+/// `NF_VMIC_MIN_RING_BYTES` and `NF_VMIC_MAX_RING_BYTES`: the ATTACH output buffer's limits.
+pub const MIN_RING_BYTES: usize = ring_bytes(MIN_CAPACITY_FRAMES);
+pub const MAX_RING_BYTES: usize = ring_bytes(MAX_CAPACITY_FRAMES);
+
+/// [`RingHeader::state`] bits: the driver published this ring.
+pub const STATE_ATTACHED: u32 = 0x1;
+/// The capture stream holding the reader slot read the ring at its latest pass (underrun or not).
+pub const STATE_READING: u32 = 0x2;
+/// That stream isn't 48 kHz float32 stereo: its packets are silence, the ring not read.
+pub const STATE_FORMAT_MISMATCH: u32 = 0x4;
+
+/// [`Stats::flags`] bits. An app ring is attached (the `attached_*` fields are valid).
+pub const STATS_ATTACHED: u32 = 0x1;
+/// The PnP device is there ([`Stats::loopback`] is valid).
+pub const STATS_LOOPBACK: u32 = 0x2;
+/// The header's [`STATE_READING`] (the reader's latest pass).
+///
+/// With [`STATS_ATTACHED`], this and [`STATS_FORMAT_MISMATCH`] are the State bits the stream holding the reader slot wrote to
+/// the header at its latest pass, and [`Stats::reader_packet_frames`] is the PacketFrames it wrote, so STATS and the header
+/// agree. While no stream holds the slot all three are 0. A stream in another format holds the slot without reading:
+/// FORMAT_MISMATCH, and its packet in its own format's frames (0 if the driver can't count its packet in frames).
+pub const STATS_READING: u32 = 0x4;
+/// The header's [`STATE_FORMAT_MISMATCH`] (the reader's latest pass).
+pub const STATS_FORMAT_MISMATCH: u32 = 0x8;
+
+/// [`Stats::stream`] indexes.
+pub const KIND_RENDER: usize = 0;
+pub const KIND_CAPTURE: usize = 1;
+pub const KINDS: usize = 2;
+
+/// The timer-lateness histogram: upper bounds of buckets 0-6 in 100 ns units; bucket 7 holds the rest (5 ms and over).
+pub const LATENESS_BUCKETS: usize = 8;
+pub const LATENESS_BOUNDS_HNS: [u64; LATENESS_BUCKETS - 1] = [500, 1_000, 2_500, 5_000, 10_000, 20_000, 50_000];
+pub const LATENESS_LABELS: [&str; LATENESS_BUCKETS] =
+    ["0-50 us", "50-100 us", "100-250 us", "250-500 us", "0.5-1 ms", "1-2 ms", "2-5 ms", "5 ms and over"];
+
+/// The ring's length for `capacity_frames` (`NF_VMIC_RING_BYTES`): the ATTACH output buffer's length, exactly. The buffer must
+/// also start on a page boundary, as [`RingMemory`](crate::RingMemory)'s `VirtualAlloc` region does.
+pub const fn ring_bytes(capacity_frames: u32) -> usize {
+    HEADER_BYTES as usize + capacity_frames as usize * FRAME_BYTES as usize
+}
+
+/// Whether the driver takes a ring of `capacity_frames`: a power of two within the limits.
+pub fn capacity_ok(capacity_frames: u32) -> bool {
+    capacity_frames.is_power_of_two() && (MIN_CAPACITY_FRAMES..=MAX_CAPACITY_FRAMES).contains(&capacity_frames)
+}
+
+/// The bucket the driver counts a timer lateness of `hns` in (AppRing.cpp, `NfVmicLatenessBucket`).
+pub fn lateness_bucket(hns: u64) -> usize {
+    LATENESS_BOUNDS_HNS.iter().position(|&bound| hns < bound).unwrap_or(LATENESS_BUCKETS - 1)
+}
+
+/// A status ATTACH completes with: the driver's NTSTATUS, the Win32 error the app sees for it (DeviceIoControl's last error, or
+/// GetOverlappedResult's: RtlNtStatusToDosError's mapping, which a test checks), and what it means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub ntstatus: u32,
+    /// The NTSTATUS's name.
+    pub name: &'static str,
+    pub win32: u32,
+    pub meaning: &'static str,
+}
+
+/// ATTACH's refusals: the driver completes the request without publishing the ring. KMDF pends every request it delivers to the
+/// driver, so on the overlapped handle each comes back as ERROR_IO_PENDING from DeviceIoControl and then its status from
+/// GetOverlappedResult ([`AttachError::pending`](crate::AttachError::pending)). The driver checks the input's magic and version
+/// before any size, so a client of another version always gets ERROR_REVISION_MISMATCH.
+#[rustfmt::skip]
+pub const ATTACH_REFUSALS: [Outcome; 9] = [
+    Outcome { ntstatus: 0xC000_0010, name: "STATUS_INVALID_DEVICE_REQUEST", win32: 1, meaning: "not from user mode" },
+    Outcome { ntstatus: 0xC000_0059, name: "STATUS_REVISION_MISMATCH", win32: 1306,
+              meaning: "the input's or the header's version isn't the driver's: it speaks another protocol version" },
+    Outcome { ntstatus: 0xC000_0206, name: "STATUS_INVALID_BUFFER_SIZE", win32: 1784,
+              meaning: "the ring's length is below MIN_RING_BYTES, above MAX_RING_BYTES, or not the header's total_bytes and \
+                        ring_bytes(capacity_frames)" },
+    Outcome { ntstatus: 0xC000_000D, name: "STATUS_INVALID_PARAMETER", win32: 87,
+              meaning: "something else in the input or the header, or a ring that isn't one MDL of exactly the buffer" },
+    Outcome { ntstatus: 0x8000_0002, name: "STATUS_DATATYPE_MISALIGNMENT", win32: 998,
+              meaning: "the ring doesn't start on a page boundary" },
+    Outcome { ntstatus: 0xC000_009A, name: "STATUS_INSUFFICIENT_RESOURCES", win32: 1450,
+              meaning: "the driver couldn't map the ring into system space" },
+    Outcome { ntstatus: 0xC000_02B6, name: "STATUS_DEVICE_REMOVED", win32: 1617,
+              meaning: "the driver is going away: close every handle to the control device (an open handle keeps the driver loaded)" },
+    Outcome { ntstatus: 0x8000_0011, name: "STATUS_DEVICE_BUSY", win32: 170,
+              meaning: "another ring is attached (`stats` shows its process)" },
+    Outcome { ntstatus: 0xC000_0120, name: "STATUS_CANCELLED", win32: 995,
+              meaning: "the request was cancelled, or the handle closed, before the ring was published" },
+];
+
+/// ATTACH failures DeviceIoControl returns at once, from before the driver saw the request (it never went pending): the I/O
+/// manager's checks, or a purged queue. ERROR_NOACCESS and ERROR_NO_SYSTEM_RESOURCES are refusals too, from GetOverlappedResult:
+/// which call returned the code tells them apart ([`refusal`]). The I/O manager's allocations and locks can fail with other codes.
+/// The NTSTATUS behind 998 here is the probe's exception (inference from how the I/O manager probes a buffer, not checked).
+#[rustfmt::skip]
+pub const ATTACH_FAILURES_AT_ONCE: [Outcome; 4] = [
+    Outcome { ntstatus: 0xC000_0022, name: "STATUS_ACCESS_DENIED", win32: 5,
+              meaning: "the I/O manager's access check: the handle wasn't opened with read and write access" },
+    Outcome { ntstatus: 0xC000_0005, name: "STATUS_ACCESS_VIOLATION", win32: 998,
+              meaning: "the I/O manager couldn't read the input, or probe the ring's memory for writing" },
+    Outcome { ntstatus: 0xC000_009A, name: "STATUS_INSUFFICIENT_RESOURCES", win32: 1450,
+              meaning: "the I/O manager couldn't allocate or lock what the request needs" },
+    QUEUE_PURGED,
+];
+
+/// How an attached ring's request ends. Either way the driver unpublishes the ring before it completes the request, and never
+/// touches the ring after.
+#[rustfmt::skip]
+pub const ATTACH_ENDINGS: [Outcome; 2] = [
+    Outcome { ntstatus: 0xC000_0120, name: "STATUS_CANCELLED", win32: 995,
+              meaning: "cancelled: CancelIoEx, the thread that issued it or its process exiting, or the handle closed" },
+    Outcome { ntstatus: 0xC000_02B6, name: "STATUS_DEVICE_REMOVED", win32: 1617,
+              meaning: "the driver is going away: close every handle to the control device (an open handle keeps the driver loaded)" },
+];
+
+/// Every request on a handle opened before its control device was deleted (the device went away), from then on: DeviceIoControl
+/// fails at once, the queue being purged. The driver deletes the symbolic link with the device, so a new handle opens on the next
+/// control device, once a PnP device is back (ERROR_FILE_NOT_FOUND until then). The framework destroys the deleted one only once
+/// the last handle to it closes, and until then it keeps the driver loaded.
+#[rustfmt::skip]
+pub const QUEUE_PURGED: Outcome = Outcome {
+    ntstatus: 0xC000_0184, name: "STATUS_INVALID_DEVICE_STATE", win32: 22,
+    meaning: "this handle is on a control device that was deleted (the driver went away; its queue is purged): close it and open \
+              a new one (an open handle keeps the old device, and the driver, loaded)",
+};
+
+/// What an ATTACH that failed with Win32 error `win32` was refused for. `pending`: the request went pending first, so the code
+/// came from GetOverlappedResult, and is looked up in [`ATTACH_REFUSALS`] first; otherwise DeviceIoControl returned it at once,
+/// and [`ATTACH_FAILURES_AT_ONCE`] comes first. Either way the other table is the fallback.
+pub fn refusal(win32: u32, pending: bool) -> Option<&'static Outcome> {
+    let (first, second): (&'static [Outcome], &'static [Outcome]) =
+        if pending { (&ATTACH_REFUSALS, &ATTACH_FAILURES_AT_ONCE) } else { (&ATTACH_FAILURES_AT_ONCE, &ATTACH_REFUSALS) };
+    first.iter().chain(second).find(|o| o.win32 == win32)
+}
+
+/// How an attached ring's request that completed with Win32 error `win32` ended (one of [`ATTACH_ENDINGS`]).
+pub fn ending(win32: u32) -> Option<&'static Outcome> {
+    ATTACH_ENDINGS.iter().find(|o| o.win32 == win32)
+}
+
+/// `NF_VMIC_RING_HEADER`, at the start of the ring: four 64-byte lines, then the frames. Line 0 is the app's, set before ATTACH
+/// (the driver copies it once and never reads it again); line 1 is the app's `write_frame`; line 2 is the driver's. The fields
+/// either side writes while the other may look are atomics.
+#[repr(C)]
+pub struct RingHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub header_bytes: u32,
+    pub capacity_frames: u32,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: u16,
+    pub frame_bytes: u32,
+    pub flags: u32,
+    pub total_bytes: u64,
+    pub reserved0: [u8; 24],
+    /// Frames written. The app stores it with release ordering, after the frames.
+    pub write_frame: AtomicU64,
+    pub reserved1: [u8; 56],
+    /// The next frame the driver reads. The driver stores it with release ordering, after its copy.
+    pub read_frame: AtomicU64,
+    /// This attachment's frames copied into capture packets.
+    pub frames_copied: AtomicU64,
+    /// Frames the driver zero-filled because the ring didn't hold them yet.
+    pub underrun_frames: AtomicU64,
+    /// Re-syncs: `write_frame` went backwards or more than a ring ahead.
+    pub resyncs: AtomicU32,
+    /// Packets zero-filled because the capture stream wasn't 48 kHz float32 stereo.
+    pub mismatch_packets: AtomicU32,
+    /// `STATE_*` bits.
+    pub state: AtomicU32,
+    /// The packet of the capture stream holding the reader slot, in frames (0: none; see [`STATS_READING`]).
+    pub packet_frames: AtomicU32,
+    /// Capture passes of the stream holding the reader slot, FORMAT_MISMATCH ones included: a rising count says a stream holds
+    /// the slot, not that it reads ([`Self::frames_copied`] measures reading).
+    pub passes: AtomicU64,
+    /// The driver's QPC at the latest of those passes.
+    pub last_pass_qpc: AtomicU64,
+    /// Reserved, 0. An atomic because the driver zeroes all of line 2 at ATTACH, while the app may hold a reference to the header.
+    pub reserved2: AtomicU64,
+    pub reserved3: [u8; 64],
+}
+
+/// `NF_VMIC_ATTACH_IN`: ATTACH's input buffer. Magic and Version are its first 8 bytes, and the ring header's, in every version:
+/// ATTACH checks the input's before any size, and the header's before its other fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachIn {
+    pub magic: u32,
+    pub version: u32,
+    pub in_bytes: u32,
+    pub flags: u32,
+}
+
+impl AttachIn {
+    pub const fn new() -> Self {
+        Self { magic: MAGIC, version: VERSION, in_bytes: size_of::<Self>() as u32, flags: 0 }
+    }
+}
+
+impl Default for AttachIn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `NF_VMIC_STREAM_STATS`: one stream kind's timer, cumulative since the driver loaded.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamStats {
+    /// Passes started by the stream's timer.
+    pub timer_passes: u64,
+    /// Passes run at once because the next was already due (each is a glitch adjustment of the stream's time line).
+    pub glitch_passes: u64,
+    /// The sum of those adjustments, 100 ns units.
+    pub glitch_hns: u64,
+    /// The largest timer lateness (the pass's QPC time minus the time the timer was armed for), 100 ns units.
+    pub lateness_max_hns: u64,
+    /// The sum of the latenesses (the mean is this over `timer_passes`).
+    pub lateness_sum_hns: u64,
+    /// Timer passes that ran before their time (rounding; expected 0).
+    pub early_passes: u64,
+    /// Pause-to-Run transitions.
+    pub runs: u64,
+    pub reserved: u64,
+    /// Timer passes by lateness ([`LATENESS_BOUNDS_HNS`]).
+    pub lateness_buckets: [u64; LATENESS_BUCKETS],
+}
+
+/// `NF_VMIC_RING_STATS`: the app ring, cumulative since the driver loaded.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingStats {
+    pub attaches: u64,
+    pub detaches: u64,
+    /// Ended by a cancel: CancelIoEx, or the issuing thread or process exiting.
+    pub detach_cancel: u64,
+    /// Ended by the handle's cleanup (closed with the attach still pending).
+    pub detach_cleanup: u64,
+    /// Ended because the device went away (the request completes with STATUS_DEVICE_REMOVED).
+    pub detach_removal: u64,
+    /// ATTACHes refused because a ring was attached already.
+    pub busy_rejects: u64,
+    /// ATTACHes refused by validation.
+    pub invalid_rejects: u64,
+    /// Capture passes that found a ring attached.
+    pub passes: u64,
+    pub frames_copied: u64,
+    pub underrun_frames: u64,
+    /// Passes with at least one underrun frame.
+    pub underrun_packets: u64,
+    pub resyncs: u64,
+    /// Passes zero-filled because the capture stream wasn't 48 kHz float32 stereo.
+    pub mismatch_packets: u64,
+    /// Passes of a second capture stream, zero-filled (one reader at a time).
+    pub not_reader_packets: u64,
+    pub reserved: [u64; 2],
+}
+
+/// `NF_VMIC_LOOPBACK_STATS`: the render-to-capture loopback ring's counters (Public.h, `LOOPBACK_RING`), widened.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopbackStats {
+    pub idle_packets: u64,
+    pub mismatch_packets: u64,
+    pub underrun_packets: u64,
+    pub underrun_frames: u64,
+    pub overrun_packets: u64,
+    pub capture_anchors: u64,
+    pub render_restarts: u64,
+    pub render_gap_fills: u64,
+    pub render_late_packets: u64,
+    pub render_lost_packets: u64,
+    pub render_not_owner: u64,
+    pub reserved: u64,
+}
+
+/// `NF_VMIC_STATS`: STATS's output.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub magic: u32,
+    pub version: u32,
+    pub stats_bytes: u32,
+    /// `STATS_*` bits.
+    pub flags: u32,
+    pub qpc_frequency: u64,
+    pub qpc_now: u64,
+    /// The attached app's process (0: none attached).
+    pub attached_pid: u32,
+    pub attached_capacity_frames: u32,
+    /// The driver's read position in the attached ring.
+    pub attached_read_frame: u64,
+    /// The `write_frame` the latest capture pass read (as the app wrote it: untrusted).
+    pub attached_write_frame: u64,
+    /// The packet of the capture stream holding the reader slot, in frames (0: none). Reported whenever a stream holds the slot,
+    /// reading or not ([`STATS_READING`]).
+    pub reader_packet_frames: u32,
+    pub reserved0: u32,
+    pub ring: RingStats,
+    pub loopback: LoopbackStats,
+    pub reserved1: [u64; 4],
+    /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
+    pub stream: [StreamStats; KINDS],
+}
+
+// The header's offsets (nf_vmic.h's layout tables and C_ASSERTs).
+#[rustfmt::skip]
+const _: () = {
+    assert!(size_of::<AttachIn>() == 16);
+    assert!(offset_of!(AttachIn, version) == 4);
+
+    assert!(size_of::<RingHeader>() == HEADER_BYTES as usize);
+    assert!(offset_of!(RingHeader, magic) == 0);
+    assert!(offset_of!(RingHeader, version) == 4);
+    assert!(offset_of!(RingHeader, header_bytes) == 8);
+    assert!(offset_of!(RingHeader, capacity_frames) == 12);
+    assert!(offset_of!(RingHeader, sample_rate) == 16);
+    assert!(offset_of!(RingHeader, channels) == 20);
+    assert!(offset_of!(RingHeader, sample_format) == 22);
+    assert!(offset_of!(RingHeader, frame_bytes) == 24);
+    assert!(offset_of!(RingHeader, flags) == 28);
+    assert!(offset_of!(RingHeader, total_bytes) == 32);
+    assert!(offset_of!(RingHeader, reserved0) == 40);
+    assert!(offset_of!(RingHeader, write_frame) == 64);
+    assert!(offset_of!(RingHeader, reserved1) == 72);
+    assert!(offset_of!(RingHeader, read_frame) == 128 && DRIVER_LINE_OFFSET == 128);
+    assert!(offset_of!(RingHeader, frames_copied) == 136);
+    assert!(offset_of!(RingHeader, underrun_frames) == 144);
+    assert!(offset_of!(RingHeader, resyncs) == 152);
+    assert!(offset_of!(RingHeader, mismatch_packets) == 156);
+    assert!(offset_of!(RingHeader, state) == 160);
+    assert!(offset_of!(RingHeader, packet_frames) == 164);
+    assert!(offset_of!(RingHeader, passes) == 168);
+    assert!(offset_of!(RingHeader, last_pass_qpc) == 176);
+    assert!(offset_of!(RingHeader, reserved2) == 184);
+    assert!(offset_of!(RingHeader, reserved3) == (DRIVER_LINE_OFFSET + LINE_BYTES) as usize);
+    assert!(MIN_RING_BYTES == 8_448 && MAX_RING_BYTES == 2_097_408);
+
+    assert!(size_of::<StreamStats>() == 128);
+    assert!(offset_of!(StreamStats, lateness_max_hns) == 24);
+    assert!(offset_of!(StreamStats, runs) == 48);
+    assert!(offset_of!(StreamStats, lateness_buckets) == 64);
+
+    assert!(size_of::<RingStats>() == 128);
+    assert!(offset_of!(RingStats, passes) == 56);
+    assert!(offset_of!(RingStats, frames_copied) == 64);
+    assert!(offset_of!(RingStats, not_reader_packets) == 104);
+
+    assert!(size_of::<LoopbackStats>() == 96);
+    assert!(offset_of!(LoopbackStats, render_not_owner) == 80);
+
+    assert!(size_of::<Stats>() == 576);
+    assert!(offset_of!(Stats, qpc_frequency) == 16);
+    assert!(offset_of!(Stats, attached_pid) == 32);
+    assert!(offset_of!(Stats, attached_read_frame) == 40);
+    assert!(offset_of!(Stats, attached_write_frame) == 48);
+    assert!(offset_of!(Stats, reader_packet_frames) == 56);
+    assert!(offset_of!(Stats, ring) == 64);
+    assert!(offset_of!(Stats, loopback) == 192);
+    assert!(offset_of!(Stats, reserved1) == 288);
+    assert!(offset_of!(Stats, stream) == 320);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacities() {
+        assert!(capacity_ok(1024) && capacity_ok(4096) && capacity_ok(1 << 18));
+        assert!(!capacity_ok(512) && !capacity_ok(256) && !capacity_ok(1 << 19) && !capacity_ok(3000) && !capacity_ok(0));
+        assert_eq!(ring_bytes(1024), 256 + 8192);
+        assert_eq!(ring_bytes(MAX_CAPACITY_FRAMES), 256 + 2 * 1024 * 1024);
+        // nf_vmic.h's comments: 8,448 and 2,097,408.
+        assert_eq!((MIN_RING_BYTES, MAX_RING_BYTES), (8_448, 2_097_408));
+        // The smallest ring holds two 10 ms shared-mode packets.
+        const { assert!(MIN_CAPACITY_FRAMES >= 2 * 480) };
+    }
+
+    #[test]
+    fn lateness_buckets_match_the_driver() {
+        // Each bound opens the next bucket; 0 and anything past 5 ms land at the ends.
+        assert_eq!(lateness_bucket(0), 0);
+        assert_eq!(lateness_bucket(499), 0);
+        assert_eq!(lateness_bucket(500), 1);
+        assert_eq!(lateness_bucket(9_999), 4);
+        assert_eq!(lateness_bucket(10_000), 5);
+        assert_eq!(lateness_bucket(49_999), 6);
+        assert_eq!(lateness_bucket(50_000), 7);
+        assert_eq!(lateness_bucket(u64::MAX), 7);
+    }
+
+    #[test]
+    fn attach_in_is_the_drivers() {
+        let a = AttachIn::new();
+        assert_eq!((a.magic, a.version, a.in_bytes, a.flags), (0x4D56_464E, 1, 16, 0));
+        // "NFVM" in memory order.
+        assert_eq!(&MAGIC.to_le_bytes(), b"NFVM");
+    }
+
+    /// Every outcome's Win32 error is what RtlNtStatusToDosError makes of its NTSTATUS (ntdll, no device), and its NTSTATUS is
+    /// the one its name says (the windows crate's constant).
+    #[test]
+    fn outcomes_map_as_windows_does() {
+        use windows::Win32::Foundation::{
+            NTSTATUS, RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION, STATUS_CANCELLED, STATUS_DATATYPE_MISALIGNMENT,
+            STATUS_DEVICE_BUSY, STATUS_DEVICE_REMOVED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_BUFFER_SIZE,
+            STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_REVISION_MISMATCH,
+        };
+        let named = [
+            ("STATUS_ACCESS_DENIED", STATUS_ACCESS_DENIED),
+            ("STATUS_ACCESS_VIOLATION", STATUS_ACCESS_VIOLATION),
+            ("STATUS_INVALID_DEVICE_REQUEST", STATUS_INVALID_DEVICE_REQUEST),
+            ("STATUS_REVISION_MISMATCH", STATUS_REVISION_MISMATCH),
+            ("STATUS_INVALID_BUFFER_SIZE", STATUS_INVALID_BUFFER_SIZE),
+            ("STATUS_INVALID_PARAMETER", STATUS_INVALID_PARAMETER),
+            ("STATUS_DATATYPE_MISALIGNMENT", STATUS_DATATYPE_MISALIGNMENT),
+            ("STATUS_INSUFFICIENT_RESOURCES", STATUS_INSUFFICIENT_RESOURCES),
+            ("STATUS_DEVICE_REMOVED", STATUS_DEVICE_REMOVED),
+            ("STATUS_DEVICE_BUSY", STATUS_DEVICE_BUSY),
+            ("STATUS_CANCELLED", STATUS_CANCELLED),
+            ("STATUS_INVALID_DEVICE_STATE", STATUS_INVALID_DEVICE_STATE),
+        ];
+        for o in ATTACH_REFUSALS.iter().chain(&ATTACH_FAILURES_AT_ONCE).chain(&ATTACH_ENDINGS) {
+            let (_, status) = named.iter().find(|(n, _)| *n == o.name).unwrap_or_else(|| panic!("{} isn't listed here", o.name));
+            assert_eq!(o.ntstatus, status.0 as u32, "{}", o.name);
+            // SAFETY: a pure ntdll function on a value.
+            let win32 = unsafe { RtlNtStatusToDosError(NTSTATUS(o.ntstatus as i32)) };
+            assert_eq!(o.win32, win32, "{} maps to {win32}", o.name);
+        }
+        // Within each table every Win32 error is its own, so the client can tell them apart. 998 and 1450 are in both: which call
+        // returned them tells them apart. STATUS_CANCELLED is both a refusal and an ending, which the client tells apart by whether
+        // the ring was published.
+        for (table, pending) in [(&ATTACH_REFUSALS[..], true), (&ATTACH_FAILURES_AT_ONCE[..], false)] {
+            for (i, o) in table.iter().enumerate() {
+                assert!(table[i + 1..].iter().all(|p| p.win32 != o.win32), "{}", o.name);
+                assert_eq!(refusal(o.win32, pending), Some(o));
+            }
+        }
+        let name = |win32, pending| refusal(win32, pending).map(|o| o.name);
+        assert_eq!((name(998, true), name(998, false)), (Some("STATUS_DATATYPE_MISALIGNMENT"), Some("STATUS_ACCESS_VIOLATION")));
+        // The other table is the fallback.
+        assert_eq!(
+            (name(1306, false), name(5, true), name(22, true)),
+            (Some("STATUS_REVISION_MISMATCH"), Some("STATUS_ACCESS_DENIED"), Some("STATUS_INVALID_DEVICE_STATE"))
+        );
+        assert_eq!((ending(995).map(|o| o.name), ending(1617).map(|o| o.name)), (Some("STATUS_CANCELLED"), Some("STATUS_DEVICE_REMOVED")));
+        assert_eq!((refusal(2, true), refusal(2, false), ending(87)), (None, None, None));
+    }
+}
