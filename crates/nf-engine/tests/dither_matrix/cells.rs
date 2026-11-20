@@ -10,8 +10,9 @@ use nf_core::chain::Chain;
 use nf_core::config::{DEFAULT_NOISE_MODEL, GateConfig, GateMode, ProcessingConfig};
 use nf_core::controls::ChainControls;
 use nf_core::noise::{HopReport, ModelInfo, NoiseModel, NoiseStage};
-use nf_core::stage::StageError;
+use nf_core::stage::{Stage, StageError};
 use nf_engine::models::{ModelThread, build_chain};
+use nf_stages::Aec3Stage;
 
 /// The model pack the UL-UNAS chains run.
 pub const ULUNAS: &str = "ulunas";
@@ -98,24 +99,35 @@ pub struct Built {
 }
 
 /// The chain for `cfg`, built and activated on this thread as the engine builds it, its model inline as the offline tools run
-/// it (the same blocks behind as on the engine's worker, so the same output). With no noise stage running, it is the engine's
-/// own (`nf_engine::models::build_chain`: RNNoise's stage in the noise slot, off). Otherwise the noise stage is the one
-/// `models.rs` builds with its model wrapped in [`Timed`], in `nf_stages::build_chain_with`, the constructor `models.rs` calls:
-/// `the_timed_chains_are_the_engine_s` checks the output is the engine's bit for bit.
-pub fn build(kind: &ChainKind, cfg: &ProcessingConfig) -> Result<Built, String> {
+/// it (the same blocks behind as on the engine's worker, so the same output), and AEC3's stage dithering its reference at
+/// `aec_dither` ([`nf_stages::AEC3_REFERENCE_DITHER`] is the app's; 0 for the matrix's "bare" policy). Without AEC3 or a noise
+/// stage running it is the engine's own (`nf_engine::models::build_chain`: RNNoise's stage in the noise slot, off). Otherwise
+/// it is what `nf_stages::build_chain_with` (the constructor `models.rs` calls) builds, written out so AEC3's dither can be
+/// set: `Chain::new` with the AEC3 stage and the noise stage `models.rs` builds (its model wrapped in [`Timed`]), then
+/// `activate`. `the_timed_chains_are_the_engine_s` checks the output is the engine's bit for bit at the app's dither.
+pub fn build(kind: &ChainKind, cfg: &ProcessingConfig, aec_dither: f32) -> Result<Built, String> {
     let controls = Arc::new(ChainControls::new(cfg));
-    let Some(model) = kind.model else {
+    if !kind.aec && kind.model.is_none() {
         let b = build_chain(controls, cfg, cfg.aec_enabled, ModelThread::Inline).map_err(|e| e.0)?;
         return Ok(Built { chain: b.chain, model_ns: None });
-    };
-    let ns = Arc::new(AtomicU64::new(0));
-    let stage = match model {
-        Model::Rnnoise => NoiseStage::new(controls.clone(), Box::new(Timed::new(nf_stages::RnnoiseModel::new(), ns.clone()))),
-        Model::Ulunas => ulunas_stage(controls.clone(), cfg, ns.clone()),
     }
-    .map_err(|e| e.0)?;
-    let chain = nf_stages::build_chain_with(controls, cfg.aec_enabled, Box::new(stage)).map_err(|e| e.0)?;
-    Ok(Built { chain, model_ns: Some(ns) })
+    let ns = Arc::new(AtomicU64::new(0));
+    let noise: Box<dyn Stage> = match kind.model {
+        // The noise filter off: the engine's noise slot (`models.rs`' `noise_stage` for the default model), off.
+        None => Box::new(nf_stages::rnnoise_stage(controls.clone()).map_err(|e| e.0)?),
+        Some(Model::Rnnoise) => {
+            Box::new(NoiseStage::new(controls.clone(), Box::new(Timed::new(nf_stages::RnnoiseModel::new(), ns.clone()))).map_err(|e| e.0)?)
+        }
+        Some(Model::Ulunas) => Box::new(ulunas_stage(controls.clone(), cfg, ns.clone()).map_err(|e| e.0)?),
+    };
+    let aec: Option<Box<dyn Stage>> = if cfg.aec_enabled {
+        Some(Box::new(Aec3Stage::with_reference_dither(controls.clone(), aec_dither).map_err(|e| e.0)?))
+    } else {
+        None
+    };
+    let mut chain = Chain::new(controls, aec, Some(noise));
+    chain.activate().map_err(|e| e.0)?;
+    Ok(Built { chain, model_ns: kind.model.map(|_| ns) })
 }
 
 /// `nf_ort::noise_stage` for the installed pack, inline, at the depth `models.rs` gives it offline, with the model timed.

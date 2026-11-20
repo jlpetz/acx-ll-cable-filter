@@ -24,7 +24,7 @@ pub mod harness;
 mod rnnoise;
 pub mod synth;
 
-pub use aec3::{AEC3_DESCRIPTOR, AEC3_LATENCY, Aec3Stage};
+pub use aec3::{AEC3_DESCRIPTOR, AEC3_LATENCY, AEC3_REFERENCE_DITHER, Aec3Stage};
 pub use rnnoise::{MAKER_POLL, RNNOISE_INFO, RNNOISE_LATENCY, RnnoiseModel, SPARES, rnnoise_stage};
 
 /// Whether sonora's FTZ/DAZ guard is built in (this crate's `sonora-denormal-guard` feature, TODO 10), for a harness in a crate
