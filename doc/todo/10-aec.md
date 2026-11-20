@@ -52,15 +52,15 @@ Facts and sources: `doc/research-2026-10.md` (Echo cancellation).
   it) and after them (the caller's word, both ways). `tests/refactor_parity.rs` is bit-identical to crates.io's 0.3.0 in both
   builds, `rt_no_alloc` counts 0, and the workspace suites pass in both (855 passed each).
 - **Measured** (`doc/dev/build-report.md` §13: `tests/timing.rs`' `silence_costs`; 3 s of the scene, then 29 s timed of an
-  exact-zero mic and reference; medians of 9 quiet runs a build, ABBA order; µs a block, off / on):
+  exact-zero mic and reference; medians of 8 quiet runs a build, ABBA order; µs a block, off / on):
 
   | Row | p50 | p99 | max |
   |---|---|---|---|
-  | AEC3, silence, the engine's dither (the app) | 47.2 / 46.2 | 56.9 / 55.9 | 116.6 / 123.2 |
-  | chain with AEC3, silence, the engine's dither (the app) | 66.4 / 65.5 | 77.0 / 76.5 | 139.2 / 192.6 |
-  | AEC3, silence, the mic undithered (only the stage's reference dither) | 388.0 / 46.1 | 465.2 / 56.0 | 749.5 / 132.1 |
-  | control: sonora, zero reference, no dither | 668.5 / 45.7 | 714.0 / 54.5 | 879.0 / 88.5 |
-  | AEC3 with signal (echo, near end, noise) | 47.0 / 47.1 | 63.3 / 64.4 | 115.1 / 97.9 |
+  | AEC3, silence, the engine's dither (the app) | 47.2 / 46.2 | 56.8 / 55.2 | 112.9 / 101.2 |
+  | chain with AEC3, silence, the engine's dither (the app) | 66.4 / 65.5 | 76.8 / 76.5 | 115.9 / 181.6 |
+  | AEC3, silence, the mic undithered (only the stage's reference dither) | 388.0 / 46.0 | 465.1 / 55.8 | 692.8 / 116.9 |
+  | control: sonora, zero reference, no dither | 667.8 / 45.7 | 707.2 / 54.5 | 877.7 / 88.5 |
+  | AEC3 with signal (echo, near end, noise) | 47.0 / 47.1 | 63.3 / 64.2 | 105.3 / 94.7 |
 
   With our dither the guard buys about 1 µs a block (2%) in sustained silence, consistently (the runs' p50 ranges don't
   overlap), and nothing with signal; no subnormal is left in sonora's state then. The max column is the VM's jitter in both.

@@ -9,10 +9,10 @@ sonora 0.3.0's FTZ/DAZ guard a cargo feature, off by default, so that either bui
 
 It is the published package as cargo unpacked it (the `.cargo-ok` marker removed), plus the patch below. `sonora-0.3.0.patch`
 is the whole difference: applied with `patch -p1` to the unpacked `.crate`, it gives this directory byte for byte (checked
-2026-11-20) as git stores it, with LF line endings; a checkout with `core.autocrlf` shows CRLF. The other six sonora crates (`sonora-aec3`, `-agc2`, `-common-audio`, `-fft`, `-ns`, `-simd`) still come from
-crates.io: none of them reads or writes MXCSR or FPCR. The guard is `sonora`'s `src/denormal_disabler.rs`, which
-`audio_processing_impl.rs` holds in each of its four entry points (`process_stream`, `process_reverse_stream` and their
-`_i16` forms).
+2026-11-20) as git stores it, with LF line endings; a checkout with `core.autocrlf` shows CRLF. The other six sonora crates
+(`sonora-aec3`, `-agc2`, `-common-audio`, `-fft`, `-ns`, `-simd`) still come from crates.io: none of them reads or writes MXCSR
+or FPCR. The guard is `sonora`'s `src/denormal_disabler.rs`, which `audio_processing_impl.rs` holds in each of its four entry
+points (`process_stream`, `process_reverse_stream` and their `_i16` forms).
 
 ## What changed
 
@@ -64,7 +64,11 @@ benefit in their implementation maybe we make it switchable". `doc/todo/10-aec.m
 If sonora ships an opt-out (the draft request is in `doc/todo/10-aec.md`), or the owner wants the guard always on:
 
 1. Remove `[patch.crates-io]` and `exclude = ["vendor"]` from the workspace `Cargo.toml`, and this directory.
-2. Always on: remove the `sonora-denormal-guard` features (nf-stages, nf-app), and `GUARD` in `tests/mxcsr.rs` becomes
-   `true`. An upstream opt-out: point nf-stages' feature at it, minding which way round upstream's flag is.
+2. Always on: remove the `sonora-denormal-guard` features (nf-stages, nf-app) and every `cfg!` of it, which rustc's
+   `unexpected_cfgs` lint would otherwise flag (an error under clippy's `-D warnings`): `GUARD` in `tests/mxcsr.rs` becomes
+   `true`, and the guard line in `tests/timing.rs`' `preamble()` goes (or prints "on"). Then the feature's mentions: the
+   comments in the workspace `Cargo.toml`, `aec3.rs`, `bench.rs`, `tests/mxcsr.rs` and `tests/timing.rs`,
+   `doc/design/architecture.md`, `doc/design/engine.md`, `doc/dev/api/sonora-nnnoiseless.md` 1.12 and TODO 10. An upstream
+   opt-out: point nf-stages' feature at it, minding which way round upstream's flag is.
 3. `cargo update -p sonora` puts the registry source and checksum back in `Cargo.lock`.
 4. Run `tests/mxcsr.rs`, `tests/refactor_parity.rs`, `tests/rt_no_alloc.rs` and the timing test (`silence_costs`).

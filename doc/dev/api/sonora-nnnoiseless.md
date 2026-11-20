@@ -383,9 +383,9 @@ the decision; `doc/dev/build-report.md` §13 the measurements.
   `DenormalDisabler::new` reads and writes nothing, `is_supported()` is false, and building the processor logs the
   `tracing::info!` above (we install no subscriber, so nowhere). nf-stages' `sonora-denormal-guard` turns it on; nf-app
   forwards it.
-- **Measured, guard off → on** (medians of 9 quiet runs a build, µs a block, p50): AEC3 in sustained silence with the engine's
-  dither 47.2 → 46.2, the chain with AEC3 66.4 → 65.5; with signal no change (AEC3 47.0 → 47.1, the chain 83.5 → 83.5). Where
-  the dither doesn't reach: a zero mic with only the stage's reference dither 388.0 → 46.1, the undithered zero reference 668.5
+- **Measured, guard off → on** (medians of 8 quiet runs a build, µs a block, p50): AEC3 in sustained silence with the engine's
+  dither 47.2 → 46.2, the chain with AEC3 66.4 → 65.5; with signal no change (AEC3 47.0 → 47.1, the chain 83.7 → 83.7). Where
+  the dither doesn't reach: a zero mic with only the stage's reference dither 388.0 → 46.0, the undithered zero reference 667.8
   → 45.7. With the dither, no subnormal is left in sonora's state after 10 s of silence (a scan of its `Debug` dump, as its own
   `silent_render_leaves_no_subnormal_state` does); with the mic at exact zero, 777 values in 13 fields.
 - **Output and MXCSR, measured:** bit-identical to crates.io's 0.3.0 both ways (`tests/refactor_parity.rs`). Inside a call

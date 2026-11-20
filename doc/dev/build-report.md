@@ -924,38 +924,44 @@ of the timing scene (far-end speech, its echo and the near end), then 30 s of an
 usual 1 s warm-up (2,900 blocks). "Engine's dither" adds the engine's ±1e-9 to the mic and the reference (one generator, its
 seed, the mic's block first, as `pipeline.rs` does) and then the stage adds its own to the reference: the app's signal.
 "Stage's dither only" leaves the mic exact zero, as a host other than our engine might send it. The two release test exes ran
-alternately in ABBA order with `--test-threads 1`, after one discarded run each, 26 rounds in all. Medians of 9 runs per build
-from the quiet rounds, µs a block:
+alternately in ABBA order with `--test-threads 1`, after one discarded run each, 26 rounds in all. Medians of 8 runs per build
+from the quiet rounds (the mean of the middle two, rounded half up), µs a block:
 
 | Row | p50 off | p50 on | p99 off | p99 on | max off | max on |
 |---|---|---|---|---|---|---|
-| AEC3, silence, engine's dither (the app) | 47.2 | **46.2** | 56.9 | 55.9 | 116.6 | 123.2 |
-| chain + AEC3, silence, engine's dither (the app) | 66.4 | **65.5** | 77.0 | 76.5 | 139.2 | 192.6 |
-| AEC3, silence, stage's dither only (mic undithered) | 388.0 | **46.1** | 465.2 | 56.0 | 749.5 | 132.1 |
-| control: sonora, zero reference, no dither (18 runs) | 668.5 | **45.7** | 714.0 | 54.5 | 879.0 | 88.5 |
-| AEC3 (echo + near end + noise) | 47.0 | 47.1 | 63.3 | 64.4 | 115.1 | 97.9 |
-| AEC3, silent reference (dithered) | 43.1 | 43.2 | 52.5 | 52.4 | 126.8 | 138.1 |
-| chain: meters + AEC3 + RNNoise | 83.5 | 83.5 | 104.6 | 105.6 | 193.1 | 217.1 |
-| chain: meters + RNNoise (no sonora) | 35.5 | 35.4 | 46.5 | 46.7 | 84.6 | 81.9 |
-| RNNoise (noisy speech; no sonora) | 34.7 | 35.1 | 47.1 | 45.4 | 104.1 | 88.6 |
+| AEC3, silence, engine's dither (the app) | 47.2 | **46.2** | 56.8 | 55.2 | 112.9 | 101.2 |
+| chain + AEC3, silence, engine's dither (the app) | 66.4 | **65.5** | 76.8 | 76.5 | 115.9 | 181.6 |
+| AEC3, silence, stage's dither only (mic undithered) | 388.0 | **46.0** | 465.1 | 55.8 | 692.8 | 116.9 |
+| control: sonora, zero reference, no dither (16 runs) | 667.8 | **45.7** | 707.2 | 54.5 | 877.7 | 88.5 |
+| AEC3 (echo + near end + noise) | 47.0 | 47.1 | 63.3 | 64.2 | 105.3 | 94.7 |
+| AEC3, silent reference (dithered) | 43.1 | 43.1 | 52.2 | 52.1 | 124.5 | 135.2 |
+| chain: meters + AEC3 + RNNoise | 83.7 | 83.7 | 105.6 | 105.2 | 199.4 | 207.4 |
+| chain: meters + RNNoise (no sonora) | 35.6 | 35.5 | 46.2 | 46.5 | 82.4 | 78.7 |
+| RNNoise (noisy speech; no sonora) | 34.9 | 35.2 | 47.2 | 45.4 | 98.9 | 87.5 |
 
 - The box: a Windows Server 2025 VM (Xeon 6975P-C, 4 cores, 8 threads) over RDP. Another session ran `cargo` and `rustc` on
-  and off throughout, and Defender scanned their output. A round counts if both its runs saw at most 18% mean and 25% peak
-  total CPU (`typeperf`, each second; our one timing thread is 12.5%): rounds 15-17, 20 and 22-26. Rounds 1-6 ran at 16-100%
-  mean, 9-12 beside `rustc`, and 7, 8, 13 and 14 peaked at 27-32%; 18, 19 and 21 caught `pwsh`, `codex`, TiWorker and an SSM
-  worker. In the 9 quiet rounds RNNoise's p50, which the guard can't touch, stayed within 34.2-36.5 µs. The max column is the
-  median of the runs' maxima; an AEC3 row's max in one run is anywhere from 57 µs to 1.3 ms in either build (the VM), so it
-  doesn't separate them.
+  and off throughout, and Defender scanned their output. Total CPU was logged each second by `typeperf`: one logger from round
+  1, a second from round 7 and a third from round 15, all three left running, each sampling at its own phase within the second.
+  A round counts if both its runs stayed at or under 18% mean and 25% peak in every logger then running (our one timing thread
+  is 12.5%): rounds 15, 16, 20 and 22-26. Rounds 1-6 ran at 16-100% mean and 10-12 beside `rustc`; 7-9, 13, 14 and 17 peaked
+  at 27-46%; 18, 19 and 21 caught `pwsh`, `codex`, TiWorker and an SSM worker. Round 17 was counted before review: its off
+  run peaked at 27.4% in the first logger (24.3% in the third), with TiWorker busy for 1.3 s, and its AEC3 row with signal ran
+  at 50.2 µs p50 and 1.25 ms max, against 46.8-48.5 µs and at most 174 µs in the 8 counted off runs. Dropping it left the
+  app's two rows as they were; the other p50s moved by 0.2 µs at most, and the control's from 668.5 to 667.8. In the 8 quiet
+  rounds RNNoise's p50, which the guard can't touch, stayed within 34.2-36.5 µs. The max column is the median of the runs'
+  maxima; a dithered AEC3 row's max in one run is anywhere from 57 µs to 0.5 ms in either build (the VM), so it doesn't
+  separate them.
 - With our dither the guard is worth about 1 µs a block in sustained silence (2%, p50) and nothing measurable while there is
   signal. The 1 µs is consistent: the runs' p50 ranges don't overlap (AEC3 46.8-47.4 off and 45.9-46.5 on; the chain 66.1-67.1
-  and 65.2-66.0). p99 differs by 1 µs at most.
+  and 65.2-66.0). p99 differs by 1.6 µs at most in the rows with sonora, within the runs' spread: RNNoise's p99, which the
+  guard can't touch, differs by 1.8, and the app's AEC3 row's p99 ranges overlap (55.5-64.5 off, 52.1-81.7 on).
 - No subnormal is left in sonora's state in that silence. A scan of its `Debug` dump (as sonora's own
   `silent_render_leaves_no_subnormal_state` does; a throwaway test, not kept) after 3 s of the scene and 10 s of the engine's
   dithered silence found none; with the mic left at exact zero it found 777 values in 13 fields (the capture band-split filter,
   the high-pass, AEC3's capture decimator, comfort noise, the output framer). So the 1 µs is transient arithmetic or code
   layout, not a stall. Not traced further.
 - Where the dither doesn't reach, the guard matters: a zero mic without the engine's dither costs 388 µs a block without it and
-  46 with it, and the undithered zero reference 668.5 and 45.7 (§12: 674 on 0.2.0, 46 on 0.3.0). In the app the engine dithers
+  46 with it, and the undithered zero reference 667.8 and 45.7 (§12: 674 on 0.2.0, 46 on 0.3.0). In the app the engine dithers
   both. The offline `process` command doesn't dither (a chain recording's blocks already are), so a WAV with digital silence
   runs at the slow figure there without the guard: still about 25 times real time, offline.
 
