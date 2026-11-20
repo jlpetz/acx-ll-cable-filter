@@ -1,0 +1,7 @@
+# The driver's build output: MSBuild's per-project folders and our signed packages (driver/out).
+out/
+x64/
+ARM64/
+*.tlog
+*.user
+.vs/

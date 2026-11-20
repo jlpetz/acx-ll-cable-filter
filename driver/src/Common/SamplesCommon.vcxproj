@@ -36,7 +36,7 @@
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
-    <KMDF_VERSION_MINOR>31</KMDF_VERSION_MINOR>
+    <KMDF_VERSION_MINOR>35</KMDF_VERSION_MINOR>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -46,7 +46,7 @@
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
-    <KMDF_VERSION_MINOR>31</KMDF_VERSION_MINOR>
+    <KMDF_VERSION_MINOR>35</KMDF_VERSION_MINOR>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -56,7 +56,7 @@
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
-    <KMDF_VERSION_MINOR>31</KMDF_VERSION_MINOR>
+    <KMDF_VERSION_MINOR>35</KMDF_VERSION_MINOR>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -66,7 +66,7 @@
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
-    <KMDF_VERSION_MINOR>31</KMDF_VERSION_MINOR>
+    <KMDF_VERSION_MINOR>35</KMDF_VERSION_MINOR>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -99,7 +99,7 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace_macros.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
       <AdditionalIncludeDirectories>$(SDK_INC_PATH);$(DDK_INC_PATH)\acx\km\1.1;..\inc;..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=31;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -112,7 +112,7 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace_macros.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
       <AdditionalIncludeDirectories>$(SDK_INC_PATH);$(DDK_INC_PATH)\acx\km\1.1;..\inc;..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=31;KMDF_VERSION_MINOR=31;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -125,7 +125,7 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace_macros.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
       <AdditionalIncludeDirectories>$(SDK_INC_PATH);$(DDK_INC_PATH)\acx\km\1.1;..\inc;..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=31;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -138,7 +138,7 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace_macros.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
       <AdditionalIncludeDirectories>$(SDK_INC_PATH);$(DDK_INC_PATH)\acx\km\1.1;..\inc;..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=31;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ACX_VERSION_MAJOR=1;ACX_VERSION_MINOR=1;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
