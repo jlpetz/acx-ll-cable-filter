@@ -137,6 +137,14 @@ NfVmicRecordRun(
     _In_ ULONG      Kind
 );
 
+// A timer pass's working time, in QPC ticks (NF_VMIC_STREAM_STATS.WorkQpcTicks).
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicRecordPassWork(
+    _In_ ULONG      Kind,
+    _In_ ULONGLONG  QpcTicks
+);
+
 __drv_maxIRQL(DISPATCH_LEVEL)
 VOID
 NfVmicCopyStreamStats(

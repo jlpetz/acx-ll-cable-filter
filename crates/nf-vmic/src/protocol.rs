@@ -283,7 +283,9 @@ pub struct StreamStats {
     pub early_passes: u64,
     /// Pause-to-Run transitions.
     pub runs: u64,
-    pub reserved: u64,
+    /// QPC ticks the timer passes spent working (the callback's first clock read to the end of its work, glitch passes run
+    /// at once included): over `timer_passes` and the QPC frequency, the mean CPU time of a pass.
+    pub work_qpc_ticks: u64,
     /// Timer passes by lateness ([`LATENESS_BOUNDS_HNS`]).
     pub lateness_buckets: [u64; LATENESS_BUCKETS],
 }

@@ -115,6 +115,16 @@ NfVmicRecordRun(
 
 _Use_decl_annotations_
 VOID
+NfVmicRecordPassWork(
+    ULONG       Kind,
+    ULONGLONG   QpcTicks
+)
+{
+    InterlockedAdd64((volatile LONG64*)&NfVmicStreamStats(Kind)->WorkQpcTicks, (LONG64)QpcTicks);
+}
+
+_Use_decl_annotations_
+VOID
 NfVmicCopyStreamStats(
     PNF_VMIC_STREAM_STATS Out
 )

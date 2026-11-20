@@ -178,7 +178,9 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
     NF_VMIC_STREAM_STATS (128 bytes), per stream kind: TimerPasses (passes the stream's timer started), GlitchPasses (passes
     run at once because the next was already due: each is one glitch adjustment of the stream's time line), GlitchHns (their
     sum), LatenessMaxHns, LatenessSumHns, EarlyPasses (timer passes before their time: rounding, expected 0), Runs
-    (Pause-to-Run), Reserved, LatenessBuckets[8]. A timer pass's lateness is the time it ran (its QPC, in 100 ns units)
+    (Pause-to-Run), WorkQpcTicks, LatenessBuckets[8]. WorkQpcTicks: the QPC ticks the timer passes spent working, from the
+    timer callback's first clock read to the end of StreamPassCallback (the packet's work, the notification, the next pass armed,
+    and any glitch passes run at once), so WorkQpcTicks / TimerPasses / QpcFrequency is the mean CPU time of a pass. A timer pass's lateness is the time it ran (its QPC, in 100 ns units)
     minus the time ScheduleNextPass armed the timer for. Buckets: below 50 us, 50-100, 100-250, 250-500 us, 0.5-1 ms, 1-2 ms,
     2-5 ms, and 5 ms and over (NF_VMIC_LATENESS_BOUNDS_HNS are the upper bounds of the first seven).
 
@@ -281,7 +283,7 @@ typedef struct _NF_VMIC_STREAM_STATS {
     UINT64  LatenessSumHns;             //  32
     UINT64  EarlyPasses;                //  40
     UINT64  Runs;                       //  48
-    UINT64  Reserved;                   //  56
+    UINT64  WorkQpcTicks;               //  56
     UINT64  LatenessBuckets[NF_VMIC_LATENESS_BUCKETS];  //  64
 } NF_VMIC_STREAM_STATS, *PNF_VMIC_STREAM_STATS;
 

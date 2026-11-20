@@ -1535,20 +1535,27 @@ fn print_stats(s: &Stats) {
     } else {
         println!("loopback: no device");
     }
-    print_timer("render", &s.stream[KIND_RENDER]);
-    print_timer("capture", &s.stream[KIND_CAPTURE]);
+    print_timer("render", &s.stream[KIND_RENDER], s.qpc_frequency);
+    print_timer("capture", &s.stream[KIND_CAPTURE], s.qpc_frequency);
 }
 
-fn print_timer(kind: &str, t: &StreamStats) {
+/// The mean working time of a timer pass in microseconds, from the QPC ticks the passes spent.
+fn work_us(ticks: u64, passes: u64, frequency: u64) -> f64 {
+    if passes == 0 || frequency == 0 { 0.0 } else { ticks as f64 * 1e6 / frequency as f64 / passes as f64 }
+}
+
+fn print_timer(kind: &str, t: &StreamStats, frequency: u64) {
     let mean = if t.timer_passes == 0 { 0.0 } else { us(t.lateness_sum_hns) / t.timer_passes as f64 };
     println!(
-        "{kind} timer: {} passes in {} runs; glitch adjustments {} ({:.1} ms in all); early {}; lateness mean {mean:.1} us, max {:.1} us",
+        "{kind} timer: {} passes in {} runs; glitch adjustments {} ({:.1} ms in all); early {}; lateness mean {mean:.1} us, max {:.1} us; \
+         work {:.2} us a pass",
         t.timer_passes,
         t.runs,
         t.glitch_passes,
         us(t.glitch_hns) / 1000.0,
         t.early_passes,
-        us(t.lateness_max_hns)
+        us(t.lateness_max_hns),
+        work_us(t.work_qpc_ticks, t.timer_passes, frequency)
     );
     for (label, count) in LATENESS_LABELS.iter().zip(t.lateness_buckets) {
         println!("  {label:>14}  {count:>12}  {:>8.4}%", percent(count, t.timer_passes));
@@ -2710,12 +2717,14 @@ fn print_latency(r: &LatencyReport, log: &CaptureLog, w: &Window, frequency: u64
     let passes = timer(s1).timer_passes.saturating_sub(timer(s0).timer_passes);
     let lateness = timer(s1).lateness_sum_hns.saturating_sub(timer(s0).lateness_sum_hns);
     let mean_us = if passes == 0 { 0.0 } else { us(lateness) / passes as f64 };
+    let work = timer(s1).work_qpc_ticks.saturating_sub(timer(s0).work_qpc_ticks);
     println!("measured {seconds:.2} s, QPC {:.3} MHz", frequency as f64 / 1e6);
     println!(
         "the driver: the reader's packet {} frames; capture timer +{passes} passes, lateness mean {mean_us:.1} us over the window \
-         (max {:.1} us since the driver loaded); passes of a stream that isn't the reader +{}",
+         (max {:.1} us since the driver loaded), work {:.2} us a pass; passes of a stream that isn't the reader +{}",
         s1.reader_packet_frames,
         us(timer(s1).lateness_max_hns),
+        work_us(work, passes, frequency),
         s1.ring.not_reader_packets.saturating_sub(s0.ring.not_reader_packets)
     );
     println!(

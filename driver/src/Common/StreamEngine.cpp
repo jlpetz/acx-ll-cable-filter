@@ -631,14 +631,21 @@ CStreamEngine::s_EvtStreamPassCallback(
     // reading through QpcToHns) minus the time ScheduleNextPass armed it for. Timer-fired passes only: the ones
     // ScheduleNextPass runs at once count as glitch adjustments instead.
     //
+    // The same reading starts the pass's working time (NF_VMIC_STREAM_STATS.WorkQpcTicks), taken again once StreamPassCallback
+    // returns: the CPU cost of a pass, for the /Os and /Ot comparison and the soak.
+    //
+    ULONG           kind = This->m_StatsKind;
+    LARGE_INTEGER   passStart = KeQueryPerformanceCounter(NULL);
     {
-        ULONGLONG now = This->QpcToHns(KeQueryPerformanceCounter(NULL));
+        ULONGLONG now = This->QpcToHns(passStart);
 
-        NfVmicRecordTimerPass(This->m_StatsKind, (LONGLONG)(now - This->m_ArmedHns));
+        NfVmicRecordTimerPass(kind, (LONGLONG)(now - This->m_ArmedHns));
     }
 
     // Call the StreamPassCallback for the engine
     This->StreamPassCallback();
+
+    NfVmicRecordPassWork(kind, (ULONGLONG)(KeQueryPerformanceCounter(NULL).QuadPart - passStart.QuadPart));
 }
 
 // This is run every time the stream timer fires
