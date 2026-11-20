@@ -274,6 +274,24 @@ Live (`quality --test echo --echo-delay D`, 150 s, the exclusive mic, an 18 ms l
 Left: the quality report's echo-delay line can quote a turn's lead from before the hold when the hold changes mid-take
 (the turns measured are right); real speakers in phase 2 (TODO 13).
 
+## Dither and FTZ/DAZ (2026-11-20, open)
+The mic and reference blocks get a ~1e-9 dither (`pipeline.rs:40`, `DITHER`): it keeps AEC3's and RNNoise's filters (and our
+gate and floor) out of denormal range on exact digital silence, without FTZ/DAZ. sonora 0.3.0 also sets FTZ/DAZ inside each of
+its calls. The mic dither travels through the chain to the cable, so digital silence comes out about -180 dBFS, not zero, once
+a filter runs (an outside review's offline test: every sample of a settled silent second nonzero with AEC3 and RNNoise on).
+- **The owner (2026-11-20):** agnostic on whose denormal handling; "if there is a benefit in their implementation maybe we
+  make it switchable"; decide from the tests, which must include every filter the chain can run; exact digital silence
+  matters for studio recording.
+- **Proposals (an outside review's, ours to test; not decided):** a clean bypass (no dither when no filter runs); the dither on
+  the reference only (where sonora #34's 674 us stall was), the mic clean; an end stage that writes exact zeros once the input
+  is digitally silent and every active stage reports its tail finished (CLAP's tail extension, TODO 17).
+- **The matrix to run:** chains bypass, RNNoise, RNNoise + AEC3, UL-UNAS (the onnx build; ONNX Runtime doesn't flush denormals
+  unless a session option asks, our understanding), UL-UNAS + AEC3, each with the gate off, static and auto; dither on mic and
+  reference, reference only, none; sonora's FTZ/DAZ on and off (a build option on a patched copy). Signals: sustained digital
+  silence; speech then digital silence (the tails); the reference silent, then active. Measures: p50, p99 and the worst block
+  per stage and for the chain; on speech, the largest output difference between mic dither on and off (dB); in silence, the
+  share of exact zeros and the time to the first. On a quiet box, runs alternated.
+
 ## Later
 - **Optional Windows path:** open the mic in Communications mode, check `IAudioEffectsManager` for AEC/NS, and set the reference with `IAcousticEchoCancellationControl` (22621+; E_NOINTERFACE when unsupported).
   - Where the OEM supplies no Communications-mode processing, this path gets Voice Clarity (Windows 11 client editions).

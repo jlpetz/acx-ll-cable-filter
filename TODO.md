@@ -120,7 +120,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - CLAP-shaped (#17, the owner's call): the mic on the main input, the speaker reference on a second input port, one output.
 - Order: AEC → noise model → gate. Opt-in "using speakers" mode. Stop the cable being picked as the reference. Show AEC3 delay and ERLE. Warn when NS is on without AEC on speakers.
 - Later: an optional Windows Voice Clarity path; a neural AEC (LocalVQE, 16 kHz, GGML) as a v2 experiment.
-**Next**: the echo-path guard (ours, 2026-11-03/04: the mic waits whole loopback periods only for an echo that comes before its reference, on staged trials; live a 5 ms echo's far-only turns 22 to 59 dB at a 20 ms wait, 10 ms at a 10 ms wait) on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2; the owner's call on sonora 0.3.0's per-call FTZ/DAZ.
+**Next**: the echo-path guard (ours, 2026-11-03/04: the mic waits whole loopback periods only for an echo that comes before its reference, on staged trials; live a 5 ms echo's far-only turns 22 to 59 dB at a 20 ms wait, 10 ms at a 10 ms wait) on real speakers in phase 2; a smaller loopback period dropped (#13's detail); recorded pairs in #2; the dither matrix, then the owner's call on the mic dither and sonora 0.3.0's per-call FTZ/DAZ (the owner, 2026-11-20: decide from the tests, every filter in the chain included; exact digital silence matters for studio use; detail, "Dither and FTZ/DAZ").
 **Detail**: `doc/todo/10-aec.md`
 
 ---
