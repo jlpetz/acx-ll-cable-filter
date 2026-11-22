@@ -425,6 +425,7 @@ typedef struct _CODEC_CAPTURE_CIRCUIT_CONTEXT {
     ACXVOLUME           BoostElement;
     ACXVOLUME           VolumeElement;
     ACXKEYWORDSPOTTER   KeywordSpotter;
+    PCWSTR              EndpointName;       // noise-filter (TODO 19): the bridge pin's name, which names the endpoint (a literal)
 } CODEC_CAPTURE_CIRCUIT_CONTEXT, * PCODEC_CAPTURE_CIRCUIT_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CODEC_CAPTURE_CIRCUIT_CONTEXT, GetCaptureCircuitContext)
@@ -465,6 +466,7 @@ CodecC_CreateCaptureCircuit(
     _In_     const GUID *           ComponentGuid,
     _In_     const GUID *           MicCustomName,
     _In_     const UNICODE_STRING * CircuitName,
+    _In_     PCWSTR                 EndpointName,
     _Out_    ACXCIRCUIT *           Circuit
 );
 

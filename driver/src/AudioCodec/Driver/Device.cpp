@@ -155,6 +155,7 @@ Return Value:
 
     devCtx->Render = nullptr;
     devCtx->Capture = nullptr;
+    devCtx->Capture2 = nullptr;
     devCtx->ExcludeD3Cold = WdfFalse;
     devCtx->VmicRegistered = FALSE;
 
@@ -201,7 +202,11 @@ Return Value:
     //
     RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, &CODEC_RENDER_COMPONENT_GUID, &renderCircuitName));
 
-    RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE_COMPONENT_GUID, &MIC_CUSTOM_NAME, &captureCircuitName));
+    RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE_COMPONENT_GUID, &MIC_CUSTOM_NAME, &captureCircuitName, L"Microphone"));
+
+    // noise-filter (TODO 19, option A): the call microphone, a second capture circuit (DriverSettings.h).
+    RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE2_COMPONENT_GUID, &MIC2_CUSTOM_NAME, &capture2CircuitName,
+                                                      L"Call Microphone"));
 
     return status;
 }
@@ -294,6 +299,15 @@ Return Value:
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: capture packet-size constraints not set (0x%08X)\n", publish);
     }
 
+    // The call microphone: the same constraints (its INF's default period replaces their range there; TODO 22).
+    ASSERT(devCtx->Capture2);
+    RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture2));
+    publish = PublishPacketSizeConstraints(devCtx->Capture2);
+    if (!NT_SUCCESS(publish))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: call microphone packet-size constraints not set (0x%08X)\n", publish);
+    }
+
     return status;
 }
 
@@ -336,6 +350,7 @@ Return Value:
     //
     RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Render));
     RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture));
+    RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture2));
 
     // NOTE: Release streaming h/w resources here.
 

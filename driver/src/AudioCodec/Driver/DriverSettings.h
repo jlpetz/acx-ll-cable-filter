@@ -50,5 +50,14 @@ DEFINE_GUID(DEVICE_CONTAINER_GUID, 0x00000000, 0x0000, 0x0000, 0xFF, 0xFF, 0xFF,
 // This string must match the string defined in AudioCodec.inf for the microphone name:
 DECLARE_CONST_UNICODE_STRING(captureCircuitName, L"Microphone0");
 
+//
+// noise-filter (TODO 19, the owner's option A, 2026-11-23): a second capture circuit, the call microphone. Its INF interface
+// sets a 5 ms default engine period (PKEY_AudioEngine_OEMPeriod) for clients that ask for no period (call apps); the first
+// keeps IAudioClient3's small periods. Its own component ID; its endpoint is named by the bridge pin's name callback (CaptureCircuit.cpp).
+//
+DEFINE_GUID(CODEC_CAPTURE2_COMPONENT_GUID, 0xc5b359a3, 0x1341, 0x46a3, 0xa2, 0xbd, 0x98, 0x5f, 0x57, 0x06, 0xce, 0x1b);
+DEFINE_GUID(MIC2_CUSTOM_NAME, 0x3edea053, 0x9f32, 0x4cba, 0xa3, 0xc6, 0xfe, 0xca, 0xe1, 0xe1, 0x70, 0x0f);
+DECLARE_CONST_UNICODE_STRING(capture2CircuitName, L"Microphone1");
+
 // This string must match the string defined in AudioCodec.inf for the speaker name:
 DECLARE_CONST_UNICODE_STRING(renderCircuitName, L"Speaker0");

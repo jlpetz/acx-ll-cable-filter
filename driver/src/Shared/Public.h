@@ -115,6 +115,7 @@ typedef struct _LOOPBACK_RING {
 typedef struct _CODEC_DEVICE_CONTEXT {
     ACXCIRCUIT      Render;
     ACXCIRCUIT      Capture;
+    ACXCIRCUIT      Capture2;               // noise-filter (TODO 19): the call microphone (DriverSettings.h)
     WDF_TRI_STATE   ExcludeD3Cold;
     LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
     BOOLEAN         VmicRegistered;         // noise-filter (TODO 19, spike check 4): NfVmic_DeviceAdd ran; the cleanup undoes it
@@ -303,7 +304,8 @@ CodecC_AddStaticCapture(
     _In_ WDFDEVICE              Device,
     _In_ const GUID *           ComponentGuid,
     _In_ const GUID  *          MicCustomName,
-    _In_ const UNICODE_STRING * CircuitName
+    _In_ const UNICODE_STRING * CircuitName,
+    _In_ PCWSTR                 EndpointName    // noise-filter (TODO 19): the endpoint's name (a literal, kept)
 );
 
 PAGED_CODE_SEG

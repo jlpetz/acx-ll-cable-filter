@@ -207,11 +207,14 @@ Return Value:
 
 --*/
 {
-    UNREFERENCED_PARAMETER(Pin);
+    PCODEC_CAPTURE_CIRCUIT_CONTEXT circuitCtx;
 
     PAGED_CODE();
 
-    return RtlUnicodeStringPrintf(Name, L"CustomName2");
+    // noise-filter (TODO 19): the circuit's own endpoint name (two capture circuits; the sample returned "CustomName2").
+    circuitCtx = GetCaptureCircuitContext(AcxPinGetCircuit(Pin));
+    return RtlUnicodeStringPrintf(Name, L"%ws",
+                                  (circuitCtx != nullptr && circuitCtx->EndpointName != nullptr) ? circuitCtx->EndpointName : L"Microphone");
 }
 
 VOID
@@ -243,7 +246,8 @@ CodecC_AddStaticCapture(
     _In_ WDFDEVICE              Device,
     _In_ const GUID *           ComponentGuid,
     _In_ const GUID *           MicCustomName,
-    _In_ const UNICODE_STRING * CircuitName
+    _In_ const UNICODE_STRING * CircuitName,
+    _In_ PCWSTR                 EndpointName
 )
 /*++
 
@@ -285,18 +289,34 @@ Return Value:
     ASSERT(devCtx != nullptr);
 
     //
-    // Alloc audio context to current device.
+    // Alloc audio context to current device: once, with the first capture circuit (noise-filter, TODO 19: there are two, and a
+    // device holds one context of a type).
     //
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, CAPTURE_DEVICE_CONTEXT);
-    RETURN_NTSTATUS_IF_FAILED(WdfObjectAllocateContext(Device, &attributes, (PVOID*)&captureDevCtx));
-    ASSERT(captureDevCtx);
+    if (devCtx->Capture == nullptr)
+    {
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, CAPTURE_DEVICE_CONTEXT);
+        RETURN_NTSTATUS_IF_FAILED(WdfObjectAllocateContext(Device, &attributes, (PVOID*)&captureDevCtx));
+        ASSERT(captureDevCtx);
+    }
+    else if (devCtx->Capture2 != nullptr)
+    {
+        // Two capture circuits at most (Capture, the low-latency microphone; Capture2, the call microphone).
+        return STATUS_INVALID_DEVICE_STATE;
+    }
 
     //
     // Create a capture circuit associated with this child device.
     //
-    RETURN_NTSTATUS_IF_FAILED(CodecC_CreateCaptureCircuit(Device, ComponentGuid, MicCustomName, CircuitName, &captureCircuit));
+    RETURN_NTSTATUS_IF_FAILED(CodecC_CreateCaptureCircuit(Device, ComponentGuid, MicCustomName, CircuitName, EndpointName, &captureCircuit));
 
-    devCtx->Capture = captureCircuit;
+    if (devCtx->Capture == nullptr)
+    {
+        devCtx->Capture = captureCircuit;
+    }
+    else
+    {
+        devCtx->Capture2 = captureCircuit;
+    }
 
     return status;
 }
@@ -368,6 +388,7 @@ CodecC_CreateCaptureCircuit(
     _In_     const GUID *           ComponentGuid,
     _In_     const GUID *           MicCustomName,
     _In_     const UNICODE_STRING * CircuitName,
+    _In_     PCWSTR                 EndpointName,
     _Out_    ACXCIRCUIT*            Circuit
 )
 /*++
@@ -466,6 +487,7 @@ Return Value:
 
         circuitCtx = GetCaptureCircuitContext(circuit);
         ASSERT(circuitCtx);
+        circuitCtx->EndpointName = EndpointName;
     }
 
     //
@@ -540,16 +562,14 @@ Return Value:
         pinCfg.Category = &KSNODETYPE_MICROPHONE;
         pinCfg.PinCallbacks = &pinCallbacks;
 
-        // Specify how to read the custom name.
-        if (g_UseCustomInfName)
-        {
-            pinCfg.Name = MicCustomName;
-        }
-        else
-        {
-            pinCallbacks.EvtAcxPinRetrieveName = CodecC_EvtAcxPinRetrieveName;
-        }
-        g_UseCustomInfName = !g_UseCustomInfName;
+        //
+        // The bridge pin's name, which names the endpoint: the circuit's EndpointName, through EvtAcxPinRetrieveName.
+        // (noise-filter, TODO 19: the sample alternated this with a name GUID through a global flipped at every circuit made,
+        // so with two circuits, or a device made again, the names depended on how many had been made; a GUID's name would
+        // need an HKLM MediaCategories entry, which a driver package may not write, InfVerif error 1321.)
+        //
+        UNREFERENCED_PARAMETER(MicCustomName);
+        pinCallbacks.EvtAcxPinRetrieveName = CodecC_EvtAcxPinRetrieveName;
 
         WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
         attributes.ParentObject = circuit;
