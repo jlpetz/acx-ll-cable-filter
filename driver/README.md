@@ -33,7 +33,10 @@ integer fallback and Windows 11. The sample's tone, WAV reader and SaveData are 
 
 Three of the sample's stream-engine bugs are fixed. UpdatePosition subtracted the glitch adjustment (time) from a byte
 position, and let the position pass the packet in progress (a Pause could then stall the next Run's timer for about 111
-days). The first capture packet of a run reported a QPC of 0. And `KSCONVERT_PERFORMANCE_TIME` (ks.h) names its argument
+days). Capture packets were stamped a packet late: ACX hands clients the QPC passed to `AcxRtStreamNotifyPacketComplete` as
+the packet's first frame's time (it never calls `EvtAcxStreamGetCapturePacket`, whose answer the sample meant for that),
+and the sample passed the pass's own time, the packet's end. A capture stream now passes its packet's start on the stream's
+time line (STATS' `CaptureTrace` and `nf-vmic-test stamps` show it). And `KSCONVERT_PERFORMANCE_TIME` (ks.h) names its argument
 three times, so ScheduleNextPass and UpdatePosition read the clock three times per conversion: across a low-word wrap
 (every 2^32 ticks, about 7 minutes at 10 MHz) the words of two reads could make a time about 429 s off and stall the
 stream. Each conversion now takes one reading (`QpcToHns`), and GetPresentationPosition reports the position and its QPC

@@ -29,6 +29,13 @@ it, with a reproduction. Nothing has been posted; posting is the owner's.
 3. Could the shared engine give plain-Initialize clients a smaller default (the low-latency stack's own) while keeping the
    IAudioClient3 range, for virtual and hardware devices alike?
 
+## A second finding we could add (our proposal, not yet the owner's)
+ACX capture timestamps (TODO 19, 2026-11-23): ACX never calls `EvtAcxStreamGetCapturePacket` (0 calls, shared and
+exclusive, every mode and period tried) and hands clients the QPC passed to `AcxRtStreamNotifyPacketComplete` as the
+packet's first frame's time (GetBuffer's `pu64QPCPosition`, to the tick). Its documentation calls that QPC "the packet
+completion time", and the AudioCodec sample passes the completion time, so a driver that follows both stamps every capture
+packet one packet late. We now pass the packet's start. Question: which is intended, and should the docs and the sample say so?
+
 ## Where to report (to choose)
 - Feedback Hub, Developer Platform → Audio (reaches the audio team; needs a Microsoft account).
 - An issue on MicrosoftDocs/windows-driver-docs, for the documentation side: the OEMPeriod page dates from Windows 7 and says

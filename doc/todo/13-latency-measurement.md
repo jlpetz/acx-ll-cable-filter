@@ -139,6 +139,9 @@ period (as the engine's mic was). Each figure is one run's median; the sweeps wi
 - Not yet explained. Candidates: the shared-mode audio engine's period on each side (a capture packet waits up to a period
   before the app is woken; the mix runs a period ahead of the device), which the design sum leaves out; and the output
   target (a period + a block + the margin, 22 ms), whose block may be more than it needs.
+- Ruled out (2026-11-23, TODO 19's `nf-vmic-test stamps`): late capture stamps. VB-CABLE's are its packets' first frames'
+  (the client receives a packet 11.0-11.1 ms after its device time at a 10 ms period), so they don't shorten the readout.
+  Our own driver's were a packet late until 9a32c5c (TODO 19), which would have shortened it by a packet there.
 
 ## Cable-only mode (built and run 2026-11-01)
 `latency --cable-only --probe "CABLE-A Input" --capture "CABLE-A Output" [--reps N]` plays the same sweep train with no engine
