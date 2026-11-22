@@ -39,6 +39,8 @@ pub(crate) type Hr = i32;
 
 /// Dither amplitude for the mic and reference blocks: about -180 dBFS. It keeps AEC3's and
 /// RNNoise's filters out of denormal range on exact digital silence (sonora #34) without FTZ/DAZ.
+/// The mic is dithered only while a stage runs (`Chain::runs_a_stage`): in bypass digital silence
+/// stays exact (TODO 10, the owner's decision of 2026-11-22; the matrix, doc/dev/dither-matrix-2026-11-21.md).
 pub(crate) const DITHER: f32 = 1e-9;
 /// Mic FIFO capacity: 200 ms.
 const MIC_FIFO: usize = 9_600;
@@ -183,6 +185,10 @@ pub(crate) trait BlockProcessor {
     fn latency(&self) -> u32 {
         0
     }
+    /// Whether to dither this block's mic: while a stage runs (`Chain::runs_a_stage`). The tests' stand-ins keep it on.
+    fn dither_mic(&self) -> bool {
+        true
+    }
 }
 
 impl BlockProcessor for Chain {
@@ -200,6 +206,10 @@ impl BlockProcessor for Chain {
     #[inline]
     fn latency(&self) -> u32 {
         Chain::latency(self)
+    }
+    #[inline]
+    fn dither_mic(&self) -> bool {
+        self.runs_a_stage()
     }
 }
 
@@ -682,7 +692,9 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
                 self.counters.tap_overflows += 1;
             }
         }
-        self.dither.apply(&mut self.mic_blk[..], DITHER);
+        if proc.dither_mic() {
+            self.dither.apply(&mut self.mic_blk[..], DITHER);
+        }
         self.take_reference(head, t_capture);
         if let Some(g) = self.echo_guard.as_mut().filter(|_| self.has_reference) {
             g.block(&self.mic_blk, &self.ref_blk);
@@ -1516,6 +1528,26 @@ mod tests {
         }
     }
 
+    /// Records the mic blocks the chain saw, asking for the mic dither or not.
+    struct MicSpy {
+        seen: Vec<f32>,
+        dither: bool,
+    }
+
+    impl BlockProcessor for MicSpy {
+        fn process<T: Ticks>(&mut self, mic: &Block, _r: &Block, out: &mut Block, _t: &mut T) -> ChainReport {
+            self.seen.extend_from_slice(mic);
+            *out = *mic;
+            ChainReport::default()
+        }
+        fn aec_stats(&self) -> Option<AecStats> {
+            None
+        }
+        fn dither_mic(&self) -> bool {
+            self.dither
+        }
+    }
+
     /// Records the reference block the chain saw.
     struct RefSpy(Vec<f32>);
 
@@ -2128,6 +2160,32 @@ mod tests {
         p.drain_mic(&mut mic, 0.0).unwrap();
         let r = p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false);
         assert_eq!(r, Err(0x8889_0004_u32 as i32));
+    }
+
+    /// The mic is dithered only while the chain runs a stage (TODO 10): in bypass digital silence reaches the chain, and so the
+    /// cable, as exact zeros; with a stage running every mic block is dithered, as AEC3 and RNNoise need.
+    #[test]
+    fn the_mic_is_dithered_only_while_a_stage_runs() {
+        for dither in [false, true] {
+            let mut p = pipe(true);
+            let mut sink = FakeSink::new(4800);
+            p.prefill(&mut sink).unwrap();
+            let tel = Telemetry::new();
+            let mut spy = MicSpy { seen: Vec::new(), dither };
+            let mut mic = FakeCapture::default();
+            for b in 0..3usize {
+                mic.push((b * 480) as u64, None, vec![0.0; 480]);
+                p.drain_mic(&mut mic, 0.0).unwrap();
+                p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+            }
+            assert_eq!(spy.seen.len(), 3 * 480);
+            if dither {
+                assert!(spy.seen.iter().all(|v| v.abs() <= 1.0001e-9), "dither only");
+                assert!(spy.seen.chunks(480).all(|b| b.iter().any(|&v| v != 0.0)), "every block dithered");
+            } else {
+                assert!(spy.seen.iter().all(|&v| v.to_bits() == 0), "exact zeros in bypass");
+            }
+        }
     }
 
     /// No loopback packets at all (silence without the keep-alive): each block's reference is

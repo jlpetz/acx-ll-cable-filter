@@ -227,6 +227,16 @@ impl Chain {
             + self.noise.as_ref().map_or(0, |s| s.latency(c.noise.enabled.load(Relaxed)))
     }
 
+    /// Whether a stage will run on the next block: one is switched on, or was running on the last block (the block a stage is
+    /// switched off on still runs it once, into its delay line). While one does, the engine dithers the mic, so no stage's
+    /// state decays into exact-zero input, where RNNoise and AEC3 stall on subnormals; in bypass nothing runs and the mic
+    /// passes as it came, so digital silence stays exact (TODO 10, the owner's decision of 2026-11-22).
+    pub fn runs_a_stage(&self) -> bool {
+        let c = &self.controls;
+        let runs = |slot: &Option<Slot>, want: bool| slot.as_ref().is_some_and(|s| want || matches!(s.mode, Mode::On | Mode::Starting(_)));
+        runs(&self.aec, c.aec.enabled.load(Relaxed)) || runs(&self.noise, c.noise.enabled.load(Relaxed))
+    }
+
     /// The live controls the chain reads each block.
     pub fn controls(&self) -> &ChainControls {
         &self.controls
@@ -638,6 +648,29 @@ mod tests {
             c.passthrough.store(true, Relaxed);
             assert_eq!(chain.process(&[0.1; BLOCK], &[0.0; BLOCK], &mut out).noise, None, "not in passthrough");
         }
+    }
+
+    /// The engine dithers the mic while a stage runs (TODO 10): runs_a_stage is true while one is switched on and on the block
+    /// it is switched off on (still run once), and false in bypass and once the switch-off block has passed.
+    #[test]
+    fn a_stage_runs_while_switched_on_and_on_its_switch_off_block() {
+        let c = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        let noise = Wired::new(&[features::DENOISE], MONO_IN_OUT.clone(), false);
+        let mut chain = Chain::new(c.clone(), None, Some(Box::new(noise)));
+        chain.activate().unwrap();
+        c.noise.enabled.store(false, Relaxed);
+        feed_marked(&mut chain, 0, 2);
+        assert!(!chain.runs_a_stage(), "bypass");
+        c.noise.enabled.store(true, Relaxed);
+        assert!(chain.runs_a_stage(), "switched on: the next block runs it");
+        feed_marked(&mut chain, 2, 4);
+        assert!(chain.runs_a_stage(), "on");
+        c.noise.enabled.store(false, Relaxed);
+        assert!(chain.runs_a_stage(), "the switch-off block still runs it");
+        feed_marked(&mut chain, 4, 5);
+        assert!(!chain.runs_a_stage(), "off after the switch-off block");
+        let empty = Chain::new(Arc::new(ChainControls::new(&ProcessingConfig::default())), None, None);
+        assert!(!empty.runs_a_stage(), "no stages at all");
     }
 
     #[test]
