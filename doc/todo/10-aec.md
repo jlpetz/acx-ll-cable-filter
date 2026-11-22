@@ -274,7 +274,10 @@ Live (`quality --test echo --echo-delay D`, 150 s, the exclusive mic, an 18 ms l
 Left: the quality report's echo-delay line can quote a turn's lead from before the hold when the hold changes mid-take
 (the turns measured are right); real speakers in phase 2 (TODO 13).
 
-## Dither and FTZ/DAZ (2026-11-20, open; the matrix ran 2026-11-21)
+## Dither and FTZ/DAZ (decided by the owner 2026-11-22, from the matrix of 2026-11-21)
+**The owner (2026-11-22):** our proposal below, "unless there is a better option I'm not seeing": dither while a filter runs,
+the guard off, none in bypass; the exact-zero end stage later.
+
 **Results:** `doc/dev/dither-matrix-2026-11-21.md` (the harness and raw data on branch `worktree-wf_4989e0ed-c97-3`, d0f6095 and
 90bb776, beside the vendored guard switch). In short:
 - a clean mic stalls RNNoise 10x after speech (p99 481 against 47 us) in either guard build, and degrades UL-UNAS's output
