@@ -17,7 +17,8 @@ Written from the registry sources on 2026-10-26. Path prefixes used below (all u
 `sonora-simd` (all `0.2.0`) and `tracing 0.1` (`sonora-0.2.0/Cargo.toml`). `sonora-fft 0.2.0` comes in
 through `sonora-aec3`. All seven are built from the same git commit `a024d6ef` (`.cargo_vcs_info.json`).
 Our pins: `sonora = "=0.3.0"` since 2026-11-20 (Part 1 describes 0.2.0, the pin until then; 1.11 says what 0.3.0
-changed), `nnnoiseless = { version = "=0.5.2", default-features = false }`.
+changed), patched from `vendor/` so that its FTZ/DAZ guard is a cargo feature, off by default (1.12),
+`nnnoiseless = { version = "=0.5.2", default-features = false }`.
 
 Statements marked **(inferred)** come from reading the code, not from a test or measurement.
 Statements marked **(GitHub)** come from the upstream repo (issue or PR text), not from the 0.2.0 sources.
@@ -356,7 +357,8 @@ changes up to M156. Our code compiled unchanged. Paths below are under `sonora-0
   drop, also when unwinding. Its own docs state the caveats: formally undefined behaviour in Rust, LLVM may move float
   operations across the guard, and code reached from inside the call (the global allocator, `tracing` subscribers, the
   panic hook) runs with FTZ. Measured: the undithered zero-reference row went from 674 to 46 µs a block; the thread's
-  MXCSR is the same after the stage's blocks (`crates/nf-stages/tests/aec3.rs`, `aec3_leaves_the_thread_s_mxcsr_as_it_found_it`).
+  MXCSR is the same after the stage's blocks (`aec3_leaves_the_thread_s_mxcsr_as_it_found_it`, now in
+  `crates/nf-stages/tests/mxcsr.rs`). Since 2026-11-20 our build has the guard only with a feature, off by default (1.12).
 - **`mul_add` (1.9):** without native FMA (`sonora_simd::NATIVE_FMA`, false at x86-64-v2) the biquads, the three-band filter
   bank and `fft4g` use plain expressions (sonora #37). At our v3 baseline it is `true` and the code is unchanged.
 - **Render buffer:** the headroom fix for render-buffer underruns (upstream d460e60e19). We call render then capture once
@@ -364,9 +366,30 @@ changes up to M156. Our code compiled unchanged. Paths below are under `sonora-0
 - **Config:** `AudioProcessingBuilder::echo_canceller3_config` (sonora #41, #47), with `EchoCanceller3Config` re-exported
   from `sonora::config`; invalid configs are clamped with a `tracing::warn!` (`audio_processing_impl.rs:1327`). Unused by us.
 - **Logging:** besides 1.7's, `tracing::info!("Denormal disabler unsupported")` when the processor is built on a target
-  without FTZ (not ours). Nothing logs on the hot path.
+  without FTZ (and, since 1.12, in our build without the guard). Nothing logs on the hot path.
 - **Output, measured:** bit-identical to 0.2.0 on our config (`tests/refactor_parity.rs`' 20 s golden, with and without AEC3),
   the latency still 430 samples, and AEC3 p50 49.5 → 47.0 µs a block (`doc/dev/build-report.md` §12).
+
+### 1.12 The FTZ/DAZ guard as a cargo feature (2026-11-20)
+
+The guard of 1.11 is ours to switch: `vendor/sonora-0.3.0` is the released crate with a `denormal-guard` feature, off by
+default, wired in by `[patch.crates-io]` (`vendor/README.md`, which has the diff, `vendor/sonora-0.3.0.patch`). TODO 10 has
+the decision; `doc/dev/build-report.md` §13 the measurements.
+
+- **Where it is:** only in `sonora` (`src/denormal_disabler.rs`, held by `audio_processing_impl.rs`' four entry points). None of
+  the other six crates reads or writes MXCSR or FPCR (a grep of all seven for `mxcsr`, `setcsr`, `fpcr` and flush-to-zero).
+- **The patch:** the x86 and aarch64 `imp` modules require the feature in their `cfg`, and the no-op module takes the
+  negation. Without the feature every target builds the no-op guard, as one without hardware flush-to-zero does:
+  `DenormalDisabler::new` reads and writes nothing, `is_supported()` is false, and building the processor logs the
+  `tracing::info!` above (we install no subscriber, so nowhere). nf-stages' `sonora-denormal-guard` turns it on; nf-app
+  forwards it.
+- **Measured, guard off → on** (medians of 8 quiet runs a build, µs a block, p50): AEC3 in sustained silence with the engine's
+  dither 47.2 → 46.2, the chain with AEC3 66.4 → 65.5; with signal no change (AEC3 47.0 → 47.1, the chain 83.7 → 83.7). Where
+  the dither doesn't reach: a zero mic with only the stage's reference dither 388.0 → 46.0, the undithered zero reference 667.8
+  → 45.7. With the dither, no subnormal is left in sonora's state after 10 s of silence (a scan of its `Debug` dump, as its own
+  `silent_render_leaves_no_subnormal_state` does); with the mic at exact zero, 777 values in 13 fields.
+- **Output and MXCSR, measured:** bit-identical to crates.io's 0.3.0 both ways (`tests/refactor_parity.rs`). Inside a call
+  MXCSR reads 0x1f80 without the guard and 0x9fc0 with it, and after it the caller's word both ways (`tests/mxcsr.rs`).
 
 ---
 

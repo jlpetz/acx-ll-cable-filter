@@ -12,9 +12,11 @@
 //! - **Denormals (1.10, 1.11):** the reference is dithered at 1e-9 (about -180 dBFS) on every block, gaps
 //!   included. A silent reference otherwise decays AEC3's filter states into subnormals (sonora
 //!   #34): with sonora 0.2.0 an undithered zero reference cost 674 µs a block on the dev box against
-//!   45 µs dithered (`tests/timing.rs`). sonora 0.3.0 sets FTZ and DAZ for each call itself and
-//!   restores MXCSR on return (`tests/aec3.rs` checks it), which takes the undithered row to 46 µs; the
-//!   dither stays. The engine dithers the mic.
+//!   45 µs dithered (`tests/timing.rs`). The engine dithers the mic. sonora 0.3.0 sets FTZ and DAZ for each call
+//!   and restores MXCSR on return, which takes the undithered row to 46 µs; the vendored 0.3.0 does that only with
+//!   nf-stages' `sonora-denormal-guard` feature, off by default (TODO 10, vendor/README.md). `tests/mxcsr.rs` checks
+//!   MXCSR inside and after sonora's calls in both builds. [`Aec3Stage::with_reference_dither`] sets the amplitude, 0 for
+//!   none: for TODO 10's dither matrix (nf-engine's `tests/dither_matrix`), which needs a reference nothing dithers.
 //! - **Latency:** [`AEC3_LATENCY`], measured by the `stream_offset_is_aec3_latency` test. On voiced
 //!   speech the high-pass delays the strong low harmonics, which pulls a plain cross-correlation
 //!   about 30 samples late; GCC-PHAT, or an impulse, finds the stream offset.
@@ -50,8 +52,8 @@ use sonora::{AudioProcessing, Config, StreamConfig};
 /// handling): the same with the high-pass off, and 0 with AEC3 off. sonora-nnnoiseless.md 1.8's
 /// estimate from the code, about 4.5 ms, is too low.
 pub const AEC3_LATENCY: u32 = 430;
-/// The reference dither's amplitude: about -180 dBFS.
-const REFERENCE_DITHER: f32 = 1e-9;
+/// The reference dither's amplitude ([`Aec3Stage::new`]'s): about -180 dBFS.
+pub const AEC3_REFERENCE_DITHER: f32 = 1e-9;
 /// The reference dither's seed.
 const DITHER_SEED: u32 = 0x5EED_AEC3;
 
@@ -72,6 +74,8 @@ pub struct Aec3Stage {
     _controls: Arc<ChainControls>,
     apm: AudioProcessing,
     dither: Dither,
+    /// The reference dither's amplitude; 0: the reference isn't dithered.
+    dither_amplitude: f32,
     /// Something was processed since `new` or the last `reset`.
     dirty: bool,
     // Blocks inline, and sanitised by a kernel taking each block as its own argument, so the loops
@@ -84,8 +88,15 @@ pub struct Aec3Stage {
 }
 
 impl Aec3Stage {
-    /// Builds AEC3 (allocates heavily: do it before real-time).
+    /// Builds AEC3 (allocates heavily: do it before real-time), its reference dithered at [`AEC3_REFERENCE_DITHER`].
     pub fn new(controls: Arc<ChainControls>) -> Result<Self, StageError> {
+        Self::with_reference_dither(controls, AEC3_REFERENCE_DITHER)
+    }
+
+    /// [`Aec3Stage::new`] with the reference dithered at `amplitude`, or not at all at 0 (a silent reference then decays AEC3's
+    /// filter states into subnormals, sonora #34, unless sonora's FTZ/DAZ guard is built in). For TODO 10's dither matrix;
+    /// the app builds the stage with `new`.
+    pub fn with_reference_dither(controls: Arc<ChainControls>, amplitude: f32) -> Result<Self, StageError> {
         let apm = build_apm();
         let rate = apm.proc_sample_rate_hz();
         if rate != SAMPLE_RATE as usize {
@@ -95,6 +106,7 @@ impl Aec3Stage {
             _controls: controls,
             apm,
             dither: Dither::new(DITHER_SEED),
+            dither_amplitude: amplitude,
             dirty: false,
             mic: [0.0; BLOCK],
             reference: [0.0; BLOCK],
@@ -102,9 +114,12 @@ impl Aec3Stage {
         })
     }
 
-    /// One render then one capture call: `self.reference` and `self.mic` must be filled.
+    /// The reference's dither, then one render and one capture call: `self.reference` and `self.mic` must be filled.
     #[inline]
     fn run(&mut self, output: &mut Block) {
+        if self.dither_amplitude != 0.0 {
+            self.dither.apply(&mut self.reference[..], self.dither_amplitude);
+        }
         // Both calls only fail on a format mismatch, which the fixed 48 kHz mono configs rule out.
         let r = self.apm.process_render_f32(&[&self.reference[..]], &mut [&mut self.scratch[..]]);
         debug_assert!(r.is_ok());
@@ -150,7 +165,6 @@ impl Stage for Aec3Stage {
             Some(r) => sanitize_into(r, &mut self.reference),
             None => self.reference.fill(0.0),
         }
-        self.dither.apply(&mut self.reference[..], REFERENCE_DITHER);
         sanitize_into(io.main(), &mut self.mic);
         self.run(io.output);
     }
@@ -161,7 +175,6 @@ impl Stage for Aec3Stage {
         }
         self.dirty = false;
         self.reference.fill(0.0);
-        self.dither.apply(&mut self.reference[..], REFERENCE_DITHER);
         self.mic.fill(0.0);
         let mut discard = [0.0f32; BLOCK];
         self.run(&mut discard);
@@ -198,10 +211,12 @@ mod tests {
         x.map(|v| if v.is_finite() { v.clamp(-limit, limit) } else { 0.0 })
     }
 
-    /// The stage is sonora driven directly: the same config, the reference sanitised and dithered with the same seed, the
-    /// mic sanitised, render then capture. Bit for bit, through NaNs, infinities and blocks without a reference port.
-    #[test]
-    fn the_stage_is_sonora_driven_directly() {
+    fn controls() -> Arc<ChainControls> {
+        Arc::new(ChainControls::new(&ProcessingConfig::default()))
+    }
+
+    /// 4 s of echo and near speech with NaNs and infinities in both inputs: the mic and the far end.
+    fn hostile_echo() -> (Vec<f32>, Vec<f32>) {
         let len = 4 * 48_000;
         let mut far = speech_like(len, Voice::LOW, 7).samples;
         let echo = scaled(&delayed(&convolve(&far, &room_impulse_response(4800, 0.15, 8))[..len], 1920), 0.5);
@@ -211,27 +226,72 @@ mod tests {
             far[i + 3] = f32::INFINITY;
             mic[i + 9] = f32::NEG_INFINITY;
         }
-        let mut stage = Aec3Stage::new(Arc::new(ChainControls::new(&ProcessingConfig::default()))).expect("stage");
-        stage.activate(&Activation::HOST).expect("activate");
-        let mut apm = build_apm();
-        let mut dither = Dither::new(DITHER_SEED);
-        let (mut scratch, mut direct, mut y) = ([0.0f32; BLOCK], [0.0f32; BLOCK], [0.0f32; BLOCK]);
-        for (b, (mi, ri)) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0).enumerate() {
-            // Now and then no reference port at all: that reads as a silent reference.
-            let mut r = if b % 50 == 7 {
-                stage.process(ProcessIo::new(&[mi], &mut y));
-                [0.0; BLOCK]
-            } else {
-                stage.process(ProcessIo::new(&[mi, ri], &mut y));
-                sanitized(ri)
+        (mic, far)
+    }
+
+    /// The stage is sonora driven directly: the same config, the reference sanitised and dithered with the same seed (at
+    /// [`AEC3_REFERENCE_DITHER`], `new`'s; or not at all, `with_reference_dither` at 0), the mic sanitised, render then
+    /// capture, and a reset's silent pair the same. Bit for bit, through NaNs, infinities, blocks without a reference port
+    /// and resets.
+    #[test]
+    fn the_stage_is_sonora_driven_directly() {
+        let (mic, far) = hostile_echo();
+        for (amplitude, stage) in
+            [(AEC3_REFERENCE_DITHER, Aec3Stage::new(controls())), (0.0, Aec3Stage::with_reference_dither(controls(), 0.0))]
+        {
+            let mut stage = stage.expect("stage");
+            stage.activate(&Activation::HOST).expect("activate");
+            let mut apm = build_apm();
+            let mut dither = Dither::new(DITHER_SEED);
+            let (mut scratch, mut direct, mut y) = ([0.0f32; BLOCK], [0.0f32; BLOCK], [0.0f32; BLOCK]);
+            let mut pair = |apm: &mut AudioProcessing, mut r: Block, m: &Block, out: &mut Block| {
+                if amplitude != 0.0 {
+                    dither.apply(&mut r, amplitude);
+                }
+                apm.process_render_f32(&[&r[..]], &mut [&mut scratch[..]]).expect("render");
+                apm.process_capture_f32(&[&m[..]], &mut [&mut out[..]]).expect("capture");
             };
-            dither.apply(&mut r, REFERENCE_DITHER);
-            apm.process_render_f32(&[&r[..]], &mut [&mut scratch[..]]).expect("render");
-            apm.process_capture_f32(&[&sanitized(mi)[..]], &mut [&mut direct[..]]).expect("capture");
-            let first = y.iter().zip(&direct).position(|(a, b)| a.to_bits() != b.to_bits());
-            assert_eq!(first, None, "block {b}: the stage differs from sonora");
+            for (b, (mi, ri)) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0).enumerate() {
+                if b % 97 == 60 {
+                    stage.reset(); // one silent pair, its output discarded
+                    pair(&mut apm, [0.0; BLOCK], &[0.0; BLOCK], &mut [0.0; BLOCK]);
+                }
+                // Now and then no reference port at all: that reads as a silent reference.
+                let r = if b % 50 == 7 {
+                    stage.process(ProcessIo::new(&[mi], &mut y));
+                    [0.0; BLOCK]
+                } else {
+                    stage.process(ProcessIo::new(&[mi, ri], &mut y));
+                    sanitized(ri)
+                };
+                pair(&mut apm, r, &sanitized(mi), &mut direct);
+                let first = y.iter().zip(&direct).position(|(a, b)| a.to_bits() != b.to_bits());
+                assert_eq!(first, None, "amplitude {amplitude}, block {b}: the stage differs from sonora");
+            }
+            assert!(stage.aec_stats().erle_db.is_finite(), "AEC3 converged enough to report");
         }
-        assert!(stage.aec_stats().erle_db.is_finite(), "AEC3 converged enough to report");
+    }
+
+    /// `with_reference_dither` at [`AEC3_REFERENCE_DITHER`] is `new`, bit for bit, through resets and blocks without a
+    /// reference port (the dither matrix builds every stage with it).
+    #[test]
+    fn new_is_the_default_reference_dither() {
+        let (mic, far) = hostile_echo();
+        let mut a = Aec3Stage::new(controls()).expect("new");
+        let mut b = Aec3Stage::with_reference_dither(controls(), AEC3_REFERENCE_DITHER).expect("with_reference_dither");
+        a.activate(&Activation::HOST).expect("activate");
+        b.activate(&Activation::HOST).expect("activate");
+        let (mut ya, mut yb) = ([0.0f32; BLOCK], [0.0f32; BLOCK]);
+        for (i, (mi, ri)) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0).enumerate() {
+            if i % 97 == 60 {
+                a.reset();
+                b.reset();
+            }
+            let inputs: &[&Block] = if i % 50 == 7 { &[mi] } else { &[mi, ri] };
+            a.process(ProcessIo::new(inputs, &mut ya));
+            b.process(ProcessIo::new(inputs, &mut yb));
+            assert!(ya.iter().zip(&yb).all(|(x, y)| x.to_bits() == y.to_bits()), "block {i} differs");
+        }
     }
 
     /// AEC3 through TODO 2's reusable check (`harness::check_stage`): the profile, its 430 at every block phase (impulses at
@@ -250,7 +310,7 @@ mod tests {
         let mut direct = Vec::with_capacity(len);
         for (mi, ri) in mic.as_chunks::<BLOCK>().0.iter().zip(far.as_chunks::<BLOCK>().0) {
             let mut r = sanitized(ri);
-            dither.apply(&mut r, REFERENCE_DITHER);
+            dither.apply(&mut r, AEC3_REFERENCE_DITHER);
             apm.process_render_f32(&[&r[..]], &mut [&mut scratch[..]]).expect("render");
             apm.process_capture_f32(&[&sanitized(mi)[..]], &mut [&mut out[..]]).expect("capture");
             direct.extend_from_slice(&out);

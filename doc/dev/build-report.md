@@ -892,3 +892,91 @@ ONNX Runtime's worker and stays true.
   say; scoped to its own calls, and tested not to persist). Our proposal: accept it, and keep the dither.
 - The render-buffer headroom fix (for underruns) can't show offline; live loopback gaps are where it would.
 - Nothing was run on audio devices.
+
+## 13. sonora's FTZ/DAZ guard as a feature (2026-11-20)
+
+sonora 0.3.0 sets MXCSR's FTZ and DAZ for each `process_*` call (§12). That guard is now a cargo feature, off by default.
+`vendor/sonora-0.3.0` is the released crate (its `.crate` checked against `Cargo.lock`'s SHA-256) plus a three-file patch,
+`vendor/sonora-0.3.0.patch`, wired in by `[patch.crates-io]` as the vendored 0.2.0 was (2026-10-26 to 10-28;
+`vendor/README.md`). Only `sonora` holds the guard (`src/denormal_disabler.rs`); the other six sonora crates still come from
+crates.io, and `Cargo.lock` changed only in `sonora`'s source and checksum lines. Without the feature every target builds the
+guard's no-op variant, as a target without hardware flush-to-zero does upstream; with it, the code is 0.3.0's. nf-stages'
+`sonora-denormal-guard` turns it on and nf-app forwards it, so `cargo build --release --features sonora-denormal-guard` builds
+the app with the guard. Built and measured in a worktree from main at 446bb4a, its own `target/`, rustc 1.102.0-nightly
+5f4effd57, on the dev box.
+
+**Machine code:** the release timing test exe built without the feature has no `stmxcsr` or `ldmxcsr` (llvm-objdump); with it,
+2 and 6 (the two f32 entry points the bench calls: the set, the restore, and the restore on unwind).
+
+**MXCSR inside and after a call** (`tests/mxcsr.rs`, new; the stage-level test moved there from `tests/aec3.rs`): a recording
+global allocator reads MXCSR while sonora re-initialises for a new stream format inside each of its four entry points (865
+allocator calls in the first). Without the feature every reading is 0x1f80, the caller's word; with it, 0x9fc0 (FTZ and DAZ
+added). After each call the thread's word is the caller's, both ways. With its expectation inverted the test fails in both
+builds.
+
+**Output:** bit-identical both ways. `tests/refactor_parity.rs`' golden was recorded on crates.io's 0.3.0 (the patch and the
+two feature lines commented out, `Cargo.lock` back on the registry source, then restored) and matched the patched crate bit for
+bit without the feature and with it: both streams, 2,000 blocks each. The workspace suites pass in both builds, `rt_no_alloc`
+included (`the_aec3_chain_does_not_allocate_after_build`, 0 allocations).
+
+**Timing** (`tests/timing.rs`: new rows in `nf_stages::bench` and a new ignored test, `silence_costs`). Sustained silence is 3 s
+of the timing scene (far-end speech, its echo and the near end), then 30 s of an exact-zero mic and reference, timed after the
+usual 1 s warm-up (2,900 blocks). "Engine's dither" adds the engine's ±1e-9 to the mic and the reference (one generator, its
+seed, the mic's block first, as `pipeline.rs` does) and then the stage adds its own to the reference: the app's signal.
+"Stage's dither only" leaves the mic exact zero, as a host other than our engine might send it. The two release test exes ran
+alternately in ABBA order with `--test-threads 1`, after one discarded run each, 26 rounds in all. Medians of 8 runs per build
+from the quiet rounds (the mean of the middle two, rounded half up), µs a block:
+
+| Row | p50 off | p50 on | p99 off | p99 on | max off | max on |
+|---|---|---|---|---|---|---|
+| AEC3, silence, engine's dither (the app) | 47.2 | **46.2** | 56.8 | 55.2 | 112.9 | 101.2 |
+| chain + AEC3, silence, engine's dither (the app) | 66.4 | **65.5** | 76.8 | 76.5 | 115.9 | 181.6 |
+| AEC3, silence, stage's dither only (mic undithered) | 388.0 | **46.0** | 465.1 | 55.8 | 692.8 | 116.9 |
+| control: sonora, zero reference, no dither (16 runs) | 667.8 | **45.7** | 707.2 | 54.5 | 877.7 | 88.5 |
+| AEC3 (echo + near end + noise) | 47.0 | 47.1 | 63.3 | 64.2 | 105.3 | 94.7 |
+| AEC3, silent reference (dithered) | 43.1 | 43.1 | 52.2 | 52.1 | 124.5 | 135.2 |
+| chain: meters + AEC3 + RNNoise | 83.7 | 83.7 | 105.6 | 105.2 | 199.4 | 207.4 |
+| chain: meters + RNNoise (no sonora) | 35.6 | 35.5 | 46.2 | 46.5 | 82.4 | 78.7 |
+| RNNoise (noisy speech; no sonora) | 34.9 | 35.2 | 47.2 | 45.4 | 98.9 | 87.5 |
+
+- The box: a Windows Server 2025 VM (Xeon 6975P-C, 4 cores, 8 threads) over RDP. Another session ran `cargo` and `rustc` on
+  and off throughout, and Defender scanned their output. Total CPU was logged each second by `typeperf`: one logger from round
+  1, a second from round 7 and a third from round 15, all three left running, each sampling at its own phase within the second.
+  A round counts if both its runs stayed at or under 18% mean and 25% peak in every logger then running (our one timing thread
+  is 12.5%): rounds 15, 16, 20 and 22-26. Rounds 1-6 ran at 16-100% mean and 10-12 beside `rustc`; 7-9, 13, 14 and 17 peaked
+  at 27-46%; 18, 19 and 21 caught `pwsh`, `codex`, TiWorker and an SSM worker. Round 17 was counted before review: its off
+  run peaked at 27.4% in the first logger (24.3% in the third), with TiWorker busy for 1.3 s, and its AEC3 row with signal ran
+  at 50.2 µs p50 and 1.25 ms max, against 46.8-48.5 µs and at most 174 µs in the 8 counted off runs. Dropping it left the
+  app's two rows as they were; the other p50s moved by 0.2 µs at most, and the control's from 668.5 to 667.8. In the 8 quiet
+  rounds RNNoise's p50, which the guard can't touch, stayed within 34.2-36.5 µs. The max column is the median of the runs'
+  maxima; a dithered AEC3 row's max in one run is anywhere from 57 µs to 0.5 ms in either build (the VM), so it doesn't
+  separate them.
+- With our dither the guard is worth about 1 µs a block in sustained silence (2%, p50) and nothing measurable while there is
+  signal. The 1 µs is consistent: the runs' p50 ranges don't overlap (AEC3 46.8-47.4 off and 45.9-46.5 on; the chain 66.1-67.1
+  and 65.2-66.0). p99 differs by 1.6 µs at most in the rows with sonora, within the runs' spread: RNNoise's p99, which the
+  guard can't touch, differs by 1.8, and the app's AEC3 row's p99 ranges overlap (55.5-64.5 off, 52.1-81.7 on).
+- No subnormal is left in sonora's state in that silence. A scan of its `Debug` dump (as sonora's own
+  `silent_render_leaves_no_subnormal_state` does; a throwaway test, not kept) after 3 s of the scene and 10 s of the engine's
+  dithered silence found none; with the mic left at exact zero it found 777 values in 13 fields (the capture band-split filter,
+  the high-pass, AEC3's capture decimator, comfort noise, the output framer). So the 1 µs is transient arithmetic or code
+  layout, not a stall. Not traced further.
+- Where the dither doesn't reach, the guard matters: a zero mic without the engine's dither costs 388 µs a block without it and
+  46 with it, and the undithered zero reference 667.8 and 45.7 (§12: 674 on 0.2.0, 46 on 0.3.0). In the app the engine dithers
+  both. The offline `process` command doesn't dither (a chain recording's blocks already are), so a WAV with digital silence
+  runs at the slow figure there without the guard: still about 25 times real time, offline.
+
+**Checks:** `cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean with no features,
+with `--features nf-stages/sonora-denormal-guard`, with `--features nf-app/onnx`, and with both. `cargo test --workspace
+--no-fail-fast`: **855 passed, 0 failed, 31 ignored** without the guard and the same with it; with `--features nf-app/onnx`,
+the same, guard off and on. `tests/refactor_parity.rs` (ignored by design) as above. `python todo_check.py` clean. The vendored crate builds
+without a warning both ways, and sonora's own tests pass in it both ways (211 unit tests, 4 and 14 in its test files).
+
+**Docs:** TODO 10's entry and `doc/todo/10-aec.md` (the measurements, our proposal, and a draft upstream request for an opt-out,
+not posted), TODO 1's pin line, `doc/dev/api/sonora-nnnoiseless.md` (1.11, and a new 1.12), `doc/design/architecture.md`,
+`doc/design/engine.md`, `vendor/README.md`, and the comments in `aec3.rs`, `bench.rs` and `tests/timing.rs`.
+
+**Left open**
+- The owner's call on the default. Our proposal: off, as built, with the dither (1 µs a block is all the guard buys the app).
+- If the stage is offered to other hosts (TODO 17), it should dither its mic input as it does its reference (or that build turns
+  the guard on): with an undithered zero mic it stalls at 388 µs a block.
+- Nothing was run on audio devices.
