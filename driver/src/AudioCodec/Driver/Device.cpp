@@ -84,6 +84,40 @@ NTSTATUS - SUCCESS if able to configure the framework
     return STATUS_SUCCESS;
 }
 
+//
+// noise-filter (TODO 19, the owner's options A and D, 2026-11-23): which microphones this device makes, from its hardware key's
+// NfMicrophones (the INF sets it per hardware ID): 1 the low-latency one (Microphone0), 2 the call one (Microphone1), 3 both.
+// Absent, 0 or out of range: both.
+//
+#define NF_MIC_LOW_LATENCY  0x1
+#define NF_MIC_CALL         0x2
+
+PAGED_CODE_SEG
+static
+ULONG
+NfReadMicrophones(
+    _In_ WDFDEVICE Device
+)
+{
+    DECLARE_CONST_UNICODE_STRING(valueName, L"NfMicrophones");
+    WDFKEY  key;
+    ULONG   value = 0;
+
+    PAGED_CODE();
+
+    if (NT_SUCCESS(WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_READ, WDF_NO_OBJECT_ATTRIBUTES, &key)))
+    {
+        if (!NT_SUCCESS(WdfRegistryQueryULong(key, &valueName, &value)))
+        {
+            value = 0;
+        }
+        WdfRegistryClose(key);
+    }
+
+    value &= (NF_MIC_LOW_LATENCY | NF_MIC_CALL);
+    return (value != 0) ? value : (NF_MIC_LOW_LATENCY | NF_MIC_CALL);
+}
+
 PAGED_CODE_SEG
 NTSTATUS
 Codec_EvtBusDeviceAdd(
@@ -202,11 +236,19 @@ Return Value:
     //
     RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, &CODEC_RENDER_COMPONENT_GUID, &renderCircuitName));
 
-    RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE_COMPONENT_GUID, &MIC_CUSTOM_NAME, &captureCircuitName, L"Microphone"));
-
-    // noise-filter (TODO 19, option A): the call microphone, a second capture circuit (DriverSettings.h).
-    RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE2_COMPONENT_GUID, &MIC2_CUSTOM_NAME, &capture2CircuitName,
-                                                      L"Call Microphone"));
+    // noise-filter (TODO 19): the microphones this hardware ID asks for (NfReadMicrophones); the call one is a second capture
+    // circuit (DriverSettings.h). The first made goes in devCtx->Capture, a second in devCtx->Capture2.
+    ULONG microphones = NfReadMicrophones(device);
+    if (microphones & NF_MIC_LOW_LATENCY)
+    {
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE_COMPONENT_GUID, &MIC_CUSTOM_NAME, &captureCircuitName,
+                                                          L"Microphone"));
+    }
+    if (microphones & NF_MIC_CALL)
+    {
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE2_COMPONENT_GUID, &MIC2_CUSTOM_NAME, &capture2CircuitName,
+                                                          L"Call Microphone"));
+    }
 
     return status;
 }
@@ -291,21 +333,27 @@ Return Value:
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: render packet-size constraints not set (0x%08X)\n", publish);
     }
 
-    ASSERT(devCtx->Capture);
-    RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture));
-    publish = PublishPacketSizeConstraints(devCtx->Capture);
-    if (!NT_SUCCESS(publish))
+    // The microphones this variant made (NfReadMicrophones): one or two capture circuits. The call microphone takes the same
+    // constraints (its INF's default period replaces their range there; TODO 22).
+    ASSERT(devCtx->Capture != nullptr);
+    if (devCtx->Capture != nullptr)
     {
-        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: capture packet-size constraints not set (0x%08X)\n", publish);
+        RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture));
+        publish = PublishPacketSizeConstraints(devCtx->Capture);
+        if (!NT_SUCCESS(publish))
+        {
+            DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: capture packet-size constraints not set (0x%08X)\n", publish);
+        }
     }
-
-    // The call microphone: the same constraints (its INF's default period replaces their range there; TODO 22).
-    ASSERT(devCtx->Capture2);
-    RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture2));
-    publish = PublishPacketSizeConstraints(devCtx->Capture2);
-    if (!NT_SUCCESS(publish))
+    if (devCtx->Capture2 != nullptr)
     {
-        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: call microphone packet-size constraints not set (0x%08X)\n", publish);
+        RETURN_NTSTATUS_IF_FAILED(AcxDeviceAddCircuit(Device, devCtx->Capture2));
+        publish = PublishPacketSizeConstraints(devCtx->Capture2);
+        if (!NT_SUCCESS(publish))
+        {
+            DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: second microphone packet-size constraints not set (0x%08X)\n",
+                       publish);
+        }
     }
 
     return status;
@@ -349,8 +397,14 @@ Return Value:
     // The driver uses this DDI to delete a circuit from the current device. 
     //
     RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Render));
-    RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture));
-    RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture2));
+    if (devCtx->Capture != nullptr)
+    {
+        RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture));
+    }
+    if (devCtx->Capture2 != nullptr)
+    {
+        RETURN_NTSTATUS_IF_FAILED(AcxDeviceRemoveCircuit(Device, devCtx->Capture2));
+    }
 
     // NOTE: Release streaming h/w resources here.
 

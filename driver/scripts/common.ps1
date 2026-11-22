@@ -17,6 +17,12 @@ $script:ProjectDir   = Join-Path $DriverRoot 'src\AudioCodec\Driver'
 $script:PackageName  = 'AudioCodec'
 $script:InfName      = 'AudioCodec.inf'
 $script:HardwareId   = 'ROOT\AudioCodec'
+# The three variants (TODO 19, the owner's options A and D): one INF, the microphones chosen by hardware ID.
+$script:HardwareIds  = [ordered]@{
+    'both'        = 'ROOT\AudioCodec'              # the low-latency and the call microphone
+    'call'        = 'ROOT\AudioCodecCall'          # the call microphone (a 5 ms default period)
+    'low-latency' = 'ROOT\AudioCodecLowLatency'    # the low-latency microphone (IAudioClient3's small periods)
+}
 # KMDF 1.35 needs Windows 11 24H2 or Server 2025 (build 26100).
 $script:CatalogOs    = '10_GE_X64,Server2025_X64'
 

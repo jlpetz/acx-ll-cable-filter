@@ -18,12 +18,13 @@ if ($cert) {
     Write-Note 'none (Setup-TestSigning.ps1 makes it)'
 }
 
-Write-Step "Device $HardwareId"
-$devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $HardwareId })
+Write-Step "Device (variants: $(($HardwareIds.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '))"
+$devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $d = $_; @($HardwareIds.Values | Where-Object { $d.HardwareID -contains $_ }).Count -gt 0 })
 if ($devices.Count -eq 0) { Write-Note 'not installed' }
 foreach ($d in $devices) {
     $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
-    Write-Host "   $($d.InstanceId): $($d.Status)$(if ($problem) { ", problem code $problem" })"
+    $variant = ($HardwareIds.GetEnumerator() | Where-Object { $d.HardwareID -contains $_.Value } | Select-Object -First 1).Key
+    Write-Host "   $($d.InstanceId): $($d.Status)$(if ($problem) { ", problem code $problem" }) (variant: $variant)"
     $children = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Where-Object {
             (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data -eq $d.InstanceId -or
             $_.FriendlyName -match [regex]::Escape($PackageName) })

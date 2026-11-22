@@ -8,8 +8,12 @@
 . (Join-Path $PSScriptRoot 'common.ps1')
 Assert-Admin
 
-Write-Step "Remove $HardwareId"
-& (Find-WdkTool 'devcon.exe') remove $HardwareId
+foreach ($id in $HardwareIds.Values) {
+    if (@(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $id }).Count -gt 0) {
+        Write-Step "Remove $id"
+        & (Find-WdkTool 'devcon.exe') remove $id
+    }
+}
 
 Write-Step "Delete $InfName from the driver store"
 $published = @(Get-WindowsDriver -Online | Where-Object { (Split-Path -Leaf $_.OriginalFileName) -eq $InfName.ToLower() -or
