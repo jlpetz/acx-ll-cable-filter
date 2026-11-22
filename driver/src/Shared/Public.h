@@ -370,12 +370,6 @@ CaptureMC_AddStaticCapture(
 
 PAGED_CODE_SEG
 NTSTATUS
-CodecC_CircuitCleanup(
-    _In_ ACXCIRCUIT Device
-);
-
-PAGED_CODE_SEG
-NTSTATUS
 MicArray_CircuitCleanup(
     _In_ ACXCIRCUIT Device
 );

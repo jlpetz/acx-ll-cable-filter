@@ -504,8 +504,10 @@ Return Value:
         ExFreePoolWithTag(buffer, DeviceDriverTag);
     }
 
-    if (devCtx->Capture)
-    {
-        CodecC_CircuitCleanup(devCtx->Capture);
-    }
+    //
+    // noise-filter (TODO 19, spike check 6): the sample called CodecC_CircuitCleanup(devCtx->Capture) here, which only looked
+    // up the circuit's context. The circuit is a child of the device, so the framework has cleaned it up before this callback
+    // runs and its handle is stale: under Driver Verifier the lookup faulted on device removal (bugcheck 0x7E in
+    // Wdf01000!FxIFR, from WdfObjectGetTypedContext, 2026-11-22). Nothing is lost without it.
+    //
 }

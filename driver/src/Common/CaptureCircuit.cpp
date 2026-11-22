@@ -239,25 +239,6 @@ Return Value:
 
 PAGED_CODE_SEG
 NTSTATUS
-CodecC_CircuitCleanup(
-    _In_ ACXCIRCUIT Circuit
-)
-{
-    PCODEC_CAPTURE_CIRCUIT_CONTEXT  circuitCtx;
-
-    PAGED_CODE();
-
-    //
-    // Remove the static capture circuit.
-    //
-    circuitCtx = GetCaptureCircuitContext(Circuit);
-    ASSERT(circuitCtx != nullptr);
-
-    return STATUS_SUCCESS;
-}
-
-PAGED_CODE_SEG
-NTSTATUS
 CodecC_AddStaticCapture(
     _In_ WDFDEVICE              Device,
     _In_ const GUID *           ComponentGuid,
