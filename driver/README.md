@@ -39,6 +39,11 @@ three times, so ScheduleNextPass and UpdatePosition read the clock three times p
 stream. Each conversion now takes one reading (`QpcToHns`), and GetPresentationPosition reports the position and its QPC
 from the same reading (the sample read it three times in UpdatePosition and once more for the QPC).
 
+Two microphones (TODO 19, the owner's option A): "Microphone" keeps IAudioClient3's small periods (128-480 frames, the
+packet-size constraints) for apps that ask for them, and "Call Microphone" (a second capture circuit, `Microphone1`) has a
+5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
+reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
+
 The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
 (page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
 plays it instead of the loopback, frame for frame. The request ends with ERROR_OPERATION_ABORTED (a cancel, the issuing thread
