@@ -457,11 +457,6 @@ CStreamEngine::Run()
     m_StartTime = QpcToHns(qpcStart);
     m_StartPosition = m_Position;
 
-    // noise-filter (TODO 19): the run's first packet starts now. StreamPassCallback moves this to m_LastPacketStart, which
-    // GetCapturePacket reports as the packet's QPC; left as it was (0 from the constructor, or the last pass before a
-    // Pause), the first packet of every run had the wrong capture time.
-    InterlockedExchange64(&m_CurrentPacketStart.QuadPart, qpcStart.QuadPart);
-
     // Reset time we've lost to glitches
     m_GlitchAdjust = 0;
 
@@ -659,7 +654,7 @@ VOID
 CStreamEngine::StreamPassCallback()
 {
     ULONGLONG completedPacket;
-    ULONGLONG qpcCompleted;
+    ULONGLONG qpcNotify;
 
     // Process the packet (e.g. save render to file/generate capture data)
     ProcessPacket();
@@ -667,17 +662,25 @@ CStreamEngine::StreamPassCallback()
     // We've completed a packet! Increment our currently active packet
     completedPacket = (ULONG)InterlockedIncrement((LONG*)&m_CurrentPacket) - 1;
     // Save the time at which we moved to the next packet
-    qpcCompleted = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
+    qpcNotify = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
 
-    InterlockedExchange64(&m_LastPacketStart.QuadPart, m_CurrentPacketStart.QuadPart);
-    InterlockedExchange64(&m_CurrentPacketStart.QuadPart, qpcCompleted);
-
-    // Tell ACX we've completed the packet. noise-filter (TODO 19): a capture stream's goes in the timestamp trace.
+    //
+    // noise-filter (TODO 19, the capture-timestamp trace, 2026-11-23): ACX gives a capture packet the QPC passed here as its
+    // first frame's time: GetBuffer's device QPC position, shared and exclusive, every mode and period tried, equal to the
+    // tick (NF_VMIC_CAPTURE_TRACE, nf-vmic-test stamps). It never called EvtAcxStreamGetCapturePacket, whose QPCPacketStart
+    // the sample meant for that. So a capture stream passes its packet's start on the time line ScheduleNextPass keeps
+    // (smooth, its glitch adjustments included), not now: with now, every client saw its frames a packet late, after the
+    // time it received them. A render stream passes now, as the sample did.
+    //
     if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
     {
-        NfVmicTraceCaptureNotify(completedPacket, qpcCompleted);
+        qpcNotify = PacketStartQpc(completedPacket);
+        InterlockedExchange64(&m_LastPacketStart.QuadPart, (LONG64)qpcNotify);
+        NfVmicTraceCaptureNotify(completedPacket, qpcNotify);
     }
-    (void)AcxRtStreamNotifyPacketComplete(m_Stream, completedPacket, qpcCompleted);
+
+    // Tell ACX we've completed the packet.
+    (void)AcxRtStreamNotifyPacketComplete(m_Stream, completedPacket, qpcNotify);
 
     // Schedule when our new current packet will finish
     ScheduleNextPass();
@@ -805,6 +808,33 @@ CStreamEngine::QpcToHns(
 )
 {
     return KSCONVERT_PERFORMANCE_TIME(m_PerformanceCounterFrequency.QuadPart, Qpc);
+}
+
+_Use_decl_annotations_
+ULONGLONG
+CStreamEngine::HnsToQpc(
+    ULONGLONG   Hns
+)
+{
+    ULONGLONG frequency = (ULONGLONG)m_PerformanceCounterFrequency.QuadPart;
+
+    // Whole seconds and the rest apart, as KSCONVERT_PERFORMANCE_TIME does, so neither product overflows.
+    return (Hns / HNS_PER_SEC) * frequency + (Hns % HNS_PER_SEC) * frequency / HNS_PER_SEC;
+}
+
+_Use_decl_annotations_
+ULONGLONG
+CStreamEngine::PacketStartQpc(
+    ULONGLONG   Packet
+)
+{
+    ULONGLONG position = Packet * m_PacketSize;
+    ULONGLONG fromRun;
+
+    // ScheduleNextPass's time line: the latest Run's time and position, the glitch adjustments, the nominal rate. A packet
+    // begun before that Run (a Pause inside it) starts at the Run.
+    fromRun = (position > m_StartPosition) ? position - m_StartPosition : 0;
+    return HnsToQpc(m_StartTime + m_GlitchAdjust + fromRun * HNS_PER_SEC / GetBytesPerSecond());
 }
 
 _Use_decl_annotations_
@@ -1640,7 +1670,6 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     // noise-filter (TODO 19, spike check 5): this stream's timer counts as a capture stream's (NF_VMIC_IOCTL_STATS).
     m_StatsKind = NF_VMIC_KIND_CAPTURE;
 
-    m_CurrentPacketStart.QuadPart = 0;
     m_LastPacketStart.QuadPart = 0;
 
     RtlInitUnicodeString(&m_HostCaptureFileName, NULL);

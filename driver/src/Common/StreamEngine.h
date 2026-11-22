@@ -333,8 +333,7 @@ protected:
     ULONGLONG           m_StartPosition;
     ULONGLONG           m_GlitchAdjust;
     LARGE_INTEGER       m_PerformanceCounterFrequency;
-    LARGE_INTEGER       m_CurrentPacketStart;
-    LARGE_INTEGER       m_LastPacketStart;
+    LARGE_INTEGER       m_LastPacketStart;  // a capture stream's latest completed packet's start (PacketStartQpc)
     DWORD               m_ToneFrequency;
     BOOL                m_Offload;
     CSimPeakMeter       m_PeakMeter;
@@ -388,6 +387,20 @@ protected:
     ULONGLONG
     QpcToHns(
         _In_    LARGE_INTEGER   Qpc
+        );
+
+    // noise-filter (TODO 19): QpcToHns's inverse, to the tick below.
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    HnsToQpc(
+        _In_    ULONGLONG       Hns
+        );
+
+    // noise-filter (TODO 19): a packet's start on the stream's time line, as a QPC (StreamPassCallback says why).
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    PacketStartQpc(
+        _In_    ULONGLONG       Packet
         );
 
     virtual
