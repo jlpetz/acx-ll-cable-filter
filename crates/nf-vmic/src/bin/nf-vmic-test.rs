@@ -45,8 +45,8 @@ use nf_vmic::protocol::{
 use nf_vmic::signal::{self, CheckReport, SequenceChecker};
 use nf_vmic::{AttachError, Attachment, Device, RingMemory, Writer, top_up};
 use wasapi::{
-    AudioClient, AudioClientProperties, DeviceEnumerator, Direction, Handle, SampleType, StreamMode, StreamOption, TimingMode, WasapiError,
-    WaveFormat, calculate_period_100ns,
+    AudioClient, AudioClientProperties, DeviceEnumerator, Direction, Handle, SampleType, StreamCategory, StreamMode, StreamOption,
+    TimingMode, WasapiError, WaveFormat, calculate_period_100ns,
 };
 use windows::Win32::Foundation::{E_FAIL, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, FALSE, HANDLE, TRUE};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
@@ -90,7 +90,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       one capture packet (480 frames for a shared stream's 10 ms period), or every pass underruns; the feed ends with an error
       once the reader's packet shows the target is below it. --start: the first frame's number. A refusal says why:
       ERROR_NOT_SUPPORTED (50) means a capture stream is open in a format other than 48 kHz float32 stereo.
-  nf-vmic-test verify [--seconds N] [--device NAME] [--mode raw|default] [--period-frames N]
+  nf-vmic-test verify [--seconds N] [--device NAME] [--mode raw|default|communications] [--period-frames N]
       Start `feed` first, in another window, and leave it running. Then record the capture endpoint (default \"Microphone
       (AudioCodec Device)\") in shared mode, float32 stereo 48 kHz, for N seconds (default 10), and check that the app ring
       fed it: the driver's statistics just before and after (the same attachment, read throughout, its frames copied), and
@@ -109,7 +109,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       throughout, and its timer must still run after the last kill. --no-capture leaves the reading to another capture
       client: without one the result is INCONCLUSIVE.
   nf-vmic-test open --device NAME [--render] (--exclusive | --shared) --format float|pcm24 [--period-frames N]
-                    [--mode raw|default] [--seconds N]
+                    [--mode raw|default|communications] [--seconds N]
       Open the endpoint (capture, or render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32
       PCM (a 32-bit container with 24 valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name (or
       that of the call after it that failed, up to Start), then hold the stream running for N seconds (default 10; Ctrl+C
@@ -122,7 +122,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       tests. 4: refused, but not shown to be by that rule: the outcome line names the call and its HRESULT, and says
       whether the counter rules the driver's ring rule out (another client holding the device, a bad period, the engine)
       or can't tell (no driver statistics, or a render endpoint). 3: it opened and started, then stopped running.
-  nf-vmic-test latency [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N] [--mode raw|default]
+  nf-vmic-test latency [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N] [--mode raw|default|communications]
                        [--device NAME] [--exclusive]
       In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192)
       as feed does, and record the capture endpoint (shared, float32 stereo 48 kHz; --mode and --period-frames as for
@@ -229,13 +229,14 @@ impl<'a> Opts<'a> {
         }
     }
 
-    /// `--mode raw|default`, or `default` where it isn't given.
+    /// `--mode raw|default|communications`, or `default` where it isn't given.
     fn mode(&self, default: Mode) -> Result<Mode, String> {
         match self.optional::<String>("--mode")?.as_deref() {
             None => Ok(default),
             Some("raw") => Ok(Mode::Raw),
             Some("default") => Ok(Mode::Default),
-            Some(other) => Err(format!("--mode {other:?}: raw or default")),
+            Some("communications") => Ok(Mode::Communications),
+            Some(other) => Err(format!("--mode {other:?}: raw, default or communications")),
         }
     }
 
@@ -363,13 +364,16 @@ fn is_reading(s: &Stats) -> bool {
 
 // ---- streams: formats, processing modes, HRESULTs, opening a client ----
 
-/// The processing mode a stream asks for: AUDCLNT_STREAMOPTIONS_RAW, set before Initialize, or none (DEFAULT).
+/// The processing mode a stream asks for: AUDCLNT_STREAMOPTIONS_RAW, set before Initialize, or none (DEFAULT), or the
+/// Communications category (as call apps open the mic), which Windows maps to the endpoint's COMMUNICATIONS mode where it has
+/// one and to DEFAULT where it hasn't.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// RAW where the endpoint takes it, else DEFAULT (verify's, latency's and kill-test's default).
     RawWhereOffered,
     Raw,
     Default,
+    Communications,
 }
 
 /// A stream's sample format: 48 kHz stereo, eight bytes a frame (`protocol::FRAME_BYTES`) either way.
@@ -427,6 +431,7 @@ impl StreamSpec {
             Mode::RawWhereOffered => "RAW where offered",
             Mode::Raw => "RAW",
             Mode::Default => "DEFAULT mode",
+            Mode::Communications => "the Communications category",
         };
         let period = match (self.exclusive, self.period_frames) {
             (true, Some(n)) => format!("a {n}-frame ({:.2} ms) period", ms(u64::from(n))),
@@ -725,7 +730,7 @@ fn engine_periods(device: &wasapi::Device, format: &WaveFormat) -> Option<String
 fn open_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec) -> Result<Opened, Refusal> {
     match spec.mode {
         Mode::Raw => init_client(device, dir, spec, true),
-        Mode::Default => init_client(device, dir, spec, false),
+        Mode::Default | Mode::Communications => init_client(device, dir, spec, false),
         Mode::RawWhereOffered => init_client(device, dir, spec, true).or_else(|raw| {
             let mut o = init_client(device, dir, spec, false)?;
             o.notes.insert(0, format!("RAW refused ({raw}); DEFAULT mode instead, so the endpoint's effects, if any, run"));
@@ -734,13 +739,17 @@ fn open_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec) -> Re
     }
 }
 
-/// A fresh client, with RAW set (before Initialize, as IAudioClient2 requires) when asked.
-fn new_client(device: &wasapi::Device, raw: bool) -> Result<AudioClient, Refusal> {
+/// A fresh client, with RAW or the Communications category set (before Initialize, as IAudioClient2 requires) when asked.
+fn new_client(device: &wasapi::Device, raw: bool, communications: bool) -> Result<AudioClient, Refusal> {
     let client = device.get_iaudioclient().map_err(|e| Refusal::at("IMMDevice::Activate", e))?;
     if raw {
         client
             .set_properties(AudioClientProperties::new().set_option(StreamOption::Raw))
             .map_err(|e| Refusal::at("SetClientProperties (RAW)", e))?;
+    } else if communications {
+        client
+            .set_properties(AudioClientProperties::new().set_category(StreamCategory::Communications))
+            .map_err(|e| Refusal::at("SetClientProperties (Communications)", e))?;
     }
     Ok(client)
 }
@@ -748,7 +757,8 @@ fn new_client(device: &wasapi::Device, raw: bool) -> Result<AudioClient, Refusal
 fn init_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec, raw: bool) -> Result<Opened, Refusal> {
     let rate = i64::from(protocol::SAMPLE_RATE);
     let format = spec.format.wave();
-    let mut client = new_client(device, raw)?;
+    let communications = spec.mode == Mode::Communications;
+    let mut client = new_client(device, raw, communications)?;
     let mut notes = Vec::new();
     let (default_hns, _) = client.get_device_period().map_err(|e| Refusal::at("GetDevicePeriod", e))?;
     let init_call = if spec.exclusive {
@@ -760,7 +770,7 @@ fn init_client(device: &wasapi::Device, dir: Direction, spec: &StreamSpec, raw: 
             // Microsoft's recovery: the failed client's buffer size, on a fresh client.
             let frames = client.get_buffer_size().map_err(|e| Refusal::at("GetBufferSize", e))?;
             notes.push(format!("Initialize returned AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED; opened again at the aligned {frames} frames"));
-            client = new_client(device, raw)?;
+            client = new_client(device, raw, communications)?;
             let period_hns = calculate_period_100ns(i64::from(frames), rate);
             client
                 .initialize_client(&format, &dir, &StreamMode::EventsExclusive { period_hns })
@@ -3209,7 +3219,7 @@ mod tests {
             (&["--device", "M", "--exclusive", "--shared", "--format", "float"], "one of --exclusive and --shared"),
             (&["--device", "M", "--exclusive"], "--format float|pcm24 is required"),
             (&["--device", "M", "--exclusive", "--format", "int16"], "float or pcm24"),
-            (&["--device", "M", "--exclusive", "--format", "float", "--mode", "comms"], "raw or default"),
+            (&["--device", "M", "--exclusive", "--format", "float", "--mode", "comms"], "raw, default or communications"),
             (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "0"], "--period-frames 0"),
             (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "48001"], "--period-frames 48001"),
             (&["--device", "M", "--exclusive", "--format", "float", "--seconds", "0"], "--seconds 0"),
@@ -3227,6 +3237,9 @@ mod tests {
         let a = args(&["--mode", "default", "--period-frames", "160"]);
         let o = Opts::parse(&a, &["--mode", "--period-frames"], &[]).unwrap();
         assert_eq!((o.mode(Mode::RawWhereOffered), o.period_frames()), (Ok(Mode::Default), Ok(Some(160))));
+        let a = args(&["--mode", "communications"]);
+        let o = Opts::parse(&a, &["--mode", "--period-frames"], &[]).unwrap();
+        assert_eq!(o.mode(Mode::RawWhereOffered), Ok(Mode::Communications));
     }
 
     #[test]
