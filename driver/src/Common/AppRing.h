@@ -116,6 +116,7 @@ typedef struct _NF_APP_RING {
 extern NF_APP_RING              g_NfAppRing;
 extern UCHAR                    g_NfAppHistory[NF_APP_HISTORY_BYTES];   // non-paged .bss; under g_NfAppRing.Lock
 extern NF_VMIC_STREAM_STATS     g_NfStreamStats[NF_VMIC_KINDS];     // interlocked access only
+extern NF_VMIC_CAPTURE_TRACE    g_NfCaptureTrace;                   // interlocked access only
 
 //
 // Timer statistics (AppRing.cpp): interlocked, no lock, no allocation; callable up to DISPATCH_LEVEL from any code.
@@ -152,6 +153,40 @@ __drv_maxIRQL(DISPATCH_LEVEL)
 VOID
 NfVmicCopyStreamStats(
     _Out_writes_(NF_VMIC_KINDS) PNF_VMIC_STREAM_STATS Out
+);
+
+//
+// The capture-timestamp trace (NF_VMIC_CAPTURE_TRACE): interlocked, no lock, no allocation; callable up to DISPATCH_LEVEL.
+//
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicTraceCaptureQuery(
+    _In_ ULONGLONG  QueryQpc,
+    _In_ ULONG      Packet,
+    _In_ ULONGLONG  PacketQpc
+);
+
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicTraceCaptureNotify(
+    _In_ ULONGLONG  Packet,
+    _In_ ULONGLONG  Qpc
+);
+
+// NfVmicTraceCaptureCount's counters.
+#define NF_VMIC_TRACE_POSITION          0
+#define NF_VMIC_TRACE_CURRENT_PACKET    1
+
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicTraceCaptureCount(
+    _In_ ULONG      Counter
+);
+
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicCopyCaptureTrace(
+    _Out_ PNF_VMIC_CAPTURE_TRACE Out
 );
 
 //

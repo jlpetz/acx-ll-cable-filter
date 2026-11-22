@@ -529,8 +529,9 @@ NfVmic_Stats(
     out->QpcFrequency = (UINT64)frequency.QuadPart;
     out->QpcNow = (UINT64)now.QuadPart;
 
-    // The timer statistics are interlocked: no lock.
+    // The timer statistics and the capture-timestamp trace are interlocked: no lock.
     NfVmicCopyStreamStats(out->Stream);
+    NfVmicCopyCaptureTrace(&out->CaptureTrace);
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
 

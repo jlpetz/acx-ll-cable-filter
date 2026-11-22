@@ -501,6 +501,11 @@ CStreamEngine::GetPresentationPosition(
     *PositionInBlocks = m_Position / blockAlign;
     *QPCPosition = (ULONGLONG)qpc.QuadPart;
 
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
+    {
+        NfVmicTraceCaptureCount(NF_VMIC_TRACE_POSITION);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -667,7 +672,11 @@ CStreamEngine::StreamPassCallback()
     InterlockedExchange64(&m_LastPacketStart.QuadPart, m_CurrentPacketStart.QuadPart);
     InterlockedExchange64(&m_CurrentPacketStart.QuadPart, qpcCompleted);
 
-    // Tell ACX we've completed the packet.
+    // Tell ACX we've completed the packet. noise-filter (TODO 19): a capture stream's goes in the timestamp trace.
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
+    {
+        NfVmicTraceCaptureNotify(completedPacket, qpcCompleted);
+    }
     (void)AcxRtStreamNotifyPacketComplete(m_Stream, completedPacket, qpcCompleted);
 
     // Schedule when our new current packet will finish
@@ -811,6 +820,11 @@ CStreamEngine::GetCurrentPacket(
     currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
 
     *CurrentPacket = currentPacket;
+
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
+    {
+        NfVmicTraceCaptureCount(NF_VMIC_TRACE_CURRENT_PACKET);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1705,6 +1719,9 @@ CCaptureStreamEngine::GetCapturePacket(
     *LastCapturePacket = currentPacket - 1;
     *QPCPacketStart = (ULONGLONG)qpcPacketStart;
     *MoreData = FALSE;
+
+    // noise-filter (TODO 19): the capture-timestamp trace (NF_VMIC_CAPTURE_TRACE).
+    NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, currentPacket - 1, (ULONGLONG)qpcPacketStart);
 
     return status;
 }

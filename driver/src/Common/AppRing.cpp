@@ -24,6 +24,7 @@ Environment:
 NF_APP_RING             g_NfAppRing;
 DECLSPEC_CACHEALIGN UCHAR g_NfAppHistory[NF_APP_HISTORY_BYTES];
 NF_VMIC_STREAM_STATS    g_NfStreamStats[NF_VMIC_KINDS];
+NF_VMIC_CAPTURE_TRACE   g_NfCaptureTrace;
 
 static
 PNF_VMIC_STREAM_STATS
@@ -142,5 +143,56 @@ NfVmicCopyStreamStats(
         {
             dest[i] = (UINT64)ReadNoFence64(&source[i]);
         }
+    }
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicTraceCaptureQuery(
+    ULONGLONG   QueryQpc,
+    ULONG       Packet,
+    ULONGLONG   PacketQpc
+)
+{
+    InterlockedIncrement64((volatile LONG64*)&g_NfCaptureTrace.PacketQueries);
+    InterlockedExchange64((volatile LONG64*)&g_NfCaptureTrace.LastQueryQpc, (LONG64)QueryQpc);
+    InterlockedExchange64((volatile LONG64*)&g_NfCaptureTrace.LastQueryPacket, (LONG64)Packet);
+    InterlockedExchange64((volatile LONG64*)&g_NfCaptureTrace.LastQueryPacketQpc, (LONG64)PacketQpc);
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicTraceCaptureNotify(
+    ULONGLONG   Packet,
+    ULONGLONG   Qpc
+)
+{
+    InterlockedExchange64((volatile LONG64*)&g_NfCaptureTrace.LastNotifyPacket, (LONG64)Packet);
+    InterlockedExchange64((volatile LONG64*)&g_NfCaptureTrace.LastNotifyQpc, (LONG64)Qpc);
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicTraceCaptureCount(
+    ULONG Counter
+)
+{
+    InterlockedIncrement64((volatile LONG64*)((Counter == NF_VMIC_TRACE_POSITION) ? &g_NfCaptureTrace.PositionQueries
+                                                                                  : &g_NfCaptureTrace.CurrentPacketQueries));
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicCopyCaptureTrace(
+    PNF_VMIC_CAPTURE_TRACE Out
+)
+{
+    const volatile LONG64*  source = (const volatile LONG64*)&g_NfCaptureTrace;
+    UINT64*                 dest = (UINT64*)Out;
+    ULONG                   i;
+
+    for (i = 0; i < sizeof(NF_VMIC_CAPTURE_TRACE) / sizeof(UINT64); i++)
+    {
+        dest[i] = (UINT64)ReadNoFence64(&source[i]);
     }
 }

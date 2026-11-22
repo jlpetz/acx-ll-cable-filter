@@ -143,11 +143,11 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
-NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
+NF_VMIC_STATS (640 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
-       0     4  Magic, 4 Version, 8 StatsBytes (576), 12 Flags (NF_VMIC_STATS_*)
+       0     4  Magic, 4 Version, 8 StatsBytes (640), 12 Flags (NF_VMIC_STATS_*)
       16     8  QpcFrequency             KeQueryPerformanceCounter's frequency
       24     8  QpcNow                   the QPC when the snapshot was taken
       32     4  AttachedPid              the attached app's process id (0: none)
@@ -164,6 +164,7 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
      312     8  HandoffSkippedFrames     the copy's frames such a stream never delivered: what the copy held past its place
                                          (the last reader's underrun silence there included; its recorded gaps not)
      320   256  Stream[2]                NF_VMIC_STREAM_STATS: [NF_VMIC_KIND_RENDER], [NF_VMIC_KIND_CAPTURE]
+     576    64  CaptureTrace             NF_VMIC_CAPTURE_TRACE: what capture streams told ACX of their packets' times
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
@@ -188,6 +189,13 @@ NF_VMIC_STATS (576 bytes; all counters cumulative since the driver loaded; times
     and any glitch passes run at once), so WorkQpcTicks / TimerPasses / QpcFrequency is the mean CPU time of a pass. A timer pass's lateness is the time it ran (its QPC, in 100 ns units)
     minus the time ScheduleNextPass armed the timer for. Buckets: below 50 us, 50-100, 100-250, 250-500 us, 0.5-1 ms, 1-2 ms,
     2-5 ms, and 5 ms and over (NF_VMIC_LATENESS_BOUNDS_HNS are the upper bounds of the first seven).
+
+    NF_VMIC_CAPTURE_TRACE (64 bytes; TODO 19, the capture-timestamp trace): PacketQueries counts EvtAcxStreamGetCapturePacket
+    calls, and LastQueryQpc, LastQueryPacket and LastQueryPacketQpc are the latest one's clock reading and answer (the packet
+    number and its QPCPacketStart). LastNotifyPacket and LastNotifyQpc are the latest AcxRtStreamNotifyPacketComplete's
+    packet and QPCCompletion. PositionQueries and CurrentPacketQueries count EvtAcxStreamGetPresentationPosition and
+    EvtAcxStreamGetCurrentPacket calls. All capture streams', the latest of any of them; QPCs in ticks; each field is written
+    whole, the set not as one.
 
 --*/
 
@@ -328,6 +336,17 @@ typedef struct _NF_VMIC_LOOPBACK_STATS {
                                         //      circuit, or (not expected) no free format slot on its own
 } NF_VMIC_LOOPBACK_STATS, *PNF_VMIC_LOOPBACK_STATS;
 
+typedef struct _NF_VMIC_CAPTURE_TRACE {
+    UINT64  PacketQueries;              //   0
+    UINT64  LastQueryQpc;               //   8
+    UINT64  LastQueryPacket;            //  16
+    UINT64  LastQueryPacketQpc;         //  24
+    UINT64  LastNotifyPacket;           //  32
+    UINT64  LastNotifyQpc;              //  40
+    UINT64  PositionQueries;            //  48
+    UINT64  CurrentPacketQueries;       //  56
+} NF_VMIC_CAPTURE_TRACE, *PNF_VMIC_CAPTURE_TRACE;
+
 typedef struct _NF_VMIC_STATS {
     UINT32                  Magic;                      //   0
     UINT32                  Version;                    //   4
@@ -348,6 +367,7 @@ typedef struct _NF_VMIC_STATS {
     UINT64                  ReaderHandoffs;             // 304
     UINT64                  HandoffSkippedFrames;       // 312
     NF_VMIC_STREAM_STATS    Stream[NF_VMIC_KINDS];      // 320
+    NF_VMIC_CAPTURE_TRACE   CaptureTrace;               // 576
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
 C_ASSERT(sizeof(NF_VMIC_ATTACH_IN) == 16);
@@ -376,7 +396,9 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryUnderrunFrames) == 296);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, ReaderHandoffs) == 304);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, HandoffSkippedFrames) == 312);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Stream) == 320);
-C_ASSERT(sizeof(NF_VMIC_STATS) == 576);
+C_ASSERT(sizeof(NF_VMIC_CAPTURE_TRACE) == 64);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, CaptureTrace) == 576);
+C_ASSERT(sizeof(NF_VMIC_STATS) == 640);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
 C_ASSERT(NF_VMIC_IOCTL_STATS == 0x00226004);
 

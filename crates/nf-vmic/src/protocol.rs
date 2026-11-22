@@ -345,6 +345,27 @@ pub struct LoopbackStats {
     pub refused_opens: u64,
 }
 
+/// `NF_VMIC_CAPTURE_TRACE` (TODO 19, the capture-timestamp trace): what capture streams told ACX of their packets' times, the
+/// latest of any capture stream. QPCs in ticks ([`Stats::qpc_frequency`]); each field is read whole, the set not as one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureTrace {
+    /// EvtAcxStreamGetCapturePacket calls.
+    pub packet_queries: u64,
+    /// The latest one's clock reading.
+    pub last_query_qpc: u64,
+    /// Its answer: the packet number and the packet's QPCPacketStart.
+    pub last_query_packet: u64,
+    pub last_query_packet_qpc: u64,
+    /// The latest AcxRtStreamNotifyPacketComplete's packet and QPCCompletion.
+    pub last_notify_packet: u64,
+    pub last_notify_qpc: u64,
+    /// EvtAcxStreamGetPresentationPosition calls.
+    pub position_queries: u64,
+    /// EvtAcxStreamGetCurrentPacket calls.
+    pub current_packet_queries: u64,
+}
+
 /// `NF_VMIC_STATS`: STATS's output.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -380,6 +401,7 @@ pub struct Stats {
     pub handoff_skipped_frames: u64,
     /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
     pub stream: [StreamStats; KINDS],
+    pub capture_trace: CaptureTrace,
 }
 
 // The header's offsets (nf_vmic.h's layout tables and C_ASSERTs).
@@ -431,7 +453,10 @@ const _: () = {
     assert!(offset_of!(LoopbackStats, render_not_owner) == 80);
     assert!(offset_of!(LoopbackStats, refused_opens) == 88);
 
-    assert!(size_of::<Stats>() == 576);
+    assert!(size_of::<CaptureTrace>() == 64);
+    assert!(offset_of!(CaptureTrace, last_notify_qpc) == 40);
+    assert!(size_of::<Stats>() == 640);
+    assert!(offset_of!(Stats, capture_trace) == 576);
     assert!(offset_of!(Stats, qpc_frequency) == 16);
     assert!(offset_of!(Stats, attached_pid) == 32);
     assert!(offset_of!(Stats, attached_read_frame) == 40);

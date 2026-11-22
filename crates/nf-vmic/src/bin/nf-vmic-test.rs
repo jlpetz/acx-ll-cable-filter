@@ -18,6 +18,8 @@
 //!   frame from the feed's publication to its receipt (the host's QPC when GetBuffer returned its packet, and the frame's
 //!   device time: GetBuffer's device QPC position plus its place in the packet), and checks that its own stream read the
 //!   ring rather than a secondary's late copy; [`nf_vmic::latency`] has the arithmetic.
+//! - `stamps` records a capture endpoint and, after each GetBuffer, reads the driver's capture-timestamp trace from STATS, to
+//!   set the device time the client sees beside the packet times the driver gave ACX (TODO 19).
 //!
 //! The spike's control device admits SYSTEM and Administrators only: run it elevated. The owner runs it (CLAUDE.md); no test
 //! starts it. Its feed loop prints a status line a second, which formats and allocates: a test tool's liberty, with the ring's
@@ -39,8 +41,8 @@ use std::{io, thread};
 
 use nf_vmic::latency::{self, Block, Continuity, FrameCounts, Log, Receipt, Run, Summary, Weighted};
 use nf_vmic::protocol::{
-    self, KIND_CAPTURE, KIND_RENDER, LATENESS_LABELS, RingHeader, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_READING, STATS_ATTACHED,
-    STATS_FORMAT_MISMATCH, STATS_LOOPBACK, STATS_READING, Stats, StreamStats,
+    self, CaptureTrace, KIND_CAPTURE, KIND_RENDER, LATENESS_LABELS, RingHeader, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_READING,
+    STATS_ATTACHED, STATS_FORMAT_MISMATCH, STATS_LOOPBACK, STATS_READING, Stats, StreamStats,
 };
 use nf_vmic::signal::{self, CheckReport, SequenceChecker};
 use nf_vmic::{AttachError, Attachment, Device, RingMemory, Writer, top_up};
@@ -134,6 +136,11 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       other feed first (the ring must be this process's), and close other apps that record the endpoint: a capture stream
       already running holds the ring's reader slot, and unless it shares this one's driver stream (shared, the same mode)
       this one gets the ring's audio late, as a secondary (a check fails).
+  nf-vmic-test stamps [--packets N] [--period-frames N] [--mode raw|default|communications] [--device NAME] [--exclusive]
+      Record the capture endpoint (as latency does; no ring needed) and, after each GetBuffer for N packets (default 200)
+      past a 0.5 s warm-up, read the driver's capture-timestamp trace from STATS. Print the client's device time minus the
+      packet start the driver last answered GetCapturePacket with, minus the completion time it last notified, and minus
+      the query's own time (min, median, max in ms), the calls per packet, and the last rows.
 
 Exit codes: 0 pass, 1 fail, 2 a usage or set-up error, 3 inconclusive (open: 0 opened and ran, 1 refused by the
 driver's app ring rule, 4 refused otherwise, 3 stopped).";
@@ -151,6 +158,7 @@ fn main() -> ExitCode {
         Some("kill-test") => kill_test(rest),
         Some("open") => open(rest),
         Some("latency") => latency(rest),
+        Some("stamps") => stamps(rest),
         Some("help" | "-h" | "--help") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -2534,6 +2542,112 @@ fn latency_feed(
         None => None,
     };
     Ok((end, window))
+}
+
+/// One stamps packet: GetBuffer's times beside the driver's capture-timestamp trace, read from STATS just after.
+#[derive(Clone, Copy)]
+struct StampRow {
+    host_qpc: u64,
+    device_hns: Option<u64>,
+    frames: u32,
+    trace: CaptureTrace,
+}
+
+/// stamps: what capture time the client sees for each packet, beside what the driver told ACX (TODO 19, the capture
+/// timestamps reading a packet late). No ring needed: the stream's silence carries the same stamps.
+fn stamps(args: &[String]) -> Result<Verdict, String> {
+    let valued = ["--packets", "--period-frames", "--mode", "--device"];
+    let o = Opts::parse(args, &valued, &["--exclusive"])?;
+    let packets: usize = o.value("--packets", 200)?;
+    if !(1..=100_000).contains(&packets) {
+        return Err(format!("--packets {packets}: from 1 to 100000"));
+    }
+    let name: String = o.value("--device", ENDPOINT.to_string())?;
+    let spec = StreamSpec {
+        exclusive: o.flag("--exclusive"),
+        period_frames: o.period_frames()?,
+        mode: o.mode(Mode::RawWhereOffered)?,
+        ..StreamSpec::SHARED_FLOAT
+    };
+    let device = open_device()?;
+    let frequency = read_stats(&device)?.qpc_frequency;
+    let _com = Com::mta()?;
+    let mut capture = Capture::open(&name, spec)?;
+    println!("recording {name:?}: {}", capture.describe());
+    let mut rows = Vec::with_capacity(packets);
+    let mut error = None;
+    capture.start()?;
+    let warm_until = Instant::now() + Duration::from_millis(500);
+    while rows.len() < packets && error.is_none() {
+        capture.read_packets(|p| {
+            if Instant::now() < warm_until || rows.len() >= packets || error.is_some() {
+                return;
+            }
+            match device.stats() {
+                Ok(s) => rows.push(StampRow { host_qpc: p.host_qpc, device_hns: p.qpc_hns, frames: p.frames, trace: s.capture_trace }),
+                Err(e) => error = Some(format!("STATS: {e}")),
+            }
+        })?;
+    }
+    capture.stop();
+    if let Some(e) = error {
+        return Err(e);
+    }
+    print_stamps(&rows, frequency);
+    Ok(Verdict::Pass)
+}
+
+/// stamps' report: each difference's min, median and max, then the last rows as they came.
+fn print_stamps(rows: &[StampRow], frequency: u64) {
+    let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency);
+    let ms = |h: i64| h as f64 / 10_000.0;
+    let spread = |name: &str, mut v: Vec<i64>| {
+        v.sort_unstable();
+        match (v.first(), v.get(v.len() / 2), v.last()) {
+            (Some(&lo), Some(&mid), Some(&hi)) => println!("  {name:<58} {:>8.3} {:>8.3} {:>8.3}", ms(lo), ms(mid), ms(hi)),
+            _ => println!("  {name:<58} (no packets with a device time)"),
+        }
+    };
+    let stamped: Vec<(&StampRow, i64)> = rows.iter().filter_map(|r| r.device_hns.map(|d| (r, d as i64))).collect();
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else { return };
+    let span = rows.len().saturating_sub(1).max(1) as f64;
+    let per = |f: fn(&CaptureTrace) -> u64| (f(&last.trace) - f(&first.trace)) as f64 / span;
+    println!(
+        "{} packets ({} with a device time), {} frames each at first; per packet the driver answered {:.2} GetCapturePacket, {:.2} \
+         GetPresentationPosition, {:.2} GetCurrentPacket",
+        rows.len(),
+        stamped.len(),
+        first.frames,
+        per(|t| t.packet_queries),
+        per(|t| t.position_queries),
+        per(|t| t.current_packet_queries),
+    );
+    println!("  {:<58} {:>8} {:>8} {:>8}", "ms (the client's device time minus ...)", "min", "median", "max");
+    spread(
+        "the latest query's QPCPacketStart (the driver's packet start)",
+        stamped.iter().map(|(r, d)| d - hns(r.trace.last_query_packet_qpc)).collect(),
+    );
+    spread("the latest notify's QPCCompletion", stamped.iter().map(|(r, d)| d - hns(r.trace.last_notify_qpc)).collect());
+    spread("the latest query's own clock reading", stamped.iter().map(|(r, d)| d - hns(r.trace.last_query_qpc)).collect());
+    spread("(the client's receipt minus its device time)", stamped.iter().map(|(r, d)| hns(r.host_qpc) - d).collect());
+    let same = rows.iter().filter(|r| r.trace.last_query_packet == r.trace.last_notify_packet).count();
+    println!("  the latest query named the latest notified packet at {same} of {} packets", rows.len());
+    println!(
+        "  the last rows: device ms, query packet / its start ms, notify packet / its QPC ms, receipt ms (all from the first device time)"
+    );
+    let base = stamped.first().map_or(0, |&(_, d)| d);
+    for r in rows.iter().rev().take(8).rev() {
+        let at = |qpc: u64| ms(hns(qpc) - base);
+        println!(
+            "    {:>10} {:>7} / {:>10.3} {:>7} / {:>10.3} {:>10.3}",
+            r.device_hns.map_or("error".to_string(), |d| format!("{:.3}", ms(d as i64 - base))),
+            r.trace.last_query_packet,
+            at(r.trace.last_query_packet_qpc),
+            r.trace.last_notify_packet,
+            at(r.trace.last_notify_qpc),
+            at(r.host_qpc),
+        );
+    }
 }
 
 fn latency(args: &[String]) -> Result<Verdict, String> {
