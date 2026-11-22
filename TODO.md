@@ -218,7 +218,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Base (study 2026-10-28): Microsoft's ACX AudioCodec sample (MS-PL), cut down (about 3.5-4.5k lines, 19-34 dev-days, an estimate), borrowing microsoft/low-latency-audio's (MIT) packet-size code and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
 - Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 (C++, Spectre libraries, WDK extension), WDK and SDK 10.0.28000 (ACX 1.1, KMDF 1.35). VB-CABLE 3.3.1.7 loads on Server 2025.
 - The spike (the VM, 2026-11-20 to 22; `doc/todo/19-spike-2026-11-20.md`): checks 1-7 passed. The cable alone 12.0 ms against VB-CABLE's 50-62; float32 then 24-in-32 on both endpoints; the app-fed ring (`nf_vmic.h`, `crates/nf-vmic`) bit-exact into shared and exclusive recordings, two capture streams at once, a counted one-time skip at a reader handoff (the owner: keep it); hour soaks at 128 and 96 frames with no timer glitch; Driver Verifier clean after one fix to the sample's removal path (1a0353d). Open: forced PCM, mixed formats, physical Windows 11.
-**Next**: Verifier off at the next reboot (or a code-integrity round, the owner's call); the small-period helper doesn't shorten a Communications-category client's 10 ms device packets (2026-11-22; the spike notes), so a call app's latency rests on its own period; a 5 ms default on the mic endpoint (OEMPeriod, branch `trial-oemperiod-5ms`) halves it, at the cost of IAudioClient3's sub-5 ms periods: the owner's call; the shared-mode capture timestamps (about a packet late); the format matrix on Windows 11; physical latency/CPU comparisons.
+**Next**: Driver Verifier stays on (the owner, 2026-11-23: code changes' bugs show sooner; add the code-integrity flag at the next reboot); call apps get a 10 ms device stream whatever helper runs, and a 5 ms default (OEMPeriod, branch `trial-oemperiod-5ms`) halves it but can't be switched at runtime (TODO 22): the owner wants it switchable, so two mics, or one swapped by a helper service, or both, is the owner's pick; the shared-mode capture timestamps (about a packet late); the format matrix on Windows 11; physical latency/CPU comparisons.
 **Detail**: `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`, `doc/todo/19-spike-2026-11-20.md`
 
 ---
@@ -230,3 +230,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Most of the measures exist: the latency budget (#13), the reference's facts (#10), the counters, the live probe.
 **Next**: real-hardware runs to set the thresholds (the two live wording bugs fixed 2026-11-02, b53a965); then the GUI's readout and the calibration.
 **Detail**: `doc/todo/21-device-health.md`
+
+---
+
+### 22. [driver] Report to Microsoft: an endpoint's default period can't change without re-creating the device
+**Priority**: Low | **Status**: open (asked by the owner 2026-11-23); nothing posted.
+- `PKEY_AudioEngine_OEMPeriod` (the endpoint's default engine period, 5-9 ms) halves call apps' latency on our mic (10 -> 5 ms), but Windows reads it only when the endpoint is created at install: runtime writes with Audiosrv, AudioEndpointBuilder or device restarts don't apply it. With it set, IAudioClient3's small periods collapse to the OEM period (128-480 frames -> 240). Creating or re-creating a device, or changing its driver, needs admin (`SwDeviceCreate`'s documentation).
+- The owner: "Having to re-register devices in this way seems strange, I would assume [it] wasn't intended."
+**Next**: the owner picks where to post (Feedback Hub's Audio area, MicrosoftDocs/windows-driver-docs, microsoft/low-latency-audio) and posts the draft; recheck its figures on Windows 11 first if possible.
+**Detail**: `doc/todo/22-oemperiod-report.md` (the findings, the questions, a draft)
