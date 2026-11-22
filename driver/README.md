@@ -43,6 +43,9 @@ Two microphones (TODO 19, the owner's option A): "Microphone" keeps IAudioClient
 packet-size constraints) for apps that ask for them, and "Call Microphone" (a second capture circuit, `Microphone1`) has a
 5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
 reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
+Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|low-latency`; the driver reads
+`NfMicrophones` from the device's hardware key): `ROOT\AudioCodec` both, `ROOT\AudioCodecCall` the call microphone,
+`ROOT\AudioCodecLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
 
 The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
 (page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
