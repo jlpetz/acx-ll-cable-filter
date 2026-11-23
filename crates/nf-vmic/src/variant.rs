@@ -28,9 +28,14 @@
 //!    properties the INF gives it (the call microphone's default period), only when it creates it (TODO 22: of the changes
 //!    tried, only uninstalling and reinstalling applied a new period), and a driver update keeps the device and its endpoints.
 //! 2. A device kept is checked once, before anything changes ([`check_kept`]): it has been working, so Windows has made its
-//!    endpoints, and a microphone of the variant without one is a microphone its package doesn't have (the newest package in
-//!    the driver store may be the single-microphone driver's, as when it is the only one there). That stops the switch
-//!    ([`SwitchError::PackageLacks`]), the nothing-to-do one too; a microphone disabled in the Sound panel passes, with a
+//!    endpoints, and a microphone of the variant without one is either one its package doesn't make or one Windows didn't
+//!    make. Which microphones a package makes, for a hardware ID, its INF says ([`package_mics`]: the reference strings of the
+//!    AddInterface lines in the install section that ID's models line names; the single-microphone driver's has the
+//!    Microphone alone, and may be the newest package for `ROOT\AudioCodec`, as when it is the only one in the driver store).
+//!    If the package makes it (a switch whose microphones didn't come in step 6, say), or its INF couldn't be read (ours, the
+//!    owner's to confirm), the device is re-created ([`KeptCheck::Recreate`]). If not, the switch stops, the nothing-to-do one too
+//!    ([`SwitchError::PackageLacks`]): it says to add the three variants' package, or, when one of ours that makes it is
+//!    there but ranks below the newest, how DriverVer ranks them. A microphone disabled in the Sound panel passes, with a
 //!    warning (ours, the owner's to confirm). With nothing else to do, the switch ends here.
 //! 3. Note our capture endpoints (active or disabled) if a device is to be created, then the new device, not yet registered
 //!    (`SetupDiCreateDeviceInfoW` under class MEDIA with `DICD_GENERATE_ID`, as devcon does: `ROOT\MEDIA\NNNN`; the hardware ID
@@ -38,8 +43,8 @@
 //!    (`SetupDiBuildDriverInfoList(SPDIT_COMPATDRIVER)`), which is how Plug and Play itself matches a hardware ID to an INF,
 //!    keeping the nodes whose INF (`C:\Windows\INF\oemNN.inf`) has the original name `audiocodec.inf`
 //!    (`SetupGetInfInformationW` + `SetupQueryInfOriginalFileInformationW`), the newest by date, then version. So endpoints
-//!    that can't be read, or a missing driver, stop the switch before anything is removed. An element that isn't registered
-//!    yet is a phantom: destroying the set deletes it.
+//!    that can't be read, a missing driver, or one whose INF doesn't make the variant's microphones (as in step 2), stop the
+//!    switch before anything is removed. An element that isn't registered yet is a phantom: destroying the set deletes it.
 //! 4. Remove the old devices (`DiUninstallDevice`, what `pnputil /remove-device` does). If Windows needs a restart to finish a
 //!    removal, stop there: the old driver may still be loaded. The new device is registered only after this, so that its
 //!    endpoints are made while the old ones are gone, and the driver never runs twice.
@@ -58,9 +63,10 @@
 //!    is reported.
 //!
 //! What a failure leaves: before step 4, nothing changed. One in step 4 leaves the devices not yet removed (the steps say
-//! which were), one in step 5 none of ours (the device that didn't install is removed again); a second run of the switch
-//! creates the device afresh. One in step 6 leaves the new device, working on the chosen package, without the microphones
-//! that didn't come.
+//! which were). One in step 5 leaves none of ours, the device that didn't install removed again, unless removing it failed
+//! too (the error names it, to remove by hand); a second run of the switch creates the device afresh. (A restart Windows
+//! asks for in step 5 isn't a failure: the new device is left for it.) One in step 6 leaves the new device, or the one kept,
+//! working on the chosen package, without the microphones that didn't come; a second run re-creates it (step 2).
 
 use std::fmt;
 use std::mem::size_of;
@@ -70,17 +76,19 @@ use std::time::{Duration, Instant};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_PROB, CM_PROB_NEED_RESTART, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES,
     DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DN_HAS_PROBLEM, DN_STARTED, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA,
-    HDEVINFO, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W,
-    SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_HARDWAREID, SetupDiBuildDriverInfoList,
-    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
-    SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiGetDriverInfoDetailW, SetupDiSetDeviceRegistryPropertyW, SetupGetInfDriverStoreLocationW, SetupGetInfInformationW,
-    SetupQueryInfOriginalFileInformationW,
+    HDEVINFO, INF_STYLE_WIN4, INFCONTEXT, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
+    SP_DRVINFO_DETAIL_DATA_W, SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_HARDWAREID, SetupCloseInfFile,
+    SetupDiBuildDriverInfoList, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo,
+    SetupDiEnumDriverInfoW, SetupDiGetActualSectionToInstallW, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+    SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW, SetupDiSetDeviceRegistryPropertyW,
+    SetupFindFirstLineW, SetupFindNextMatchLineW, SetupGetInfDriverStoreLocationW, SetupGetInfInformationW, SetupGetStringFieldW,
+    SetupOpenInfFileW, SetupQueryInfOriginalFileInformationW,
 };
 use windows::Win32::Devices::Properties::{DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_DriverVersion, DEVPROPTYPE};
 use windows::Win32::Foundation::{
     DEVPROPKEY, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS,
-    ERROR_PATH_NOT_FOUND, GetLastError, HANDLE, HLOCAL, HWND, LocalFree, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PATH_NOT_FOUND, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{
@@ -276,6 +284,8 @@ pub struct OurDevice {
     /// The newest of our packages in the driver store for its hardware ID (the compatible-driver search on the device, as
     /// [`choose`] ranks them): `None` if there's none; the error if the search failed.
     pub newest: Result<Option<Candidate>, WinError>,
+    /// Our other packages there for its hardware ID, ranked below the newest (none if the search failed).
+    pub others: Vec<Candidate>,
 }
 
 impl OurDevice {
@@ -358,6 +368,15 @@ impl Plan {
     pub fn is_nothing(&self) -> bool {
         self.remove.is_empty() && !self.create
     }
+
+    /// Re-creates the device it would keep: Windows lacks a microphone its package makes ([`KeptCheck::Recreate`]).
+    pub fn recreate_kept(&mut self) {
+        if let Some(k) = self.keep.take() {
+            self.remove.push(k);
+            self.remove.sort_unstable();
+            self.create = true;
+        }
+    }
 }
 
 /// Keeps the first device of the target variant that is working and runs the newest of our packages in the driver store,
@@ -397,16 +416,69 @@ pub enum SwitchError {
     LockDenied(WinError),
     /// Our capture endpoints couldn't be read, and the switch checks the microphones with them. Nothing was changed.
     NoEndpoints(WinError),
-    /// The device that would be kept (`device`, of the `target` variant, its driver `driver`) works on the driver store's
-    /// newest package, but Windows has no endpoint of it for these microphones: that package doesn't have them (the
-    /// single-microphone driver's has the Microphone alone). Nothing was changed.
-    PackageLacks { device: String, target: Variant, driver: String, missing: Vec<Mic> },
+    /// The driver store's newest package for the target's hardware ID doesn't make some of its microphones, by its INF: the
+    /// device that would be kept lacks them, or the new device's package would. Nothing was changed.
+    PackageLacks(Box<Lacking>),
     /// The new device wasn't working on the chosen package, so it was removed again. The old devices were removed before it
     /// was made.
     Install(Box<NotKept>),
     /// The device works on the newest package, but Windows hadn't made these microphones after [`MICS_WAIT`]. `seen`: our
     /// endpoints at the last look; `read`: the last look's error, if it failed. The device stays.
     Mics { missing: Vec<Mic>, seen: Vec<String>, read: Option<WinError> },
+}
+
+/// The newest of our packages for a variant doesn't make some of its microphones ([`SwitchError::PackageLacks`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lacking {
+    pub target: Variant,
+    /// The device that would be kept, and its driver (`ROOT\MEDIA\0003`, "driver oem12.inf 1.0.0.0"); `None` when it is a new
+    /// device's package.
+    pub device: Option<(String, String)>,
+    /// The newest package, described ([`Candidate::describe`]).
+    pub newest: String,
+    /// The target's microphones it doesn't make (and, for a device kept, Windows hasn't).
+    pub missing: Vec<Mic>,
+    /// The best ranked of our other packages for the hardware ID that makes all the target's microphones, described: staged,
+    /// but ranked below the newest.
+    pub ranked_below: Option<String>,
+}
+
+impl Lacking {
+    fn it(&self) -> &'static str {
+        if self.missing.len() == 1 { "it" } else { "them" }
+    }
+
+    /// "that package doesn't make it (its INF's interfaces for ROOT\AudioCodec; ...)".
+    pub fn reason(&self) -> String {
+        format!(
+            "that package doesn't make {} (its INF's interfaces for {}; the single-microphone driver's has the Microphone alone)",
+            self.it(),
+            self.target.hardware_id()
+        )
+    }
+
+    /// What to do: add the three variants' package, or, when one is there but ranks below the newest, how packages rank.
+    pub fn advice(&self) -> String {
+        let it = self.it();
+        let arg = self.target.arg();
+        match &self.ranked_below {
+            None => format!(
+                "No other AudioCodec package in the driver store makes {it}. Add the package with the three variants to the driver \
+                 store (from an administrator prompt in its folder, driver\\out\\Release\\AudioCodec once \
+                 driver\\scripts\\Build-Driver.ps1 has built it: pnputil /add-driver AudioCodec.inf), then run `noise-filter mic \
+                 variant {arg}`: it re-creates the device with that package."
+            ),
+            Some(better) => format!(
+                "{better} makes {it}, but ranks below the newest, {}: Plug and Play, and the switch, take the package whose \
+                 DriverVer has the latest date, then the highest version. Build the three variants' package again \
+                 (driver\\scripts\\Build-Driver.ps1 stamps DriverVer with the build's UTC date and time of day, so a new build \
+                 ranks above the earlier ones; driver\\README.md has the exception, builds of 2026-11-23 from before e3026e5), add \
+                 it (pnputil /add-driver AudioCodec.inf, from an administrator prompt in driver\\out\\Release\\AudioCodec), then \
+                 run `noise-filter mic variant {arg}`.",
+                self.newest
+            ),
+        }
+    }
 }
 
 /// A new device that wasn't kept ([`SwitchError::Install`]).
@@ -456,13 +528,26 @@ impl fmt::Display for SwitchError {
                 "the audio endpoints couldn't be read ({e}), and the switch checks the microphones with them: nothing was \
                  changed. Is the Windows Audio Endpoint Builder service running?"
             ),
-            SwitchError::PackageLacks { device, target, driver, missing } => write!(
-                f,
-                "{device} works on the driver store's newest AudioCodec package ({driver}), but Windows has no {} on it: {} \
-                 Nothing was changed.",
-                mics_text(missing),
-                package_advice(missing, *target)
-            ),
+            SwitchError::PackageLacks(lacking) => {
+                let missing = mics_text(&lacking.missing);
+                match &lacking.device {
+                    Some((device, driver)) => write!(
+                        f,
+                        "{device} works on the driver store's newest AudioCodec package ({driver}), but Windows has no {missing} on \
+                         it: {}. {} Nothing was changed.",
+                        lacking.reason(),
+                        lacking.advice()
+                    ),
+                    None => write!(
+                        f,
+                        "the driver store's newest AudioCodec package for {}, {}, lacks {missing}: {}. {} Nothing was changed.",
+                        lacking.target.hardware_id(),
+                        lacking.newest,
+                        lacking.reason(),
+                        lacking.advice()
+                    ),
+                }
+            }
             SwitchError::Install(not_kept) => {
                 let NotKept { device, chosen, failure, removed } = not_kept.as_ref();
                 write!(f, "the new device {device} isn't working on the chosen driver ({chosen}): {failure}. ")?;
@@ -490,7 +575,11 @@ impl fmt::Display for SwitchError {
                 if let Some(e) = read {
                     write!(f, "; the last look at the endpoints failed: {e}")?;
                 }
-                write!(f, ". The device stays: `noise-filter mic variant` and the Sound panel's Recording tab show what's there now.")
+                write!(
+                    f,
+                    ". The device stays, and a second run of the switch re-creates it if they're still missing: `noise-filter mic \
+                     variant` and the Sound panel's Recording tab show what's there now."
+                )
             }
         }
     }
@@ -514,21 +603,28 @@ pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, Swi
         say(&format!("    ({})", d.package_note()));
     }
     let devices: Vec<OurDevice> = ours.iter().map(|(_, d)| d.clone()).collect();
-    let plan = plan(&devices, target);
+    let mut plan = plan(&devices, target);
     if let Some(k) = plan.keep {
-        // It has been working, so its endpoints are made: one missing is a microphone its package lacks. Checked before
-        // anything changes.
-        let check = check_kept(target, &devices[k], &sessions::capture_endpoints())?;
-        if plan.is_nothing() {
-            say(&format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id()));
-        } else {
-            say(&format!("Keeping {}", devices[k].instance_id));
-        }
-        for line in found_lines(&check) {
-            say(&line);
-        }
-        if plan.is_nothing() {
-            return Ok(Outcome::Nothing);
+        // It has been working, so its endpoints are made: one missing is a microphone its package doesn't make (stop), or one
+        // Windows didn't (re-create it). Checked before anything changes.
+        match check_kept(target, &devices[k], &sessions::capture_endpoints())? {
+            KeptCheck::Has(check) => {
+                if plan.is_nothing() {
+                    say(&format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id()));
+                } else {
+                    say(&format!("Keeping {}", devices[k].instance_id));
+                }
+                for line in found_lines(&check) {
+                    say(&line);
+                }
+                if plan.is_nothing() {
+                    return Ok(Outcome::Nothing);
+                }
+            }
+            KeptCheck::Recreate { note, .. } => {
+                say(&format!("{note}: re-creating it"));
+                plan.recreate_kept();
+            }
         }
     }
     // A new device's microphones are endpoints that weren't there before: read them first, before the new device's element
@@ -709,35 +805,62 @@ pub fn check_mics(wanted: &Wanted, now: &[CaptureEndpoint]) -> MicCheck {
     check
 }
 
-/// One look at the microphones of a device kept as it is (`device`, of the target variant, working on the newest package):
-/// its endpoints were made when it started, so a microphone missing is one its package doesn't have
-/// ([`SwitchError::PackageLacks`]). `now`: our capture endpoints, as [`sessions::capture_endpoints`] read them.
-pub fn check_kept(target: Variant, device: &OurDevice, now: &Result<Vec<CaptureEndpoint>, WinError>) -> Result<MicCheck, SwitchError> {
-    let now = now.as_ref().map_err(|e| SwitchError::NoEndpoints(e.clone()))?;
-    let check = check_mics(&Wanted { target, device: &device.instance_id, before: &[] }, now);
-    if !check.missing.is_empty() {
-        return Err(SwitchError::PackageLacks {
-            device: device.instance_id.clone(),
-            target,
-            driver: driver_text(device.inf.as_deref(), device.driver_version.as_deref()),
-            missing: check.missing,
-        });
-    }
-    Ok(check)
+/// What [`check_kept`] found of a device kept as it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeptCheck {
+    /// It has the variant's microphones: kept.
+    Has(MicCheck),
+    /// Windows lacks `missing`, though the package it runs makes them (or its INF couldn't be read, so it may): a switch
+    /// whose microphones didn't come, say. The switch re-creates it; `note` says why ("ROOT\MEDIA\0003 runs ... on it").
+    Recreate { missing: Vec<Mic>, note: String },
 }
 
-/// Why a device on the newest package lacks `missing`, and what to do, for a switch to `target`: "the package it runs
-/// doesn't have it (...). Add the package with the three variants to the driver store (...), then run `noise-filter mic
-/// variant both`: ...".
-pub fn package_advice(missing: &[Mic], target: Variant) -> String {
-    format!(
-        "the package it runs doesn't have {} (the single-microphone driver's has the Microphone alone). Add the package with the \
-         three variants to the driver store (from an administrator prompt in its folder, driver\\out\\Release\\AudioCodec once \
-         driver\\scripts\\Build-Driver.ps1 has built it: pnputil /add-driver AudioCodec.inf), then run `noise-filter mic variant \
-         {}`: it re-creates the device with that package.",
-        if missing.len() == 1 { "it" } else { "them" },
-        target.arg()
-    )
+/// One look at the microphones of a device kept as it is (`device`, of the target variant, working on the newest package):
+/// its endpoints were made when it started, so a microphone missing is one its package doesn't make, by its INF
+/// ([`SwitchError::PackageLacks`]: nothing to do but add a package), or one Windows didn't make ([`KeptCheck::Recreate`]).
+/// `now`: our capture endpoints, as [`sessions::capture_endpoints`] read them.
+pub fn check_kept(target: Variant, device: &OurDevice, now: &Result<Vec<CaptureEndpoint>, WinError>) -> Result<KeptCheck, SwitchError> {
+    let now = now.as_ref().map_err(|e| SwitchError::NoEndpoints(e.clone()))?;
+    let check = check_mics(&Wanted { target, device: &device.instance_id, before: &[] }, now);
+    if check.missing.is_empty() {
+        return Ok(KeptCheck::Has(check));
+    }
+    let id = &device.instance_id;
+    let lacked = mics_text(&check.missing);
+    // A device kept runs the newest package (plan); `None` here would be one that doesn't, which plan never keeps
+    let newest = device.newest.as_ref().ok().and_then(Option::as_ref);
+    let unmade: Vec<Mic> = match newest.map(|c| &c.mics) {
+        Some(Err(why)) => {
+            let note = format!(
+                "{id} runs the newest AudioCodec package, but Windows has no {lacked} on it, and the package's INF couldn't be read \
+                 to say whether it makes {} ({why})",
+                if check.missing.len() == 1 { "it" } else { "them" }
+            );
+            return Ok(KeptCheck::Recreate { missing: check.missing, note });
+        }
+        Some(Ok(makes)) => check.missing.iter().filter(|m| !makes.contains(m)).copied().collect(),
+        None => check.missing.clone(),
+    };
+    if unmade.is_empty() {
+        let note = format!(
+            "{id} runs the newest AudioCodec package, which makes {lacked} (its INF's interfaces for {}), but Windows has no \
+             {lacked} on it (a switch whose microphones didn't come, say)",
+            target.hardware_id()
+        );
+        return Ok(KeptCheck::Recreate { missing: check.missing, note });
+    }
+    Err(SwitchError::PackageLacks(Box::new(Lacking {
+        target,
+        device: Some((id.clone(), driver_text(device.inf.as_deref(), device.driver_version.as_deref()))),
+        newest: newest.map(Candidate::describe).unwrap_or_default(),
+        missing: unmade,
+        ranked_below: best_with(target, &device.others).map(Candidate::describe),
+    })))
+}
+
+/// The best ranked of `others` (ours, for the target's hardware ID) that makes all the target's microphones, by its INF.
+fn best_with(target: Variant, others: &[Candidate]) -> Option<&Candidate> {
+    others.iter().filter(|c| c.is_ours() && c.makes(target.mics()) == Some(true)).max_by_key(|c| (c.date, c.version))
 }
 
 /// A check's microphones, a line each (`  the Call Microphone: "Call Microphone (2- AudioCodec Device)"`), then a warning for
@@ -1021,14 +1144,8 @@ impl DeviceSet {
                 continue;
             };
             let Bound { health, inf, driver_version } = self.bound(&data);
-            let device = OurDevice {
-                instance_id: self.instance_id(&data)?,
-                variant,
-                health,
-                inf,
-                driver_version,
-                newest: self.newest_for(&mut data),
-            };
+            let (newest, others) = rank(self.packages_for(&mut data));
+            let device = OurDevice { instance_id: self.instance_id(&data)?, variant, health, inf, driver_version, newest, others };
             out.push((data, device));
         }
         Ok(out)
@@ -1043,14 +1160,12 @@ impl DeviceSet {
         }
     }
 
-    /// The newest of our packages compatible with an element: the compatible-driver search on it (which only reads the
-    /// driver store), then [`choose`].
-    fn newest_for(&self, data: &mut SP_DEVINFO_DATA) -> Result<Option<Candidate>, WinError> {
+    /// The drivers compatible with an element: the compatible-driver search on it (which only reads the driver store).
+    fn packages_for(&self, data: &mut SP_DEVINFO_DATA) -> Result<Vec<Candidate>, WinError> {
         // SAFETY: an element of our set.
         unsafe { SetupDiBuildDriverInfoList(self.get(), Some(data), SPDIT_COMPATDRIVER) }
             .map_err(WinError::of("SetupDiBuildDriverInfoList"))?;
-        let candidates: Vec<Candidate> = self.compat_drivers(data)?.into_iter().map(|(_, c)| c).collect();
-        Ok(choose(&candidates).map(|i| candidates[i].clone()))
+        Ok(self.compat_drivers(data)?.into_iter().map(|(_, c)| c).collect())
     }
 
     fn instance_id(&self, data: &SP_DEVINFO_DATA) -> Result<String, WinError> {
@@ -1101,10 +1216,12 @@ impl DeviceSet {
                 Err(e) if win32_code(&e) == ERROR_NO_MORE_ITEMS.0 => break,
                 Err(e) => return Err(WinError::new("SetupDiEnumDriverInfoW", &e)),
             }
-            let inf = self.driver_inf(data, &node)?;
+            let (inf, section) = self.driver_inf(data, &node)?;
             let original = original_inf_name(&inf).map_err(|e| e.to_string());
+            let mics = package_mics(&inf, &section).map_err(|e| e.to_string());
             let candidate = Candidate {
                 original,
+                mics,
                 inf,
                 provider: from_wide(&node.ProviderName),
                 description: from_wide(&node.Description),
@@ -1116,8 +1233,9 @@ impl DeviceSet {
         Ok(out)
     }
 
-    /// The INF a driver node comes from (`C:\Windows\INF\oem12.inf`).
-    fn driver_inf(&self, data: &SP_DEVINFO_DATA, node: &SP_DRVINFO_DATA_V2_W) -> Result<String, WinError> {
+    /// The INF a driver node comes from (`C:\Windows\INF\oem12.inf`), and the install section its models line names for the
+    /// hardware ID (`Audio_Device`).
+    fn driver_inf(&self, data: &SP_DEVINFO_DATA, node: &SP_DRVINFO_DATA_V2_W) -> Result<(String, String), WinError> {
         // 8 KB, 8-byte aligned: the fixed part and the node's hardware IDs. Only the fixed part is read; if the IDs don't fit, the
         // call fills the fixed part and fails with ERROR_INSUFFICIENT_BUFFER.
         let mut buf = vec![0u64; 1024];
@@ -1131,9 +1249,9 @@ impl DeviceSet {
             Err(e) if win32_code(&e) == ERROR_INSUFFICIENT_BUFFER.0 => {}
             Err(e) => return Err(WinError::new("SetupDiGetDriverInfoDetailW", &e)),
         }
-        // SAFETY: the call filled the fixed part; the field is read by value, through the raw pointer.
-        let name = unsafe { (&raw const (*detail).InfFileName).read() };
-        Ok(from_wide(&name))
+        // SAFETY: the call filled the fixed part; the fields are read by value, through the raw pointer.
+        let (name, section) = unsafe { ((&raw const (*detail).InfFileName).read(), (&raw const (*detail).SectionName).read()) };
+        Ok((from_wide(&name), from_wide(&section)))
     }
 }
 
@@ -1150,12 +1268,29 @@ pub struct Candidate {
     pub date: u64,
     /// The INF's DriverVer version, four 16-bit parts.
     pub version: u64,
+    /// The microphones it makes for the hardware ID it was found for, by its INF ([`package_mics`]), or why they couldn't
+    /// be read.
+    pub mics: Result<Vec<Mic>, String>,
 }
 
 impl Candidate {
     /// Whether it's our INF (by its original name).
     pub fn is_ours(&self) -> bool {
         self.original.as_deref().is_ok_and(|n| n.eq_ignore_ascii_case(INF_NAME))
+    }
+
+    /// Whether it makes all of `mics`, by its INF: `None` if that couldn't be read.
+    pub fn makes(&self, mics: &[Mic]) -> Option<bool> {
+        self.mics.as_ref().ok().map(|has| mics.iter().all(|m| has.contains(m)))
+    }
+
+    /// "the Microphone and the Call Microphone", "no microphone", or why its INF couldn't be read.
+    pub fn mics_note(&self) -> String {
+        match &self.mics {
+            Ok(mics) if mics.is_empty() => "makes no microphone".into(),
+            Ok(mics) => format!("makes {}", mics.iter().map(|m| m.describe()).collect::<Vec<_>>().join(" and ")),
+            Err(why) => format!("its microphones unread: {why}"),
+        }
     }
 
     /// "C:\Windows\INF\oem12.inf (audiocodec.inf), VS_Microsoft, 1.0.0.0 of 2026-11-23".
@@ -1178,6 +1313,18 @@ pub fn choose(candidates: &[Candidate]) -> Option<usize> {
         }
     }
     best
+}
+
+/// A search's drivers (or its error) as the newest of ours ([`choose`]) and the rest of ours, ranked below it.
+pub fn rank(found: Result<Vec<Candidate>, WinError>) -> (Result<Option<Candidate>, WinError>, Vec<Candidate>) {
+    match found {
+        Err(e) => (Err(e), Vec::new()),
+        Ok(all) => {
+            let best = choose(&all);
+            let others = all.iter().enumerate().filter(|&(i, c)| Some(i) != best && c.is_ours()).map(|(_, c)| c.clone()).collect();
+            (Ok(best.map(|i| all[i].clone())), others)
+        }
+    }
 }
 
 /// A device's state and driver, as Windows reports them.
@@ -1298,9 +1445,15 @@ impl Pending {
             } else {
                 ": not ours"
             };
-            say(&format!("  {}{mark}", c.describe()));
+            let mics = if c.is_ours() { format!(" ({})", c.mics_note()) } else { String::new() };
+            say(&format!("  {}{mark}{mics}", c.describe()));
         }
         let Some(chosen) = chosen else { return Err(SwitchError::NoDriver { hardware_id: target.hardware_id() }) };
+        // A package that doesn't make the variant's microphones, by its INF, would fail the check after the install: stop
+        // before anything is removed (one whose INF couldn't be read is checked then)
+        if let Some(lacking) = new_package_lacks(target, &candidates[chosen], &rank(Ok(candidates.clone())).1) {
+            return Err(SwitchError::PackageLacks(Box::new(lacking)));
+        }
         match store_location(&candidates[chosen].inf) {
             Ok(path) => say(&format!("  stored at {path}")),
             Err(e) => say(&format!("  (its driver-store folder is unknown: {e})")),
@@ -1357,6 +1510,20 @@ impl Pending {
     }
 }
 
+/// What a new device's package (`newest`, chosen for `target`) lacks of the target's microphones, by its INF, and the best of
+/// `others` (ours, ranked below it) that has them all; `None` if it has them, or its INF couldn't be read.
+pub fn new_package_lacks(target: Variant, newest: &Candidate, others: &[Candidate]) -> Option<Lacking> {
+    let makes = newest.mics.as_ref().ok()?;
+    let missing: Vec<Mic> = target.mics().iter().filter(|m| !makes.contains(m)).copied().collect();
+    (!missing.is_empty()).then(|| Lacking {
+        target,
+        device: None,
+        newest: newest.describe(),
+        missing,
+        ranked_below: best_with(target, others).map(Candidate::describe),
+    })
+}
+
 /// A devnode's state.
 fn health(devinst: u32) -> Health {
     let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
@@ -1398,6 +1565,74 @@ pub fn store_location(inf_path: &str) -> Result<String, WinError> {
     // SAFETY: a NUL-terminated path; no platform or locale; the buffer's length goes with it.
     unsafe { SetupGetInfDriverStoreLocationW(&path, None, PCWSTR::null(), &mut buf, None) }
         .map_err(WinError::of("SetupGetInfDriverStoreLocationW"))?;
+    Ok(from_wide(&buf))
+}
+
+/// The microphones a package makes for a hardware ID, by its INF (`inf_path`, `C:\Windows\INF\oem12.inf`) and the install
+/// section the ID's models line names (`section`, the driver node's: `Audio_Device`): the reference strings of the
+/// AddInterface lines in the section's `.Interfaces`, as the platform decorates it (`Audio_Device.NT.Interfaces`), each by
+/// [`sessions::mic_of_filter`]; in [`Variant::mics`]' order. The single-microphone driver's `Audio_Device` has `Microphone0`
+/// alone; the three variants' has both, its `Audio_Device_Call` `Microphone1`. Any user may read it.
+pub fn package_mics(inf_path: &str, section: &str) -> Result<Vec<Mic>, WinError> {
+    let inf = InfFile::open(inf_path)?;
+    let interfaces = HSTRING::from(format!("{}.Interfaces", inf.actual_section(section)?));
+    let key = w!("AddInterface");
+    let mut found = Vec::new();
+    let mut line = INFCONTEXT::default();
+    // SAFETY: an open INF; NUL-terminated names; `line` is a live out-structure. It fails when there's no such line (or
+    // section): no interfaces.
+    let mut more = unsafe { SetupFindFirstLineW(inf.0, &interfaces, key, &mut line) }.is_ok();
+    while more {
+        // Field 2 of `AddInterface={guid},reference,section`: the reference string, the INF's %strings% substituted
+        if let Ok(reference) = string_field(&line, 2) {
+            found.push(sessions::mic_of_filter(&reference));
+        }
+        let current = line;
+        // SAFETY: a line of the INF, which is still open; `line` is a live out-structure.
+        more = unsafe { SetupFindNextMatchLineW(&current, key, &mut line) }.is_ok();
+    }
+    Ok([Mic::LowLatency, Mic::Call].into_iter().filter(|m| found.contains(m)).collect())
+}
+
+/// An INF opened with SetupOpenInfFileW, closed on drop.
+struct InfFile(*mut std::ffi::c_void);
+
+impl InfFile {
+    fn open(path: &str) -> Result<Self, WinError> {
+        let name = HSTRING::from(path);
+        // SAFETY: a NUL-terminated path; no class to match; no error line wanted. INVALID_HANDLE_VALUE on failure.
+        let handle = unsafe { SetupOpenInfFileW(&name, PCWSTR::null(), INF_STYLE_WIN4, None) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE.0 {
+            return Err(WinError { call: "SetupOpenInfFileW", code: last_error() });
+        }
+        Ok(Self(handle))
+    }
+
+    /// The decorated install section the platform uses (`Audio_Device.NT` for `Audio_Device`).
+    fn actual_section(&self, section: &str) -> Result<String, WinError> {
+        let name = HSTRING::from(section);
+        // Section names are at most 255 characters (MAX_INF_SECTION_NAME_LENGTH)
+        let mut buf = vec![0u16; 256];
+        // SAFETY: an open INF; a NUL-terminated name; the buffer's length goes with it.
+        unsafe { SetupDiGetActualSectionToInstallW(self.0, &name, Some(&mut buf), None, None) }
+            .map_err(WinError::of("SetupDiGetActualSectionToInstallW"))?;
+        Ok(from_wide(&buf))
+    }
+}
+
+impl Drop for InfFile {
+    fn drop(&mut self) {
+        // SAFETY: our handle, closed once.
+        unsafe { SetupCloseInfFile(self.0) };
+    }
+}
+
+/// A field of an INF line, its %strings% substituted.
+fn string_field(line: &INFCONTEXT, index: u32) -> Result<String, WinError> {
+    // An INF string is at most 4096 characters (MAX_INF_STRING_LENGTH), and its NUL
+    let mut buf = vec![0u16; 4097];
+    // SAFETY: a line of an open INF; the buffer's length goes with it.
+    unsafe { SetupGetStringFieldW(line, index, Some(&mut buf), None) }.map_err(WinError::of("SetupGetStringFieldW"))?;
     Ok(from_wide(&buf))
 }
 
@@ -1476,8 +1711,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use windows::Win32::Security::{
-        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
-        TOKEN_IMPERSONATE, TOKEN_QUERY, WinAuthenticatedUserSid, WinWorldSid,
+        CheckTokenMembership, CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser, RevertToSelf, SID_AND_ATTRIBUTES,
+        TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, WinAuthenticatedUserSid, WinWorldSid,
     };
     use windows::Win32::System::Threading::{CREATE_MUTEX_INITIAL_OWNER, GetCurrentProcess, OpenProcessToken};
 
@@ -1551,6 +1786,7 @@ mod tests {
             inf: Some("oem12.inf".into()),
             driver_version: Some("1.0.0.0".into()),
             newest: Ok(Some(newest())),
+            others: vec![],
         }
     }
 
@@ -1811,29 +2047,73 @@ mod tests {
     #[test]
     fn a_kept_device_must_have_the_variants_microphones() {
         use Mic::*;
-        let d = dev(Variant::Both, Health::Working);
-        let e = check_kept(Variant::Both, &d, &Ok(vec![ep("{m}", MICROPHONE, LowLatency, OLD, true)])).unwrap_err();
-        assert_eq!(e, SwitchError::PackageLacks {
-            device: r"ROOT\MEDIA\0003".into(),
-            target: Variant::Both,
-            driver: "driver oem12.inf 1.0.0.0".into(),
-            missing: vec![Call]
-        });
+        let only_low = Ok(vec![ep("{m}", MICROPHONE, LowLatency, OLD, true)]);
+        // The single-microphone package alone in the driver store: no package makes the Call Microphone
+        let d = OurDevice { newest: Ok(Some(single())), ..dev(Variant::Both, Health::Working) };
+        let e = check_kept(Variant::Both, &d, &only_low).unwrap_err();
+        assert_eq!(
+            e,
+            SwitchError::PackageLacks(Box::new(Lacking {
+                target: Variant::Both,
+                device: Some((r"ROOT\MEDIA\0003".into(), "driver oem12.inf 1.0.0.0".into())),
+                newest: single().describe(),
+                missing: vec![Call],
+                ranked_below: None,
+            }))
+        );
         let text = e.to_string();
         assert!(
             text.starts_with(
-                r#"ROOT\MEDIA\0003 works on the driver store's newest AudioCodec package (driver oem12.inf 1.0.0.0), but Windows has no "Call Microphone (AudioCodec Device)" on it: the package it runs doesn't have it (the single-microphone driver's"#
+                r#"ROOT\MEDIA\0003 works on the driver store's newest AudioCodec package (driver oem12.inf 1.0.0.0), but Windows has no "Call Microphone (AudioCodec Device)" on it: that package doesn't make it (its INF's interfaces for ROOT\AudioCodec; the single-microphone driver's has the Microphone alone). No other AudioCodec package in the driver store makes it. Add the package"#
             ),
             "{text}"
         );
         assert!(text.contains("pnputil /add-driver AudioCodec.inf), then run `noise-filter mic variant both`: it re-creates"), "{text}");
         assert!(text.ends_with("with that package. Nothing was changed."), "{text}");
         let none = check_kept(Variant::Both, &d, &Ok(vec![])).unwrap_err();
-        assert!(none.to_string().contains(r#"no "Microphone (AudioCodec Device)" and "Call Microphone (AudioCodec Device)" on it"#));
-        assert!(none.to_string().contains("doesn't have them"));
+        let SwitchError::PackageLacks(lacking) = &none else { panic!("{none:?}") };
+        assert_eq!(lacking.missing, [Call], "the Microphone, which the package makes, isn't what it lacks");
+        assert!(none.to_string().contains(r#"no "Call Microphone (AudioCodec Device)" on it: that package doesn't make it"#), "{none}");
+
+        // Astra's review of a3421c6: the three variants' package staged, but ranked below it by DriverVer: say how they rank
+        let ranked = OurDevice { others: vec![staged()], ..d.clone() };
+        let text = check_kept(Variant::Both, &ranked, &only_low).unwrap_err().to_string();
+        let expected = format!(
+            "{} makes it, but ranks below the newest, {}: Plug and Play, and the switch, take the package whose DriverVer has the \
+             latest date, then the highest version.",
+            staged().describe(),
+            single().describe()
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(text.contains("Build the three variants' package again") && text.ends_with("Nothing was changed."), "{text}");
+        // ... but not one that lacks it too
+        let also_single = OurDevice { others: vec![Candidate { inf: r"C:\Windows\INF\oem2.inf".into(), ..single() }], ..d.clone() };
+        assert!(check_kept(Variant::Both, &also_single, &only_low).unwrap_err().to_string().contains("No other AudioCodec package"));
+
+        // Astra's review of a3421c6: the newest package makes it, but Windows didn't (a switch whose microphones didn't come):
+        // re-created, not blamed on the package
+        let d = dev(Variant::Both, Health::Working);
+        let KeptCheck::Recreate { missing, note } = check_kept(Variant::Both, &d, &only_low).unwrap() else { panic!() };
+        assert_eq!(missing, [Call]);
+        assert_eq!(
+            note,
+            r#"ROOT\MEDIA\0003 runs the newest AudioCodec package, which makes "Call Microphone (AudioCodec Device)" (its INF's interfaces for ROOT\AudioCodec), but Windows has no "Call Microphone (AudioCodec Device)" on it (a switch whose microphones didn't come, say)"#
+        );
+        // Its INF unread: it may make it, so re-created too
+        let unread_inf =
+            OurDevice { newest: Ok(Some(Candidate { mics: Err("SetupOpenInfFileW failed".into()), ..newest() })), ..d.clone() };
+        let KeptCheck::Recreate { note, .. } = check_kept(Variant::Both, &unread_inf, &only_low).unwrap() else { panic!() };
+        assert!(note.ends_with("and the package's INF couldn't be read to say whether it makes it (SetupOpenInfFileW failed)"), "{note}");
+        // The plan then re-creates it
+        let mut p = plan(std::slice::from_ref(&d), Variant::Both);
+        assert!(p.is_nothing());
+        p.recreate_kept();
+        assert_eq!(p, Plan { keep: None, remove: vec![0], create: true });
+
         // Both there: kept; one disabled passes, with a warning
         let both = Ok(vec![ep("{m}", MICROPHONE, LowLatency, OLD, true), ep("{c}", CALL_MICROPHONE, Call, OLD, false)]);
-        let lines = found_lines(&check_kept(Variant::Both, &d, &both).unwrap());
+        let KeptCheck::Has(check) = check_kept(Variant::Both, &d, &both).unwrap() else { panic!() };
+        let lines = found_lines(&check);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], "  the Microphone: \"Microphone (AudioCodec Device)\"");
         assert_eq!(lines[1], "  the Call Microphone: \"Call Microphone (AudioCodec Device)\", disabled in the Sound panel");
@@ -1845,10 +2125,10 @@ mod tests {
             "{}",
             lines[2]
         );
-        // Another device's microphone isn't the kept one's
+        // Another device's microphone isn't the kept one's: it lacks it, so it is re-created (its package makes it)
         let call = dev(Variant::Call, Health::Working);
         let elsewhere = Ok(vec![ep("{c}", CALL_MICROPHONE, Call, NEW, true)]);
-        assert!(matches!(check_kept(Variant::Call, &call, &elsewhere), Err(SwitchError::PackageLacks { .. })));
+        assert!(matches!(check_kept(Variant::Call, &call, &elsewhere), Ok(KeptCheck::Recreate { .. })));
         // Unread: not checked, so it stops, nothing changed
         let unread = WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 };
         assert_eq!(check_kept(Variant::Both, &d, &Err(unread.clone())), Err(SwitchError::NoEndpoints(unread)));
@@ -2067,6 +2347,43 @@ mod tests {
         assert!(text.starts_with("the switch's lock refused this process (") && text.contains("ERROR_ACCESS_DENIED (5)"), "{text}");
     }
 
+    /// Whether this thread's token has BUILTIN\Administrators enabled: an elevated administrator's (or SYSTEM's).
+    fn elevated() -> bool {
+        let mut admins = well_known_sid(WinBuiltinAdministratorsSid).unwrap();
+        let mut member = BOOL(0);
+        // SAFETY: no token, so this thread's (or the process's); a SID that outlives the call; `member` is a live out-pointer.
+        unsafe { CheckTokenMembership(None, PSID(admins.as_mut_ptr().cast()), &mut member) }.unwrap();
+        member.as_bool()
+    }
+
+    /// Astra's review of a3421c6: the switch's own lock (its boundary and descriptor) was tested only refusing. Elevated, this
+    /// process takes it, a second take (another thread, as another switch) is Busy, and once released it can be taken again.
+    /// It holds the real lock for a moment: a switch that comes meanwhile waits for it.
+    #[test]
+    fn the_switchs_lock_lets_an_elevated_administrator_in() {
+        if !elevated() {
+            eprintln!("skipped: this process isn't an elevated administrator's, so the switch's lock refuses it (the test above)");
+            return;
+        }
+        let take = || std::thread::spawn(|| SwitchLock::take(&LOCK, Duration::ZERO, &mut |_| {}).map(drop)).join().unwrap();
+        let held = match SwitchLock::take(&LOCK, Duration::ZERO, &mut |_| {}) {
+            Ok(lock) => lock,
+            Err(SwitchError::Busy) => {
+                eprintln!("skipped: a switch holds the lock now");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(take(), Err(SwitchError::Busy), "held");
+        drop(held);
+        match take() {
+            Ok(()) => {}
+            // A real switch that waited for this test's take has it now
+            Err(SwitchError::Busy) => eprintln!("note: a switch took the lock as soon as it was released"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
     /// The microphones' filters are the INF's and the driver's.
     #[test]
     fn the_microphones_filters_are_the_drivers() {
@@ -2083,6 +2400,87 @@ mod tests {
             assert_eq!(v.mics().iter().map(|&m| default_name(m)).collect::<Vec<_>>(), v.microphones(), "{v:?}");
         }
         assert_eq!(mics_text(&[Mic::Call]), "\"Call Microphone (AudioCodec Device)\"");
+    }
+
+    /// Astra's review of a3421c6: which microphones a package makes comes from its INF, the install section the hardware ID
+    /// names. The repo's INF for each variant, the single-microphone driver's, and what isn't there.
+    #[test]
+    fn a_packages_microphones_are_its_infs_interfaces() {
+        use Mic::*;
+        let inf = concat!(env!("CARGO_MANIFEST_DIR"), r"\..\..\driver\src\AudioCodec\Driver\AudioCodec.inf");
+        assert_eq!(package_mics(inf, "Audio_Device").unwrap(), [LowLatency, Call]);
+        assert_eq!(package_mics(inf, "Audio_Device_Call").unwrap(), [Call]);
+        assert_eq!(package_mics(inf, "Audio_Device_LowLatency").unwrap(), [LowLatency]);
+        assert_eq!(package_mics(inf, "No_Such_Section").unwrap(), []);
+        // The single-microphone driver's INF (before f2e7d15), cut to what's read: the speaker and one microphone
+        let single = std::env::temp_dir().join(format!("nf-vmic-test-single-{}.inf", std::process::id()));
+        let text = [
+            "[Version]",
+            "Signature=\"$WINDOWS NT$\"",
+            "Class=MEDIA",
+            "[Audio_Device.NT]",
+            "[Audio_Device.NT.Interfaces]",
+            "AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_Speaker%,  Audio_Device.I.Speaker",
+            "AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_Microphone%, Audio_Device.I.Microphone",
+            "AddInterface=%KSCATEGORY_CAPTURE%,  %KSNAME_Microphone%, Audio_Device.I.Microphone",
+            "[Strings]",
+            "KSCATEGORY_AUDIO=\"{6994AD04-93EF-11D0-A3CC-00A0C9223196}\"",
+            "KSCATEGORY_CAPTURE=\"{65E8773D-8F56-11D0-A3B9-00A0C9223196}\"",
+            "KSNAME_Speaker=\"Speaker0\"",
+            "KSNAME_Microphone=\"Microphone0\"",
+        ]
+        .join("\r\n");
+        std::fs::write(&single, text).unwrap();
+        let read = package_mics(single.to_str().unwrap(), "Audio_Device");
+        let _ = std::fs::remove_file(&single);
+        assert_eq!(read.unwrap(), [LowLatency]);
+        let missing = package_mics(r"C:\no\such\folder\x.inf", "Audio_Device").unwrap_err();
+        assert_eq!(missing.call, "SetupOpenInfFileW");
+    }
+
+    /// Astra's review of a3421c6: a switch to both with the single-microphone package newest in the driver store made a device
+    /// without the Call Microphone, and failed 15 s later. It stops first, saying why, before anything is removed.
+    #[test]
+    fn a_new_devices_package_must_make_the_variants_microphones() {
+        use Mic::*;
+        assert_eq!(new_package_lacks(Variant::Both, &newest(), &[]), None);
+        assert_eq!(new_package_lacks(Variant::LowLatency, &single(), &[]), None);
+        let unread = Candidate { mics: Err("SetupOpenInfFileW failed".into()), ..newest() };
+        assert_eq!(new_package_lacks(Variant::Both, &unread, &[]), None, "checked after the install instead");
+        let lacking = new_package_lacks(Variant::Both, &single(), &[]).unwrap();
+        let expected =
+            Lacking { target: Variant::Both, device: None, newest: single().describe(), missing: vec![Call], ranked_below: None };
+        assert_eq!(lacking, expected);
+        let text = SwitchError::PackageLacks(Box::new(lacking)).to_string();
+        assert!(
+            text.starts_with(&format!(
+                r#"the driver store's newest AudioCodec package for ROOT\AudioCodec, {}, lacks "Call Microphone (AudioCodec Device)": that package doesn't make it"#,
+                single().describe()
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with("it re-creates the device with that package. Nothing was changed."), "{text}");
+        let ranked = new_package_lacks(Variant::Both, &single(), &[unread, staged()]).unwrap();
+        assert_eq!(ranked.ranked_below, Some(staged().describe()));
+        assert_eq!(new_package_lacks(Variant::Call, &single(), &[]).unwrap().missing, [Call]);
+    }
+
+    #[test]
+    fn a_search_ranks_ours_below_the_newest() {
+        let older = candidate(r"C:\Windows\INF\oem3.inf", "AudioCodec.inf", 100, V1);
+        let newer = candidate(r"C:\Windows\INF\oem12.inf", "audiocodec.inf", 200, V1);
+        let foreign = candidate(r"C:\Windows\INF\oem9.inf", "othercodec.inf", 900, V1);
+        assert_eq!(rank(Ok(vec![older.clone(), newer.clone(), foreign.clone()])), (Ok(Some(newer)), vec![older]));
+        assert_eq!(rank(Ok(vec![foreign])), (Ok(None), vec![]));
+        let failed = WinError { call: "SetupDiBuildDriverInfoList", code: 5 };
+        assert_eq!(rank(Err(failed.clone())), (Err(failed), vec![]));
+        // The plan's re-creation of a device kept, beside one it removes
+        let mut p = plan(&[dev(Variant::Both, Health::Working), dev(Variant::Call, Health::Working)], Variant::Call);
+        assert_eq!(p, Plan { keep: Some(1), remove: vec![0], create: false });
+        p.recreate_kept();
+        assert_eq!(p, Plan { keep: None, remove: vec![0, 1], create: true });
+        p.recreate_kept();
+        assert_eq!(p, Plan { keep: None, remove: vec![0, 1], create: true }, "once");
     }
 
     #[test]
@@ -2106,6 +2504,7 @@ mod tests {
         );
     }
 
+    /// One of our packages (by its original name) with the three variants: for `ROOT\AudioCodec`, both microphones.
     fn candidate(inf: &str, original: &str, date: u64, version: u64) -> Candidate {
         Candidate {
             inf: inf.into(),
@@ -2114,7 +2513,18 @@ mod tests {
             description: "AudioCodec Device".into(),
             date,
             version,
+            mics: Ok(vec![Mic::LowLatency, Mic::Call]),
         }
+    }
+
+    /// The single-microphone driver's package (oem12.inf, the newest in [`dev`]), which makes the Microphone alone.
+    fn single() -> Candidate {
+        Candidate { mics: Ok(vec![Mic::LowLatency]), ..newest() }
+    }
+
+    /// The three variants' package, staged, but ranked below [`single`] (an older DriverVer date).
+    fn staged() -> Candidate {
+        candidate(r"C:\Windows\INF\oem15.inf", "audiocodec.inf", 100, (23 << 48) | 1)
     }
 
     #[test]
@@ -2203,8 +2613,8 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "the device is working on the newest package, but after 15 s Windows hasn't made \"Call Microphone (AudioCodec Device)\" \
-             (ours there: \"Microphone (AudioCodec Device)\"). The device stays: `noise-filter mic variant` and the Sound panel's \
-             Recording tab show what's there now."
+             (ours there: \"Microphone (AudioCodec Device)\"). The device stays, and a second run of the switch re-creates it if \
+             they're still missing: `noise-filter mic variant` and the Sound panel's Recording tab show what's there now."
         );
         let e = SwitchError::Mics { missing: vec![Mic::LowLatency, Mic::Call], seen: vec![], read: Some(WinError { call: "X", code: 5 }) };
         let text = e.to_string();

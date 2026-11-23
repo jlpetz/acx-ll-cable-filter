@@ -18,8 +18,8 @@
 //! filter's device interface path holds the device's instance ID (`root#media#0004`) and the circuit's reference string
 //! (`microphone0` the low-latency one, `microphone1` the call one), which hold whatever the endpoint is named. Windows numbers
 //! a second device's names ("Microphone (2- AudioCodec Device)"), and the user may rename an endpoint in the Sound panel;
-//! only when the filter can't be read does the name decide ([`mic_of`]). The endpoint is ours by its name: a rename in the
-//! Sound panel changes the part before the brackets, not the device's name in them.
+//! only when no copy of the filter's path names one of our microphones does the name decide ([`mic_of`]). The endpoint is
+//! ours by its name: a rename in the Sound panel changes the part before the brackets, not the device's name in them.
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{PROPERTYKEY, S_OK};
@@ -40,7 +40,8 @@ use crate::win_error::WinError;
 
 /// The endpoint's copy of the KS filter path it's connected to, in its property store: not documented; seen on Windows
 /// build 26100 as `{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0`, on a disabled endpoint too.
-/// [`identify`] reads it only when the documented route (the endpoint's device topology) gives nothing.
+/// [`identify`] goes by it only when the documented route (the endpoint's device topology) doesn't name one of our
+/// microphones.
 const PKEY_ENDPOINT_FILTER: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x233164c8_1b2c_4c7d_bc68_b671687a2567), pid: 1 };
 
 /// Which of our microphones an endpoint is.
@@ -85,11 +86,13 @@ pub fn is_ours(endpoint_name: &str) -> bool {
 }
 
 /// The microphone a KS filter's reference string names: the driver's capture circuits (`microphone0`, `microphone1`; any
-/// case, as the path has them in lower case).
+/// case, as the path has them in lower case), with or without a suffix after the name (`microphone0/00010001`: whatever
+/// follows its first character that isn't a letter or a digit), so `microphone01` isn't `microphone0`.
 pub fn mic_of_filter(reference: &str) -> Mic {
-    if reference.eq_ignore_ascii_case(MICROPHONE_FILTER) {
+    let name = reference.trim_start().split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default();
+    if name.eq_ignore_ascii_case(MICROPHONE_FILTER) {
         Mic::LowLatency
-    } else if reference.eq_ignore_ascii_case(CALL_MICROPHONE_FILTER) {
+    } else if name.eq_ignore_ascii_case(CALL_MICROPHONE_FILTER) {
         Mic::Call
     } else {
         Mic::Other
@@ -113,12 +116,20 @@ pub fn parse_filter(path: &str) -> Option<(String, String)> {
     (!instance.is_empty()).then(|| (instance, reference.to_string()))
 }
 
-/// An endpoint's microphone and the instance ID of the device it's on, from the KS filter it's connected to (`filter`, a
-/// device interface path), or, if that wasn't read, its microphone by its name and no device.
-pub fn identify(filter: Option<&str>, name: &str) -> (Mic, Option<String>) {
-    match filter.and_then(parse_filter) {
-        Some((instance, reference)) => (mic_of_filter(&reference), Some(instance)),
-        None => (mic_of(name), None),
+/// An endpoint's microphone and the instance ID of the device it's on, from the KS filter it's connected to: `filters` are
+/// the copies of the filter's device interface path that were read, the documented route's first. The first that parses
+/// and names one of our microphones decides. If none does (none read or parsed, or each in a form [`parse_filter`] and
+/// [`mic_of_filter`] don't know), the name decides the microphone ([`mic_of`]), and the device is the first parsed path's,
+/// if any.
+pub fn identify(filters: &[&str], name: &str) -> (Mic, Option<String>) {
+    let parsed: Vec<(String, String)> = filters.iter().filter_map(|p| parse_filter(p)).collect();
+    let named = parsed.iter().find_map(|(instance, reference)| match mic_of_filter(reference) {
+        Mic::Other => None,
+        mic => Some((mic, instance.clone())),
+    });
+    match named {
+        Some((mic, instance)) => (mic, Some(instance)),
+        None => (mic_of(name), parsed.into_iter().next().map(|(instance, _)| instance)),
     }
 }
 
@@ -345,10 +356,11 @@ impl Drop for Mta {
 fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
     let mut out = Vec::new();
     for ours in our_capture_endpoints(DEVICE_STATE_ACTIVE)? {
-        // One that went away meanwhile isn't listed
+        // One that went away meanwhile isn't listed, nor one whose sessions can't be read: the others still are
         let Ok(id) = device_id(&ours.device) else { continue };
+        let Ok(sessions) = sessions_of(&ours.device) else { continue };
         let (mic, _) = ours.identify();
-        out.push(Endpoint { id, mic, sessions: sessions_of(&ours.device)?, name: ours.name });
+        out.push(Endpoint { id, mic, sessions, name: ours.name });
     }
     Ok(out)
 }
@@ -376,10 +388,11 @@ struct Ours {
 
 impl Ours {
     /// Its microphone and device ([`identify`]): by the filter its device topology is connected to, else the property
-    /// store's copy, else by its name.
+    /// store's copy, whichever first names one of our microphones; else by its name.
     fn identify(&self) -> (Mic, Option<String>) {
-        let filter = connected_filter(&self.device).filter(|p| parse_filter(p).is_some()).or_else(|| self.cached_filter.clone());
-        identify(filter.as_deref(), &self.name)
+        let topology = connected_filter(&self.device);
+        let filters: Vec<&str> = topology.iter().chain(&self.cached_filter).map(String::as_str).collect();
+        identify(&filters, &self.name)
     }
 }
 
@@ -395,9 +408,9 @@ fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
     let count = unsafe { endpoints.GetCount() }.map_err(WinError::of("IMMDeviceCollection::GetCount"))?;
     let mut out = Vec::new();
     for i in 0..count {
+        // An endpoint that went away meanwhile, or whose name can't be read, isn't ours to list; the others still are
         // SAFETY: a live collection and an index below its count.
-        let device = unsafe { endpoints.Item(i) }.map_err(WinError::of("IMMDeviceCollection::Item"))?;
-        // An endpoint that went away meanwhile, or whose name can't be read, isn't ours to list
+        let Ok(device) = (unsafe { endpoints.Item(i) }) else { continue };
         // SAFETY: a live device; read access only.
         let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
         let Ok(name) = string_property(&store, &PKEY_Device_FriendlyName) else { continue };
@@ -581,12 +594,42 @@ mod tests {
         assert_eq!(mic_of_filter("speaker0"), Mic::Other);
         assert_eq!(mic_of_filter(""), Mic::Other);
         // The filter decides, whatever the name: renamed, numbered, or another microphone's
-        assert_eq!(identify(Some(low), "Studio mic (AudioCodec Device)"), (Mic::LowLatency, Some(r"root\media\0004".into())));
-        assert_eq!(identify(Some(call), crate::variant::MICROPHONE), (Mic::Call, Some(r"ROOT\MEDIA\0012".into())));
+        assert_eq!(identify(&[low], "Studio mic (AudioCodec Device)"), (Mic::LowLatency, Some(r"root\media\0004".into())));
+        assert_eq!(identify(&[call], crate::variant::MICROPHONE), (Mic::Call, Some(r"ROOT\MEDIA\0012".into())));
         // Without one that parses, the name, and no device
-        assert_eq!(identify(None, "Call Microphone (2- AudioCodec Device)"), (Mic::Call, None));
-        assert_eq!(identify(Some("garbage"), crate::variant::MICROPHONE), (Mic::LowLatency, None));
-        assert_eq!(identify(None, "Studio mic (AudioCodec Device)"), (Mic::Other, None));
+        assert_eq!(identify(&[], "Call Microphone (2- AudioCodec Device)"), (Mic::Call, None));
+        assert_eq!(identify(&["garbage"], crate::variant::MICROPHONE), (Mic::LowLatency, None));
+        assert_eq!(identify(&[], "Studio mic (AudioCodec Device)"), (Mic::Other, None));
+    }
+
+    /// Astra's review of a3421c6: a path that parsed but named neither microphone (a suffix after the reference string, or
+    /// another form) made the endpoint Mic::Other, and the property store's copy was never looked at.
+    #[test]
+    fn each_copy_of_the_filter_is_tried_until_one_names_a_microphone() {
+        // A suffix after the reference string (as the endpoint's registry copy has it on some builds) still names it
+        assert_eq!(mic_of_filter("microphone0/00010001"), Mic::LowLatency);
+        assert_eq!(mic_of_filter("Microphone1|x"), Mic::Call);
+        assert_eq!(mic_of_filter(r"microphone1\x"), Mic::Call);
+        // ... but a longer name isn't ours
+        assert_eq!(mic_of_filter("microphone01"), Mic::Other);
+        assert_eq!(mic_of_filter("microphone"), Mic::Other);
+        let suffixed = r"{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone1/00010001";
+        assert_eq!(identify(&[suffixed], crate::variant::MICROPHONE), (Mic::Call, Some(r"root\media\0004".into())));
+        // The topology's path parses but names neither (no reference string, or one we don't know): the property store's
+        // copy decides
+        let bare = r"\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}";
+        let unknown = r"\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\pin3";
+        let cached = r"{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone1";
+        for topology in [bare, unknown, "garbage"] {
+            let found = identify(&[topology, cached], "Studio mic (AudioCodec Device)");
+            assert_eq!(found, (Mic::Call, Some(r"root\media\0004".into())), "{topology}");
+        }
+        // The first that names one wins
+        let low = r"\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\Microphone0";
+        assert_eq!(identify(&[low, cached], "x (AudioCodec Device)").0, Mic::LowLatency);
+        // None names one: the name decides, on the device the first parsed path names
+        assert_eq!(identify(&["garbage", bare, unknown], crate::variant::CALL_MICROPHONE), (Mic::Call, Some(r"root\media\0004".into())));
+        assert_eq!(identify(&[unknown], "Studio mic (AudioCodec Device)"), (Mic::Other, Some(r"root\media\0004".into())));
     }
 
     #[test]

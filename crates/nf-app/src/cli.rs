@@ -990,9 +990,11 @@ Usage:
                                  A switch re-creates the device: it asks for elevation, and the
                                  microphones are gone for a few seconds. The variant already there
                                  is re-created too if it doesn't run the driver store's newest
-                                 AudioCodec package (an upgrade), and kept only if Windows has its
-                                 microphones (by kind, whatever they're named). A switch ends once
-                                 the device works on that package and Windows has made them
+                                 AudioCodec package (an upgrade), or if Windows lacks one of its
+                                 microphones (by kind, whatever they're named) that the package
+                                 makes. If that package doesn't make it, the switch stops (exit 2,
+                                 nothing changed) and says which package to add. A switch ends
+                                 once the device works on that package and Windows has made them
   noise-filter --help | --version
 
 FLIGHT RECORDER (run --flight; always on in devices --check):
@@ -1111,8 +1113,9 @@ LAB (offline, no devices):
   --config FILE and PROCESSING (but --model, --aec and --ns) apply to every model
 
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error (mic variant: a Windows call,
-named; a new device not working on the chosen driver; its microphones not made in 15 s; a
-device kept whose package lacks one of them; or another switch running for over 60 s),
+named; the lock refusing a caller that isn't an elevated administrator; another switch
+running for over 60 s; the newest driver package lacking one of the variant's microphones;
+a new device not working on the chosen driver; or its microphones not made in 15 s),
 3 no result (latency: no valid repetition; quality: the recording didn't line up with the
 scene; latency, quality, run --seconds or devices --check: cancelled; mic variant: the
 elevation prompt declined), 4 the large-page or mic variant helper started without
@@ -1683,6 +1686,10 @@ mod tests {
         assert!(help.contains("noise-filter mic sessions") && help.contains("noise-filter mic variant [both|call|low-latency]"));
         assert!(!help.contains(REPORT_FLAG));
         assert!(help.contains(&format!("{} mic variant: Windows needs a restart", crate::exit::Exit::RestartPending.code())));
+        // What a switch does with a device that lacks a microphone, and the lock's refusal among the 2s (Astra's review of
+        // a3421c6)
+        assert!(help.contains("If that package doesn't make it, the switch stops (exit 2,\n"), "{help}");
+        assert!(help.contains("named; the lock refusing a caller that isn't an elevated administrator;"), "{help}");
     }
 
     /// `run --seconds N` stops after N seconds (a soak); without it, it runs until Ctrl+C.

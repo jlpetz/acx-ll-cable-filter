@@ -6,9 +6,9 @@ pub enum Exit {
     Ok = 0,
     /// The command line doesn't parse, or misses something it needs.
     Usage = 1,
-    /// The engine, a device or a file failed (for `mic variant`, a Windows call, named in the message, a new device not working
-    /// on the chosen driver, its microphones not made, a device kept whose package lacks one of them, or another switch holding
-    /// the lock).
+    /// The engine, a device or a file failed (for `mic variant`, a Windows call, named in the message, the lock refusing a
+    /// caller that isn't an elevated administrator, another switch holding it, the driver store's newest package lacking one
+    /// of the variant's microphones, a new device not working on the chosen driver, or its microphones not made).
     Error = 2,
     /// The latency test ran but found no valid repetition; or the user cancelled: a test, or `mic variant`'s elevation prompt.
     NoResult = 3,
