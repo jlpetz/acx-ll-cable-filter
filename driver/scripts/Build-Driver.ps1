@@ -10,8 +10,10 @@
        for Windows 11 24H2 and Server 2025 (KMDF 1.35's floor), and signed.
     -NoSign skips the signing (a build check only).
     -PacketFrames 96 builds the 96-frame trial (TODO 19): NF_PACKET_FRAMES 96 and a 1 ms floor (PacketSize.cpp), passed to
-    cl.exe through the CL environment variable. The packet size is kept in out\<Configuration>\packet-frames.txt, and a build
-    whose size differs from the last one rebuilds everything (MSBuild doesn't see the CL variable change).
+    cl.exe through the CL environment variable, which MSBuild doesn't track. out\<Configuration>\packet-frames.txt reads
+    <size>-complete once a build has finished, and any other build rebuilds everything: one of the other size, one after a
+    build that failed or was stopped (the marker then reads <size>-incomplete), one with no marker. The last package is removed
+    before MSBuild runs, so a build that fails leaves none in out\ to be taken for the size it was asked for.
 
 .EXAMPLE
     .\Build-Driver.ps1
@@ -28,14 +30,26 @@ param(
 
 Write-Step "Build ($Configuration, x64, $PacketFrames-frame packets)"
 $msbuild = Find-MSBuild
-$marker = Join-Path $DriverRoot "out\$Configuration\packet-frames.txt"
-# A missing marker is unknown (out\ may have been cleared while the intermediates in src\ remain): rebuild. The marker names the
-# size before MSBuild runs, so a build that fails or is stopped part way leaves it naming the size its objects may hold, and
-# the next build of the other size rebuilds.
+$out = Join-Path $DriverRoot "out\$Configuration"
+$marker = Join-Path $out 'packet-frames.txt'
+$pkg = Join-Path $out $PackageName
+# The marker reads "<size>-complete" once a build of that size has finished (MSBuild, then the package made), and
+# "<size>-incomplete" from before MSBuild starts until then, so a build that fails or is stopped part way leaves it incomplete
+# and the next build rebuilds, whatever its size: objects the stopped build didn't get to are the last size's (all of them,
+# should it stop before its Rebuild's Clean), and an incremental build wouldn't recompile them (MSBuild doesn't see the CL
+# variable change). Anything else is unknown: rebuild. That covers a missing marker (out\ may have been cleared while the
+# intermediates in src\ remain) and a bare size, which until 2026-11-23 the script wrote before MSBuild ran.
 $last = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '' }
-$target = if ($last -ne "$PacketFrames") { 'Rebuild' } else { 'Build' }
-New-Item -ItemType Directory -Force -Path (Split-Path $marker) | Out-Null
-Set-Content -Path $marker -Value "$PacketFrames" -NoNewline
+$target = if ($last -ne "$PacketFrames-complete") { 'Rebuild' } else { 'Build' }
+if ($target -eq 'Rebuild') {
+    $why = if ($last) { "the marker read $last" } else { 'no marker' }
+    Write-Note "rebuilding everything ($why)"
+}
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+Set-Content -Path $marker -Value "$PacketFrames-incomplete" -NoNewline
+# The last package goes before MSBuild runs, not after: a build that fails then leaves no package in out\ to be installed as
+# this one (Install-Driver.ps1 says there is none).
+if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 $savedCl = $env:CL
 if ($PacketFrames -ne 128) { $env:CL = "/DNF_PACKET_FRAMES#$PacketFrames /DNF_MIN_PACKET_PERIOD_HNS#10000" } else { $env:CL = $null }
 try {
@@ -49,9 +63,7 @@ try {
 }
 
 $built = Join-Path $ProjectDir "x64\$Configuration"
-$pkg = Join-Path $DriverRoot "out\$Configuration\$PackageName"
 Write-Step "Package: $pkg"
-if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 foreach ($f in "$PackageName.sys", $InfName) {
     $src = Join-Path $built $f
@@ -59,7 +71,10 @@ foreach ($f in "$PackageName.sys", $InfName) {
     Copy-Item $src $pkg
 }
 $pdb = Join-Path $built "$PackageName.pdb"
-if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $DriverRoot "out\$Configuration") }
+if (Test-Path $pdb) { Copy-Item $pdb $out }
+# The build has finished: its objects and the package's .sys are of this size. (A signing that fails below leaves the package
+# unsigned, of this size still; the next build of it just packages and signs again.)
+Set-Content -Path $marker -Value "$PacketFrames-complete" -NoNewline
 
 Write-Step 'InfVerif'
 $infverif = Find-WdkTool 'infverif.exe'

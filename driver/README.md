@@ -82,10 +82,14 @@ ring's lock, with the loopback's lock nested inside it at stream creation. Share
    EC2 serial console; the spike box runs without it (the owner: as few changes as possible). Ported from TMR-MD's
    build.ps1.
 2. `scripts\Build-Driver.ps1`: MSBuild, then the package in `out\Release\AudioCodec`: the `.sys` signed, the catalog made
-   by inf2cat for `10_GE_X64,Server2025_X64` and signed. `-PacketFrames 96` builds the 96-frame trial (a 1 ms floor); a
-   build of the other size rebuilds everything. The INF's DriverVer gets today's UTC date (`NfInfDate`): inf2cat refuses a
-   date after UTC today, which the WDK's default, the local date, is here after local midnight (inf2cat exits -2). A
-   package with an older date doesn't replace a newer one: `Uninstall-Driver.ps1` first.
+   by inf2cat for `10_GE_X64,Server2025_X64` and signed. `-PacketFrames 96` builds the 96-frame trial (a 1 ms floor).
+   MSBuild doesn't track the size (it reaches cl.exe through the CL variable), so `out\Release\packet-frames.txt` reads
+   `96-complete` or `128-complete` once a build has finished, and a build of the other size rebuilds everything, as does
+   one after a build that failed or was stopped (the marker then reads `96-incomplete`) or with no such marker. The old
+   package is removed before MSBuild runs: a failed build leaves none in `out\` to install by mistake. The INF's DriverVer
+   gets today's UTC date (`NfInfDate`): inf2cat refuses a date after UTC today, which the WDK's default, the local date, is
+   here after local midnight (inf2cat exits -2). A package with an older date doesn't replace a newer one:
+   `Uninstall-Driver.ps1` first.
 3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
 4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
 5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts
