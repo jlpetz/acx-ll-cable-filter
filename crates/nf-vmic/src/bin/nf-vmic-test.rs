@@ -1290,6 +1290,8 @@ struct Packet<'a> {
     frames: u32,
     /// AUDCLNT_BUFFERFLAGS_SILENT: the packet is silence, whatever its bytes.
     silent: bool,
+    /// AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY: Windows says this packet doesn't follow on from the one before.
+    discontinuity: bool,
     /// GetBuffer's device QPC position, in 100 ns units: the time the endpoint gives for the packet's first frame (`None`
     /// where it flagged AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR).
     qpc_hns: Option<u64>,
@@ -1434,12 +1436,13 @@ impl Capture {
             }
             self.next_index = Some(position + u64::from(frames));
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
             let qpc_hns = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0).then_some(qpc);
             self.silent_packets += u64::from(silent);
             // SAFETY: GetBuffer handed out `frames` frames at `data`, each FRAME_BYTES long (both formats' block align: two
             // 32-bit samples), the engine's until ReleaseBuffer below; nothing writes them meanwhile.
             let bytes = unsafe { std::slice::from_raw_parts(data, frames as usize * protocol::FRAME_BYTES as usize) };
-            on_packet(&Packet { bytes, frames, silent, qpc_hns, host_qpc, position });
+            on_packet(&Packet { bytes, frames, silent, discontinuity, qpc_hns, host_qpc, position });
             // SAFETY: releases all of the packet just read; `bytes` isn't used past here.
             unsafe { self.capture.ReleaseBuffer(frames) }.map_err(|e| format!("ReleaseBuffer returned {}", hresult::name(e.code())))?;
         }
@@ -2612,6 +2615,8 @@ struct StampRow {
     /// (the trace's latest still the one from before the pause). Measured 2026-11-23: the engine hands a restarted client a
     /// packet before the device's next one, stamped about when it gives it; not the driver's, so not checked.
     engine_made: bool,
+    /// Windows flagged the packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY (a client that fell behind, or a stream's start).
+    discontinuity: bool,
     trace: CaptureTrace,
 }
 
@@ -2637,6 +2642,8 @@ struct StepCheck {
     gaps: usize,
     /// Packets the shared engine made itself after a resume ([`StampRow::engine_made`]): left out.
     engine_made: usize,
+    /// Steps into a packet Windows flagged as a discontinuity: not checked, and listed apart (index of the second row).
+    flagged: Vec<usize>,
 }
 
 /// Each packet's stamp must step by exactly the frames before it while the stream runs (the device position says which
@@ -2658,6 +2665,10 @@ fn check_steps(rows: &[StampRow]) -> StepCheck {
         c.checked += 1;
         let step = tb as i64 - ta as i64;
         let expected = (u64::from(a.frames) * 10_000_000 / u64::from(protocol::SAMPLE_RATE)) as i64;
+        if b.discontinuity {
+            c.flagged.push(i);
+            continue;
+        }
         if a.segment == b.segment {
             if (step - expected).abs() > STAMP_SLACK_HNS {
                 c.wrong.push(i);
@@ -2719,6 +2730,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
                         frames: p.frames,
                         segment: segment as u32,
                         engine_made: false,
+                        discontinuity: p.discontinuity,
                         trace: s.capture_trace,
                     }),
                     Err(e) => error = Some(format!("STATS: {e}")),
@@ -2753,8 +2765,11 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
                 let rec = (hns(r.host_qpc) - base) / 10_000.0;
                 let drv = (hns(r.trace.last_notify_qpc) - base) / 10_000.0;
                 println!(
-                    "    row {i:>4} run {:>2} position {:>9} frames {:>4} device {dev:>12} receipt {rec:>12.4} driver's latest {drv:>12.4}",
-                    r.segment, r.position, r.frames
+                    "    row {i:>4} run {:>2} position {:>9} frames {:>4} device {dev:>12} receipt {rec:>12.4} driver's latest {drv:>12.4}{}",
+                    r.segment,
+                    r.position,
+                    r.frames,
+                    if r.discontinuity { " DISCONTINUITY" } else { "" }
                 );
             }
         }
@@ -2779,6 +2794,9 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     };
     for &i in c.wrong.iter().chain(&c.overlapping).take(12) {
         println!("{}", at(i));
+    }
+    for &i in c.flagged.iter().take(12) {
+        println!("{} (flagged a discontinuity: not checked)", at(i));
     }
     let verdict = if c.no_time > 0 || !c.wrong.is_empty() || !c.overlapping.is_empty() {
         println!("FAIL: the stamps don't follow the audio");
@@ -3145,6 +3163,7 @@ mod tests {
             frames: 480,
             segment,
             engine_made: false,
+            discontinuity: false,
             trace: CaptureTrace::default(),
         }
     }
@@ -3654,7 +3673,7 @@ mod tests {
     fn a_render_stream_writes_the_test_signal() {
         let mut bytes = vec![0xAA_u8; 5 * 8 + 3];
         write_signal(&mut bytes, signal::CODE_MODULUS - 2);
-        let packet = Packet { bytes: &bytes, frames: 5, silent: false, qpc_hns: None, host_qpc: 0, position: 0 };
+        let packet = Packet { bytes: &bytes, frames: 5, silent: false, discontinuity: false, qpc_hns: None, host_qpc: 0, position: 0 };
         let codes: Vec<_> = packet.float_frames().map(signal::decode).collect();
         let top = signal::CODE_MODULUS as u32;
         assert_eq!(codes, [Some(top - 2), Some(top - 1), Some(0), Some(1), Some(2)]);
