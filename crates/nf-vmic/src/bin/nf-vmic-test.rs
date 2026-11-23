@@ -104,7 +104,8 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       small-period helper, or a second client in another mode); the period granted is printed. Unmute the endpoint. The
       first capture stream to run reads the ring; the driver gives the others its audio as secondary streams. When the
       reader stops, another takes the slot with one counted skip (a gap that must match the driver's count); the rest play
-      on with neither gap nor repeat, getting silence the driver counts where the new reader's packet is longer.
+      on with no repeat: silence the driver counts where the new reader's packet is longer, and one counted skip where it
+      is shorter (a gap that must match SecondarySkippedFrames).
   nf-vmic-test stats
       Print the driver's statistics.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]

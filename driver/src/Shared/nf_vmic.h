@@ -221,7 +221,9 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
     Ring.NotReaderPackets counts all their passes. SecondarySkips counts the times one of them moved on to a shorter reader
     packet's lag (a handoff to a reader with a shorter packet: the owner, 2026-11-23), and SecondarySkippedFrames the copy's
     frames it so passed over, counted as HandoffSkippedFrames is: from the copy's valid start to its end, less its recorded
-    gaps. So a recording that played on through a handoff has a gap of exactly those frames, and one that took the slot a
+    gaps. So a recording that played on through a handoff to a shorter packet has a gap of exactly those frames, as long
+    as the copy held the span (below: frames it didn't yet hold are lost uncounted, as for any read past its end), and one
+    that took the slot a
     gap of HandoffSkippedFrames (the last reader's underrun silence in either span counts but is no gap). The copy holds the
     whole span unless the new reader's timer is later than the skipping stream's by more than the 1 ms, which leaves that
     stream's read short too (SecondaryUnderrunFrames).
