@@ -50,6 +50,21 @@ is windows-reactor (WinUI 3). Public release is the intent.
 - **After touching the start-up path** (either exe's `main`, `cpu_check.rs`) or updating the
   toolchain: `python tools/check_cpu_gate_asm.py` on a fresh `--emit asm` build (TODO #18).
 
+## Privacy (the owner, 2026-11-23)
+The repo is public (github.com/jlpetz/acx-ll-cable-filter). No file, commit message or commit identity may hold:
+- **email addresses.** Commits use the owner's GitHub no-reply address (this clone's `user.email`).
+- **IP addresses, and systems' FQDNs or internal host names.** A short host name is fine.
+- **Unique IDs an outsider could use to identify our systems or accounts:** cloud instance, image, volume and network IDs,
+  regions and zones, account numbers, IAM user and key names, certificate thumbprints, serial numbers.
+- **Keys, tokens or passwords.**
+
+Write "the dev box" or "TMR's dev box" instead, and scrub logs pasted into docs the same way.
+- **The pre-push check** (`tools/privacy_check.py`, run by `tools/git-hooks/pre-push`) refuses a push whose new commits break
+  this. A clone turns it on with `git config core.hooksPath tools/git-hooks`. Never skip it (`--no-verify`).
+- Private strings it must catch but mustn't name (it's public) go in `.git/info/privacy-deny`, which is local and never
+  committed. False positives go in `tools/privacy-allow.txt`.
+- `python -I tools/privacy_check.py --all` checks the whole history.
+
 ## Commits
 - No `Co-Authored-By` line. Write "TODO NN", never `#NNN` (GitHub links it to an issue).
 

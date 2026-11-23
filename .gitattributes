@@ -1,2 +1,4 @@
 # Shell scripts keep LF in a Windows checkout (core.autocrlf): bash reads a CR as part of each line.
 *.sh text eol=lf
+# Git hooks run under Git's sh too
+tools/git-hooks/* text eol=lf

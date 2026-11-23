@@ -1,0 +1,10 @@
+# Strings shaped like a privacy finding that are not one (tools/privacy_check.py). One literal per line.
+# Version numbers and an OID that look like IPv4 addresses:
+0.0.0.0
+1.0.0.0
+1.2.3.4
+0.9.7.8
+0.9.8.0
+0.9.8.1
+2.4.0.0
+2.5.29.19
