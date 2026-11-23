@@ -240,3 +240,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - The owner: "Having to re-register devices in this way seems strange, I would assume [it] wasn't intended."
 **Next**: the owner picks where to post (Feedback Hub's Audio area, MicrosoftDocs/windows-driver-docs, microsoft/low-latency-audio) and posts the draft; recheck its figures on Windows 11 first if possible.
 **Detail**: `doc/todo/22-oemperiod-report.md` (the findings, the questions, a draft)
+
+---
+
+### 23. [driver] Pre-release driver validation
+**Priority**: High (before release) | **Status**: open; the owner agreed 2026-11-23 to a validation phase with HLK; the scope and order are ours.
+- Driver Verifier rounds beyond `/standard` (which stays on in development): kernel synchronization delay fuzzing, low resources simulation, code integrity, additional DDI compliance, force pending I/O with invariant MDL checking, power framework delay fuzzing.
+- The HLK's Device Fundamentals tests (PnP, sleep and reboot cycles, concurrent I/O, penetration tests fuzzing the control device's IOCTLs) and the audio tests that apply; KMDF's verifier; CodeQL's driver queries; ApiValidator on for release builds; physical Windows 11 machines (the owner's).
+**Next**: agree the order with the owner once the driver's feature set settles; code integrity at the owner's next reboot.
+**Detail**: `doc/todo/23-driver-validation.md`
