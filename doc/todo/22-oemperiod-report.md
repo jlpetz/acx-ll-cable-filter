@@ -55,6 +55,12 @@ steps were 10.000 ms and the first packet arrived 11.74–12.32 ms after Start. 
 The ACX driver supplies the first-frame time to its completion notification as described above. When an unread
 packet spans Stop/Start, which component supplies its first-frame timestamp? How should an ACX driver ensure
 that the timestamps a client sees on consecutive packets keep advancing? Physical Windows 11 confirmation is pending.
+
+(Ours, the same evening, for the owner to fold in or leave: `nf-vmic-test stamps` now waits 30-170% of a packet before
+each Stop, so a packet is left unread on purpose. Exclusive, 480 and 128 frames, 16 restarts each: every restart that left
+one (4 of 16) handed it out about 0.3 ms after Start stamped about then, and the next packet, the driver's, came 3.5-7.4 ms
+earlier; none of the others did. In shared mode the engine does the same with 3-10 restarts in 16, and at a 5 ms period
+it also hands out, after Start, packets completed before Stop with the driver's own stamps.)
 [WASAPI capture packet timestamps](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)
 and [ACX packet completion timestamps](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/acxstreams/nf-acxstreams-acxrtstreamnotifypacketcomplete).
 

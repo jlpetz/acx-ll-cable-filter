@@ -199,6 +199,23 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
 - Left: the sweeps themselves now spread 60.1-66.4 ms from run to run (65.7-68.7 before); the readout's budget, now right,
   can say which part moves (the cables' bursty mic delivery, the engine's phase). And the 2 ms with exclusive output, set
   against the shared cable-alone figure (`--cable-only` can't open an exclusive probe yet).
+- **The spread, measured (2026-11-23 evening, `nf-scratch/latency/spread.sh`: 8 runs each; VB-CABLE A as the mic cable,
+  our driver as the output cable, passthrough; blocks saved per run).** App + output cable, the runs' medians:
+
+  | Options | Run medians | Run to run | What moves |
+  |---|---|---|---|
+  | Today's defaults (exclusive mic and output, adaptive target) | 38.50-41.00 ms | 2.5 ms | the adaptive target settling |
+  | The mic shared (10 ms), the output exclusive | 46.70-49.42 ms | 2.7 ms | mic delivery 17.2-18.9 ms |
+  | The output shared (10 ms), the mic exclusive | 52.82-59.86 ms | 7.0 ms | render side 11.4-18.4 ms |
+
+  So the all-shared spread is mostly the shared output's render side, the engine's phase against our writes (one run in 8
+  at 11.4 ms, the rest 17.4-18.4), and less the shared mic's delivery phase. The readout's budget carries both, so the
+  readout tracks them (run 8 of the shared output: readout 40.9 ms against 46.6-48.0). With the defaults four runs (1, 5,
+  7, 8) agreed within 0.6 ms (38.50-39.08, sweeps within 1 ms); in the other four the sweeps stepped down 3.00 ms at a time
+  across the run (spread 7.9-10.3 ms) with a mean output queue of 18.3-20.3 ms against 15.3: the adaptive target still
+  coming down when the test began (ours, from the queue means; the test doesn't wait for the target to settle). Next: let
+  the latency test wait for the adaptive target to settle (or report it), then the exclusive figure against an exclusive
+  cable-only probe.
 
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the
