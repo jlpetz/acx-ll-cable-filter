@@ -14,12 +14,13 @@
 //! - **Two InfoBars.** The notice (errors and results; a fault that stops a run, once per fault)
 //!   and, under it, the engine's warnings while it runs, which closes by itself when they clear.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nf_engine::{
-    DeviceInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress, LatencyReport, LatencyTest,
-    LatencyTestRequest, Remedy,
+    DeviceInfo, EffectConfig, EffectInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress,
+    LatencyReport, LatencyTest, LatencyTestRequest, OutputBackend, Remedy,
 };
 use nf_mem::privilege::{HELPER_NOT_ELEVATED, helper_args};
 use windows_reactor::*;
@@ -35,6 +36,8 @@ use crate::widgets::{
     track_width,
 };
 use crate::{SharedEngine, format, screen, waiting};
+
+mod effect;
 
 /// The status waiter's period: the status line and the diagnostics change slowly.
 const STATUS_TICK: Duration = Duration::from_millis(500);
@@ -82,6 +85,7 @@ pub(crate) enum Job {
 /// What the status waiter brings.
 pub(crate) struct Feed {
     status: EngineStatus,
+    effect: Option<EffectInfo>,
     /// The running test's generation and progress, when a test was running as the waiter was armed.
     test: Option<(u64, LatencyProgress)>,
     save_error: Option<String>,
@@ -95,10 +99,13 @@ pub(crate) enum Msg {
     Devices(Result<Vec<DeviceInfo>, EngineError>),
     TestStarted(Result<LatencyTest, EngineError>),
     LargePages(Result<u32, String>),
+    AllowDriver,
+    DriverAllowed(Result<(), String>),
     // Header and devices
     StartStop,
     Refresh,
     Mic(Option<usize>),
+    OutputBackend(Option<usize>),
     Output(Option<usize>),
     Reference(Option<usize>),
     // Processing
@@ -113,6 +120,16 @@ pub(crate) enum Msg {
     Hold(f64),
     Range(f64),
     Vad(bool),
+    ChooseEffect,
+    EffectChosen(Result<Option<PathBuf>, String>),
+    RemoveEffect,
+    BypassEffect(bool),
+    EffectParam {
+        path: PathBuf,
+        plugin_id: String,
+        id: u32,
+        value: Option<f64>,
+    },
     // The live section's toggles (its callbacks)
     ShowMeters(bool),
     ShowReadout(bool),
@@ -249,7 +266,11 @@ impl Choices {
         Self {
             mic: devices::choices(list, Picker::MIC, d.mic.as_deref()),
             output: devices::choices(list, Picker::OUTPUT, d.output.as_deref()),
-            reference: devices::choices(list, Picker::reference(d.output.as_deref()), d.reference.as_deref()),
+            reference: devices::choices(
+                list,
+                Picker::reference(if settings.engine.io.output_backend == OutputBackend::Wasapi { d.output.as_deref() } else { None }),
+                d.reference.as_deref(),
+            ),
             probe: devices::choices(list, Picker::PROBE, ui.test_probe.as_deref()),
             capture: devices::choices(list, Picker::CAPTURE, ui.test_capture.as_deref()),
         }
@@ -400,6 +421,8 @@ pub(crate) struct Window {
     /// The window's latest width, for the meters' track.
     width: f64,
     status: EngineStatus,
+    effect: Option<EffectInfo>,
+    choosing_effect: bool,
     job: Option<Job>,
     faults: FaultWatch,
     warnings: WarningsBar,
@@ -409,6 +432,8 @@ pub(crate) struct Window {
     choices: Choices,
     test: TestPanel,
     elevating: bool,
+    granting_driver: bool,
+    elevated: bool,
     large_pages_set_up: bool,
     notice: Option<Notice>,
     /// The status waiter in flight.
@@ -432,15 +457,24 @@ impl Window {
             if cancel.is_cancelled() {
                 // The window has closed (or the task was dropped): the result is discarded, so don't
                 // touch an engine that `run` may be stopping.
-                return Msg::Feed(Box::new(Feed { status: EngineStatus::default(), test: None, save_error: None }));
+                return Msg::Feed(Box::new(Feed { status: EngineStatus::default(), effect: None, test: None, save_error: None }));
             }
             let test = test.map(|(generation, t)| (generation, t.progress()));
-            Msg::Feed(Box::new(Feed { status: engine.status(), test, save_error: errors.take() }))
+            Msg::Feed(Box::new(Feed { status: engine.status(), effect: engine.effect_info(), test, save_error: errors.take() }))
         }));
     }
 
     fn take_feed(&mut self, feed: Feed) {
         self.take_status(feed.status);
+        self.effect = feed.effect;
+        if self.settings.engine.effect.plugin_id.is_none()
+            && let Some(id) = self.active_effect().map(|fx| fx.plugin_id.clone())
+        {
+            // The engine chose the initial effect. Persist that identity before saving any parameter IDs or reopening a
+            // reordered bundle. The executing effect already has this ID, so no control message or restart is needed.
+            self.settings.engine.effect.plugin_id = Some(id);
+            self.persist();
+        }
         if let Some((generation, progress)) = feed.test {
             self.test.progress(generation, progress);
         }
@@ -481,7 +515,8 @@ impl Window {
         if config == self.settings.engine {
             return;
         }
-        let devices_changed = config.devices != self.settings.engine.devices;
+        let devices_changed =
+            config.devices != self.settings.engine.devices || config.io.output_backend != self.settings.engine.io.output_backend;
         self.settings.engine = config;
         self.engine.apply(&self.settings.engine);
         if devices_changed {
@@ -516,7 +551,13 @@ impl Window {
                 },
                 Msg::Stopped,
             );
-        } else if self.settings.engine.devices.output.is_none() {
+        } else if self.settings.engine.io.output_backend == OutputBackend::DriverRing && !self.elevated && !nf_vmic::broker::authorized() {
+            self.notice = Some(Notice::new(
+                InfoBarSeverity::Warning,
+                "Allow direct output first",
+                "Under Devices, choose Allow direct output, approve the driver helper for this session, then press Start.",
+            ));
+        } else if self.settings.engine.io.output_backend == OutputBackend::Wasapi && self.settings.engine.devices.output.is_none() {
             self.notice = Some(Notice::new(
                 InfoBarSeverity::Warning,
                 "Choose an output first",
@@ -670,6 +711,8 @@ impl Component for Window {
             settings,
             engine,
             status,
+            effect: None,
+            choosing_effect: false,
             job: None,
             faults: FaultWatch::default(),
             warnings: WarningsBar::default(),
@@ -678,6 +721,8 @@ impl Component for Window {
             choices: Choices::default(),
             test: TestPanel::default(),
             elevating: false,
+            granting_driver: false,
+            elevated: nf_mem::privilege::is_elevated(),
             large_pages_set_up: false,
             notice: start.warning.clone().map(|w| Notice::new(InfoBarSeverity::Warning, "Settings reset", w)),
             feed: None,
@@ -695,6 +740,25 @@ impl Component for Window {
             Msg::Devices(result) => self.devices_listed(result),
             Msg::TestStarted(result) => self.test.started(result),
             Msg::LargePages(result) => self.large_pages_done(result),
+            Msg::AllowDriver if !self.granting_driver => {
+                self.granting_driver = true;
+                context.spawn_background_with_rejection(
+                    |_| Msg::DriverAllowed(nf_vmic::broker::authorize().map_err(|e| e.to_string())),
+                    Msg::DriverAllowed(Err(NOT_RUN.to_owned())),
+                );
+            }
+            Msg::AllowDriver => {}
+            Msg::DriverAllowed(result) => {
+                self.granting_driver = false;
+                self.notice = Some(match result {
+                    Ok(()) => Notice::new(
+                        InfoBarSeverity::Success,
+                        "Driver connection approved",
+                        "Direct output is available for this app session.",
+                    ),
+                    Err(e) => Notice::new(InfoBarSeverity::Error, "Couldn't authorize direct output", e),
+                });
+            }
             Msg::StartStop => self.start_stop(context),
             Msg::Refresh => self.refresh_devices(context),
             // `None` means WinUI cleared the selection (its items changed): keep the stored device,
@@ -704,6 +768,12 @@ impl Component for Window {
                     self.configure(|c| c.devices.mic = id);
                 }
             }
+            Msg::OutputBackend(Some(i)) if !self.test.busy() => match i {
+                0 => self.configure(|c| c.io.output_backend = OutputBackend::DriverRing),
+                1 => self.configure(|c| c.io.output_backend = OutputBackend::Wasapi),
+                _ => {}
+            },
+            Msg::OutputBackend(_) => {}
             Msg::Output(index) => {
                 if let Some(id) = index.and_then(|i| self.choices.output.id_at(i)) {
                     self.configure(|c| c.devices.output = id);
@@ -747,6 +817,20 @@ impl Component for Window {
                 g.range_db = RANGE_DB.clamp(v as f32, g.range_db);
             }),
             Msg::Vad(on) => self.configure(|c| c.processing.gate.use_vad = on),
+            Msg::ChooseEffect => self.choose_effect(context),
+            Msg::EffectChosen(result) => {
+                self.choosing_effect = false;
+                match result {
+                    Ok(Some(path)) if self.settings.engine.effect.path.as_ref() != Some(&path) => {
+                        self.configure(|c| c.effect = EffectConfig { path: Some(path), bypass: false, ..Default::default() });
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.notice = Some(Notice::new(InfoBarSeverity::Error, "Couldn't choose an effect", e)),
+                }
+            }
+            Msg::RemoveEffect => self.configure(|c| c.effect = EffectConfig::default()),
+            Msg::BypassEffect(on) => self.configure(|c| c.effect.bypass = on),
+            Msg::EffectParam { path, plugin_id, id, value } => self.set_effect_param(&path, &plugin_id, id, value),
             Msg::ShowMeters(on) => self.configure(|c| c.processing.meters_enabled = on),
             Msg::ShowReadout(on) => self.configure(|c| c.processing.latency_readout_enabled = on),
             Msg::TestMode(index) => {
@@ -818,6 +902,7 @@ impl Component for Window {
                 self.warnings_bar(context),
                 self.devices_card(context),
                 self.processing_card(context),
+                self.effect_card(context),
                 View::component::<Live>(self.live_input(context)),
                 self.test_section(context),
                 self.diagnostics_section(context),
@@ -838,10 +923,15 @@ impl Window {
         };
         let status = format::status_line(&self.status, self.job);
         Grid::new().columns([GridLength::STAR, GridLength::Auto]).column_spacing(16.0).children((
-            StackPanel::new()
-                .grid_column(0)
-                .spacing(2.0)
-                .children((TextBlock::new().text("noise-filter").font_size(28.0).font_weight(FontWeight::SEMI_BOLD), secondary(status))),
+            StackPanel::new().grid_column(0).spacing(2.0).children((
+                TextBlock::new().text("noise-filter").font_size(28.0).font_weight(FontWeight::SEMI_BOLD),
+                secondary(status),
+                if stops(&self.status) {
+                    secondary("Minimize to keep filtering. Closing the window stops the filter.").into()
+                } else {
+                    View::empty()
+                },
+            )),
             Button::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
@@ -900,19 +990,59 @@ impl Window {
         let loaded = self.devices.is_some();
         // Changing a device mid-test would break the test's loop
         let enabled = loaded && !self.test.busy();
+        let ring = self.settings.engine.io.output_backend == OutputBackend::DriverRing;
+        let cable_b = self.devices.iter().flatten().find(|d| d.flow == nf_engine::Flow::Render && d.name.contains("Noise Filter Cable B"));
+        let filtering_to_b = !ring && cable_b.is_some_and(|b| self.settings.engine.devices.output.as_ref() == Some(&b.id));
+        let plain = if filtering_to_b {
+            Some(
+                "The filter feeds the Noise Filter Cable B microphone. For a separate plain cable, play to Speakers (AudioCodec Device) \
+                  and record from its microphone.",
+            )
+        } else if cable_b.is_some() {
+            Some(
+                "For a separate plain cable, play to Speakers (Noise Filter Cable B) and record from its microphone. \
+                  Direct output feeds the AudioCodec microphone.",
+            )
+        } else if !stops(&self.status) {
+            Some("For a plain cable, leave the filter stopped. Play to Speakers (AudioCodec Device) and record from its microphone.")
+        } else {
+            None
+        };
         let placeholder = |p: &'static str| if loaded { p } else { "Loading devices…" };
         card(
             "Devices",
             None,
             StackPanel::new().spacing(12.0).children((
                 device_combo("Microphone", &self.choices.mic, placeholder("Choose a microphone"), enabled, context.callback(Msg::Mic)),
-                device_combo(
-                    "Output (virtual cable)",
-                    &self.choices.output,
-                    placeholder("Pick the cable your apps use as their mic"),
-                    enabled,
-                    context.callback(Msg::Output),
+                plain.map_or_else(View::empty, |text| secondary(text).into()),
+                combo(
+                    "Output route",
+                    &["Direct to driver", "WASAPI playback device"],
+                    usize::from(!ring),
+                    !self.test.busy(),
+                    context.callback(Msg::OutputBackend),
                 ),
+                if ring {
+                    StackPanel::new().spacing(6.0).children((
+                        secondary("Select the AudioCodec microphone in your recording or call app."),
+                        if self.elevated || nf_vmic::broker::authorized() {
+                            View::empty()
+                        } else {
+                            Button::new()
+                                .is_enabled(!self.granting_driver)
+                                .on_click(context.callback(|()| Msg::AllowDriver))
+                                .content(if self.granting_driver { "Waiting for approval…" } else { "Allow direct output…" })
+                        },
+                    ))
+                } else {
+                    device_combo(
+                        "Output (virtual cable)",
+                        &self.choices.output,
+                        placeholder("Pick the cable your apps use as their mic"),
+                        enabled,
+                        context.callback(Msg::Output),
+                    )
+                },
                 device_combo(
                     "Echo reference (speakers)",
                     &self.choices.reference,
@@ -1003,6 +1133,7 @@ impl Window {
             engine: SharedEngine(Arc::clone(&self.engine)),
             show_meters: p.meters_enabled,
             show_readout: p.latency_readout_enabled,
+            direct: self.settings.engine.io.output_backend == OutputBackend::DriverRing,
             track: track_width(self.width),
             on_show_meters: context.callback(Msg::ShowMeters),
             on_show_readout: context.callback(Msg::ShowReadout),
@@ -1104,7 +1235,9 @@ impl Window {
             };
             (s as usize, view)
         };
-        let (latency, streams) = (IoSwitch::LATENCY.map(io_switch), IoSwitch::STREAMS.map(io_switch));
+        let wasapi = io.output_backend == OutputBackend::Wasapi;
+        let latency = IoSwitch::LATENCY.into_iter().filter(|s| wasapi || matches!(s, IoSwitch::ExclusiveMic)).map(io_switch);
+        let streams = IoSwitch::STREAMS.map(io_switch);
         let heading =
             |text: &'static str| TextBlock::new().text(text).font_weight(FontWeight::SEMI_BOLD).margin(Thickness::new(0.0, 6.0, 0.0, 0.0));
         let body = StackPanel::new().spacing(12.0).children((
@@ -1114,13 +1247,13 @@ impl Window {
             secondary(EXCLUSIVE_FALLBACK),
             heading("Streams"),
             StackPanel::new().spacing(12.0).keyed_children(streams),
-            slider(
+            if wasapi { slider(
                 format::labelled("Output margin (ms)", io.output_margin_ms, 1, ""),
                 OUTPUT_MARGIN_MS,
                 io.output_margin_ms,
                 true,
                 context.callback(Msg::OutputMargin),
-            ),
+            ) } else { View::empty() },
             StackPanel::new().spacing(4.0).children((
                 Button::new()
                     .horizontal_alignment(HorizontalAlignment::Left)
@@ -1388,5 +1521,9 @@ mod tests {
         assert_eq!(c.output.selected, Some(0));
         assert_eq!(c.reference.labels, ["Default speakers"]);
         assert_eq!(c.capture.labels, ["(missing) gone"]);
+        s.engine.io.output_backend = OutputBackend::DriverRing;
+        let ring = Choices::new(&list, &s);
+        assert_eq!(ring.reference.labels, ["Default speakers", "CABLE Input"], "a saved WASAPI output never hides the ring's reference");
+        assert_eq!(ring.output.selected, Some(0), "keep the endpoint for a switch back to WASAPI");
     }
 }

@@ -463,7 +463,10 @@ CStreamEngine::Run()
     ScheduleNextPass();
 
     // noise-filter (TODO 19, spike check 5): counted per stream kind (NF_VMIC_IOCTL_STATS).
-    NfVmicRecordRun(m_StatsKind);
+    if (m_Loopback && m_Loopback->AppFeed)
+    {
+        NfVmicRecordRun(m_StatsKind);
+    }
 
     m_CurrentState = AcxStreamStateRun;
     status = STATUS_SUCCESS;
@@ -496,7 +499,7 @@ CStreamEngine::GetPresentationPosition(
     *PositionInBlocks = m_Position / blockAlign;
     *QPCPosition = (ULONGLONG)qpc.QuadPart;
 
-    if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Loopback && m_Loopback->AppFeed)
     {
         NfVmicTraceCaptureCount(NF_VMIC_TRACE_POSITION);
     }
@@ -634,6 +637,11 @@ CStreamEngine::s_EvtStreamPassCallback(
     // The same reading starts the pass's working time (NF_VMIC_STREAM_STATS.WorkQpcTicks), taken again once StreamPassCallback
     // returns: the CPU cost of a pass, for the /Os and /Ot comparison and the soak.
     //
+    if (!This->m_Loopback || !This->m_Loopback->AppFeed)
+    {
+        This->StreamPassCallback();
+        return;
+    }
     ULONG           kind = This->m_StatsKind;
     LARGE_INTEGER   passStart = KeQueryPerformanceCounter(NULL);
     {
@@ -676,7 +684,10 @@ CStreamEngine::StreamPassCallback()
     {
         qpcNotify = PacketStartQpc(completedPacket);
         InterlockedExchange64(&m_LastPacketStart.QuadPart, (LONG64)qpcNotify);
-        NfVmicTraceCaptureNotify(completedPacket, qpcNotify);
+        if (m_Loopback && m_Loopback->AppFeed)
+        {
+            NfVmicTraceCaptureNotify(completedPacket, qpcNotify);
+        }
     }
 
     // Tell ACX we've completed the packet.
@@ -751,7 +762,10 @@ CStreamEngine::ScheduleNextPass()
         m_GlitchAdjust += delay;
 
         // noise-filter (TODO 19, spike check 5): counted, with the time it moved the stream's time line.
-        NfVmicRecordGlitch(m_StatsKind, (ULONGLONG)delay);
+        if (m_Loopback && m_Loopback->AppFeed)
+        {
+            NfVmicRecordGlitch(m_StatsKind, (ULONGLONG)delay);
+        }
 
         StreamPassCallback();
 
@@ -879,7 +893,7 @@ CStreamEngine::GetCurrentPacket(
     // ACX's packet numbers are 32-bit: the count's low 32 bits (m_CurrentPacket).
     *CurrentPacket = (ULONG)currentPacket;
 
-    if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Loopback && m_Loopback->AppFeed)
     {
         NfVmicTraceCaptureCount(NF_VMIC_TRACE_CURRENT_PACKET);
     }
@@ -1105,6 +1119,10 @@ CaptureStreamOpen(
     NTSTATUS        status = STATUS_SUCCESS;
     KIRQL           oldIrql;
 
+    if (!Ring || !Ring->AppFeed)
+    {
+        return Ring ? LoopbackStreamOpen(Ring, FALSE, Format) : STATUS_INVALID_DEVICE_STATE;
+    }
     KeAcquireSpinLock(&app->Lock, &oldIrql);
 
     if (!ringFormat && app->Header != NULL)
@@ -1139,6 +1157,14 @@ CaptureStreamClose(
     PNF_APP_RING    app = &g_NfAppRing;
     KIRQL           oldIrql;
 
+    if (!Ring || !Ring->AppFeed)
+    {
+        if (Ring)
+        {
+            LoopbackStreamClose(Ring, FALSE, Format);
+        }
+        return;
+    }
     KeAcquireSpinLock(&app->Lock, &oldIrql);
 
     if (Ring != NULL)
@@ -1710,6 +1736,7 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_AppEndAttach(0),
     m_AppOtherLead(0),
     m_AppOtherValid(FALSE),
+    m_AppLiveAttach(0),
     m_AppNoSlot(FALSE)
 {
     PAGED_CODE();
@@ -1798,7 +1825,10 @@ CCaptureStreamEngine::GetCapturePacket(
     *MoreData = FALSE;
 
     // noise-filter (TODO 19): the capture-timestamp trace (NF_VMIC_CAPTURE_TRACE).
-    NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, (ULONG)(currentPacket - 1), (ULONGLONG)qpcPacketStart);
+    if (m_Loopback && m_Loopback->AppFeed)
+    {
+        NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, (ULONG)(currentPacket - 1), (ULONGLONG)qpcPacketStart);
+    }
 
     return status;
 }
@@ -1827,7 +1857,7 @@ CCaptureStreamEngine::ProcessPacket()
     // loopback pair (spike check 7). Both in place of the sample's tone generator and WAV reader (m_ToneGenerator.GenerateSine,
     // m_WaveReader.ReadWaveData).
     //
-    if (!AppRingCapturePass(currentPacket, packetBuffer, m_PacketSize))
+    if (!m_Loopback || !m_Loopback->AppFeed || !AppRingCapturePass(currentPacket, packetBuffer, m_PacketSize))
     {
         LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
     }
@@ -2275,6 +2305,18 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     ring->Stats.Passes++;
 
+    if (ring->LiveFeed && m_AppFormatOk && !m_AppNoSlot && m_AppLiveAttach != ring->Stats.Attaches)
+    {
+        m_AppLiveAttach = ring->Stats.Attaches;
+        if (ring->LiveStreams++ == 0)
+        {
+            // No recorder could consume the old queue. A new recording must never replay an earlier mic session.
+            // New streams joining or taking over from a running secondary leave both the queue and the history alone.
+            ring->ReadFrame = NfVmicLoadAcquire64(&ring->Header->WriteFrame);
+            ring->HistoryValid = FALSE;
+        }
+    }
+
     if (ring->Reader == NULL && !m_AppNoSlot)
     {
         //
@@ -2419,8 +2461,19 @@ CCaptureStreamEngine::AppRingCapturePass(
     // The counters, then read_frame with release ordering: once the app sees it, the copy is done and those slots are free.
     // READING whether or not the ring held a whole packet: an underrun is still a pass served from the ring.
     //
+    // Live producers pair the absolute read position with the QPC of this pass. Both barriers are on the driver-owned
+    // sequence (never use a read-modify-write on app-controlled memory). Ordinary feeds retain the old layout semantics.
+    if (ring->LiveFeed)
+    {
+        NfVmicStore64(&ring->Header->ClockSequence, ++ring->ClockSequence);
+        KeMemoryBarrier();
+    }
     AppRingStoreCounters(ring, NF_VMIC_STATE_ATTACHED | NF_VMIC_STATE_READING, packetFrames, qpc);
     NfVmicStoreRelease64(&ring->Header->ReadFrame, readFrame);
+    if (ring->LiveFeed)
+    {
+        NfVmicStoreRelease64(&ring->Header->ClockSequence, ++ring->ClockSequence);
+    }
 
     KeReleaseSpinLock(&ring->Lock, oldIrql);
     return TRUE;
@@ -2562,6 +2615,10 @@ _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::AppRingReaderStop()
 {
+    if (!m_Loopback || !m_Loopback->AppFeed)
+    {
+        return;
+    }
     PNF_APP_RING    ring = &g_NfAppRing;
     KIRQL           oldIrql;
 
@@ -2569,17 +2626,29 @@ CCaptureStreamEngine::AppRingReaderStop()
 
     // Under the lock: a pass of this stream on another processor reads it there (AppRingCapturePass).
     m_AppNoSlot = TRUE;
+    if (ring->Header != NULL && ring->LiveFeed && m_AppLiveAttach == ring->Stats.Attaches)
+    {
+        NT_ASSERT(ring->LiveStreams > 0);
+        --ring->LiveStreams;
+    }
+    m_AppLiveAttach = 0;
 
     if (ring->Reader == this)
     {
         ring->Reader = NULL;
         ring->ReaderState = 0;
         ring->ReaderPacketFrames = 0;
-        if (ring->Header != NULL)
+    }
+    if (ring->Reader == NULL && ring->Header != NULL)
+    {
+        // A running secondary can take the slot on its next pass. The live producer keeps writing across that handoff.
+        ULONG state = NF_VMIC_STATE_ATTACHED;
+        if (ring->LiveFeed && ring->LiveStreams != 0)
         {
-            NfVmicStore32(&ring->Header->State, NF_VMIC_STATE_ATTACHED);
-            NfVmicStore32(&ring->Header->PacketFrames, 0);
+            state |= NF_VMIC_STATE_LIVE_HANDOFF;
         }
+        NfVmicStore32(&ring->Header->State, state);
+        NfVmicStore32(&ring->Header->PacketFrames, 0);
     }
 
     KeReleaseSpinLock(&ring->Lock, oldIrql);

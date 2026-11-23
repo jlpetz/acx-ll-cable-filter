@@ -96,7 +96,7 @@ pub enum StageRole {
     EchoCancel,
     /// Noise suppression (a model plus its floor and gate).
     Noise,
-    /// Post effects (a voice changer, EQ); none in v0.
+    /// Post effects such as gain or EQ.
     Effect,
 }
 

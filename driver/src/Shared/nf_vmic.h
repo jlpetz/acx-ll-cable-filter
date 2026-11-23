@@ -8,7 +8,8 @@
     the ring's rules for the app's side: its positions, WriteFrame and ReadFrame, the fill, the State bits). NF_VMIC_STATS
     also carries its size (StatsBytes), which a reader checks with the version, so it has grown without one; and the driver's
     handling of its other capture streams (the reader's copy, handoffs, their counters) can change without one, as it has
-    at version 1 (the owner, 2026-11-23).
+    at version 1 (the owner, 2026-11-23). Ordinary ATTACH, its header and STATS keep version 1. Live ATTACH and its header
+    negotiate version 2 with NF_VMIC_ATTACH_LIVE; older drivers refuse that request with STATUS_REVISION_MISMATCH.
 
 Module Name:
 
@@ -34,7 +35,7 @@ Abstract:
         below). 998 and 1450 are in the list below too: which call returned them tells them apart. The driver checks the input's
         Magic and Version before any size, so a client of another version always gets STATUS_REVISION_MISMATCH:
           - STATUS_INVALID_DEVICE_REQUEST (ERROR_INVALID_FUNCTION, 1): not from user mode.
-          - STATUS_REVISION_MISMATCH (ERROR_REVISION_MISMATCH, 1306): the input's or the header's Version isn't NF_VMIC_VERSION.
+          - STATUS_REVISION_MISMATCH (ERROR_REVISION_MISMATCH, 1306): unsupported input version, or a header version different from the input.
           - STATUS_INVALID_BUFFER_SIZE (ERROR_INVALID_USER_BUFFER, 1784): the output buffer is shorter than NF_VMIC_MIN_RING_BYTES
             or longer than NF_VMIC_MAX_RING_BYTES, or its length isn't the header's TotalBytes and NF_VMIC_RING_BYTES(CapacityFrames).
           - STATUS_INVALID_PARAMETER (ERROR_INVALID_PARAMETER, 87): anything else in the input or the header, or an output buffer
@@ -82,8 +83,11 @@ The ring's rules:
       fill = WriteFrame - ReadFrame as an unsigned 64-bit difference: if fill > CapacityFrames (WriteFrame went backwards, or
       ran more than a ring ahead) it re-syncs, ReadFrame = WriteFrame, so the ring reads as empty, and counts it. It then copies
       min(fill, P) frames from ReadFrame, zero-fills the rest of the packet (an underrun, counted), advances ReadFrame by the
-      frames copied, and stores ReadFrame with release ordering after the copy. Every frame the app writes is delivered once
-      and in order; an underrun inserts silence and drops nothing; an app that keeps 0 <= fill <= capacity never sees a re-sync.
+      frames copied, and stores ReadFrame with release ordering after the copy. With ordinary ATTACH every frame the app writes
+      is delivered once and in order; an underrun inserts silence and drops nothing; a valid fill never causes a re-sync.
+    - NF_VMIC_ATTACH_LIVE discards unread audio on the first pass after all capture readers have stopped, including first open.
+      A live microphone producer skips writes while idle. During LIVE_HANDOFF another reader is still running: keep feeding at
+      the previous packet size until it takes the slot. Ordinary attachments (Flags = 0) retain their queued frames across idle.
     - The capacity, and the fill the app keeps, must be at least one capture packet (PacketFrames: 480 frames for a shared
       stream's 10 ms period), or every pass underruns. NF_VMIC_MIN_CAPACITY_FRAMES holds two such packets.
     - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one began to pause:
@@ -137,7 +141,7 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     ------ ---- ---------------- ------- -------------------------------------------------------------------------------
     Line 0 (0-63): set by the app before ATTACH; the driver copies it once and checks it.
        0     4  Magic            app     NF_VMIC_MAGIC
-       4     4  Version          app     NF_VMIC_VERSION
+       4     4  Version          app     the request's Version (NF_VMIC_VERSION or NF_VMIC_LIVE_VERSION)
        8     4  HeaderBytes      app     NF_VMIC_HEADER_BYTES
       12     4  CapacityFrames   app     a power of two, NF_VMIC_MIN_CAPACITY_FRAMES to NF_VMIC_MAX_CAPACITY_FRAMES
       16     4  SampleRate       app     NF_VMIC_SAMPLE_RATE (48000)
@@ -160,7 +164,7 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
      164     4  PacketFrames     driver  the packet of the stream holding the reader slot, in frames (0: none; see STATS)
      168     8  Passes           driver  capture passes of the stream holding the reader slot, FORMAT_MISMATCH ones included
      176     8  LastPassQpc      driver  KeQueryPerformanceCounter at the latest of those passes
-     184     8  Reserved2        driver  0
+     184     8  ClockSequence    driver  live attachments: even for stable ReadFrame, LastPassQpc and PacketFrames; odd while updating
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
@@ -258,6 +262,7 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
 
 #define NF_VMIC_MAGIC                   0x4D56464Eu     // "NFVM" in memory order
 #define NF_VMIC_VERSION                 1u
+#define NF_VMIC_LIVE_VERSION            2u              // opt-in ATTACH and ring header only; ordinary ATTACH and STATS stay v1
 
 #define NF_VMIC_DEVICE_NAME             L"\\Device\\NoiseFilterVmic"
 #define NF_VMIC_SYMLINK_NAME            L"\\DosDevices\\NoiseFilterVmic"
@@ -283,9 +288,13 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
 #define NF_VMIC_MAX_RING_BYTES          NF_VMIC_RING_BYTES(NF_VMIC_MAX_CAPACITY_FRAMES)     // 2,097,408
 
 // NF_VMIC_RING_HEADER.State bits.
+// Live producer: the first pass after all readers have stopped drops pre-existing audio. Ordinary feeds preserve every frame.
+#define NF_VMIC_ATTACH_LIVE             0x00000001u
+
 #define NF_VMIC_STATE_ATTACHED          0x00000001u     // the driver published this ring
 #define NF_VMIC_STATE_READING           0x00000002u     // the stream holding the reader slot read it at its latest pass (underrun or not)
 #define NF_VMIC_STATE_FORMAT_MISMATCH   0x00000004u     // that stream isn't 48 kHz float32 stereo: silence, the ring not read
+#define NF_VMIC_STATE_LIVE_HANDOFF      0x00000008u     // live attachment: another running reader can take the vacant slot
 
 // NF_VMIC_STATS.Flags bits.
 #define NF_VMIC_STATS_ATTACHED          0x00000001u     // an app ring is attached (the Attached* fields are valid)
@@ -305,9 +314,9 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
 // size, and the header's before its other fields.
 typedef struct _NF_VMIC_ATTACH_IN {
     UINT32  Magic;                      //   0: NF_VMIC_MAGIC
-    UINT32  Version;                    //   4: NF_VMIC_VERSION
+    UINT32  Version;                    //   4: NF_VMIC_VERSION or NF_VMIC_LIVE_VERSION
     UINT32  InBytes;                    //   8: sizeof(NF_VMIC_ATTACH_IN)
-    UINT32  Flags;                      //  12: 0
+    UINT32  Flags;                      //  12: 0 or NF_VMIC_ATTACH_LIVE
 } NF_VMIC_ATTACH_IN, *PNF_VMIC_ATTACH_IN;
 
 typedef struct _NF_VMIC_RING_HEADER {
@@ -336,7 +345,7 @@ typedef struct _NF_VMIC_RING_HEADER {
     UINT32  PacketFrames;               // 164
     UINT64  Passes;                     // 168
     UINT64  LastPassQpc;                // 176
-    UINT64  Reserved2;                  // 184
+    UINT64  ClockSequence;              // 184: live attachment only
     // Line 3.
     UINT8   Reserved3[64];              // 192
 } NF_VMIC_RING_HEADER, *PNF_VMIC_RING_HEADER;

@@ -72,6 +72,9 @@ typedef struct _NF_APP_RING {
     PUCHAR                  Data;                   // and its frames, Header + NF_VMIC_HEADER_BYTES
     ULONG                   CapacityFrames;         // from the header's copy at ATTACH; never read from the ring again
     ULONG                   AttachPid;
+    BOOLEAN                 LiveFeed;               // opt-in NF_VMIC_ATTACH_LIVE
+    ULONG                   LiveStreams;            // streams that passed since the end of the last idle interval
+    ULONGLONG               ClockSequence;          // producer-owned, never read from the app mapping
     ULONGLONG               ReadFrame;              // the driver's position: stored to Header->ReadFrame, never read back
     ULONGLONG               LastWriteSeen;          // the WriteFrame the latest pass read (STATS; untrusted)
     PVOID                   Reader;                 // the CCaptureStreamEngine holding the reader slot, or NULL
@@ -248,7 +251,7 @@ NfVmic_DriverInit(
 
 __declspec(noinline)
 __drv_requiresIRQL(PASSIVE_LEVEL)
-VOID
+NTSTATUS
 NfVmic_DeviceAdd(
     _In_ WDFDRIVER      Driver,
     _In_ WDFDEVICE      Device,

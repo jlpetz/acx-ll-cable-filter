@@ -170,11 +170,10 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 15. [gui] Settings window (Reactor)
-**Priority**: Medium (phase 3) | **Status**: designed.
-- Device pickers (mic, output cable, echo reference), AEC and noise-filter checkboxes, floor/gate controls, model picker, meter, latency readout, the Lab page.
-- A separate process that talks to the engine over a named pipe. Owner: minimise for now; once #16's tray exists, the window closes freely and the tray reopens or starts it.
-- Noise filter off means bypassed: the model isn't run and its delay is removed (a brief jump on toggle is fine).
-**Next**: after phase 2.
+**Priority**: High for v0.1 | **Status**: settings window implemented. Stopped and running acceptance passed on the virtual dev box.
+- The window selects the mic, echo reference and output route, starts and stops the filter, controls AEC, RNNoise and the gate, and shows meters and latency. It loads a CLAP effect with bypass and parameter controls.
+- Settings survive close and reopen. Minimise keeps the process alive. Closing stops the engine. The tray and background engine are TODO 16.
+**Next**: verify the standard-user grant and physical Windows 11 experience. The later model-pack picker and quality Lab page have separate scope.
 **Detail**: `doc/todo/15-gui-tray.md`
 
 ---
@@ -194,7 +193,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
 - EQ, voice changers and automatic gain control are in scope (owner, 2026-11-20). Evaluate Sonora AGC2 as an optional app effect that can run with AEC and denoising off.
 - Exact mute (not built; detail, "Exact mute"): an end stage writing exact zeros, the owner's (agreed 2026-11-22, for later; TODO 10); as an explicit output guarantee, triggered once the mic as captured has been exact zeros for longer than the chain's latency plus a tail, ours (2026-11-23, the owner's to confirm). The filters don't get there alone: with the far end playing, AEC3 puts out -75 to -89 dBFS from a silent mic, and no gate after AEC3 brings that to 24-bit zero.
-**Next**: recheck CLAP's headers before the .clap export (doc/todo/17's list); a lock-free queue for stages' own params with the GUI (#15) or the first effect.
+- The app hosts one external `.clap` after the built-ins. A restricted worker processes the audio, the GUI edits its parameters and bypass, and offline WAV rendering uses the same effect. An independent gain plugin exercises the public ABI.
+**Next**: test additional third-party effects against the host profile; recheck CLAP's headers before exporting the built-in stages.
 **Detail**: `doc/todo/17-post-effects.md`
 
 ---
@@ -212,7 +212,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 19. [driver] Our own virtual mic
-**Priority**: High (after v0 live testing) | **Status**: option D chosen by the owner 2026-10-28 as the main goal: our own root-enumerated virtual audio driver, based on an existing open-source one and cut down to what we need. VB-CABLE (C) stays the v0 path and the latency/CPU benchmark; usbip-win2 (B) is a lab comparison at most.
+**Priority**: High | **Status**: the app feeds A directly or through WASAPI. A's call and low-latency mics share one signal. Optional Cable B is independent. Both work standalone. Simultaneous routes passed on the dev VM. Setup: `driver/README.md`. Baseline: VB-CABLE.
 - Owner's criteria: latency and quality at least VB-CABLE's; controllable from inside the app; open source others can reuse.
 - Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
 - Base (study 2026-10-28): Microsoft's ACX AudioCodec sample (MS-PL), cut down, borrowing microsoft/low-latency-audio's (MIT) packet-size code and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.

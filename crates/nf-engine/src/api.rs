@@ -6,14 +6,16 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use nf_core::config::{
-    AUTO_MODEL_DEPTH, BURSTY_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EngineConfig, GateConfig, GateMode, HighBand, IoConfig,
-    MAX_MODEL_DEPTH, MicDelivery, ProcessingConfig, STEADY_MODEL_DEPTH, is_model_id,
+    AUTO_MODEL_DEPTH, BURSTY_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EffectConfig, EngineConfig, GateConfig, GateMode, HighBand,
+    IoConfig, MAX_MODEL_DEPTH, MicDelivery, OutputBackend, ProcessingConfig, STEADY_MODEL_DEPTH, is_model_id,
 };
 pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{
     BudgetTotals, ECHO_GUARD_COOLING, ECHO_GUARD_HELD, ECHO_GUARD_TRIAL, ECHO_GUARD_WATCHING, EngineState, LatencyBudget, MeterSnapshot,
     OutputEvents, REFERENCE_TARGET_HIGH_MS, TelemetrySnapshot, WakeBlocks,
 };
+
+pub use crate::effect::{EffectInfo, attach_offline_effect};
 
 /// Endpoint direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -965,6 +967,11 @@ impl Engine {
     /// device, I/O or AEC changes trigger an early retry.
     pub fn apply(&self, config: &EngineConfig) {
         crate::control::apply(&self.inner, config)
+    }
+
+    /// The external effect in the active chain, including any blocks that fell back to aligned dry audio.
+    pub fn effect_info(&self) -> Option<EffectInfo> {
+        crate::control::lock(&self.inner.effect).as_ref().map(crate::effect::LoadedEffect::snapshot)
     }
 
     pub fn telemetry(&self) -> TelemetrySnapshot {

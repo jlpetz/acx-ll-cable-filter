@@ -1,0 +1,165 @@
+//! Elevated side. Its entire input after authentication is START or STOP; its only transfer is an anonymous ring into the
+//! kernel-identified parent process. No command can supply a path, a handle, a capacity or a duplication target.
+
+use std::fs::OpenOptions;
+use std::os::windows::fs::OpenOptionsExt;
+
+use windows::Win32::Foundation::DuplicateHandle;
+use windows::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
+use windows::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE};
+use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSListen, WTSQuerySessionInformationW,
+    WTSUserName,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    QueryFullProcessImageNameW,
+};
+use windows::core::PWSTR;
+
+use super::*;
+
+pub(super) const FLAG: &str = "--vmic-broker";
+
+fn image(process: HANDLE) -> io::Result<Vec<u16>> {
+    let mut path = vec![0; 32768];
+    let mut len = path.len() as u32;
+    // SAFETY: a queryable process and a writable buffer whose element count we supply.
+    unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len) }.map_err(io_error)?;
+    path.truncate(len as usize);
+    Ok(path)
+}
+
+fn session_id(pid: u32) -> io::Result<u32> {
+    let mut session = 0;
+    // SAFETY: one live output word.
+    unsafe { ProcessIdToSessionId(pid, &mut session) }.map_err(io_error)?;
+    Ok(session)
+}
+
+/// The microphone is machine-global. Grant access only while the requester is the sole logged-in interactive session.
+fn check_sessions(own: u32) -> io::Result<()> {
+    struct WtsBuffer(*mut core::ffi::c_void);
+    impl Drop for WtsBuffer {
+        fn drop(&mut self) {
+            // SAFETY: the WTS call allocated this buffer, and ownership is unique.
+            unsafe { WTSFreeMemory(self.0) };
+        }
+    }
+    let mut count = 0;
+    let mut sessions: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    // SAFETY: local server. On success WTS returns a counted array valid until WTSFreeMemory.
+    unsafe { WTSEnumerateSessionsW(None, 0, 1, &mut sessions, &mut count) }.map_err(io_error)?;
+    let _sessions = WtsBuffer(sessions.cast());
+    if sessions.is_null() || count == 0 || own == 0 {
+        return Err(denied());
+    }
+    let mut active = false;
+    // SAFETY: WTS supplied `count` live WTS_SESSION_INFOW values.
+    for s in unsafe { std::slice::from_raw_parts(sessions, count as usize) } {
+        if s.SessionId == own {
+            active = s.State == WTSActive;
+        } else if s.SessionId != 0 && s.State != WTSListen {
+            let mut user = PWSTR::null();
+            let mut bytes = 0;
+            // SAFETY: WTS supplies this buffer and its byte count; we only check that the first UTF-16 unit is nonzero.
+            unsafe { WTSQuerySessionInformationW(None, s.SessionId, WTSUserName, &mut user, &mut bytes) }.map_err(io_error)?;
+            let _user = WtsBuffer(user.0.cast());
+            // SAFETY: an available first code unit is inside the WTS-owned buffer.
+            if bytes >= 2 && !user.is_null() && unsafe { *user.0 } != 0 {
+                return Err(denied());
+            }
+        }
+    }
+    if active { Ok(()) } else { Err(denied()) }
+}
+
+fn connect_parent(pipe: &File, expected: u32) -> io::Result<(OwnedHandle, u32)> {
+    let mut peer = 0;
+    // SAFETY: read-only peer query on our connected local pipe.
+    unsafe { GetNamedPipeServerProcessId(raw(pipe), &mut peer) }.map_err(io_error)?;
+    if peer == 0 || peer != expected {
+        return Err(denied());
+    }
+    // SAFETY: the PID is the actual pipe creator. Opening a process handle pins this PID through every later duplication.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE, false, peer) }
+        .map_err(io_error)?;
+    // SAFETY: OpenProcess handed us ownership.
+    let process = unsafe { OwnedHandle::from_raw_handle(h.0) };
+    let session = session_id(peer)?;
+    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for this image query.
+    if session != session_id(std::process::id())? || !alive(&process) || image(h)? != image(unsafe { GetCurrentProcess() })? {
+        return Err(denied());
+    }
+    check_sessions(session)?;
+    Ok((process, session))
+}
+
+fn start_feed(parent: &OwnedHandle, active: &mut Option<Attachment>) -> io::Result<u64> {
+    if active.is_some() {
+        return Err(io::Error::from_raw_os_error(ERROR_BUSY.0 as i32));
+    }
+    let (ring, section) = RingMemory::shared(LIVE_CAPACITY)?;
+    let attachment = Device::open()?.attach_live(ring).map_err(|e| e.error)?;
+    let mut remote = HANDLE::default();
+    // SAFETY: fresh anonymous pagefile section only; verified, live recipient. Limit access to the two view rights and disallow inheritance.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            *section,
+            raw(parent),
+            &mut remote,
+            FILE_MAP_READ.0 | FILE_MAP_WRITE.0,
+            false,
+            Default::default(),
+        )
+    }
+    .map_err(io_error)?;
+    *active = Some(attachment);
+    Ok(remote.0 as usize as u64)
+}
+
+pub(super) fn serve(pid: u32, nonce: &str) -> io::Result<()> {
+    let mut pipe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .security_qos_flags((SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS).0)
+        .open(connection::name(pid, nonce))?;
+    // SAFETY: never let a caller that stops draining the pipe block this privileged loop or its session checks.
+    unsafe { SetNamedPipeHandleState(raw(&pipe), Some(&(PIPE_READMODE_BYTE | PIPE_NOWAIT)), None, None) }.map_err(io_error)?;
+    let (parent, session) = match connect_parent(&pipe, pid) {
+        Ok(pair) => pair,
+        Err(e) => return reply(&mut pipe, Err(e)),
+    };
+    reply(&mut pipe, Ok(0))?;
+    let mut active = None;
+    let mut checked = Instant::now();
+    while alive(&parent) {
+        if checked.elapsed() >= Duration::from_millis(200) {
+            check_sessions(session)?;
+            checked = Instant::now();
+        }
+        let pending = match available(&pipe) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if pending == 0 {
+            std::thread::sleep(POLL);
+            continue;
+        }
+        let mut command = [0];
+        pipe.read_exact(&mut command)?;
+        let result = match command[0] {
+            START => check_sessions(session).and_then(|()| start_feed(&parent, &mut active)),
+            STOP => match active.take() {
+                Some(attachment) => attachment.detach().map(|_| 0),
+                None => Ok(0),
+            },
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        };
+        reply(&mut pipe, result)?;
+    }
+    Ok(())
+}

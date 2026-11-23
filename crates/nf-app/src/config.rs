@@ -116,6 +116,14 @@ pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Ve
     };
     args.processing.apply(&mut cfg.processing);
     args.io.apply(&mut cfg.io);
+    if let Some(backend) = args.output_backend {
+        cfg.io.output_backend = backend;
+    }
+    if cfg.io.output_backend == nf_engine::OutputBackend::DriverRing && args.output.is_some() {
+        return Err(Failure::usage(
+            "--output selects a WASAPI device. Use --output-backend wasapi with it, or omit --output for driver-ring.",
+        ));
+    }
     if args.mic.is_some() || args.output.is_some() || args.reference.is_some() {
         let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
         let resolve = |q: &Option<String>, flow, what| -> Result<Option<String>, Failure> {
@@ -131,7 +139,7 @@ pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Ve
             cfg.devices.reference = Some(id);
         }
     }
-    if cfg.devices.output.as_deref().is_none_or(str::is_empty) {
+    if cfg.io.output_backend == nf_engine::OutputBackend::Wasapi && cfg.devices.output.as_deref().is_none_or(str::is_empty) {
         return Err(Failure::usage(
             "Choose the playback device the filtered mic goes to with --output, e.g. --output \"CABLE Input\" \
              (`noise-filter devices` lists them)",
@@ -165,6 +173,16 @@ mod tests {
             dev("{ren-2}", "CABLE Input 2 (VB-Audio Virtual Cable)", Flow::Render),
             dev("{ren-3}", "CABLE Input", Flow::Render),
         ]
+    }
+
+    #[test]
+    fn direct_output_needs_no_playback_endpoint() {
+        let mut args = EngineArgs { output_backend: Some(nf_engine::OutputBackend::DriverRing), ..Default::default() };
+        let cfg = engine_config(&args, || panic!("no WASAPI output to resolve")).unwrap();
+        assert!(cfg.devices.output.is_none());
+        assert_eq!(cfg.io.output_backend, nf_engine::OutputBackend::DriverRing);
+        args.output = Some("some cable".into());
+        assert!(engine_config(&args, || panic!("conflicting route")).is_err());
     }
 
     #[test]

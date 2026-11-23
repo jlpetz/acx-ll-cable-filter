@@ -624,6 +624,22 @@ mod tests {
         assert_eq!(parse(&serde_json::to_vec(&Settings::default()).unwrap()).unwrap(), Settings::default());
     }
 
+    #[test]
+    fn old_settings_keep_wasapi_and_direct_output_and_effect_settings_survive_a_relaunch() {
+        let mut settings = parse(br#"{"engine":{"devices":{"output":"cable"}}}"#).unwrap();
+        assert_eq!(settings.engine.io.output_backend, nf_engine::OutputBackend::Wasapi);
+        assert_eq!(settings.engine.effect, nf_engine::EffectConfig::default());
+        settings.engine.io.output_backend = nf_engine::OutputBackend::DriverRing;
+        settings.engine.effect = nf_engine::EffectConfig {
+            path: Some("C:/Effects/Studio Gain.clap".into()),
+            plugin_id: Some("test.gain".into()),
+            bypass: true,
+            params: [(7, 0.25)].into(),
+            worker_blocks: 2,
+        };
+        assert_eq!(parse(&serde_json::to_vec_pretty(&settings).unwrap()).unwrap(), settings);
+    }
+
     /// The I/O switches: each reads and writes its own field, the latency options are on by default (the owner, 2026-11-02),
     /// and a change goes through the settings file and back.
     #[test]

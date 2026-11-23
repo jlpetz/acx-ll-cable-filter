@@ -11,6 +11,19 @@ pub struct EngineConfig {
     pub devices: DeviceSelection,
     pub processing: ProcessingConfig,
     pub io: IoConfig,
+    pub effect: EffectConfig,
+}
+
+/// The optional external CLAP effect after the noise stage. Parameter IDs belong to the selected plugin.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EffectConfig {
+    pub path: Option<std::path::PathBuf>,
+    pub plugin_id: Option<String>,
+    pub bypass: bool,
+    pub params: std::collections::BTreeMap<u32, f64>,
+    /// Worker delay in 10 ms blocks. Zero selects from mic delivery; saved chain recordings carry the actual depth.
+    pub worker_blocks: u8,
 }
 
 /// Endpoint ids (WASAPI device ids). `None` = the system default for that role.
@@ -245,10 +258,20 @@ impl Default for GateConfig {
     }
 }
 
+/// Where the engine sends processed audio. Older settings keep their selected WASAPI playback device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputBackend {
+    #[default]
+    Wasapi,
+    DriverRing,
+}
+
 /// Device-side choices. Changing any of these restarts the streams.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IoConfig {
+    pub output_backend: OutputBackend,
     /// Try IAudioClient3's smallest shared-mode period on the mic (falls back to the default).
     pub low_latency_periods: bool,
     /// Open the mic in RAW mode where the device supports it (no OEM effects ahead of AEC3).
@@ -281,6 +304,7 @@ pub struct IoConfig {
 impl Default for IoConfig {
     fn default() -> Self {
         Self {
+            output_backend: OutputBackend::Wasapi,
             low_latency_periods: true,
             raw_mic: true,
             output_margin_ms: 2.0,

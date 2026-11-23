@@ -89,6 +89,8 @@ pub(crate) enum StartFailure {
     DefaultMicIsOutput(String),
     /// Opening or starting a stream failed with this HRESULT.
     Open { role: StreamRole, hr: i32 },
+    /// Opening the live driver attachment failed. A removed or busy device can become available again.
+    DriverRing { message: String, retry: bool },
     /// A stage refused to start.
     Stage(String),
     /// The audio thread ended without reporting (it panicked).
@@ -141,6 +143,7 @@ impl StartFailure {
             StartFailure::NotFound(_) | StartFailure::DefaultMicIsOutput(_) => true,
             StartFailure::Timeout | StartFailure::ThreadDied | StartFailure::DriverBusy => true,
             StartFailure::Open { hr, .. } => transient_hr(*hr),
+            StartFailure::DriverRing { retry, .. } => *retry,
             _ => false,
         }
     }
@@ -182,7 +185,9 @@ pub(crate) fn remedy_for_fault(f: Fault) -> Option<Remedy> {
 /// a real mic and real speakers.
 pub(crate) fn is_virtual_cable(name: &str) -> bool {
     let n = name.to_lowercase();
-    ["vb-audio", "voicemeeter", "virtual audio cable", "virtual cable"].iter().any(|k| n.contains(k))
+    ["vb-audio", "voicemeeter", "virtual audio cable", "virtual cable", "audiocodec device", "noise filter cable b"]
+        .iter()
+        .any(|k| n.contains(k))
 }
 
 /// What stopped a running audio thread. Packed into one `AtomicU64` so the audio thread can
@@ -300,6 +305,7 @@ pub(crate) fn describe_start_failure(f: &StartFailure) -> String {
             "The default microphone is the recording side of the output cable ({adapter}), so the filter would only hear its own output. Pick your real microphone, or make it the default; the filter starts when the default changes."
         ),
         StartFailure::Open { role, hr } => describe_hr(*role, *hr),
+        StartFailure::DriverRing { message, .. } => message.clone(),
         StartFailure::Stage(msg) => format!("The audio processing couldn't start: {msg}"),
         StartFailure::ThreadDied => "The audio thread stopped unexpectedly while starting. Check the log file.".to_owned(),
         StartFailure::Timeout => "The audio devices took too long to open. Check that they're connected and try again.".to_owned(),

@@ -101,6 +101,10 @@ impl ClockReading {
 
 /// A render stream as the pipeline sees it. Frames are at the app's 48 kHz.
 pub(crate) trait RenderSink {
+    /// For a direct feed, the capture reader's actual packet, or zero while no recorder is running.
+    fn driver_packet(&self) -> Option<usize> {
+        None
+    }
     fn buffer_frames(&self) -> usize;
     /// Frames queued in the device buffer.
     fn padding(&mut self) -> Result<usize, Hr>;
@@ -330,6 +334,7 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     out_target: usize,
     out_period: usize,
     out_margin: usize,
+    driver_ring: bool,
     /// The output target follows the delivery (`IoConfig::adaptive_output`; out_target.rs); `None`: it's fixed.
     adaptive: Option<AdaptiveTarget>,
     pending: Box<[f32]>,
@@ -419,6 +424,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             out_target: cfg.out_target(),
             out_period: cfg.out_period,
             out_margin: cfg.out_margin,
+            driver_ring: false,
             adaptive: None,
             pending: vec![0.0; PENDING].into_boxed_slice(),
             pending_len: 0,
@@ -467,6 +473,13 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     pub(crate) fn with_adaptive_target(mut self) -> Self {
         self.adaptive = Some(AdaptiveTarget::new(self.out_period + self.out_margin, self.out_target));
         self
+    }
+
+    /// A direct feed obtains its target and clock from the capture reader, which may open long after the engine starts.
+    pub(crate) fn for_driver_ring(&mut self) {
+        self.driver_ring = true;
+        self.out_period = 0;
+        self.set_out_target(0);
     }
 
     /// The echo-path guard (`IoConfig::echo_guard`; echo_guard.rs) watches for an echo that comes before its reference, and
@@ -885,9 +898,30 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let sink_dry = sink.take_underruns();
         // Its device events answered late (the thread held up past the device's deadline), and the silence its device
         // played meanwhile; before the first block, as its underruns, they aren't counted.
-        let late = if self.out_started { sink.take_late() } else { (sink.take_late(), 0).1 };
+        let late = sink.take_late();
         let silence = sink.take_silence();
-        let silence = if self.out_started { silence } else { 0 };
+        let driver_packet = sink.driver_packet();
+        if let Some(packet) = driver_packet {
+            if packet != self.out_period {
+                self.out_period = packet;
+                self.fill_offset = FillOffset::new(packet);
+                self.set_out_target(packet);
+                self.out_drift.reset(packet as f32);
+                self.out_started = false;
+                if packet == 0 {
+                    self.latency_ms.clear();
+                    self.budget.clear();
+                }
+            }
+            if packet == 0 {
+                // A paused or absent recorder cannot take this block. Avoid retaining stale mic audio or counting fake underruns.
+                self.pending_len = 0;
+                self.last_out_fill = 0.0;
+                self.last_latency_ms = None;
+                return Ok(());
+            }
+        }
+        let (late, silence) = if self.out_started { (late, silence) } else { (0, 0) };
         self.counters.output_silence_frames += silence;
         self.counters.output_late_answers += late;
         let mut padding = sink.padding()?;
@@ -919,7 +953,8 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // device was found empty, or a real deficit (below). The adaptive target rises at once, and the deficit's zeros
         // below fill the device to it.
         let short = low && queued + (BLOCK as f64) < self.out_target as f64;
-        let dry = self.out_started && (sink_dry > 0 || (low && padding == 0) || short);
+        // A direct feed counts actual missing frames. Its reader can consume exactly the last queued frame without going short.
+        let dry = self.out_started && (sink_dry > 0 || (driver_packet.is_none() && ((low && padding == 0) || short)));
         // A late answer is an underrun too, but not the queue's: it doesn't strike the adaptive target, as a deeper queue
         // can't make the thread answer sooner (a bigger device period can: control.rs's exclusive period guard).
         let late = late > 0;
@@ -1091,13 +1126,26 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// mic's delivery to the wake that read the block's first sample, the wait from there to this write (the clock's
     /// reading), the queue `ahead` of it, and the render side, the rest.
     fn readout(&mut self, clock: ClockReading, index: u64, ahead: f64, times: BlockTimes) {
-        let t_play = play_time_hns(clock, index, SAMPLE_RATE as f64);
+        let t_play = if self.driver_ring {
+            driver_delivery_hns(clock, index, self.out_period)
+        } else {
+            play_time_hns(clock, index, SAMPLE_RATE as f64)
+        };
         if let Some(ms) = readout_ms(t_play, times.capture_hns) {
             self.latency_ms.push(ms);
             self.last_latency_ms = Some(ms);
             // A first sample no wake delivered can't be; it would be timed as delivered at the write (no wait).
             let wake = times.wake_hns.unwrap_or(clock.now_hns);
-            let b = budget::split(times.capture_hns, wake, clock.now_hns, t_play, ahead, times.chain);
+            let b = if self.driver_ring {
+                // The ring is the only output queue. It holds the frame until the capture pass releases it; there is no
+                // independent render stream to measure. Include the residual fraction of the capture packet in that queue time.
+                let mut b = budget::split(times.capture_hns, wake, clock.now_hns, t_play, 0.0, times.chain);
+                b.queue_ms = b.render_ms;
+                b.render_ms = 0.0;
+                b
+            } else {
+                budget::split(times.capture_hns, wake, clock.now_hns, t_play, ahead, times.chain)
+            };
             self.budget.push(&b);
             self.last_budget = Some(b);
         }
@@ -1211,6 +1259,9 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             self.set_out_target(t);
         }
         tel.output_target_ms.store(self.out_target as f32 * (1000.0 / SAMPLE_RATE as f32));
+        if self.driver_ring {
+            tel.output_period_ms.store(self.out_period as f32 * (1000.0 / SAMPLE_RATE as f32));
+        }
         tel.output_target_on_trial.store(self.adaptive.as_ref().is_some_and(AdaptiveTarget::on_trial), Relaxed);
         tel.output_drift_ppm.store(self.out_drift.ppm());
         tel.output_fill_ms.store((self.last_out_fill * (1000.0 / SAMPLE_RATE as f64)) as f32);
@@ -1284,6 +1335,15 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 #[inline]
 pub(crate) fn play_time_hns(clock: ClockReading, index: u64, fs: f64) -> f64 {
     clock.qpc_hns + (index as f64 - clock.pos_frames) * (HNS_PER_S / fs)
+}
+
+/// The driver releases a complete packet at once. `pos_frames` is the first frame still to read at the last pass.
+/// The recorder's callback can run later; this estimate ends at the predicted capture pass.
+fn driver_delivery_hns(clock: ClockReading, index: u64, packet: usize) -> f64 {
+    let frames = packet.max(1) as f64;
+    let passes = ((index as f64 - clock.pos_frames) / frames).floor() + 1.0;
+    // A late reader may already be past its predicted deadline. An unpublished frame can only be delivered from this write onward.
+    (clock.qpc_hns + passes * frames * HNS_PER_SAMPLE).max(clock.now_hns)
 }
 
 /// `t_play - t_capture` in ms, or `None` when it can't be a real latency (a bad stamp, or the
@@ -1593,6 +1653,7 @@ mod tests {
     /// consumption rate can be simulated.
     struct FakeSink {
         buffer: usize,
+        driver_packet: Option<usize>,
         padding: f64,
         played: f64,
         now_hns: f64,
@@ -1604,7 +1665,17 @@ mod tests {
 
     impl FakeSink {
         fn new(buffer: usize) -> Self {
-            Self { buffer, padding: 0.0, played: 0.0, now_hns: 1e10, written: Vec::new(), silence: 0, dry_frames: 0.0, fail_write: None }
+            Self {
+                buffer,
+                driver_packet: None,
+                padding: 0.0,
+                played: 0.0,
+                now_hns: 1e10,
+                written: Vec::new(),
+                silence: 0,
+                dry_frames: 0.0,
+                fail_write: None,
+            }
         }
         /// The device plays `frames` frames over `dt_hns`.
         fn advance(&mut self, frames: f64, dt_hns: f64) {
@@ -1617,6 +1688,9 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
+        fn driver_packet(&self) -> Option<usize> {
+            self.driver_packet
+        }
         fn take_late(&mut self) -> u64 {
             0
         }
@@ -1675,6 +1749,57 @@ mod tests {
         assert_eq!(c.out_target(), 480 + 480 + 96);
         assert_eq!(c.ref_target(), 480 + REF_MARGIN);
         assert_eq!(cfg(false).ref_target(), 0);
+    }
+
+    #[test]
+    fn driver_feed_discards_idle_blocks_and_uses_the_current_readers_packet() {
+        let mut p = pipe(false);
+        p.for_driver_ring();
+        let mut sink = FakeSink::new(8192);
+        sink.driver_packet = Some(0);
+        p.out_blk.fill(-0.5);
+        p.push_output(&mut sink, None).unwrap();
+        assert!(sink.written.is_empty());
+        assert_eq!(p.out_target(), 0);
+        sink.driver_packet = Some(128);
+        p.out_blk.fill(0.25);
+        p.push_output(&mut sink, None).unwrap();
+        assert_eq!(p.out_target(), 128);
+        assert_eq!(sink.written[..128], [0.0; 128]);
+        assert_eq!(sink.written[128..], [0.25; BLOCK]);
+        sink.advance((128 + BLOCK) as f64, 130_000.0);
+        p.push_output(&mut sink, None).unwrap();
+        assert_eq!(p.counters.render_underruns, 0); // Exactly drained; the device inserted no silence.
+        sink.driver_packet = Some(0);
+        let old = sink.written.len();
+        p.out_blk.fill(-0.5);
+        p.push_output(&mut sink, None).unwrap();
+        assert_eq!(sink.written.len(), old);
+        sink.padding = 0.0; // The live driver's first pass discards the previous recording's unread prefix.
+        sink.driver_packet = Some(480);
+        p.out_blk.fill(0.75);
+        p.push_output(&mut sink, None).unwrap();
+        assert_eq!(p.out_target(), 480);
+        assert_eq!(sink.written[old + 480..], [0.75; BLOCK]);
+        assert!(!sink.written.contains(&-0.5));
+    }
+
+    #[test]
+    fn driver_clock_releases_each_whole_packet_at_one_instant() {
+        let c = ClockReading { pos_frames: 432.0, qpc_hns: 1e7, now_hns: 1e7 + 212.0 };
+        for index in [432, 433, 559] {
+            assert_eq!(driver_delivery_hns(c, index, 128), 1e7 + 128.0 * HNS_PER_SAMPLE);
+        }
+        assert_eq!(driver_delivery_hns(c, 560, 128), 1e7 + 256.0 * HNS_PER_SAMPLE);
+        let late = ClockReading { now_hns: 1e7 + 200_000.0, ..c };
+        assert_eq!(driver_delivery_hns(late, 432, 128), late.now_hns);
+        let mut p = pipe(false);
+        p.for_driver_ring();
+        p.out_period = 128;
+        p.readout(c, 433, 480.0, BlockTimes { capture_hns: 1e7 - 1e5, wake_hns: Some(1e7), chain: 480 });
+        let b = p.last_budget.unwrap();
+        assert_eq!(b.render_ms, 0.0);
+        assert!((b.queue_ms - (128.0 * HNS_PER_SAMPLE - 212.0) as f32 * 1e-4).abs() < 1e-5);
     }
 
     /// Index-coded samples, plus one so that a zero is a filled-in sample.

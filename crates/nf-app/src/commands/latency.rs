@@ -33,13 +33,23 @@ pub fn latency(args: &LatencyArgs) -> Result<(), Failure> {
     // Armed before the start, the chain recorder holds every block from the first: the readout's inputs at start-up.
     let recorder = match &args.save_blocks {
         Some(_) => {
-            let limit = BLOCKS_LIMIT_S + if args.settle { 320.0 } else { 0.0 } + 3.0 * f64::from(args.repetitions);
+            let wait = super::run::target_wait(&cfg, args.settle).waits();
+            let limit = BLOCKS_LIMIT_S + if wait { 320.0 } else { 0.0 } + 3.0 * f64::from(args.repetitions);
             Some(engine.record_chain(limit).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?)
         }
         None => None,
     };
-    super::run::start_engine(&engine, &cfg)?;
+    super::run::start_engine(&engine, &cfg, args.engine.allow_driver)?;
     let result = measure(&engine, &cfg, args, probe, capture);
+    if let Some(fx) = engine.effect_info() {
+        say!(
+            "Effect {} processed {} blocks, missed {} deadlines, worker failed {}.",
+            fx.name,
+            fx.processed_blocks,
+            fx.missed_blocks,
+            fx.failed
+        );
+    }
     let chain = recorder.map(nf_engine::ChainRecorder::stop);
     engine.stop();
     console::finished();

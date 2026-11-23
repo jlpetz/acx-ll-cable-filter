@@ -34,6 +34,7 @@ mod convert;
 mod csv;
 mod devices;
 mod echo_guard;
+mod effect;
 mod errors;
 mod exclusive;
 mod fifo;
@@ -48,6 +49,7 @@ mod pipeline;
 mod play_record;
 mod recorder;
 mod reference;
+mod ring_output;
 mod sched;
 mod stream;
 #[cfg(test)]

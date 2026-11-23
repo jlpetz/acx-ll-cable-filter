@@ -1,6 +1,6 @@
 //! The ring's memory and its writer.
 //!
-//! [`RingMemory`] is one page-aligned, zeroed `VirtualAlloc` region with line 0 of the header filled in: what ATTACH takes as its
+//! [`RingMemory`] is one page-aligned, zeroed allocation or shared section with line 0 of the header filled in: what ATTACH takes as its
 //! output buffer. Once attached it is marked so: the driver starts every attachment at frame 0, so a ring goes back to the
 //! driver only after [`RingMemory::reset`]. [`Writer`] writes frames from `write_frame` on into free slots only
 //! (`[write_frame, read_frame + capacity)`), then publishes `write_frame` with release ordering. [`top_up`] is the pacing rule:
@@ -11,12 +11,17 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc, VirtualFree, VirtualLock,
+};
+use windows::core::{Owned, PCWSTR};
 
 use crate::protocol::{self, CHANNELS, FORMAT_FLOAT32, FRAME_BYTES, HEADER_BYTES, LINE_BYTES, MAGIC, RingHeader, SAMPLE_RATE, VERSION};
 use crate::ring::slot;
 
-/// The ring: header and frames, one `VirtualAlloc` region (page-aligned, as the driver requires), freed on drop.
+/// A ring header and its frames, in a private reservation or a pagefile section. Both are page-aligned and released on drop.
 ///
 /// While attached, an [`Attachment`](crate::Attachment) owns it, so it can't be freed under the driver.
 pub struct RingMemory {
@@ -24,6 +29,7 @@ pub struct RingMemory {
     capacity: u32,
     /// [`Device::attach`](crate::Device::attach) sent it to the driver, which may have read it: cleared by [`Self::reset`].
     attached_before: bool,
+    mapped: bool,
 }
 
 impl RingMemory {
@@ -44,6 +50,39 @@ impl RingMemory {
         // VirtualAlloc returns committed pages zeroed.
         let p = unsafe { VirtualAlloc(None, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         let base = NonNull::new(p.cast::<u8>()).ok_or_else(io::Error::last_os_error)?;
+        Ok(Self::initialize(base, capacity_frames, false))
+    }
+
+    /// Creates the broker's anonymous section. The broker initializes and attaches it before allowing the app to map a view.
+    pub(crate) fn shared(capacity: u32) -> io::Result<(Self, Owned<HANDLE>)> {
+        if !protocol::capacity_ok(capacity) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let bytes = protocol::ring_bytes(capacity);
+        // SAFETY: pagefile backing with a fixed, validated length and no globally accessible name.
+        let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, bytes as u32, PCWSTR::null()) }
+            .map_err(crate::device::io_error)?;
+        // SAFETY: CreateFileMappingW transferred ownership of this handle.
+        let section = unsafe { Owned::new(section) };
+        let base = Self::map_section(*section, capacity)?;
+        Ok((Self::initialize(base, capacity, true), section))
+    }
+
+    /// The app's view of an authenticated broker section. Its immutable header was initialized before transfer.
+    pub(crate) fn shared_writer(section: HANDLE, capacity: u32) -> io::Result<Self> {
+        let ring = Self { base: Self::map_section(section, capacity)?, capacity, attached_before: true, mapped: true };
+        // SAFETY: our live section view spans exactly `bytes`. Lock the writer's own working-set view before the audio loop.
+        unsafe { VirtualLock(ring.base.as_ptr().cast(), ring.bytes()) }.map_err(crate::device::io_error)?;
+        Ok(ring)
+    }
+
+    fn map_section(section: HANDLE, capacity: u32) -> io::Result<NonNull<u8>> {
+        // SAFETY: the caller owns a readable/writable section handle. Windows verifies the requested length fits its section.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, protocol::ring_bytes(capacity)) };
+        NonNull::new(view.Value.cast()).ok_or_else(io::Error::last_os_error)
+    }
+
+    fn initialize(base: NonNull<u8>, capacity_frames: u32, mapped: bool) -> Self {
         // SAFETY: `base` is page-aligned (more than RingHeader's 8), writable and at least HEADER_BYTES long; all-zero bytes are a
         // valid RingHeader (integers, atomics and byte arrays); and no other reference to the memory exists yet.
         let h = unsafe { &mut *base.as_ptr().cast::<RingHeader>() };
@@ -56,8 +95,8 @@ impl RingMemory {
         h.sample_format = FORMAT_FLOAT32;
         h.frame_bytes = FRAME_BYTES;
         h.flags = 0;
-        h.total_bytes = bytes as u64;
-        Ok(Self { base, capacity: capacity_frames, attached_before: false })
+        h.total_bytes = protocol::ring_bytes(capacity_frames) as u64;
+        Self { base, capacity: capacity_frames, attached_before: false, mapped }
     }
 
     /// Whether the ring went to the driver before (its ATTACH went pending). [`Device::attach`](crate::Device::attach) refuses
@@ -69,6 +108,11 @@ impl RingMemory {
 
     pub(crate) fn mark_attached(&mut self) {
         self.attached_before = true;
+    }
+
+    pub(crate) fn set_attach_version(&mut self, version: u32) {
+        // SAFETY: attach calls this only on fresh or reset memory, before the driver can access the header.
+        unsafe { (*self.base.as_ptr().cast::<RingHeader>()).version = version };
     }
 
     /// Makes the ring as good as new for another ATTACH: lines 1 to 3 of the header zeroed (`write_frame` 0, the driver's line
@@ -129,7 +173,13 @@ impl Drop for RingMemory {
     fn drop(&mut self) {
         // SAFETY: `base` is the start of our own reservation, released once here. No request holds it: an Attachment owns the
         // ring while the request is pending and gives it up (or leaks it) only after the request has completed.
-        let _ = unsafe { VirtualFree(self.base.as_ptr().cast(), 0, MEM_RELEASE) };
+        if self.mapped {
+            // SAFETY: the caller owns the view created by MapViewOfFile.
+            let _ = unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base.as_ptr().cast() }) };
+        } else {
+            // SAFETY: base is the private reservation returned by VirtualAlloc.
+            let _ = unsafe { VirtualFree(self.base.as_ptr().cast(), 0, MEM_RELEASE) };
+        }
     }
 }
 
@@ -206,6 +256,20 @@ mod tests {
         assert_eq!((h.write_frame.load(Relaxed), h.read_frame.load(Relaxed), h.state.load(Relaxed)), (0, 0, 0));
         assert!(RingMemory::new(1000).is_err());
         assert!(RingMemory::new(512).is_err(), "below the minimum");
+    }
+
+    #[test]
+    fn a_shared_writer_sees_the_existing_ring_and_keeps_the_section_alive() {
+        let (broker, handle) = RingMemory::shared(1024).unwrap();
+        let writer = RingMemory::shared_writer(*handle, 1024).unwrap();
+        drop(handle);
+        assert!(writer.attached_before());
+        assert_eq!(writer.header().magic, MAGIC);
+        assert_eq!(Writer::new(&writer).produce(7, frame), 7);
+        assert_eq!(broker.header().write_frame.load(Acquire), 7);
+        assert_eq!(broker.frames_for_test()[6], frame(6));
+        drop(writer);
+        assert_eq!(broker.header().write_frame.load(Acquire), 7);
     }
 
     /// reset() zeroes lines 1 to 3 (write_frame and the driver's line), keeps line 0, and clears the mark.

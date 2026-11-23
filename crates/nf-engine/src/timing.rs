@@ -38,6 +38,10 @@ impl Qpc {
         ticks_to_hns(self.ticks(), self.freq)
     }
 
+    pub(crate) fn at_hns(&self, ticks: i64) -> i64 {
+        ticks_to_hns(ticks, self.freq)
+    }
+
     /// Converts a tick difference to microseconds.
     #[inline]
     pub(crate) fn ticks_to_us(&self, ticks: u64) -> f32 {

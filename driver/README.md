@@ -56,6 +56,30 @@ Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|
 `NfMicrophones` from the device's hardware key): `ROOT\AudioCodec` both, `ROOT\AudioCodecCall` the call microphone,
 `ROOT\AudioCodecLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
 
+### Independent Cable B
+
+Either cable works with the filter app closed. Send audio to its **Speakers** endpoint and select the **Microphone** on
+the same adapter in the receiving application. For the primary pair the adapter is **AudioCodec Device**. Both of its
+microphones receive the same signal. The optional **Noise Filter Cable B** adapter has a separate playback and recording
+pair, loopback memory and format negotiation.
+
+On the development checkout, install the current primary driver first. In an elevated PowerShell window run
+`driver\scripts\Cable-B.ps1 add` to create B. The script uses the primary device's installed INF, retains its microphone
+variant and restores any pre-existing default roles that Windows moved to B. `Cable-B.ps1 list` shows B and its endpoints.
+`Cable-B.ps1 remove` removes only B. Running `add` again on a healthy pair keeps its endpoint IDs.
+
+To process the signal on A, choose **Direct driver ring** or its WASAPI Speakers endpoint in the filter app. For B, choose
+**WASAPI** and **Speakers (Noise Filter Cable B)**. A direct feed takes over A's microphones while attached. B continues
+carrying whatever is played into B. The app currently runs one filter chain per engine instance.
+
+To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
+on each Speakers endpoint (`--device "Speakers (AudioCodec Device)"` and `--device "Speakers (Noise Filter Cable B)"`),
+with `--start 100000` on A and `--start 4000000` on B. While both renderers play, run
+`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (AudioCodec Device)"` and the equivalent on
+`Microphone (Noise Filter Cable B)` concurrently. Each capture's decoded marker range should remain inside its own
+renderer’s range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440`
+in place of A's renderer to verify an attached A ring coexists with B.
+
 **Latency: two figures, measured at different points** (the Server 2025 VM, 2026-11-20 to 23;
 doc/todo/19-spike-2026-11-20.md):
 

@@ -77,6 +77,7 @@ pub(crate) struct AudioShared {
 pub(crate) struct Opened {
     pub(crate) mic: StreamInfo,
     pub(crate) output: StreamInfo,
+    pub(crate) driver_ring: bool,
     pub(crate) reference: Option<StreamInfo>,
     pub(crate) mic_id: Option<String>,
     pub(crate) output_id: Option<String>,
@@ -96,6 +97,7 @@ pub(crate) struct Opened {
 /// Everything the audio thread is started with.
 pub(crate) struct AudioArgs {
     pub(crate) config: EngineConfig,
+    pub(crate) effect_stage: Option<Box<crate::effect::ExternalStage>>,
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) controls: Arc<ChainControls>,
     pub(crate) shared: Arc<AudioShared>,
@@ -180,7 +182,8 @@ fn worker_main(jobs: Receiver<AudioArgs>) {
 }
 
 fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
-    let AudioArgs { config, telemetry, controls, shared, tap, mut recorder, mut flight, mic_delivery, floors, ready, done } = args;
+    let AudioArgs { config, effect_stage, telemetry, controls, shared, tap, mut recorder, mut flight, mic_delivery, floors, ready, done } =
+        args;
     // Declared first, so dropped last: both signal "gone" after every stream is released.
     let _done = done;
     let _exit = ExitFlag(shared.clone());
@@ -190,7 +193,7 @@ fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
         }
         None => {
             let ends = Ends { tap, recorder: &mut recorder, flight: &mut flight };
-            run(Run { config, telemetry, controls, shared, ends, mic_delivery, floors, ready, mmcss })
+            run(Run { config, effect_stage, telemetry, controls, shared, ends, mic_delivery, floors, ready, mmcss })
         }
     }
     // A chain recorder the run never took (the start failed, or it stopped before its next wake) goes back, so a failed
@@ -202,6 +205,7 @@ fn run_job(args: AudioArgs, com_error: Option<i32>, mmcss: &Mmcss) {
 
 struct Run<'a> {
     config: EngineConfig,
+    effect_stage: Option<Box<crate::effect::ExternalStage>>,
     telemetry: Arc<Telemetry>,
     controls: Arc<ChainControls>,
     shared: Arc<AudioShared>,
@@ -254,7 +258,7 @@ impl Ticks for QpcTicks {
 }
 
 fn run(r: Run<'_>) {
-    let Run { config, telemetry, controls, shared, mut ends, mic_delivery, floors, ready, mmcss } = r;
+    let Run { config, effect_stage, telemetry, controls, shared, mut ends, mic_delivery, floors, ready, mmcss } = r;
     let mut warnings = Vec::new();
     if let Some(code) = mmcss.error {
         warnings.push(Warning::Mmcss(code));
@@ -272,7 +276,8 @@ fn run(r: Run<'_>) {
         return;
     }
 
-    let margin_ms = if config.io.output_margin_ms.is_finite() { config.io.output_margin_ms.clamp(0.0, 100.0) } else { 0.0 };
+    let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
+    let margin_ms = if !direct && config.io.output_margin_ms.is_finite() { config.io.output_margin_ms.clamp(0.0, 100.0) } else { 0.0 };
     // The output's period: the shared engine's pass, or (exclusive) the device's buffer; the target follows it.
     let pcfg = PipelineConfig {
         out_period: session.out.period_frames(),
@@ -282,7 +287,9 @@ fn run(r: Run<'_>) {
     };
     let (out_target, ref_target) = (pcfg.out_target(), pcfg.ref_target());
     let mut pipe: Pipeline = Pipeline::new(pcfg, DriftController::new(out_target as f32), SlipResampler::new(), SlipResampler::new());
-    if config.io.adaptive_output {
+    if direct {
+        pipe.for_driver_ring();
+    } else if config.io.adaptive_output {
         pipe = pipe.with_adaptive_target();
     }
     if config.io.echo_guard {
@@ -300,6 +307,14 @@ fn run(r: Run<'_>) {
         return;
     }
     warm_up(&mut session.chain);
+    if let Some(mut stage) = effect_stage {
+        let mic = MicOpening::of(ids.mic.as_deref(), &session.mic.info.stream_info());
+        let blocks = if config.effect.worker_blocks == 0 { mic.effect_depth(mic_delivery.as_ref()) } else { config.effect.worker_blocks };
+        if let Err(e) = stage.set_depth(blocks).and_then(|()| session.chain.attach_effect(stage)) {
+            let _ = ready.send(Err(StartFailure::Stage(e.0)));
+            return;
+        }
+    }
     let fallback_baseline = nf_mem::thread_scope_fallbacks();
     pipe.set_alloc_baseline(nf_mem::thread_scope_allocs());
 
@@ -326,13 +341,14 @@ fn run(r: Run<'_>) {
     telemetry.output_period_ms.store(session.out.info().period_ms);
     telemetry.mic_exclusive.store(session.mic.info.exclusive.is_some(), Relaxed);
     telemetry.output_exclusive.store(session.out.is_exclusive(), Relaxed);
-    telemetry.output_adaptive.store(config.io.adaptive_output, Relaxed);
+    telemetry.output_adaptive.store(!direct && config.io.adaptive_output, Relaxed);
     telemetry.output_target_ms.store(targets.output_ms);
     telemetry.reference_target_ms.store(targets.reference_ms);
     shared.chain_latency.store(session.chain.latency(), Relaxed);
     let opened = Opened {
         mic: session.mic.info.stream_info(),
         output: session.out.info().stream_info(),
+        driver_ring: direct,
         reference: session.lb.as_ref().map(|l| l.info.stream_info()),
         mic_id: ids.mic,
         output_id: ids.output,
@@ -377,16 +393,33 @@ fn open_session(
 ) -> Result<(Session, Ids), StartFailure> {
     let aec_wanted = config.processing.aec_enabled;
     let en = DeviceEnumerator::new().map_err(|e| StartFailure::Enumerator(hr_of(&e)))?;
-    let out_id = config.devices.output.as_deref().ok_or(StartFailure::NotFound(StreamRole::Output))?;
     let mic_dev = resolve(&en, config.devices.mic.as_deref(), Direction::Capture, StreamRole::Mic)?;
-    let out_dev = resolve(&en, Some(out_id), Direction::Render, StreamRole::Output)?;
-    let ids_out = out_dev.get_id().ok();
-    let out_adapter = out_dev.get_interface_friendlyname().ok();
+    let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
+    let out_dev = if direct {
+        let from_ring = mic_dev.get_interface_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours)
+            || mic_dev.get_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours);
+        if from_ring {
+            return if config.devices.mic.is_none() {
+                Err(StartFailure::DefaultMicIsOutput("Noise Filter virtual microphone".into()))
+            } else {
+                Err(StartFailure::DriverRing {
+                    message: "Choose a different input microphone: the current input records the driver's own output.".into(),
+                    retry: false,
+                })
+            };
+        }
+        None
+    } else {
+        let out_id = config.devices.output.as_deref().ok_or(StartFailure::NotFound(StreamRole::Output))?;
+        Some(resolve(&en, Some(out_id), Direction::Render, StreamRole::Output)?)
+    };
+    let ids_out = out_dev.as_ref().and_then(|d| d.get_id().ok());
+    let out_adapter = out_dev.as_ref().and_then(|d| d.get_interface_friendlyname().ok());
     let shared = same_adapter(mic_dev.get_interface_friendlyname().ok(), out_adapter.clone());
     if let Some(w) = adapter_check(config.devices.mic.is_none(), shared)? {
         warnings.push(w);
     }
-    let out_name = out_dev.get_friendlyname().unwrap_or_default();
+    let out_name = out_dev.as_ref().and_then(|d| d.get_friendlyname().ok()).unwrap_or_default();
     let out_cable = is_virtual_cable(&out_name) || out_adapter.as_deref().is_some_and(is_virtual_cable);
     let default_out = en.get_default_device_for_role(&Direction::Render, &Role::Console).ok().and_then(|d| d.get_id().ok());
     let out_default = default_out.is_some() && default_out == ids_out;
@@ -429,8 +462,11 @@ fn open_session(
     };
     let (mic, mic_warning) = CaptureStream::open_mic(&mic_dev, mic_options).map_err(open(StreamRole::Mic))?;
     let out_exclusive = output_exclusive(config.io.output_exclusive && out_floor != Some(PeriodFloor::Shared), out_default);
-    let (mut out, out_warning) =
-        Output::open(&out_dev, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS, at_least(out_floor)).map_err(open(StreamRole::Output))?;
+    let (mut out, out_warning) = match out_dev {
+        Some(device) => Output::open(&device, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS, at_least(out_floor))
+            .map_err(open(StreamRole::Output))?,
+        None => (Output::Driver(crate::ring_output::RingOutput::open()?), None),
+    };
     let mic_name = mic.info.stream_info().device_name;
     for (role, floor, device) in [(StreamRole::Mic, mic_floor, mic_name), (StreamRole::Output, out_floor, out_name)] {
         if let Some(floor) = floor {
@@ -494,6 +530,20 @@ pub(crate) struct MicOpening {
 }
 
 impl MicOpening {
+    fn delivery(&self, remembered: Option<&(Self, MicDelivery)>) -> MicDelivery {
+        match remembered.filter(|(then, _)| then.same(self)) {
+            Some((_, measured)) => *measured,
+            None if self.one_at_a_time() => MicDelivery::OneAtATime,
+            None => MicDelivery::Unknown,
+        }
+    }
+
+    pub(crate) fn effect_depth(&self, remembered: Option<&(Self, MicDelivery)>) -> u8 {
+        let blocks_per_wake = self.period_frames.div_ceil(nf_core::BLOCK as u32);
+        let delivery_floor = if self.delivery(remembered) == MicDelivery::OneAtATime { 1 } else { 2 };
+        blocks_per_wake.max(delivery_floor).min(nf_fx::MAX_DEPTH as u32) as u8
+    }
+
     pub(crate) fn of(id: Option<&str>, info: &StreamInfo) -> Self {
         Self {
             id: id.map(str::to_owned),
@@ -531,11 +581,7 @@ pub(crate) fn choose_model_depth(
     if p.noise_model == nf_core::config::DEFAULT_NOISE_MODEL {
         return None;
     }
-    let delivery = match remembered.filter(|(then, _)| then.same(mic)) {
-        Some((_, measured)) => *measured,
-        None if mic.one_at_a_time() => MicDelivery::OneAtATime,
-        None => MicDelivery::Unknown,
-    };
+    let delivery = mic.delivery(remembered);
     Some(ModelDepth { depth: p.model_depth_for(delivery), auto: p.model_depth_auto().then_some(delivery) })
 }
 

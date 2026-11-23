@@ -15,6 +15,7 @@ members = [
     "crates/nf-gui",
     "crates/nf-app",
     "crates/nf-vmic",
+    "crates/nf-fx",
 ]
 default-members = ["crates/nf-app"]
 # The vendored crate is a patch, not a member: excluded, so cargo runs inside it (its own tests) instead of refusing

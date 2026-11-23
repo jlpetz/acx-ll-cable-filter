@@ -593,6 +593,7 @@ protected:
     ULONG           m_AppOtherLead;     // the reader packet its latest pass played the copy behind (AppRingOtherPass: a shorter
                                         // one next is a counted skip, a longer one counted silence)
     BOOLEAN         m_AppOtherValid;    // its latest pass this run played the copy: a handoff to this stream counts what it skips
+    ULONGLONG       m_AppLiveAttach; // attachment whose LiveStreams count includes this run, or zero
     BOOLEAN         m_AppNoSlot;        // it gave the reader slot up (AppRingReaderStop) and may take it only after its next Run
 
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.

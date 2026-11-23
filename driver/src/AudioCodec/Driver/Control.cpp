@@ -34,13 +34,8 @@ Environment:
 #include "AppRing.h"
 
 //
-// SYSTEM and Administrators only, for the spike: wdmsec.h's SDDL_DEVOBJ_SYS_ALL_ADM_ALL, written out because wdmsec.h only
-// declares that constant (extern) and wdmsec.lib defines it. The product needs the interactive user to open it unelevated, and
-// how is a design decision still to make: granting interactive users (IU) read and write access alone is not enough. With it, a
-// user in one session (RDP, fast user switching) could feed the microphone that another session's apps capture, or hold the
-// one ring and leave the other session STATUS_DEVICE_BUSY, and STATS would tell any of them which process feeds the mic.
-// Before widening the SDDL, tie an attachment to a session (record the requester's session id at ATTACH and refuse other
-// sessions, or attach only from the active console session) and narrow what STATS shows callers who aren't administrators.
+// Only SYSTEM and Administrators can open this control device. For a standard user, nf-vmic's explicitly approved broker
+// owns the handle, checks the interactive session and transfers only the live ring pages to its parent. STATS stays privileged.
 //
 DECLARE_CONST_UNICODE_STRING(g_NfVmicSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 DECLARE_CONST_UNICODE_STRING(g_NfVmicDeviceName, NF_VMIC_DEVICE_NAME);
@@ -48,7 +43,7 @@ DECLARE_CONST_UNICODE_STRING(g_NfVmicSymlinkName, NF_VMIC_SYMLINK_NAME);
 
 //
 // The control device's life, guarded by s_CdoLock (a wait lock: WdfDeviceCreate and the rest need PASSIVE_LEVEL, which a
-// spin lock or a fast mutex wouldn't leave). s_DeviceCount counts the PnP devices that registered.
+// spin lock or a fast mutex wouldn't leave). s_DeviceCount is 0 or 1, excluding the independent WASAPI-only cable.
 //
 static WDFWAITLOCK  s_CdoLock;
 static ULONG        s_DeviceCount;
@@ -243,7 +238,8 @@ static
 NTSTATUS
 NfVmic_CheckHeader(
     _In_ const NF_VMIC_RING_HEADER* Header,
-    _In_ ULONG                      BufferBytes
+    _In_ ULONG                      BufferBytes,
+    _In_ ULONG                      Version
 )
 {
     UINT32 capacity = Header->CapacityFrames;
@@ -254,7 +250,7 @@ NfVmic_CheckHeader(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    if (Header->Version != NF_VMIC_VERSION)
+    if (Header->Version != Version)
     {
         return STATUS_REVISION_MISMATCH;
     }
@@ -336,13 +332,14 @@ NfVmic_Attach(
         status = STATUS_INVALID_PARAMETER;
         goto reject;
     }
-    if (input->Version != NF_VMIC_VERSION)
+    if (input->Version != NF_VMIC_VERSION && input->Version != NF_VMIC_LIVE_VERSION)
     {
         status = STATUS_REVISION_MISMATCH;
         goto reject;
     }
     // This version's input struct, exactly: the length first, then the fields past the first 8 bytes.
-    if (InputBufferLength != sizeof(NF_VMIC_ATTACH_IN) || input->InBytes != sizeof(NF_VMIC_ATTACH_IN) || input->Flags != 0)
+    if (InputBufferLength != sizeof(NF_VMIC_ATTACH_IN) || input->InBytes != sizeof(NF_VMIC_ATTACH_IN) ||
+        input->Flags != (input->Version == NF_VMIC_LIVE_VERSION ? NF_VMIC_ATTACH_LIVE : 0u))
     {
         status = STATUS_INVALID_PARAMETER;
         goto reject;
@@ -395,7 +392,7 @@ NfVmic_Attach(
 
     // One copy of the header, checked; nothing from line 0 is read from the ring again.
     RtlCopyMemory(&copy, base, sizeof(copy));
-    status = NfVmic_CheckHeader(&copy, (ULONG)OutputBufferLength);
+    status = NfVmic_CheckHeader(&copy, (ULONG)OutputBufferLength, input->Version);
     if (!NT_SUCCESS(status))
     {
         goto reject;
@@ -459,6 +456,9 @@ NfVmic_Attach(
     ring->Data = base + NF_VMIC_HEADER_BYTES;
     ring->CapacityFrames = copy.CapacityFrames;
     ring->AttachPid = pid;
+    ring->LiveFeed = (input->Flags & NF_VMIC_ATTACH_LIVE) != 0;
+    ring->LiveStreams = 0;
+    ring->ClockSequence = 0;
     ring->ReadFrame = 0;
     ring->LastWriteSeen = 0;
     ring->Reader = NULL;
@@ -772,7 +772,7 @@ NfVmic_DeleteControlDevice()
 }
 
 _Use_decl_annotations_
-VOID
+NTSTATUS
 NfVmic_DeviceAdd(
     WDFDRIVER       Driver,
     WDFDEVICE       Device,
@@ -784,6 +784,12 @@ NfVmic_DeviceAdd(
 
     (void)WdfWaitLockAcquire(s_CdoLock, NULL);
 
+    // The primary cable owns the one named app feed. A duplicate manually-created primary must never receive its audio.
+    if (s_DeviceCount != 0)
+    {
+        WdfWaitLockRelease(s_CdoLock);
+        return STATUS_DEVICE_BUSY;
+    }
     s_DeviceCount++;
 
     KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
@@ -816,6 +822,7 @@ NfVmic_DeviceAdd(
     }
 
     WdfWaitLockRelease(s_CdoLock);
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_

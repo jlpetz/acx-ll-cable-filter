@@ -74,9 +74,13 @@ pub fn quality(args: &QualityArgs) -> Result<(), Failure> {
     } else {
         None
     };
-    super::run::start_engine(&engine, &cfg)?;
+    super::run::start_engine(&engine, &cfg, args.engine.allow_driver)?;
     // The depth a model pack ran at (automatic by default: chosen at the start), so that chain_config.json reruns as it ran.
-    let ran = ran_config(&cfg, engine.status().model_depth);
+    let mut ran = ran_config(&cfg, engine.status().model_depth);
+    if let Some(fx) = engine.effect_info() {
+        ran.effect.worker_blocks = fx.worker_blocks;
+        ran.effect.plugin_id = Some(fx.plugin_id);
+    }
     let route = Route { probe, capture, far, text: route };
     let take = play(&engine, &cfg, args.settle, &scene, plan.as_ref(), recorder.as_ref(), route);
     // Before the engine stops, so the recording ends with the take rather than with the run.
@@ -133,7 +137,8 @@ fn engine_args(args: &QualityArgs) -> EngineArgs {
 /// The devices must make a loop through the filter: the probe isn't its output, the capture isn't its mic, the far end is
 /// neither the probe nor the output, and echo cancellation doesn't take the probe (the scene itself) as its reference.
 fn check_devices(cfg: &EngineConfig, devices: &[DeviceInfo], probe: &str, capture: &str, far: Option<&str>) -> Result<(), String> {
-    let (mic, output) = (cfg.devices.mic.as_deref(), cfg.devices.output.as_deref());
+    let mic = cfg.devices.mic.as_deref();
+    let output = (cfg.io.output_backend == nf_engine::OutputBackend::Wasapi).then_some(cfg.devices.output.as_deref()).flatten();
     if output == Some(probe) {
         return Err("--probe is the filter's own output: play into the cable its mic records instead (e.g. \"CABLE-A Input\")".into());
     }

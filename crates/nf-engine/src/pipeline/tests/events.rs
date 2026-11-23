@@ -749,5 +749,10 @@ fn the_wakes_choose_the_model_depth() {
     // Five seconds is too few wakes to say: nothing is remembered.
     let short = wake_blocks(480, pairs, 5.0);
     assert_eq!((short.delivery(), measured_delivery(shared.clone(), &short)), (Unknown, None));
+    assert_eq!(exclusive(160).effect_depth(None), 1);
+    assert_eq!(shared.effect_depth(None), 2);
+    assert_eq!(exclusive(960).effect_depth(None), 2);
+    assert_eq!(exclusive(1440).effect_depth(None), 3);
+    assert_eq!(exclusive(2400).effect_depth(None), 4);
     assert_eq!(choose_model_depth(&pack, &shared, None), auto(2, Unknown), "a shared mic not measured yet: the safe depth");
 }

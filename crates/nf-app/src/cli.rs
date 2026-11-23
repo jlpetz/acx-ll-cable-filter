@@ -91,6 +91,9 @@ pub struct IoOptions {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineArgs {
     pub config: Option<PathBuf>,
+    pub output_backend: Option<nf_engine::OutputBackend>,
+    /// Allow one UAC prompt for the direct driver connection in this invocation.
+    pub allow_driver: bool,
     /// Device ids or name substrings, resolved against the device list at start.
     pub mic: Option<String>,
     pub output: Option<String>,
@@ -493,6 +496,14 @@ impl EngineArgs {
             "--config" => self.config = Some(PathBuf::from(text(flag, p.value(flag, inline)?)?)),
             "--mic" => self.mic = Some(text(flag, p.value(flag, inline)?)?),
             "--output" => self.output = Some(text(flag, p.value(flag, inline)?)?),
+            "--output-backend" => {
+                self.output_backend = Some(match p.value(flag, inline)? {
+                    "wasapi" => nf_engine::OutputBackend::Wasapi,
+                    "driver-ring" => nf_engine::OutputBackend::DriverRing,
+                    _ => return Err(usage("--output-backend takes wasapi or driver-ring")),
+                });
+            }
+            "--allow-driver" => self.allow_driver = switch(flag, inline)?,
             "--reference" => self.reference = Some(text(flag, p.value(flag, inline)?)?),
             _ => return Ok(self.io.take(flag, inline)? || self.processing.take(p, flag, inline)?),
         }
@@ -1009,7 +1020,9 @@ FLIGHT RECORDER (run --flight; always on in devices --check):
 OPTIONS (run, latency, quality):
   --config FILE      Settings JSON: the window's settings.json, or an engine config
   --mic DEV          Microphone (default: the system default)
-  --output DEV       Playback device that gets the filtered mic, e.g. \"CABLE Input\" (required)
+  --output-backend B Send audio through wasapi (default) or directly to our driver with driver-ring
+  --allow-driver     Allow one administrator prompt for direct output in this invocation
+  --output DEV       Playback device for wasapi, e.g. \"CABLE Input\"
   --reference DEV    Speakers whose sound AEC removes (default: the default playback device)
   DEV is a device id or part of its name (exact name first, then the first match, any case).
 
@@ -1209,6 +1222,8 @@ mod tests {
             Ok(Command::Run(RunArgs {
                 engine: EngineArgs {
                     config: Some("s.json".into()),
+                    output_backend: None,
+                    allow_driver: false,
                     mic: Some("Headset Mic".into()),
                     output: Some("CABLE Input".into()),
                     reference: Some("Speakers".into()),

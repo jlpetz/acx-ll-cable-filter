@@ -1,9 +1,10 @@
 # noise-filter CLAP host profile v0 (draft, unpublished)
 
 What noise-filter guarantees a stage, and what it expects of one (TODO 17). Every stage is CLAP-shaped: the echo
-canceller, the noise filter and, later, effects. Our own stages implement it in-process through the Rust trait
-`nf_core::stage::Stage`, with no FFI. A `.clap` export of them, and third-party CLAP plugins in an fx-host process, come
-later; this profile is what both will follow.
+canceller, the noise filter and post effects. Our own stages implement it in-process through the Rust trait
+`nf_core::stage::Stage`. The external host adapts a CLAP binary to the post-effect slot. Its port support, process
+boundary, bypass and latency are described in [Running an external effect](../todo/17-post-effects.md#running-an-external-effect).
+Exporting the built-in stages as `.clap` binaries is planned.
 
 Status: a draft. The namespace (`noise-filter`) and every id below are provisional. They become reverse-DNS, and freeze,
 before anything is published.

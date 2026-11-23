@@ -79,6 +79,8 @@ pub struct CheckReport {
     /// The first code's frame index in the recording: with `first_code`, the code each frame before it would carry.
     pub first_code_index: Option<u64>,
     pub last_code: Option<u32>,
+    /// The lowest and highest decoded code, including intermediate packets. Used to check disjoint cable marker ranges.
+    pub code_range: Option<(u32, u32)>,
     /// Signal frames exactly one code after the previous signal frame.
     pub steps_ok: u64,
     /// Forward jumps (frames lost), and the frames they skipped.
@@ -153,6 +155,7 @@ impl SequenceChecker {
         r.zeros_after_signal = 0;
         self.pending_runs = 0;
         r.signal_frames += 1;
+        r.code_range = Some(r.code_range.map_or((k, k), |(min, max)| (min.min(k), max.max(k))));
         match due {
             None => (r.first_code, r.first_code_index) = (Some(k), Some(index)),
             Some(d) if k == d => r.steps_ok += 1,

@@ -75,6 +75,7 @@ typedef struct _LOOPBACK_OPEN {
 } LOOPBACK_OPEN, *PLOOPBACK_OPEN;
 
 typedef struct _LOOPBACK_RING {
+    BOOLEAN         AppFeed;                // immutable after AddDevice: only primary cable A participates in the named control feed
     KSPIN_LOCK      Lock;
     PUCHAR          Buffer;                 // LOOPBACK_RING_BYTES, non-paged: Codec_EvtBusDeviceAdd to Codec_EvtDeviceContextCleanup
 

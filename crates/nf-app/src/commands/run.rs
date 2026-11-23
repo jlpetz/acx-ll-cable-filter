@@ -29,7 +29,7 @@ pub fn run(args: &RunArgs) -> Result<(), Failure> {
         .map(|f| arm_flight(&engine, f))
         .transpose()
         .map_err(|e| Failure::error(format!("Couldn't arm the flight recorder: {e}")))?;
-    start_engine(&engine, &cfg)?;
+    start_engine(&engine, &cfg, args.engine.allow_driver)?;
     say!("{LEGEND}");
     if let Some(n) = args.seconds {
         say!("Running for {n} s (Ctrl+C stops it sooner), then a summary of the run.");
@@ -92,12 +92,26 @@ pub fn run(args: &RunArgs) -> Result<(), Failure> {
     }
     // Before the stop: the targets read 0 while stopped.
     let (end, status, fixed_target) = (engine.telemetry(), engine.status(), engine.buffer_targets().output_ms);
+    let effect = engine.effect_info();
     engine.stop();
     say!("Stopped.");
     // After the stop: the triggers still in their post-rolls are dumped now, with what there is.
     let flight = flight.map(|f| (f.recorder.stop(), f.config));
-    let summary = tally.summary(started.elapsed().as_secs_f64(), &end, &status, fixed_target);
+    let mut summary = tally.summary(started.elapsed().as_secs_f64(), &end, &status, fixed_target);
+    if let Some(fx) = effect.as_ref() {
+        summary.effect_misses = fx.missed_blocks;
+        summary.effect_failed = fx.failed;
+    }
     say!("{}", summary.text());
+    if let Some(effect) = effect {
+        say!(
+            "Effect {} processed {} blocks, missed {} deadlines, worker failed {}.",
+            effect.name,
+            effect.processed_blocks,
+            effect.missed_blocks,
+            effect.failed
+        );
+    }
     if let Some((stats, cfg)) = &flight {
         say!("{}", flight_lines(stats, cfg));
     }
@@ -327,6 +341,8 @@ pub struct Summary {
     pub output: String,
     /// A model pack's inference worker ran (at the end).
     pub model: bool,
+    pub effect_misses: u64,
+    pub effect_failed: bool,
 }
 
 impl Tally {
@@ -410,6 +426,8 @@ impl Tally {
         });
         let device = |s: Option<&StreamInfo>| s.map_or_else(|| "--".to_owned(), |s| s.device_name.clone());
         Summary {
+            effect_misses: 0,
+            effect_failed: false,
             seconds,
             running_s: self.seconds - self.not_running,
             restarts: self.restarts,
@@ -454,6 +472,10 @@ impl Summary {
         add(c.output.coarse_drops, "output coarse drop", "output coarse drops");
         add(u64::from(self.seen_s - self.running_s), "s not running (a fault)", "s not running (a fault)");
         add(u64::from(self.restarts), "restart", "restarts");
+        add(self.effect_misses, "missed effect deadline", "missed effect deadlines");
+        if self.effect_failed {
+            g.push("external effect worker exited".into());
+        }
         g
     }
 
@@ -694,7 +716,7 @@ impl TargetWait {
 
 /// What `latency` or `quality` does about the output target with `cfg` and `--settle`.
 pub fn target_wait(cfg: &EngineConfig, settle: bool) -> TargetWait {
-    match (cfg.io.adaptive_output, settle) {
+    match (cfg.io.output_backend == nf_engine::OutputBackend::Wasapi && cfg.io.adaptive_output, settle) {
         (false, false) => TargetWait::Fixed,
         (false, true) => TargetWait::NothingToSettle,
         (true, false) => TargetWait::AtFixedStart,
@@ -756,9 +778,15 @@ pub fn changes(kind: &str, old: &[String], new: &[String]) -> Vec<String> {
 
 /// Starts `engine` with `cfg` (Ctrl+C armed first) and prints what it opened: the caller makes the engine, so it can arm the
 /// chain recorder first.
-pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig) -> Result<(), Failure> {
+pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig, allow_driver: bool) -> Result<(), Failure> {
     console::handle_ctrl_c();
     say!("{}", describe_config(cfg));
+    if cfg.io.output_backend == nf_engine::OutputBackend::DriverRing && !nf_mem::privilege::is_elevated() {
+        if !allow_driver {
+            return Err(Failure::error("Direct output needs approval for this app session. Run this command with --allow-driver."));
+        }
+        nf_vmic::broker::authorize().map_err(|e| Failure::error(format!("Couldn't authorize direct output: {e}")))?;
+    }
     engine.start(cfg).map_err(|e| {
         // A fix the app can take the user to: in a terminal, the command that opens it.
         let hint = engine.status().remedy.map_or(String::new(), |r| format!("\nTo open the setting: start {}", r.settings_uri()));
@@ -896,16 +924,21 @@ pub fn describe_config(cfg: &EngineConfig) -> String {
     };
     let io = &cfg.io;
     let mode = |exclusive: bool| if exclusive { "exclusive" } else { "shared" };
-    let latency = format!(
-        "; {} output, {} mic, {} output target",
-        mode(io.output_exclusive),
-        mode(io.mic_exclusive),
-        if io.adaptive_output { "adaptive" } else { "fixed" }
-    );
+    let ring = io.output_backend == nf_engine::OutputBackend::DriverRing;
+    let latency = if ring {
+        format!("; {} mic", mode(io.mic_exclusive))
+    } else {
+        format!(
+            "; {} output, {} mic, {} output target",
+            mode(io.output_exclusive),
+            mode(io.mic_exclusive),
+            if io.adaptive_output { "adaptive" } else { "fixed" }
+        )
+    };
     format!(
         "Starting: mic {}, output {}{}; noise filter {}, floor {} dB, gate {gate}{latency}",
         or_default(&cfg.devices.mic),
-        or_default(&cfg.devices.output),
+        if ring { "direct driver ring".to_owned() } else { or_default(&cfg.devices.output) },
         if p.aec_enabled { format!(", echo cancel on (reference {})", or_default(&cfg.devices.reference)) } else { String::new() },
         if p.noise_enabled { "on" } else { "off" },
         fixed(f64::from(p.floor_db), 0),
@@ -956,7 +989,9 @@ pub fn stream_text(s: &StreamInfo) -> String {
         // Why is in the warning.
         flags.push_str(", exclusive refused");
     }
-    format!("{} ({} Hz, {} ch, period {} ms{flags})", s.device_name, s.sample_rate, s.channels, fixed(f64::from(s.period_ms), 2))
+    let period =
+        if s.period_ms > 0.0 { format!("period {} ms", fixed(f64::from(s.period_ms), 2)) } else { "waiting for a recorder".into() };
+    format!("{} ({} Hz, {} ch, {period}{flags})", s.device_name, s.sample_rate, s.channels)
 }
 
 #[cfg(test)]
@@ -1009,6 +1044,9 @@ mod tests {
         let mut cfg = super::EngineConfig::default();
         assert_eq!(target_wait(&cfg, false), TargetWait::AtFixedStart, "the default: adaptive, measured at once");
         assert_eq!(target_wait(&cfg, true), TargetWait::Settle);
+        cfg.io.output_backend = nf_engine::OutputBackend::DriverRing;
+        assert_eq!(target_wait(&cfg, true), TargetWait::NothingToSettle);
+        cfg.io.output_backend = nf_engine::OutputBackend::Wasapi;
         cfg.io.adaptive_output = false;
         assert_eq!(target_wait(&cfg, false), TargetWait::Fixed);
         assert_eq!(target_wait(&cfg, true), TargetWait::NothingToSettle);

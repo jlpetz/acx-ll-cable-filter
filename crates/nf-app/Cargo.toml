@@ -37,6 +37,7 @@ nf-engine.workspace = true
 nf-gui.workspace = true
 # `mic sessions` and `mic variant` (TODO 19): the driver's variants and who records from its microphones.
 nf-vmic.workspace = true
+nf-fx = { path = "../nf-fx" }
 # `bench --model`: the pack's rows and the heap probe (the `onnx` feature only).
 nf-ort = { workspace = true, optional = true }
 hound.workspace = true

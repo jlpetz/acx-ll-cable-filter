@@ -155,6 +155,9 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       listed. PASS: every packet has a device time, each of the driver's stamps steps by its packet's length while the
       stream runs (by device position) and, across each resume, by at least the frames between; FAIL otherwise;
       INCONCLUSIVE when a resume's step couldn't be compared.
+  nf-vmic-test idle-test [--device NAME]
+      Start an exclusive recorder twice on a live ring. Check that samples queued before each open are discarded and new
+      samples reach the recorder. Requires an idle virtual capture endpoint.
 
 Exit codes: 0 pass, 1 fail, 2 a usage or set-up error, 3 inconclusive (open: 0 opened and ran, 1 refused by the
 driver's app ring rule, 4 refused otherwise, 3 stopped).";
@@ -173,6 +176,7 @@ fn main() -> ExitCode {
         Some("open") => open(rest),
         Some("latency") => latency(rest),
         Some("stamps") => stamps(rest),
+        Some("idle-test") => idle_test(rest),
         Some("help" | "-h" | "--help") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -971,6 +975,62 @@ fn print_ring_counters(h: &RingHeader) {
         h.resyncs.load(Relaxed),
         h.mismatch_packets.load(Relaxed),
     );
+}
+
+/// A deterministic stale-microphone test: inject marked samples in the forbidden interval, and keep the producer stopped
+/// until the first capture pass. A silent leading packet alone cannot pass this check: ReadFrame must skip the old prefix,
+/// the driver's copied count must stay still, and the recorder must subsequently receive the new marker.
+fn idle_test(args: &[String]) -> Result<Verdict, String> {
+    let opts = Opts::parse(args, &["--device"], &[])?;
+    let name: String = opts.value("--device", ENDPOINT.to_string())?;
+    let _com = Com::mta()?;
+    let device = open_device()?;
+    let attachment = device.attach_live(RingMemory::new(8192).map_err(|e| e.to_string())?).map_err(|e| e.error.to_string())?;
+    let mut writer = Writer::new(attachment.ring());
+    let header = attachment.ring().header();
+    let mut checks = Checks::default();
+    for opening in 1..=2 {
+        let idle = header.state.load(Acquire) == STATE_ATTACHED;
+        if !checks.check(idle, "no active capture reader", format_args!("open {opening}")) {
+            return Ok(Verdict::Fail);
+        }
+        let copied = header.frames_copied.load(Acquire);
+        let queued = writer.produce(1536, |_| [-0.5; 2]);
+        let end = writer.write_frame();
+        let mut capture = Capture::open(&name, StreamSpec { exclusive: true, ..StreamSpec::SHARED_FLOAT })?;
+        capture.start()?;
+        let mut stale = 0;
+        let mut observe = |f: [f32; 2]| stale += u32::from(f == [-0.5; 2]);
+        let until = Instant::now() + READING_WAIT;
+        while header.state.load(Acquire) & STATE_READING == 0 && Instant::now() < until {
+            capture.read(&mut observe)?;
+        }
+        let consumed = writer.read_frame();
+        let copied_now = header.frames_copied.load(Acquire);
+        checks.check(
+            queued == 1536 && consumed == end && copied_now == copied,
+            "queued pre-open audio discarded",
+            format_args!("open {opening}: {queued} queued, read position {consumed}/{end}, {} copied", copied_now - copied),
+        );
+        let fresh = [0.25; 2];
+        writer.produce(1536, |_| fresh);
+        let mut received = 0;
+        let until = Instant::now() + READING_WAIT;
+        while received < 1536 && Instant::now() < until {
+            capture.read(|f| {
+                received += u32::from(f == fresh);
+                stale += u32::from(f == [-0.5; 2]);
+            })?;
+        }
+        capture.stop();
+        drop(capture);
+        checks.check(
+            received == 1536 && stale == 0,
+            "only fresh mic samples delivered",
+            format_args!("open {opening}: {received}/1536 fresh frames, {stale} stale"),
+        );
+    }
+    Ok(if checks.failed == 0 { Verdict::Pass } else { Verdict::Fail })
 }
 
 // ---- verify ----
@@ -2376,6 +2436,7 @@ fn run_capture(opened: Opened, format: Format, seconds: u64) -> Result<OpenRun, 
     match format {
         Format::Float => {
             let r = checker.report();
+            println!("decoded marker range across all packets: {:?}", r.code_range);
             println!(
                 "the test signal: {} of {} frames carry a code (codes {:?} to {:?}, {} steps of one); silence {} before, {} inside \
                  ({} runs), {} after; gaps {} ({} frames), repeats {}, frames neither silence nor a code {}",
@@ -2590,8 +2651,7 @@ struct Window {
 /// latency's feed, on the thread that owns the attachment: tops the ring up to `target` as feed does, logging each block with
 /// the QPC just after its publication, until the window (`seconds` after the warm-up) is over. Nothing allocates per block.
 fn latency_feed(
-    attachment: &Attachment<'_>, device: &Device, target: u64, seconds: u64, frequency: u64, shared: &LatencyShared,
-    blocks: &mut Log<Block>,
+    attachment: &Attachment, device: &Device, target: u64, seconds: u64, frequency: u64, shared: &LatencyShared, blocks: &mut Log<Block>,
 ) -> Result<(LatencyEnd, Option<Window>), String> {
     let _pro_audio = ProAudio::join();
     let tick = Tick::new();

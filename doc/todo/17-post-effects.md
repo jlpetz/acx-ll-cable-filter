@@ -2,7 +2,30 @@
 
 Status: the owner chose CLAP for plugins on 2026-10-26, and on 2026-11-02 OK'd the proposal below: the
 AEC and the noise filter are CLAP-shaped stages too ("the best and most modern alt to VST3"). The stage
-interface v0 is built (2026-11-02, "Built" below); the `.clap` export and the fx-host are next.
+interface v0 is built (2026-11-02, "Built" below). The filter now hosts one external CLAP effect after the built-in stages.
+
+## Running an external effect
+
+In the settings window, choose a `.clap` file under **CLAP effect**, then start the filter. The window shows the effect's
+editable parameters. Changes and bypass apply while audio runs. The settings file records the path, plugin selection,
+bypass and parameter values. The `run`, `latency` and offline `process` commands accept the same file with `--config`.
+
+To try the independent gain plugin from a checkout, run `cargo build --release -p nf-fx --example gain` and copy
+`target/release/examples/gain.dll` to `Gain.clap` (use the configured Cargo target directory). The plugin uses the
+public CLAP ABI. Its gain ranges from 0 to 2, with 1 at unity.
+
+The external host accepts one mono or stereo main port in each direction, at 48 kHz, with zero plugin-reported latency.
+It sends each 480-frame block to a restricted worker process. A mic delivering one block at a time adds 10 ms of worker delay,
+including during bypass. Shared mics whose delivery is unknown start at two blocks. A longer mic period raises the depth as
+needed up to four blocks. The depth stays fixed for the run. For offline reproduction or a known input, `effect.worker_blocks`
+can specify 1–4 blocks explicitly. An ordinary offline WAV render defaults to one block.
+When the processed block misses its deadline, the app plays the dry audio from the same instant. Removing the effect
+removes the host delay. Built-in stage export and hosting multiple external effects remain open.
+
+On the dev VM, an independently built [Clack Gain](https://github.com/prokopyl/clack/tree/27ca283/plugin/examples/gain)
+at quarter gain produced the expected 48,517 samples in an aligned offline WAV. With the same effect feeding cable A
+directly, the recorder measured −12.04 dB against the source over seven seconds. All 616,320 delay-aligned samples
+in the live chain recording matched quarter gain exactly. The recorder reported a capture gap during that run.
 
 ## Every stage CLAP-shaped (proposed 2026-10-26; the owner's OK, 2026-11-02)
 - **Two inputs is not a problem for the AEC.** CLAP's audio-ports extension allows one main input
@@ -177,16 +200,16 @@ The decisions in this section are ours, within the owner's 2026-11-02 decision, 
 - **Two paths write the noise params:** `ChainControls::apply` (the GUI and the config, from any thread, unclamped:
   tests use a -200 dB floor) and `set_param` (clamped, by the stage's holder). Harmless while nothing in the app calls
   `set_param`; whether the GUI writes through params is TODO 15's call.
-- **Params of a stage's own** (an effect, a pack's `controls[]`) have no path from the GUI yet. Our proposal: a
-  lock-free single-producer queue of (slot, id, value) that `Chain::process` drains into each slot's `set_param`
-  before running it, built with TODO 15 or the first effect.
+- **External effect parameters** appear in the GUI and reach the worker as CLAP parameter events. The worker reads
+  the latest value for each parameter from bounded atomic storage. Pack-specific `controls[]` remain a separate task.
 
 ## Next
 1. Freeze the namespace (reverse-DNS) and the ids before anything is published. Recheck the CLAP facts the code
    cites (the param flag bits, `IS_ENUM` requiring `IS_STEPPED`, the standard feature tags, the gain-adjustment
    draft) against the headers then.
 2. The `.clap` export of our stages (clack-plugin, or nih-plug's ISC export), adapting the deviations above.
-3. clack-host in an fx-host process for third-party plugins, with the profile's gui, log and thread-check.
+3. Expand the `clap-sys` host beyond its generic parameter editor when effects require native editors, state chunks or
+   additional host extensions. The worker already supplies the CLAP thread-check extension.
 4. VST3 hosting later.
 5. The exact-mute end stage ("Exact mute" above; the owner's, for later), the studio case's output guarantee (ours, the
    owner's to confirm).

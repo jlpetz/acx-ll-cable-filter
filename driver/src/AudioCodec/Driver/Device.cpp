@@ -152,8 +152,21 @@ Return Value:
     WDFDEVICE                           device = nullptr;
     PCODEC_DEVICE_CONTEXT               devCtx;
     WDF_PNPPOWER_EVENT_CALLBACKS        pnpPowerCallbacks;
+    WCHAR                               hardwareIds[128] = {};
+    ULONG                               hardwareBytes;
+    DECLARE_CONST_UNICODE_STRING(cableBId, L"ROOT\\NoiseFilterCableB");
+    UNICODE_STRING                      firstId;
 
     PAGED_CODE();
+
+    // Our INF matches exact root hardware IDs. Routing must be known even on first boot or when the optional cable loads first.
+    RETURN_NTSTATUS_IF_FAILED(WdfFdoInitQueryProperty(DeviceInit, DevicePropertyHardwareID, sizeof(hardwareIds), hardwareIds, &hardwareBytes));
+    if (hardwareBytes < 2 * sizeof(WCHAR) || hardwareBytes > sizeof(hardwareIds) || hardwareIds[hardwareBytes / sizeof(WCHAR) - 1] != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    RtlInitUnicodeString(&firstId, hardwareIds);
+    const BOOLEAN cableB = RtlEqualUnicodeString(&firstId, &cableBId, TRUE);
 
     //
     // The driver calls this DDI in its AddDevice callback before creating the PnP device.
@@ -210,8 +223,12 @@ Return Value:
     // (NoiseFilterVmic), and the last one's context cleanup deletes it. A failure there costs only the app feed; it is
     // reported and the device goes on. From here on this device's cleanup must unregister, whatever fails later.
     //
-    NfVmic_DeviceAdd(Driver, device, &devCtx->Loopback);
-    devCtx->VmicRegistered = TRUE;
+    if (!cableB)
+    {
+        RETURN_NTSTATUS_IF_FAILED(NfVmic_DeviceAdd(Driver, device, &devCtx->Loopback));
+        devCtx->Loopback.AppFeed = TRUE;
+        devCtx->VmicRegistered = TRUE;
+    }
 
     //
     // The driver calls this DDI in its AddDevice callback after creating the PnP
@@ -234,15 +251,16 @@ Return Value:
     // device context. These circuits will be added to the device when the
     // prepare hardware callback is called. 
     //
-    RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, &CODEC_RENDER_COMPONENT_GUID, &renderCircuitName));
+    RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, cableB ? &CABLE_B_RENDER_COMPONENT_GUID : &CODEC_RENDER_COMPONENT_GUID,
+                                                    &renderCircuitName));
 
     // noise-filter (TODO 19): the microphones this hardware ID asks for (NfReadMicrophones); the call one is a second capture
     // circuit (DriverSettings.h). The first made goes in devCtx->Capture, a second in devCtx->Capture2.
-    ULONG microphones = NfReadMicrophones(device);
+    ULONG microphones = cableB ? NF_MIC_LOW_LATENCY : NfReadMicrophones(device);
     if (microphones & NF_MIC_LOW_LATENCY)
     {
-        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE_COMPONENT_GUID, &MIC_CUSTOM_NAME, &captureCircuitName,
-                                                          L"Microphone"));
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, cableB ? &CABLE_B_CAPTURE_COMPONENT_GUID : &CODEC_CAPTURE_COMPONENT_GUID,
+                                                          &MIC_CUSTOM_NAME, &captureCircuitName, L"Microphone"));
     }
     if (microphones & NF_MIC_CALL)
     {
@@ -297,15 +315,7 @@ Return Value:
     //
     RETURN_NTSTATUS_IF_FAILED(Codec_SetPowerPolicy(Device));
 
-    //
-    // Setting up the data saving (CSaveData) and wave file reader (CWaveReader)
-    // utility classes which will be used by the virtual streaming engine.
-    //
-    RETURN_NTSTATUS_IF_FAILED(CSaveData::SetDeviceObject(WdfDeviceWdmGetDeviceObject(Device)));
-
-    RETURN_NTSTATUS_IF_FAILED(CSaveData::InitializeWorkItems(WdfDeviceWdmGetDeviceObject(Device)));
-
-    RETURN_NTSTATUS_IF_FAILED(CWaveReader::InitializeWorkItems(WdfDeviceWdmGetDeviceObject(Device)));
+    // Both paths copy in memory. The sample's unused, driver-global WAV file work items cannot belong to two PnP devices.
 
     //
     // The driver uses this DDI to associate a circuit to a device. After
@@ -407,9 +417,6 @@ Return Value:
     }
 
     // NOTE: Release streaming h/w resources here.
-
-    CSaveData::DestroyWorkItems();
-    CWaveReader::DestroyWorkItems();
 
     status = STATUS_SUCCESS;
 

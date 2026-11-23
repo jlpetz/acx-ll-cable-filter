@@ -8,7 +8,7 @@
 . (Join-Path $PSScriptRoot 'common.ps1')
 Assert-Admin
 
-foreach ($id in $HardwareIds.Values) {
+foreach ($id in @($CableBHardwareId) + @($HardwareIds.Values)) {
     if (@(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $id }).Count -gt 0) {
         Write-Step "Remove $id"
         & (Find-WdkTool 'devcon.exe') remove $id

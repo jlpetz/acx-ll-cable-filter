@@ -59,9 +59,12 @@ pub struct Processed {
 
 /// Reads, processes and writes; the testable body of `process`.
 pub fn process_files(args: &ProcessArgs) -> Result<Processed, Failure> {
-    let mut cfg = match &args.config {
-        Some(path) => config::load(path)?.processing,
-        None => ProcessingConfig::default(),
+    let (mut cfg, effect) = match &args.config {
+        Some(path) => {
+            let cfg = config::load(path)?;
+            (cfg.processing, cfg.effect)
+        }
+        None => (ProcessingConfig::default(), Default::default()),
     };
     args.processing.apply(&mut cfg);
     let mut warnings = Vec::new();
@@ -90,15 +93,19 @@ pub fn process_files(args: &ProcessArgs) -> Result<Processed, Failure> {
 
     let start = Instant::now();
     let controls = Arc::new(ChainControls::new(&cfg));
-    let mut chain = nf_engine::models::build_chain(controls, &cfg, cfg.aec_enabled, nf_engine::models::ModelThread::Inline)
+    let mut chain = nf_engine::models::build_chain(controls.clone(), &cfg, cfg.aec_enabled, nf_engine::models::ModelThread::Inline)
         .map_err(|e| Failure::error(format!("Couldn't set up the processing chain: {e}")))?
         .chain;
     if args.warm_up {
         nf_engine::warm_up_chain(&mut chain);
     }
+    let failure = nf_engine::attach_offline_effect(&mut chain, &effect, controls).map_err(Failure::error)?;
     let latency = chain.latency();
     let skip = if args.align { latency as usize } else { 0 };
     let out = run_chain(&mut chain, &input.samples, reference.as_deref().unwrap_or(&[]), skip);
+    if let Some(error) = failure.get() {
+        return Err(Failure::error(format!("The external effect stopped the WAV render: {error}")));
+    }
     let elapsed = start.elapsed();
     write_output(&args.output, &out)?;
     Ok(Processed { frames: out.len(), latency, elapsed, warnings })

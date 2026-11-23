@@ -39,7 +39,7 @@ pub fn check(args: &CheckArgs) -> Result<(), Failure> {
         say!("warning: Couldn't arm the flight recorder ({e}); the check runs without it.");
         e.to_string()
     });
-    super::run::start_engine(&engine, &cfg)?;
+    super::run::start_engine(&engine, &cfg, args.engine.allow_driver)?;
     say!("Checking the devices for {} s: the filter runs as usual meanwhile. Ctrl+C stops it sooner.", args.seconds);
     let mut run = FirstRun::new(engine.status(), engine.telemetry());
     let started = Instant::now();

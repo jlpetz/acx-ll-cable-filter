@@ -18,6 +18,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::atomic::Ordering::Acquire;
 use std::time::{Duration, Instant};
 
@@ -67,8 +68,9 @@ fn is_set(event: &Owned<HANDLE>) -> bool {
 }
 
 /// The control device `\\.\NoiseFilterVmic`, opened for overlapped I/O, closed on drop.
+#[derive(Clone)]
 pub struct Device {
-    handle: Owned<HANDLE>,
+    handle: Rc<Owned<HANDLE>>,
 }
 
 impl Device {
@@ -91,7 +93,7 @@ impl Device {
         }
         .map_err(io_error)?;
         // SAFETY: a valid handle that nothing else owns; Owned closes it once.
-        Ok(Self { handle: unsafe { Owned::new(h) } })
+        Ok(Self { handle: Rc::new(unsafe { Owned::new(h) }) })
     }
 
     /// The driver's statistics (NF_VMIC_IOCTL_STATS), checked for the protocol's magic, version and size. `ERROR_BAD_COMMAND`:
@@ -107,7 +109,7 @@ impl Device {
         // GetOverlappedResult (which waits: it doesn't return while the request is pending) returns.
         let r = unsafe {
             DeviceIoControl(
-                *self.handle,
+                **self.handle,
                 IOCTL_STATS,
                 None,
                 0,
@@ -123,7 +125,7 @@ impl Device {
             return Err(io_error(e));
         }
         // SAFETY: our handle and this request's OVERLAPPED; waits for it to complete.
-        unsafe { GetOverlappedResult(*self.handle, overlapped_ptr, &raw mut bytes, true) }.map_err(io_error)?;
+        unsafe { GetOverlappedResult(**self.handle, overlapped_ptr, &raw mut bytes, true) }.map_err(io_error)?;
         if bytes as usize != size_of::<Stats>()
             || stats.magic != MAGIC
             || stats.version != VERSION
@@ -146,7 +148,17 @@ impl Device {
     ///
     /// A ring that was attached before ([`RingMemory::attached_before`]) is refused (`ErrorKind::InvalidInput`, the ring handed
     /// back) until [`RingMemory::reset`]: the driver starts every attachment at frame 0.
-    pub fn attach(&self, mut ring: RingMemory) -> Result<Attachment<'_>, AttachError> {
+    pub fn attach(&self, ring: RingMemory) -> Result<Attachment, AttachError> {
+        self.attach_with_flags(ring, 0)
+    }
+
+    /// Live microphone feed: after the last reader stops, the next reader starts at fresh audio. An older driver
+    /// refuses this flag, rather than replaying queued microphone samples from before the recording started.
+    pub fn attach_live(&self, ring: RingMemory) -> Result<Attachment, AttachError> {
+        self.attach_with_flags(ring, crate::protocol::ATTACH_LIVE)
+    }
+
+    fn attach_with_flags(&self, mut ring: RingMemory, flags: u32) -> Result<Attachment, AttachError> {
         if ring.attached_before() {
             let error = io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -159,13 +171,15 @@ impl Device {
             Err(error) => return Err(AttachError { error, ring: Some(ring), pending: false }),
         };
         let overlapped = NonNull::from(Box::leak(Box::new(OVERLAPPED { hEvent: *event, ..Default::default() })));
-        let input = AttachIn::new();
+        let version = if flags == 0 { VERSION } else { crate::protocol::LIVE_VERSION };
+        ring.set_attach_version(version);
+        let input = AttachIn { version, flags, ..AttachIn::new() };
         // SAFETY: our handle. The input is copied into the system buffer during the call. The ring and the OVERLAPPED belong to
         // the Attachment made below, which keeps both until the request has completed; if the call fails at once, the request
         // never started and both come straight back.
         let r = unsafe {
             DeviceIoControl(
-                *self.handle,
+                **self.handle,
                 IOCTL_ATTACH,
                 Some((&raw const input).cast()),
                 size_of::<AttachIn>() as u32,
@@ -194,7 +208,8 @@ impl Device {
         // Pending: from here the driver may publish the ring, read it and write its line, so it is marked for good. (KMDF pends
         // every request it delivers, so the driver's refusals come this way too: from ended() below.)
         ring.mark_attached();
-        let mut attachment = Attachment { device: self, ring: Some(ring), overlapped, event, abandoned: false, _not_send: PhantomData };
+        let mut attachment =
+            Attachment { device: self.clone(), ring: Some(ring), overlapped, event, abandoned: false, _not_send: PhantomData };
         let deadline = Instant::now() + ATTACH_CONFIRM;
         loop {
             if attachment.ring().header().state.load(Acquire) & STATE_ATTACHED != 0 {
@@ -234,8 +249,8 @@ pub struct AttachError {
 /// Dropping it detaches (cancel, then one wait of up to [`DETACH_WAIT_MS`]). If the request still hasn't completed by then, the
 /// ring and the OVERLAPPED are leaked rather than freed while the driver may still use them; a drop after a [`Self::detach`] or
 /// an attach whose wait timed out like that doesn't wait again.
-pub struct Attachment<'d> {
-    device: &'d Device,
+pub struct Attachment {
+    device: Device,
     ring: Option<RingMemory>,
     /// The request's OVERLAPPED: a Box's allocation, reached only through this pointer.
     overlapped: NonNull<OVERLAPPED>,
@@ -247,10 +262,15 @@ pub struct Attachment<'d> {
     _not_send: PhantomData<*const ()>,
 }
 
-impl Attachment<'_> {
+impl Attachment {
     /// The attached ring (write it with a [`Writer`](crate::Writer)).
     pub fn ring(&self) -> &RingMemory {
         self.ring.as_ref().expect("an Attachment holds its ring until it ends")
+    }
+
+    /// Nonblocking completion check for a live audio writer. No error allocation or IOCTL.
+    pub fn finished(&self) -> bool {
+        is_set(&self.event)
     }
 
     /// `Some(status)` once the request has completed: the driver ended the attachment ([`crate::protocol::ending`] explains the
@@ -261,7 +281,7 @@ impl Attachment<'_> {
         }
         let mut bytes = 0u32;
         // SAFETY: our handle and this request's OVERLAPPED; its event is set, so the request has completed and this doesn't wait.
-        match unsafe { GetOverlappedResult(*self.device.handle, self.overlapped.as_ptr(), &raw mut bytes, false) } {
+        match unsafe { GetOverlappedResult(**self.device.handle, self.overlapped.as_ptr(), &raw mut bytes, false) } {
             Ok(()) => Some(io::Error::other("the driver completed the attachment with success")),
             Err(e) => Some(io_error(e)),
         }
@@ -284,10 +304,10 @@ impl Attachment<'_> {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "the attachment was abandoned after an earlier wait"));
         }
         // SAFETY: our handle; cancels only this OVERLAPPED's request (ERROR_NOT_FOUND, ignored, if it has completed).
-        let _ = unsafe { CancelIoEx(*self.device.handle, Some(self.overlapped.as_ptr())) };
+        let _ = unsafe { CancelIoEx(**self.device.handle, Some(self.overlapped.as_ptr())) };
         let mut bytes = 0u32;
         // SAFETY: our handle and this request's OVERLAPPED; waits up to DETACH_WAIT_MS for it to complete.
-        let r = unsafe { GetOverlappedResultEx(*self.device.handle, self.overlapped.as_ptr(), &raw mut bytes, DETACH_WAIT_MS, false) };
+        let r = unsafe { GetOverlappedResultEx(**self.device.handle, self.overlapped.as_ptr(), &raw mut bytes, DETACH_WAIT_MS, false) };
         let timed_out = matches!(&r, Err(e) if win32(e).is_some_and(|w| w.0 == WAIT_TIMEOUT.0 || w == ERROR_IO_INCOMPLETE));
         // Completed means the event is set, whatever the call said: anything else is treated as still pending.
         if timed_out || !is_set(&self.event) {
@@ -309,7 +329,7 @@ impl Attachment<'_> {
     }
 }
 
-impl Drop for Attachment<'_> {
+impl Drop for Attachment {
     fn drop(&mut self) {
         // Still holding the ring and not abandoned: not detached yet, so detach now (the one wait; its status goes unread).
         if self.ring.is_some() && !self.abandoned {
@@ -333,7 +353,7 @@ mod tests {
     #[test]
     fn a_used_ring_is_refused_until_reset() {
         // A Device whose handle is an event: never the driver, and never asked anything (the refusal comes first).
-        let device = Device { handle: new_event().unwrap() };
+        let device = Device { handle: Rc::new(new_event().unwrap()) };
         let mut ring = RingMemory::new(1024).unwrap();
         ring.mark_attached();
         let e = device.attach(ring).err().expect("refused");

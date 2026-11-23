@@ -17,6 +17,8 @@ onnx = ["dep:nf-ort"]
 
 [dependencies]
 nf-core.workspace = true
+nf-vmic.workspace = true
+nf-fx = { path = "../nf-fx" }
 nf-mem.workspace = true
 nf-stages.workspace = true
 nf-ort = { workspace = true, optional = true }

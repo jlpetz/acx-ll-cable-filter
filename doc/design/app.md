@@ -58,6 +58,22 @@
 
 Argument parsing is hand-rolled (no clap) to keep the binary small.
 
+## Direct virtual microphone and external effects
+
+Select the driver ring in the window's output controls, then choose the Noise Filter microphone in the recording app.
+The CLI equivalent is `noise-filter-cli run --mic "USB microphone" --output-backend driver-ring`. This needs the updated
+ACX driver. The filter can start before a recorder opens the microphone. It drops audio captured while the microphone
+has no reader and uses the active reader's packet size when feeding it. Existing settings keep their selected WASAPI
+output. Choose **WASAPI** or pass `--output-backend wasapi --output "CABLE Input"` to use that route.
+
+Direct access from an unelevated app uses the driver's access button in the window or `--allow-driver` for a CLI invocation.
+Approval starts a separate helper which owns the driver's handle. The GUI and effects continue at their existing privileges.
+The helper serves the requesting app during its interactive session and detaches the feed on session loss.
+
+For a post effect, choose a `.clap` file in the settings window. The same settings file works with `run`, `latency` and
+`process` through `--config`. See [running an external effect](../todo/17-post-effects.md#running-an-external-effect) for
+the example gain plugin, supported ports and added latency.
+
 ## The noise model (TODO 5)
 - `--model NAME` (`run`, `latency`, `quality`, `process`; `bench` too) sets `ProcessingConfig.noise_model`: `rnnoise` (the
   default) or a model pack's id. The parser checks only its syntax (the pack id rule, `[a-z0-9][a-z0-9-]{0,63}`); the start

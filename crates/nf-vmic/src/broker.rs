@@ -1,0 +1,189 @@
+//! A user-approved connection to the machine's virtual microphone. The elevated helper keeps the driver handle and its one
+//! pending request. The caller receives just the anonymous ring section. It writes audio there directly, with effects in a separate worker.
+
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BUSY, HANDLE, WAIT_TIMEOUT};
+use windows::Win32::System::Pipes::PeekNamedPipe;
+use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::core::Owned;
+
+use crate::device::io_error;
+use crate::{Attachment, Device, RingMemory, protocol};
+
+mod connection;
+mod helper;
+
+/// The production ring size, fixed so an ordinary caller cannot request unbounded locked memory through the helper.
+pub const LIVE_CAPACITY: u32 = 8192;
+const START: u8 = 1;
+const STOP: u8 = 2;
+const IO_LIMIT: Duration = Duration::from_secs(8);
+const POLL: Duration = Duration::from_millis(10);
+static APPROVED: Mutex<Option<Arc<Session>>> = Mutex::new(None);
+
+fn raw(h: &impl AsRawHandle) -> HANDLE {
+    HANDLE(h.as_raw_handle())
+}
+
+fn alive(h: &OwnedHandle) -> bool {
+    // SAFETY: a process handle owned for this call. A zero timeout does not wait.
+    unsafe { WaitForSingleObject(raw(h), 0) == WAIT_TIMEOUT }
+}
+
+fn available(pipe: &File) -> io::Result<usize> {
+    let mut bytes = 0;
+    // SAFETY: a connected pipe owned for this call and one writable count.
+    unsafe { PeekNamedPipe(raw(pipe), None, 0, None, Some(&mut bytes), None) }.map_err(io_error)?;
+    Ok(bytes as usize)
+}
+
+/// Fixed-size response. A Win32 error or a section newly duplicated into the receiving process, never a process or driver handle.
+fn reply(pipe: &mut File, result: io::Result<u64>) -> io::Result<()> {
+    let (code, handle) = match result {
+        Ok(handle) => (0, handle),
+        Err(e) => (e.raw_os_error().unwrap_or(31), 0), // ERROR_GEN_FAILURE
+    };
+    let mut packet = [0; 12];
+    packet[..4].copy_from_slice(&i32::to_le_bytes(code));
+    packet[4..].copy_from_slice(&handle.to_le_bytes());
+    pipe.write_all(&packet)
+}
+
+struct Session {
+    child: OwnedHandle,
+    pipe: Mutex<Option<File>>,
+}
+
+impl Session {
+    /// All exchanges occur on a control thread. An incomplete exchange closes the pipe so an unacknowledged START is detached.
+    fn exchange(&self, command: Option<u8>) -> io::Result<u64> {
+        let mut slot = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
+        let pipe = slot.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+        let packet: io::Result<[u8; 12]> = (|| {
+            if let Some(byte) = command {
+                pipe.write_all(&[byte])?;
+            }
+            let start = Instant::now();
+            while available(pipe)? < 12 {
+                if !alive(&self.child) {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                if start.elapsed() >= IO_LIMIT {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(POLL);
+            }
+            let mut packet = [0; 12];
+            pipe.read_exact(&mut packet)?;
+            Ok(packet)
+        })();
+        let packet = packet.inspect_err(|_| *slot = None)?;
+        let code = i32::from_le_bytes(packet[..4].try_into().unwrap());
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        Ok(u64::from_le_bytes(packet[4..].try_into().unwrap()))
+    }
+}
+
+/// Snapshot for the settings window, outside its audio path. Never waits for a UAC prompt.
+pub fn authorized() -> bool {
+    APPROVED.try_lock().is_ok_and(|slot| slot.as_ref().is_some_and(|s| alive(&s.child)))
+}
+
+/// Explicit control-thread action. An approved session is reusable across Stop/Start. Device retries never launch this helper.
+pub fn authorize() -> io::Result<()> {
+    static PROMPTING: AtomicBool = AtomicBool::new(false);
+    if authorized() {
+        return Ok(());
+    }
+    if PROMPTING.swap(true, Ordering::AcqRel) {
+        return Err(io::Error::from_raw_os_error(ERROR_BUSY.0 as i32));
+    }
+    let result = connection::launch().map(|session| *APPROVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(session)));
+    PROMPTING.store(false, Ordering::Release);
+    result
+}
+
+/// A live writer. Only `ring` and `finished` belong in a real-time loop. Drop synchronously tears down this feed on its control path.
+pub struct LiveFeed(Feed);
+
+enum Feed {
+    Direct(Attachment),
+    Broker { ring: RingMemory, session: Arc<Session> },
+}
+
+impl LiveFeed {
+    pub fn ring(&self) -> &RingMemory {
+        match &self.0 {
+            Feed::Direct(a) => a.ring(),
+            Feed::Broker { ring, .. } => ring,
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        match &self.0 {
+            Feed::Direct(a) => a.finished(),
+            Feed::Broker { ring, session } => {
+                ring.header().state.load(Ordering::Acquire) & protocol::STATE_ATTACHED == 0 || !alive(&session.child)
+            }
+        }
+    }
+}
+
+impl Drop for LiveFeed {
+    fn drop(&mut self) {
+        if let Feed::Broker { session, .. } = &self.0 {
+            let _ = session.exchange(Some(STOP));
+        }
+    }
+}
+
+pub fn attach_live(capacity: u32) -> io::Result<LiveFeed> {
+    match Device::open() {
+        Ok(device) => return device.attach_live(RingMemory::new(capacity)?).map(|a| LiveFeed(Feed::Direct(a))).map_err(|e| e.error),
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {}
+        Err(e) => return Err(e),
+    }
+    if capacity != LIVE_CAPACITY {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let session = APPROVED.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|s| alive(&s.child));
+    let session = session.ok_or_else(denied)?;
+    let handle = session.exchange(Some(START))?;
+    // SAFETY: the authenticated helper transfers ownership of one real section in our handle table only in a successful START reply.
+    let section = unsafe { Owned::new(HANDLE(handle as usize as _)) };
+    let ring = RingMemory::shared_writer(*section, capacity).inspect_err(|_| {
+        let _ = session.exchange(Some(STOP));
+    })?;
+    Ok(LiveFeed(Feed::Broker { ring, session }))
+}
+
+fn denied() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32)
+}
+
+/// Dispatch in the app immediately after its CPU gate, before it loads any settings or starts any plug-in, log or UI.
+pub fn helper_entry() -> Option<u8> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()?.to_str()? != helper::FLAG {
+        return None;
+    }
+    let result = match (args.next(), args.next(), args.next()) {
+        (Some(pid), Some(nonce), None) => pid
+            .to_str()
+            .and_then(|p| p.parse::<u32>().ok())
+            .zip(nonce.to_str())
+            .filter(|(pid, nonce)| *pid != 0 && connection::valid_nonce(nonce))
+            .ok_or_else(denied)
+            .and_then(|(pid, nonce)| helper::serve(pid, nonce)),
+        _ => Err(denied()),
+    };
+    Some(u8::from(result.is_err()))
+}

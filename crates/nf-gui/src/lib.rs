@@ -17,6 +17,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 mod devices;
+mod effect_picker;
 mod format;
 mod live;
 mod meter;

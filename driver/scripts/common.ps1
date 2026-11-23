@@ -17,6 +17,7 @@ $script:ProjectDir   = Join-Path $DriverRoot 'src\AudioCodec\Driver'
 $script:PackageName  = 'AudioCodec'
 $script:InfName      = 'AudioCodec.inf'
 $script:HardwareId   = 'ROOT\AudioCodec'
+$script:CableBHardwareId = 'ROOT\NoiseFilterCableB' # optional independent device; never part of the primary variant switch
 # The three variants (TODO 19, the owner's options A and D): one INF, the microphones chosen by hardware ID.
 $script:HardwareIds  = [ordered]@{
     'both'        = 'ROOT\AudioCodec'              # the low-latency and the call microphone

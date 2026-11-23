@@ -30,6 +30,7 @@ pub(crate) struct LiveInput {
     pub show_meters: bool,
     /// `processing.latency_readout_enabled`: the "Live readout" toggle.
     pub show_readout: bool,
+    pub direct: bool,
     /// The meters' track width ([`crate::widgets::track_width`]).
     pub track: f64,
     pub on_show_meters: Callback<bool>,
@@ -97,9 +98,13 @@ impl Live {
         ))
     }
 
-    fn readout(&self) -> View {
+    fn readout(&self, direct: bool) -> View {
         let t = &self.telemetry;
-        let note = secondary("Excludes the cable's own buffer and the receiving app.");
+        let note = secondary(if direct {
+            "The driver reader supplies the output clock while a recording app is active. Recorder delivery is measured separately."
+        } else {
+            "Excludes the cable's own buffer and the receiving app."
+        });
         if t.state != EngineState::Running {
             return StackPanel::new().spacing(4.0).children((secondary("Shown while the filter runs."), note));
         }
@@ -107,7 +112,7 @@ impl Live {
             TextBlock::new().text(format::pipeline(t)).font_weight(FontWeight::SEMI_BOLD),
             TextBlock::new().text(format::budget(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::clocks(t)).text_wrapping(TextWrapping::Wrap),
-            TextBlock::new().text(format::streams(t)).text_wrapping(TextWrapping::Wrap),
+            TextBlock::new().text(format::streams(t, direct)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::cpu(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::dropouts(t)).text_wrapping(TextWrapping::Wrap),
             TextBlock::new().text(format::allocations(t)).text_wrapping(TextWrapping::Wrap),
@@ -193,7 +198,7 @@ impl Component for Live {
 
     fn view(&self, input: &LiveInput, context: &mut ViewContext<Self>) -> View {
         let meters = if input.show_meters { self.meters(input.track, context) } else { View::empty() };
-        let readout = if input.show_readout { self.readout() } else { View::empty() };
+        let readout = if input.show_readout { self.readout(input.direct) } else { View::empty() };
         StackPanel::new().spacing(crate::widgets::SECTION_SPACING).children((
             card("Meters", Some(show_switch("Show meters", input.show_meters, input.on_show_meters.clone())), meters),
             card("Latency", Some(show_switch("Live readout", input.show_readout, input.on_show_readout.clone())), readout),

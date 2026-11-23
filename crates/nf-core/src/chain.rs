@@ -1,6 +1,6 @@
-//! The processing chain: input meter → echo cancel → noise stage → output meter.
+//! The processing chain: input meter → echo cancel → noise stage → optional post effect → output meter.
 //!
-//! Each stage sits in a slot that is off (bypassed: a copy, no stage CPU, no delay, TODO #15), on,
+//! Each built-in stage sits in a slot that is off (bypassed: a copy, no stage CPU, no delay, TODO #15), on,
 //! in measurement passthrough (a delay line of the stage's latency stands in for it, so the measured
 //! delay equals the live configuration's, TODO #13), or draining (just switched off, still delayed).
 //! A toggle takes effect at the next block:
@@ -188,6 +188,10 @@ pub struct Chain {
     controls: Arc<ChainControls>,
     aec: Option<Slot>,
     noise: Option<Slot>,
+    /// An activated post effect. Its host maintains the same stream delay during bypass and measurement passthrough.
+    effect: Option<Box<dyn Stage>>,
+    effect_latency: u32,
+    effect_inputs: usize,
     input_meter: Meter,
     output_meter: Meter,
     a: Box<Block>,
@@ -206,6 +210,9 @@ impl Chain {
             controls,
             aec: aec.map(|s| Slot::new(s, StageRole::EchoCancel)),
             noise: noise.map(|s| Slot::new(s, StageRole::Noise)),
+            effect: None,
+            effect_latency: 0,
+            effect_inputs: 0,
             input_meter: Meter::new(),
             output_meter: Meter::new(),
             a: Box::new([0.0; BLOCK]),
@@ -223,6 +230,23 @@ impl Chain {
         for slot in [self.aec.as_mut(), self.noise.as_mut()].into_iter().flatten() {
             slot.activate()?;
         }
+        if let Some(stage) = &mut self.effect {
+            stage.activate(&Activation::HOST)?;
+            self.effect_latency = stage.latency();
+            self.effect_inputs = stage.audio_ports().input_count();
+        }
+        Ok(())
+    }
+
+    /// Installs the external host after the built-in stages have warmed up and before audio starts.
+    pub fn attach_effect(&mut self, mut stage: Box<dyn Stage>) -> Result<(), StageError> {
+        if check_host_profile(stage.as_ref())? != StageRole::Effect {
+            return Err(StageError(format!("{} is not a post effect", stage.descriptor().id)));
+        }
+        stage.activate(&Activation::HOST)?;
+        self.effect_latency = stage.latency();
+        self.effect_inputs = stage.audio_ports().input_count();
+        self.effect = Some(stage);
         Ok(())
     }
 
@@ -232,9 +256,11 @@ impl Chain {
         let c = &self.controls;
         self.aec.as_ref().map_or(0, |s| s.latency(c.aec.enabled.load(Relaxed)))
             + self.noise.as_ref().map_or(0, |s| s.latency(c.noise.enabled.load(Relaxed)))
+            + self.effect_latency
     }
 
-    /// Whether a stage will process the next block, by the controls as they read now (`Slot::runs`, which mirrors `run_slot`).
+    /// Whether a built-in stage needs mic dither on the next block (`Slot::runs`, which mirrors `run_slot`).
+    /// External effects alone receive the original signal, including exact digital silence.
     /// A slot runs its stage if the controls want it on (enabled, measurement passthrough off), or if the slot was in
     /// `Mode::On` on the last block: the block it is switched off on, or passthrough comes on, still runs it once, into the
     /// crossfade to its delay line. A start-up cut short (`Mode::Starting`, then switched off or into passthrough) ran the
@@ -323,7 +349,12 @@ impl Chain {
             report.noise_ticks = t2.wrapping_sub(t1);
         }
 
-        *out = *self.b;
+        if let Some(effect) = &mut self.effect {
+            let inputs = [&*self.b, reference];
+            effect.process(ProcessIo::new(&inputs[..self.effect_inputs], out));
+        } else {
+            *out = *self.b;
+        }
         if meters {
             report.output = Some(self.output_meter.measure(out));
         }
@@ -614,6 +645,24 @@ mod tests {
             Some(wired(&[features::DENOISE], MONO_IN_OUT.clone())),
         );
         assert!(ok.activate().is_ok());
+    }
+
+    #[test]
+    fn post_effect_receives_upstream_audio_and_its_declared_reference() {
+        let controls = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        let noise = Scaled { line: DelayLine::new(0, 0), gain: 0.5, lat: 0, resets: Arc::default(), calls: Arc::default() };
+        let mut chain = Chain::new(controls, None, Some(Box::new(noise)));
+        chain.activate().unwrap();
+        let effect = Wired::new(&[], MONO_WITH_REFERENCE.clone(), false);
+        let seen = effect.seen.clone();
+        effect.lat.store(480, Relaxed);
+        chain.attach_effect(Box::new(effect)).unwrap();
+        assert_eq!(chain.latency(), 480);
+        let mut out = [0.0; BLOCK];
+        let report = chain.process(&[0.5; BLOCK], &[0.125; BLOCK], &mut out);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[(0.25, Some(0.125))]);
+        assert_eq!(report.output.unwrap().peak, 0.25);
+        assert_eq!(out, [0.25; BLOCK]);
     }
 
     #[test]

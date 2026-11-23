@@ -25,6 +25,7 @@
 //! run the writer against the model reader over real `VirtualAlloc` memory (4 KB pages).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod broker;
 pub mod device;
 pub mod latency;
 pub mod memory;

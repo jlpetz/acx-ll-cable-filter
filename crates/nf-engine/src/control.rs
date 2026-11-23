@@ -20,7 +20,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use nf_core::config::{EngineConfig, ProcessingConfig};
+use nf_core::config::EngineConfig;
 use nf_core::controls::ChainControls;
 use nf_core::telemetry::{EngineState, Telemetry};
 use wasapi::{DeviceEnumerator, DeviceEventCallbacks, DeviceEventRegistration, DeviceState, Direction, Role};
@@ -95,6 +95,7 @@ pub(crate) struct StatusInfo {
     pub(crate) notes: Vec<String>,
     pub(crate) mic: Option<StreamInfo>,
     pub(crate) output: Option<StreamInfo>,
+    pub(crate) driver_ring: bool,
     pub(crate) reference: Option<StreamInfo>,
     pub(crate) mmcss: bool,
     pub(crate) mic_id: Option<String>,
@@ -211,6 +212,7 @@ struct Failed {
 pub(crate) struct Inner {
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) controls: Arc<ChainControls>,
+    pub(crate) effect: Mutex<Option<crate::effect::LoadedEffect>>,
     run: Mutex<RunState>,
     pub(crate) status: Mutex<StatusInfo>,
     desired: Mutex<Desired>,
@@ -244,6 +246,7 @@ impl Inner {
         Arc::new(Self {
             telemetry: Arc::new(Telemetry::new()),
             controls: Arc::new(ChainControls::new(&processing)),
+            effect: Mutex::new(None),
             run: Mutex::new(RunState::default()),
             status: Mutex::new(StatusInfo::default()),
             desired: Mutex::new(Desired::default()),
@@ -285,8 +288,12 @@ impl Inner {
 
     /// The processing settings, live: the chain reads these atomics every block. Callers hold the
     /// `desired` lock, so a start finishing can't put older values back over newer ones.
-    fn apply_live_controls(&self, processing: &ProcessingConfig) {
+    fn apply_live_controls(&self, config: &EngineConfig) {
+        let processing = &config.processing;
         self.controls.apply(processing);
+        if let Some(effect) = lock(&self.effect).as_ref() {
+            effect.apply(&config.effect);
+        }
         let readout = processing.latency_readout_enabled;
         self.readout.store(readout, Relaxed);
         if let Some(s) = lock(&self.current).as_ref() {
@@ -590,6 +597,9 @@ pub(crate) fn restart_needed(running: &EngineConfig, aec_built: bool, new: &Engi
     let (r, n) = (&running.processing, &new.processing);
     running.devices != new.devices
         || running.io != new.io
+        || running.effect.path != new.effect.path
+        || running.effect.plugin_id != new.effect.plugin_id
+        || running.effect.worker_blocks != new.effect.worker_blocks
         || (n.aec_enabled && !aec_built)
         || r.noise_model != n.noise_model
         || (n.noise_model != nf_core::config::DEFAULT_NOISE_MODEL && r.model_depth != n.model_depth)
@@ -607,7 +617,11 @@ pub(crate) fn io_changed(a: &EngineConfig, b: &EngineConfig) -> bool {
 /// control thread judges the restart again when it's due (`restart_due`), so turning AEC off, a
 /// bypass, doesn't restart either.
 pub(crate) fn apply_wants_restart(prev: &EngineConfig, new: &EngineConfig, running: Option<&EngineConfig>, aec_built: bool) -> bool {
-    io_changed(prev, new) || running.is_some_and(|r| restart_needed(r, aec_built, new))
+    io_changed(prev, new)
+        || prev.effect.worker_blocks != new.effect.worker_blocks
+        || prev.effect.path != new.effect.path
+        || prev.effect.plugin_id != new.effect.plugin_id
+        || running.is_some_and(|r| restart_needed(r, aec_built, new))
 }
 
 /// Whether a (re)start that has come due should run, judged against the run as it is then: the
@@ -818,6 +832,9 @@ impl Schedule {
 
 /// The device rules that need no device: an output is chosen, and it isn't the reference.
 pub(crate) fn validate(config: &EngineConfig) -> Result<(), String> {
+    if config.io.output_backend == nf_core::config::OutputBackend::DriverRing {
+        return Ok(());
+    }
     let Some(out) = config.devices.output.as_deref().filter(|s| !s.is_empty()) else {
         return Err(no_output_message().to_owned());
     };
@@ -913,9 +930,9 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
     let readout = {
         let mut d = lock(&inner.desired);
         d.starting = true;
-        let processing = d.config.as_ref().map_or(&config.processing, |w| &w.processing);
-        inner.apply_live_controls(processing);
-        processing.latency_readout_enabled
+        let wanted = d.config.as_ref().unwrap_or(config);
+        inner.apply_live_controls(wanted);
+        wanted.processing.latency_readout_enabled
     };
     // A run that timed out may still be stuck in a driver call, holding the device and its thread:
     // a new start would only queue behind it.
@@ -925,6 +942,9 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
         }
         run.stuck = None;
     }
+    let external = crate::effect::LoadedEffect::open(&config.effect, inner.controls.clone())
+        .map_err(|e| fail(inner, &StartFailure::Stage(e), config))?;
+    let (loaded_effect, effect_stage) = external.unzip();
     let shared = Arc::new(AudioShared::default());
     shared.readout.store(readout, Relaxed);
     let (port, end) = tap_channel();
@@ -936,6 +956,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
     let (done_tx, done_rx) = mpsc::channel();
     let args = AudioArgs {
         config: config.clone(),
+        effect_stage,
         telemetry: inner.telemetry.clone(),
         controls: inner.controls.clone(),
         shared: shared.clone(),
@@ -956,6 +977,7 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
             run.worker = Some(worker);
             run.audio = Some(handle);
             *lock(&inner.current) = Some(shared);
+            *lock(&inner.effect) = loaded_effect;
             *lock(&inner.tap) = Some(port);
             recorder::run_started(inner, rec_port);
             flight::run_started(inner, flight_port);
@@ -1074,19 +1096,26 @@ fn settle_start(inner: &Inner, config: &EngineConfig, aec_built: Option<bool>) -
     d.starting = false;
     let stale = match aec_built {
         Some(built) => {
-            d.running = Some(config.clone());
+            let mut running = config.clone();
+            if let Some(effect) = lock(&inner.effect).as_ref() {
+                effect.pin_id(&mut running.effect);
+                if let Some(wanted) = &mut d.config {
+                    effect.pin_id(&mut wanted.effect);
+                }
+            }
+            d.running = Some(running.clone());
             d.aec_built = built;
             d.waiting_for_device = false;
             d.started_at = Some(Instant::now());
             d.config.as_ref().is_some_and(|w| {
-                inner.apply_live_controls(&w.processing);
-                restart_needed(config, built, w)
+                inner.apply_live_controls(w);
+                restart_needed(&running, built, w)
             })
         }
         None => {
             d.waiting_for_device = true;
             d.started_at = None;
-            d.config.as_ref().is_some_and(|w| io_changed(config, w))
+            d.config.as_ref().is_some_and(|w| apply_wants_restart(config, w, None, false))
         }
     };
     (stale, std::mem::take(&mut d.deferred))
@@ -1110,6 +1139,7 @@ fn status_from(o: Opened) -> StatusInfo {
         notes: notes.into_iter().map(describe_warning).collect(),
         mic: Some(o.mic),
         output: Some(o.output),
+        driver_ring: o.driver_ring,
         reference: o.reference,
         mmcss: o.mmcss,
         mic_id: o.mic_id,
@@ -1140,6 +1170,7 @@ fn stop_locked(inner: &Inner, run: &mut RunState) {
         }
     }
     *lock(&inner.current) = None;
+    *lock(&inner.effect) = None;
     *lock(&inner.tap) = None;
     recorder::run_stopped(inner);
     flight::run_stopped(inner);
@@ -1200,15 +1231,19 @@ pub(crate) fn stop(inner: &Arc<Inner>) {
 pub(crate) fn apply(inner: &Arc<Inner>, config: &EngineConfig) {
     let restart = {
         let mut guard = lock(&inner.desired);
+        let mut new = config.clone();
+        if let Some(effect) = lock(&inner.effect).as_ref() {
+            effect.pin_id(&mut new.effect);
+        }
         // Processing changes need no command: the chain reads these atomics every block.
-        inner.apply_live_controls(&config.processing);
+        inner.apply_live_controls(&new);
         let d = &mut *guard;
         match d.config.as_mut() {
             // Not meant to run: nothing to restart.
             None => false,
             Some(wanted) => {
-                let prev = std::mem::replace(wanted, config.clone());
-                apply_wants_restart(&prev, config, d.running.as_ref(), d.aec_built)
+                let prev = std::mem::replace(wanted, new);
+                apply_wants_restart(&prev, wanted, d.running.as_ref(), d.aec_built)
             }
         }
     };
@@ -1219,7 +1254,12 @@ pub(crate) fn apply(inner: &Arc<Inner>, config: &EngineConfig) {
 }
 
 pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
-    let st = lock(&inner.status).clone();
+    let mut st = lock(&inner.status).clone();
+    if st.driver_ring
+        && let Some(output) = &mut st.output
+    {
+        output.period_ms = inner.telemetry.output_period_ms.load();
+    }
     let chain_latency_ms =
         lock(&inner.current).as_ref().map_or(0.0, |s| s.chain_latency.load(Relaxed) as f32 * 1000.0 / nf_core::SAMPLE_RATE as f32);
     EngineStatus {
@@ -1240,7 +1280,12 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
 }
 
 pub(crate) fn buffer_targets(inner: &Arc<Inner>) -> BufferTargets {
-    lock(&inner.status).targets
+    let st = lock(&inner.status);
+    let mut targets = st.targets;
+    if st.driver_ring {
+        targets.output_ms = inner.telemetry.output_target_ms.load();
+    }
+    targets
 }
 
 /// The pool's status line, e.g. "large pages (32 MiB)".
@@ -1384,6 +1429,11 @@ mod tests {
         assert_eq!(validate(&cfg(None, Some("cable"), Some("cable"), true)), Err(same_device_message().to_owned()));
         assert!(validate(&cfg(None, Some("cable"), Some("speakers"), true)).is_ok());
         assert!(validate(&cfg(Some("mic"), Some("cable"), None, true)).is_ok());
+        let mut direct = cfg(Some("mic"), None, Some("speakers"), true);
+        direct.io.output_backend = nf_core::config::OutputBackend::DriverRing;
+        assert!(validate(&direct).is_ok());
+        direct.devices.output = direct.devices.reference.clone(); // A saved WASAPI selection is inactive on a direct feed.
+        assert!(validate(&direct).is_ok());
     }
 
     #[test]
@@ -1412,6 +1462,21 @@ mod tests {
         assert!(!ctl.noise.enabled.load(Relaxed));
         assert_eq!(ctl.noise.floor_db.load(), -20.0);
         assert!(!engine.inner.readout.load(Relaxed));
+    }
+
+    #[test]
+    fn effect_selection_restarts_and_its_live_controls_do_not() {
+        let base = cfg(None, Some("cable"), None, false);
+        let mut wet = base.clone();
+        wet.effect.path = Some("gain.clap".into());
+        assert!(restart_needed(&base, false, &wet));
+        assert!(apply_wants_restart(&base, &wet, None, false));
+        let mut same = wet.clone();
+        same.effect.bypass = true;
+        same.effect.params.insert(4, 0.75);
+        assert!(!apply_wants_restart(&wet, &same, Some(&wet), false));
+        same.effect.plugin_id = Some("another.effect.in.the.bundle".into());
+        assert!(restart_needed(&wet, false, &same));
     }
 
     #[test]
@@ -1545,6 +1610,7 @@ mod tests {
         let o = Opened {
             mic: info.clone(),
             output: info,
+            driver_ring: false,
             reference: None,
             mic_id: Some("m".into()),
             output_id: Some("o".into()),

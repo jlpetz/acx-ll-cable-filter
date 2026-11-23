@@ -574,6 +574,7 @@ impl PeriodDevice for ExclusiveRenderDevice {
 /// fills [`EventRender`]'s ring, and each device event moves a period from it to the device).
 pub(crate) enum Output {
     Shared(RenderStream),
+    Driver(crate::ring_output::RingOutput),
     Exclusive(EventRender<ExclusiveRenderDevice>),
 }
 
@@ -598,6 +599,7 @@ impl Output {
     pub(crate) fn info(&self) -> &OpenInfo {
         match self {
             Output::Shared(s) => &s.info,
+            Output::Driver(s) => &s.info,
             Output::Exclusive(e) => &e.device().info,
         }
     }
@@ -606,6 +608,7 @@ impl Output {
     pub(crate) fn period_frames(&self) -> usize {
         match self {
             Output::Shared(s) => s.period_frames(),
+            Output::Driver(_) => BLOCK,
             Output::Exclusive(e) => e.period(),
         }
     }
@@ -627,6 +630,7 @@ impl Output {
     pub(crate) fn start(&mut self) -> Result<(), Hr> {
         match self {
             Output::Shared(s) => s.start(),
+            Output::Driver(_) => Ok(()),
             Output::Exclusive(e) => {
                 e.preroll()?;
                 e.device().start()?;
@@ -639,6 +643,7 @@ impl Output {
     pub(crate) fn stop(&self) {
         match self {
             Output::Shared(s) => s.stop(),
+            Output::Driver(_) => {}
             Output::Exclusive(e) => e.device().stop(),
         }
     }
@@ -646,7 +651,7 @@ impl Output {
     /// The event the audio thread waits on besides the mic's: the exclusive device's. `None` in shared mode (polled).
     pub(crate) fn event(&self) -> Option<HANDLE> {
         match self {
-            Output::Shared(_) => None,
+            Output::Shared(_) | Output::Driver(_) => None,
             Output::Exclusive(e) => Some(e.device().event()),
         }
     }
@@ -656,6 +661,7 @@ impl Output {
     pub(crate) fn service(&mut self, signalled: bool) -> Result<(), Hr> {
         match self {
             Output::Shared(_) => Ok(()),
+            Output::Driver(s) => s.check_attached(),
             Output::Exclusive(e) => {
                 if signalled || e.device().signalled() {
                     e.service()
@@ -668,10 +674,18 @@ impl Output {
 }
 
 impl RenderSink for Output {
+    fn driver_packet(&self) -> Option<usize> {
+        match self {
+            Output::Driver(s) => Some(s.packet()),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn buffer_frames(&self) -> usize {
         match self {
             Output::Shared(s) => s.buffer_frames(),
+            Output::Driver(s) => s.buffer_frames(),
             Output::Exclusive(e) => e.buffer_frames(),
         }
     }
@@ -679,6 +693,7 @@ impl RenderSink for Output {
     fn padding(&mut self) -> Result<usize, Hr> {
         match self {
             Output::Shared(s) => s.padding(),
+            Output::Driver(s) => s.padding(),
             Output::Exclusive(e) => e.padding(),
         }
     }
@@ -686,6 +701,7 @@ impl RenderSink for Output {
     fn write(&mut self, mono: &[f32]) -> Result<(), Hr> {
         match self {
             Output::Shared(s) => s.write(mono),
+            Output::Driver(s) => s.write(mono),
             Output::Exclusive(e) => e.write(mono),
         }
     }
@@ -693,6 +709,7 @@ impl RenderSink for Output {
     fn write_silence(&mut self, frames: usize) -> Result<(), Hr> {
         match self {
             Output::Shared(s) => s.write_silence(frames),
+            Output::Driver(s) => s.write_silence(frames),
             Output::Exclusive(e) => e.write_silence(frames),
         }
     }
@@ -700,6 +717,7 @@ impl RenderSink for Output {
     fn clock(&mut self) -> Result<Option<ClockReading>, Hr> {
         match self {
             Output::Shared(s) => s.clock(),
+            Output::Driver(s) => s.clock(),
             Output::Exclusive(e) => e.clock(),
         }
     }
@@ -707,6 +725,7 @@ impl RenderSink for Output {
     fn take_underruns(&mut self) -> u64 {
         match self {
             Output::Shared(s) => s.take_underruns(),
+            Output::Driver(s) => s.take_underruns(),
             Output::Exclusive(e) => e.take_underruns(),
         }
     }
@@ -714,6 +733,7 @@ impl RenderSink for Output {
     fn take_silence(&mut self) -> u64 {
         match self {
             Output::Shared(s) => s.take_silence(),
+            Output::Driver(s) => s.take_silence(),
             Output::Exclusive(e) => e.take_silence(),
         }
     }
@@ -721,6 +741,7 @@ impl RenderSink for Output {
     fn take_late(&mut self) -> u64 {
         match self {
             Output::Shared(s) => s.take_late(),
+            Output::Driver(s) => s.take_late(),
             Output::Exclusive(e) => e.take_late(),
         }
     }

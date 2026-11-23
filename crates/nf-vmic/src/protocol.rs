@@ -2,7 +2,7 @@
 //! the header's offsets at compile time. Change both together. Bump [`VERSION`] on a change to a layout or to a rule the app must
 //! follow (ATTACH, the ring's header and the ring's rules for the app's side); [`Stats`] carries its size, checked with the
 //! version ([`Device::stats`](crate::Device::stats)), and the driver's handling of its other capture streams can change without
-//! one (the owner, 2026-11-23). The header's comment has the rules.
+//! one (the owner, 2026-11-23). Live ATTACH and its header use [`LIVE_VERSION`]; ordinary ATTACH and STATS retain [`VERSION`].
 
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 pub const MAGIC: u32 = 0x4D56_464E;
 /// `NF_VMIC_VERSION`.
 pub const VERSION: u32 = 1;
+/// `NF_VMIC_LIVE_VERSION`: live ATTACH request and its ring. Ordinary feeds and STATS keep the v1 contract.
+pub const LIVE_VERSION: u32 = 2;
 /// `NF_VMIC_USER_PATH`: the control device, opened from user mode.
 pub const USER_PATH: &str = r"\\.\NoiseFilterVmic";
 
@@ -53,12 +55,17 @@ pub const MAX_CAPACITY_FRAMES: u32 = 1 << 18;
 pub const MIN_RING_BYTES: usize = ring_bytes(MIN_CAPACITY_FRAMES);
 pub const MAX_RING_BYTES: usize = ring_bytes(MAX_CAPACITY_FRAMES);
 
+/// ATTACH flag for a live microphone. Idle capture intervals discard queued audio on the next reader.
+pub const ATTACH_LIVE: u32 = 1;
+
 /// [`RingHeader::state`] bits: the driver published this ring.
 pub const STATE_ATTACHED: u32 = 0x1;
 /// The capture stream holding the reader slot read the ring at its latest pass (underrun or not).
 pub const STATE_READING: u32 = 0x2;
 /// That stream isn't 48 kHz float32 stereo: its packets are silence, the ring not read.
 pub const STATE_FORMAT_MISMATCH: u32 = 0x4;
+/// Live feed only: another recorder is running and can take the vacant slot on its next pass.
+pub const STATE_LIVE_HANDOFF: u32 = 0x8;
 
 /// [`Stats::flags`] bits. An app ring is attached (the `attached_*` fields are valid).
 pub const STATS_ATTACHED: u32 = 0x1;
@@ -239,8 +246,8 @@ pub struct RingHeader {
     pub passes: AtomicU64,
     /// The driver's QPC at the latest of those passes.
     pub last_pass_qpc: AtomicU64,
-    /// Reserved, 0. An atomic because the driver zeroes all of line 2 at ATTACH, while the app may hold a reference to the header.
-    pub reserved2: AtomicU64,
+    /// Even sequence for a coherent read of the live driver clock; odd while a reader updates it. Zero for ordinary attachments.
+    pub clock_sequence: AtomicU64,
     pub reserved3: [u8; 64],
 }
 
@@ -450,7 +457,7 @@ const _: () = {
     assert!(offset_of!(RingHeader, packet_frames) == 164);
     assert!(offset_of!(RingHeader, passes) == 168);
     assert!(offset_of!(RingHeader, last_pass_qpc) == 176);
-    assert!(offset_of!(RingHeader, reserved2) == 184);
+    assert!(offset_of!(RingHeader, clock_sequence) == 184);
     assert!(offset_of!(RingHeader, reserved3) == (DRIVER_LINE_OFFSET + LINE_BYTES) as usize);
     assert!(MIN_RING_BYTES == 8_448 && MAX_RING_BYTES == 2_097_408);
 

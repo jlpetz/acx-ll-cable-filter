@@ -173,8 +173,20 @@ pub(crate) fn budget(t: &TelemetrySnapshot) -> String {
 /// target fixed". Exclusive is WASAPI exclusive mode, as asked for and granted (a refused one runs shared, with a
 /// note; an output on the default playback device runs shared, with that warning); the target is fixed (a period + a
 /// block + the margin) or adaptive.
-pub(crate) fn streams(t: &TelemetrySnapshot) -> String {
+pub(crate) fn streams(t: &TelemetrySnapshot, direct: bool) -> String {
     let mode = |exclusive: bool| if exclusive { "exclusive" } else { "shared" };
+    if direct {
+        let reader = if t.output_period_ms > 0.0 {
+            format!("{} ms recording period", fixed(t.output_period_ms, 1))
+        } else {
+            "waiting for a recorder".into()
+        };
+        return format!(
+            "Streams: mic {}, {} ms period · output direct to driver, {reader}",
+            mode(t.mic_exclusive),
+            fixed(t.mic_period_ms, 1)
+        );
+    }
     format!(
         "Streams: mic {}, {} ms period · output {}, {} ms period · output target {}",
         mode(t.mic_exclusive),
@@ -260,7 +272,8 @@ pub(crate) fn stream(label: &str, s: Option<&StreamInfo>) -> String {
     let Some(s) = s else {
         return format!("{label}: not open");
     };
-    let mut line = format!("{label}: {} · {} Hz, {} ch · {} ms period", s.device_name, s.sample_rate, s.channels, fixed(s.period_ms, 1));
+    let period = if s.period_ms > 0.0 { format!("{} ms period", fixed(s.period_ms, 1)) } else { "waiting for a recorder".into() };
+    let mut line = format!("{label}: {} · {} Hz, {} ch · {period}", s.device_name, s.sample_rate, s.channels);
     if s.low_latency {
         line.push_str(" (IAudioClient3)");
     }
@@ -548,13 +561,15 @@ mod tests {
         assert!(line.ends_with("Reference lead: 0.0 ms (target —)"), "{line}");
         // The latency options: the streams' modes, and an adaptive target with the budget and the fill.
         let t = TelemetrySnapshot { mic_period_ms: 10.0, output_period_ms: 10.0, ..t };
-        assert_eq!(streams(&t), "Streams: mic shared, 10.0 ms period · output shared, 10.0 ms period · output target fixed");
+        assert_eq!(streams(&t, false), "Streams: mic shared, 10.0 ms period · output shared, 10.0 ms period · output target fixed");
+        assert!(streams(&t, true).ends_with("output direct to driver, 10.0 ms recording period"));
+        assert!(streams(&TelemetrySnapshot::default(), true).ends_with("waiting for a recorder"));
         let x = TelemetrySnapshot { output_exclusive: true, output_period_ms: 2.0, output_adaptive: true, output_target_ms: 5.0, ..t };
-        assert_eq!(streams(&x), "Streams: mic shared, 10.0 ms period · output exclusive, 2.0 ms period · output target adaptive");
+        assert_eq!(streams(&x, false), "Streams: mic shared, 10.0 ms period · output exclusive, 2.0 ms period · output target adaptive");
         assert!(budget(&x).ends_with("chain 10.0 ms on top · output target 5.0 ms (adaptive)"), "{}", budget(&x));
         assert!(clocks(&x).contains("Output fill: 15.0 ms (target 5.0, adaptive)"), "{}", clocks(&x));
         let m = TelemetrySnapshot { mic_exclusive: true, mic_period_ms: 10.0 / 3.0, ..t };
-        assert!(streams(&m).starts_with("Streams: mic exclusive, 3.3 ms period"), "{}", streams(&m));
+        assert!(streams(&m, false).starts_with("Streams: mic exclusive, 3.3 ms period"), "{}", streams(&m, false));
     }
 
     fn stream_info() -> StreamInfo {
