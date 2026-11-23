@@ -105,9 +105,12 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       first capture stream to run reads the ring; the driver gives the others its audio as secondary streams. When the
       reader stops, another takes the slot with one counted skip (a gap that must match the driver's count); the rest play
       on with no repeat: silence the driver counts where the new reader's packet is longer, and one counted skip where it
-      is shorter (a gap that must match SecondarySkippedFrames). The counts are the driver's, for every stream: where they
-      hold skips beyond the recording's gaps (two streams playing on through one handoff, or two handoffs in the
-      recording) and its gaps could be among them, the result is INCONCLUSIVE, unless another check fails.
+      is shorter (a gap that must match SecondarySkippedFrames). A stream may have one of each (it played on through one
+      handoff and took the slot at the next): two gaps, matching the two counts together. The counts are the driver's, for
+      every stream: where they hold skips beyond the recording's gaps (two streams playing on through one handoff, or two
+      handoffs in the recording) and its gaps could be among them, the result is INCONCLUSIVE, unless another check fails
+      (only per-stream counts, a driver change, could tie them). For a PASS with three streams or more, record one handoff
+      at a time, with no other stream playing on through it.
   nf-vmic-test stats
       Print the driver's statistics.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
@@ -158,7 +161,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       time, each of the driver's stamps steps by its packet's length while the stream runs (by device position) and,
       across each resume, by at least the frames between; FAIL otherwise, or for any other stamp off the grid (in the
       first run, or after the driver's first packet since a Start: listed with its offset); INCONCLUSIVE when a resume's
-      step couldn't be compared.
+      step couldn't be compared, or the grid couldn't be found from the first run's notifications (too few packets).
   nf-vmic-test idle-test [--device NAME]
       Start an exclusive recorder twice on a live ring. Check that samples queued before each open are discarded and new
       samples reach the recorder. Requires an idle virtual capture endpoint.
@@ -291,10 +294,12 @@ impl Checks {
         self.judge(ok.into(), name, detail) == Outcome::Ok
     }
 
+    /// Prints the check under a four-wide label, so the names line up: `ok`, `FAIL`, or `INC?` (inconclusive: its detail says
+    /// why).
     fn judge(&mut self, outcome: Outcome, name: &str, detail: impl Display) -> Outcome {
         let label = match outcome {
             Outcome::Ok => "ok  ",
-            Outcome::Inconclusive => "INCONCLUSIVE",
+            Outcome::Inconclusive => "INC?",
             Outcome::Fail => "FAIL",
         };
         println!("  {label} {name}: {detail}");
@@ -1143,7 +1148,8 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         Verdict::Pass => println!("PASS: the app ring fed the recording, bit-exact on both channels, in order, nothing lost or repeated"),
         Verdict::Inconclusive => println!(
             "INCONCLUSIVE: nothing failed, but {} of the checks couldn't tie the recording's gaps to the driver's counts, which \
-             are for every stream and hold skips beyond this recording's (another stream's, as far as they show)",
+             are for every stream and hold skips beyond this recording's (another stream's, as far as they show); for a PASS, \
+             record one handoff at a time, with no other stream playing on through it",
             c.inconclusive
         ),
         _ => println!("FAIL: {} of the checks", c.failed),
@@ -1185,23 +1191,37 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     // frame. A stream that plays the driver's copy on through a handoff (nf_vmic.h) gets the difference as silence where the
     // new reader's packet is longer, counted in SecondaryUnderrunFrames, with no gap; where it is shorter it moves on to the
     // new lag at once and skips the difference once (the owner, 2026-11-23), counted apart (SecondarySkips,
-    // SecondarySkippedFrames), and its gaps are tied to that count the same way. Each count stands alone: a gap matching
-    // their sum fails, and any repeat fails. Where a count holds skips this recording can't account for, another stream's
-    // (two streams playing on through one handoff to a shorter packet each skip, or two handoffs in the window: Astra's
-    // review, 2026-11-24), the gaps are INCONCLUSIVE rather than failed if they could be among them ([`gap_outcome`]).
+    // SecondarySkippedFrames), and its gaps are tied to that count the same way. A gap is one skip, so one matching the two
+    // counts' sum fails; a recording may hold a skip of each kind (it played on through one handoff and took the slot at the
+    // next), its gaps split between the counts. Any repeat fails. Where a count holds skips this recording can't account
+    // for, another stream's (two streams playing on through one handoff to a shorter packet each skip, or two handoffs in the
+    // window: Astra's review, 2026-11-24), the gaps are INCONCLUSIVE rather than failed if they could be among them
+    // ([`gap_outcome`]). For a PASS with three streams or more, record one handoff at a time, with no other stream playing on.
     let handoffs = after.reader_handoffs.saturating_sub(before.reader_handoffs);
     let skipped = after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames);
     let secondary_skips = after.secondary_skips.saturating_sub(before.secondary_skips);
     let secondary_skipped = after.secondary_skipped_frames.saturating_sub(before.secondary_skipped_frames);
-    let gaps = gap_outcome(r.gaps, r.gap_frames, &[(handoffs, skipped), (secondary_skips, secondary_skipped)]);
-    let in_order = if r.signal_frames > 0 && r.repeats == 0 && r.corrupt_frames == 0 { gaps } else { Outcome::Fail };
+    let gaps = gap_outcome(r.gaps, r.gap_frames, (handoffs, skipped), (secondary_skips, secondary_skipped));
+    // What fails the check whatever the gaps.
+    let others: Vec<&str> =
+        [(r.signal_frames == 0, "the missing signal"), (r.repeats > 0, "the repeats"), (r.corrupt_frames > 0, "the corrupt frames")]
+            .into_iter()
+            .filter_map(|(bad, what)| bad.then_some(what))
+            .collect();
+    let in_order = if others.is_empty() { gaps } else { Outcome::Fail };
     let gaps_text = match gaps {
-        Outcome::Ok => "",
-        Outcome::Inconclusive => {
+        Outcome::Ok => String::new(),
+        Outcome::Inconclusive if others.is_empty() => {
             "; the gaps could be among the counted skips, with skips beyond them another stream's, but the counts are \
              driver-wide and can't say whose (per-stream counts in STATS, a driver change, would): inconclusive"
+                .to_string()
         }
-        Outcome::Fail => "; the gaps are none of those",
+        Outcome::Inconclusive => format!(
+            "; the gaps alone could be among the counted skips (inconclusive: the counts are driver-wide), but the check \
+             fails on {}",
+            others.join(" and ")
+        ),
+        Outcome::Fail => "; the gaps are none of those".to_string(),
     };
     vec![
         Check {
@@ -1266,8 +1286,9 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             detail: format!(
                 "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one; reader \
                  handoffs over the recording {handoffs} ({skipped} frames skipped by the driver's count), streams playing on \
-                 that moved on to a shorter lag {secondary_skips} ({secondary_skipped} frames): gaps are allowed only for one of \
-                 those, one each, losing exactly its frames{gaps_text}",
+                 that moved on to a shorter lag {secondary_skips} ({secondary_skipped} frames): gaps are allowed only as those \
+                 skips, one a gap, losing exactly the frames counted (one kind's, or with a gap of each kind both kinds')\
+                 {gaps_text}",
                 r.gaps, r.gap_frames, r.repeats, r.repeat_frames, r.corrupt_frames, r.first_code, r.last_code, r.steps_ok
             ),
         },
@@ -1282,22 +1303,43 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     ]
 }
 
-/// Whether a recording's `gaps`, losing `frames` in all, are skips the driver counted over it: `counts` holds each kind's
-/// skips and their frames (reader handoffs, streams playing on to a shorter lag), each standing alone, as a gap is one skip
-/// and a recording's gaps are tied to one count. Ok: no gap, or no more gaps than a count's skips losing exactly its frames.
-/// Inconclusive: fewer gaps than a count's skips and fewer frames, so it holds skips this recording can't account for, and
-/// its gaps could be among them: another stream's skips are in the count (Astra's four-stream model, 2026-11-24: two streams
-/// playing on through one handoff skipped 334 and 352 frames, counted 686, and neither matched alone). Only per-stream counts
-/// in STATS could tie them (a driver change; not made). Fail otherwise: more gaps than a count's skips, more frames than it
-/// counted, or as many gaps as its skips (all of them this recording's) losing other than its frames.
-fn gap_outcome(gaps: u64, frames: u64, counts: &[(u64, u64)]) -> Outcome {
-    if gaps == 0 || counts.iter().any(|&(skips, skipped)| gaps <= skips && frames == skipped) {
-        Outcome::Ok
-    } else if counts.iter().any(|&(skips, skipped)| gaps < skips && frames < skipped) {
-        Outcome::Inconclusive
-    } else {
-        Outcome::Fail
+/// Whether a recording's `gaps`, losing `frames` in all, are skips the driver counted over it. `handoffs` and `secondary` are
+/// the two kinds' counts, each its skips and their frames: reader handoffs (the taker's skip) and streams playing on through
+/// one to a shorter lag. A gap is one skip, of one kind; a recording may hold both kinds (a stream that played on through one
+/// handoff and took the slot at the next: the fix's review, 2026-11-24, from three.sh's B runs), so its gaps split between
+/// the counts, each part no more gaps than its count's skips, losing at least a frame a gap and at most the count's frames,
+/// and exactly them where the part is all its count's skips (a counted skip may lose no frame: fewer gaps may lose them all).
+///
+/// Ok: no gap, or a split whose every part loses all its count's frames: one count's, or with a gap of each kind both
+/// counts' (one gap equal to their sum fails). Inconclusive: no such split, but one where a part leaves frames of its count
+/// to skips this recording can't account for, another stream's (Astra's four-stream model, 2026-11-24: two streams playing
+/// on through one handoff skipped 334 and 352 frames, counted 686, and neither matched alone); only per-stream counts in
+/// STATS could say whose (a driver change; not made). Fail: no split at all: more gaps than skips, more frames than counted,
+/// or a part that is all its count's skips losing other than their frames.
+fn gap_outcome(gaps: u64, frames: u64, handoffs: (u64, u64), secondary: (u64, u64)) -> Outcome {
+    if gaps == 0 {
+        return Outcome::Ok;
     }
+    // The fewest and most frames `n` of a count's gaps may lose: none for none; all of them for all its skips; else a frame a
+    // gap to all of them. None: more gaps than its skips, or than its frames.
+    let part = |n: u64, (skips, skipped): (u64, u64)| match n {
+        _ if n > skips || n > skipped => None,
+        0 => Some((0, 0)),
+        _ if n == skips => Some((skipped, skipped)),
+        _ => Some((n, skipped)),
+    };
+    let mut outcome = Outcome::Fail;
+    for to_handoffs in gaps.saturating_sub(secondary.0)..=gaps.min(handoffs.0) {
+        let (Some(h), Some(s)) = (part(to_handoffs, handoffs), part(gaps - to_handoffs, secondary)) else { continue };
+        // A used part's most is all its count's frames, an unused one's none.
+        if frames == h.1 + s.1 {
+            return Outcome::Ok;
+        }
+        if (h.0 + s.0..=h.1 + s.1).contains(&frames) {
+            outcome = Outcome::Inconclusive;
+        }
+    }
+    outcome
 }
 
 /// Waits (draining the stream, up to [`READING_WAIT`]) for STATS to show a capture stream reading the ring and for the stream to
@@ -2804,7 +2846,8 @@ struct StampRow {
     /// A stamp off the driver's packet grid where no resume explains it (in the first run, or in a later one after the
     /// first packet the driver stamped since its Start; Astra's review, 2026-11-24): how far it is from the nearest packet
     /// start the driver had notified, at or before its latest notification (100 ns units, later positive; past the latest,
-    /// from it). Fails stamps, and stays in the steps checked (nothing shows it isn't the driver's).
+    /// from it). Fails stamps, and stays in the steps checked (nothing shows it isn't the driver's). Only where the packet
+    /// length is known: with no grid to place a stamp, it isn't evidence against the driver.
     unexplained: Option<i64>,
     /// Windows flagged the packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY (a client that fell behind, or a stream's start).
     discontinuity: bool,
@@ -2995,8 +3038,15 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     if let Some(e) = error {
         return Err(e);
     }
-    classify_stamps(&mut rows, &done, frequency);
+    let grid = classify_stamps(&mut rows, &done, frequency);
     print_stamps(&rows, frequency);
+    match grid {
+        Some(p) => println!("the driver's packet grid, from the first run's notifications: {:.4} ms", p as f64 / 10_000.0),
+        None => println!(
+            "the driver's packet grid couldn't be found from the first run's notifications (too few rows, or all read after one \
+             notification): a stamp is the driver's only at its latest notification or the one at Stop, and no other is judged"
+        ),
+    }
     if o.flag("--verbose") {
         // Each resume's rows and the one before: run, device position, frames, device time and receipt (ms from the first).
         let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency) as f64;
@@ -3063,19 +3113,20 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     }
     if c.windows_stamped > 0 {
         println!(
-            "note: {} first packets after a resume carried a stamp Windows gave, not the driver; {backs} of them later than \
+            "note: {} of a resume's leading packets carried a stamp Windows gave, not the driver; {backs} of them later than \
              the packet after, so the client saw its stamps step back (not the driver's; TODO 22's question)",
             c.windows_stamped
         );
     }
-    let (verdict, line) = stamps_verdict(&c, rows.len(), done.len(), pending);
+    let (verdict, line) = stamps_verdict(&c, rows.len(), done.len(), pending, grid.is_some());
     println!("{line}");
     Ok(verdict)
 }
 
 /// stamps' verdict and its line, from [`check_steps`]' counts over `packets` rows and `resumes` resumes (`pending` of them
-/// with a packet left unread at Stop).
-fn stamps_verdict(c: &StepCheck, packets: usize, resumes: usize, pending: usize) -> (Verdict, String) {
+/// with a packet left unread at Stop), and whether [`classify_stamps`] found the driver's packet grid (with none, no stamp
+/// off the latest notification could be judged: INCONCLUSIVE at best).
+fn stamps_verdict(c: &StepCheck, packets: usize, resumes: usize, pending: usize, grid: bool) -> (Verdict, String) {
     let failures: Vec<String> = [
         (c.no_time, "packets without a device time"),
         (c.wrong.len(), "steps in a run that weren't a packet's length"),
@@ -3088,6 +3139,10 @@ fn stamps_verdict(c: &StepCheck, packets: usize, resumes: usize, pending: usize)
     .collect();
     if !failures.is_empty() {
         (Verdict::Fail, format!("FAIL: the driver's stamps don't follow the audio: {}", failures.join(", ")))
+    } else if !grid {
+        let line = "INCONCLUSIVE: the driver's packet grid couldn't be found from the first run, so a stamp off its latest \
+                    notification couldn't be told the driver's or Windows' (record more packets: --packets)";
+        (Verdict::Inconclusive, line.to_string())
     } else if c.across < resumes {
         let line = format!(
             "INCONCLUSIVE: {} of {resumes} resumes' steps compared (the rest: positions going back, or no packet the driver stamped)",
@@ -3117,8 +3172,11 @@ fn stamps_verdict(c: &StepCheck, packets: usize, resumes: usize, pending: usize)
 /// own packet, or one left unread at Stop and stamped again at Start (measured 2026-11-23; the latest notification alone
 /// missed a shared engine's buffered packets, a packet or two behind it). Anywhere else, in the first run or after the
 /// driver's first packet since a Start, nothing explains it (`unexplained`): Astra's review (2026-11-24) had one stamp 1 ms
-/// off in a steady run, with no resume, left out as Windows' and passed.
-fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
+/// off in a steady run, with no resume, left out as Windows' and passed. The packet length found, in 100 ns units: with none
+/// (one row in the first run, or its rows all read after one notification) a stamp is the driver's only at the latest
+/// notification, or at the one at Stop, and a stamp elsewhere is no evidence against the driver: none is `unexplained`, the
+/// rest of a resume's leading packets are still left out, and the verdict can't be a PASS ([`stamps_verdict`]).
+fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) -> Option<i64> {
     let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency);
     let mut lengths: Vec<i64> = rows
         .windows(2)
@@ -3142,14 +3200,15 @@ fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
                 None => back <= STAMP_SLACK_HNS,
             }
     };
-    // How far a stamp is from the nearest packet start at or before `reference`, later positive; past `reference`, or with no
-    // packet length known, from it.
-    let offset = |stamp: i64, reference: i64| match packet {
-        Some(p) if stamp < reference => {
+    // How far a stamp is from the nearest start of a `p`-long packet at or before `reference`, later positive; past `reference`,
+    // from it.
+    let offset = |stamp: i64, reference: i64, p: i64| {
+        if stamp < reference {
             let r = (reference - stamp) % p;
             if 2 * r > p { p - r } else { -r }
+        } else {
+            stamp - reference
         }
-        _ => stamp - reference,
     };
     // The run each row is in, and whether the driver stamped a packet in it since its Start (`late` ones are from before).
     let mut run = (u32::MAX, false);
@@ -3164,9 +3223,10 @@ fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
         let current = stop.is_none_or(|s| d > s + STAMP_SLACK_HNS) && on_grid(d, latest);
         let off = !r.late && !current;
         r.windows_stamped = off && stop.is_some() && !run.1;
-        r.unexplained = (off && !r.windows_stamped).then(|| offset(d, latest));
+        r.unexplained = packet.filter(|_| off && !r.windows_stamped).map(|p| offset(d, latest, p));
         run.1 |= current;
     }
+    packet
 }
 
 /// stamps' resumes, the first 16: the wait after the last read, the pause, whether a packet was left unread at Stop, then
@@ -3628,7 +3688,7 @@ mod tests {
     /// after that Start; anywhere else it fails, listed with its offset (Astra's review, 2026-11-24).
     #[test]
     fn stamps_fail_a_stamp_off_the_grid_that_no_resume_explains() {
-        let verdict = |rows: &[StampRow], resumes: usize| stamps_verdict(&check_steps(rows), rows.len(), resumes, 0).0;
+        let verdict = |rows: &[StampRow], resumes: usize| stamps_verdict(&check_steps(rows), rows.len(), resumes, 0, true).0;
         // Astra's case: a steady 10 ms stream, no resume, one stamp 1 ms late. It was left out as Windows' and passed.
         let steady = |shift: f64| -> Vec<StampRow> {
             (0..10u64)
@@ -3639,7 +3699,7 @@ mod tests {
                 .collect()
         };
         let mut rows = steady(1.0);
-        classify_stamps(&mut rows, &[], 10_000_000);
+        assert_eq!(classify_stamps(&mut rows, &[], 10_000_000), Some(100_000), "the 10 ms grid");
         assert!(rows.iter().all(|r| !r.windows_stamped));
         let c = check_steps(&rows);
         assert_eq!((c.windows_stamped, c.unexplained.clone(), c.wrong.clone()), (0, vec![(4, 10_000)], vec![4, 5]));
@@ -3706,6 +3766,42 @@ mod tests {
         assert!(rows.iter().all(|r| !r.windows_stamped));
         assert_eq!(check_steps(&rows).unexplained, vec![(5, 13_700)]);
         assert_eq!(verdict(&rows, 1), Verdict::Fail);
+    }
+
+    /// With no packet length from the first run (one row: --packets 1; or its rows all read after one notification), a stamp
+    /// off the latest notification can't be placed: not unexplained, no FAIL for it, and the verdict INCONCLUSIVE at best (the
+    /// fix's review, 2026-11-24). A step that is wrong still fails.
+    #[test]
+    fn stamps_are_inconclusive_without_the_drivers_packet_grid() {
+        let judge = |rows: &mut [StampRow], done: &[Resume]| {
+            let grid = classify_stamps(rows, done, 10_000_000);
+            let c = check_steps(rows);
+            (grid, c.unexplained.clone(), stamps_verdict(&c, rows.len(), done.len(), 0, grid.is_some()).0)
+        };
+        // Shared at 5 ms (the Call Microphone): the client's packets a packet or two behind the latest notification, all read
+        // after the same one. Before, the first two were unexplained and failed.
+        let mut rows = [traced(0, 240, 0.0, 0, (100, 10.0)), traced(240, 240, 5.0, 0, (100, 10.0)), traced(480, 240, 10.0, 0, (100, 10.0))];
+        assert_eq!(judge(&mut rows, &[]), (None, vec![], Verdict::Inconclusive));
+        assert!(rows.iter().all(|r| !r.windows_stamped && !r.late));
+        assert_eq!(check_steps(&rows).checked, 2);
+        // The same with a packet number for each: the 5 ms grid, and PASS.
+        for (n, r) in rows.iter_mut().enumerate() {
+            (r.trace.last_notify_packet, r.trace.last_notify_qpc) = (100 + n as u64, 50_000 * n as u64);
+        }
+        assert_eq!(judge(&mut rows, &[]), (Some(50_000), vec![], Verdict::Pass));
+        // One row in the first run, then a resume: its first packet off the notification at Stop is still left out as
+        // Windows', and nothing else is judged off the grid.
+        let mut rows = [
+            traced(0, 480, 0.0, 0, (10, 0.0)),
+            traced(480, 480, 22.93, 1, (11, 10.0)),
+            traced(960, 480, 21.42, 1, (12, 21.42)),
+            traced(1440, 480, 31.42, 1, (13, 31.42)),
+        ];
+        assert_eq!(judge(&mut rows, &[resume(10.0)]), (None, vec![], Verdict::Inconclusive));
+        assert_eq!(rows.iter().map(|r| r.windows_stamped).collect::<Vec<_>>(), [false, true, false, false]);
+        // A step in a run that isn't its packet's length fails, grid or not.
+        rows[3].device_hns = Some(320_000);
+        assert_eq!(judge(&mut rows, &[resume(10.0)]).2, Verdict::Fail);
     }
 
     /// stamps' verdict (Astra's review and recheck, 2026-11-23): a run's stamps step by exactly a packet; across a resume
@@ -4222,12 +4318,25 @@ mod tests {
         // Gaps the rise can't hold fail: more frames than counted, more gaps than skips, or a gap for each skip (all of them
         // this recording's) losing other than their frames.
         assert_eq!(failed(&checks(&after, &gap(1, 687))), bad, "more frames than counted");
-        assert_eq!(failed(&checks(&after, &gap(3, 600))), bad, "more gaps than skips");
-        assert_eq!(failed(&checks(&after, &gap(2, 600))), bad, "every skip this recording's, its frames short");
-        // A repeat or a corrupt frame fails, whatever the gaps.
+        assert_eq!(failed(&checks(&after, &gap(4, 1135))), bad, "more gaps than skips");
+        assert_eq!(failed(&checks(&after, &gap(3, 1000))), bad, "every skip this recording's, its frames short");
+        assert_eq!(failed(&checks(&after, &gap(2, 449 + 686 + 1))), bad, "more frames than all three skips counted");
+        // Every skip this recording's, its frames all of them: the taker's and both others'.
+        assert_eq!(verdict_of(&checks(&after, &gap(3, 449 + 686))), Verdict::Pass);
+        // Two gaps losing 600: the taker's 449 and one of the others' (151), as far as the counts show.
+        assert_eq!(failed(&checks(&after, &gap(2, 600))), unsure);
+        // A repeat or a corrupt frame fails, whatever the gaps; the detail says the gaps alone were inconclusive and what
+        // failed it.
         let with = |repeats, corrupt_frames| CheckReport { repeats, repeat_frames: 10 * repeats, corrupt_frames, ..gap(1, 334) };
-        assert_eq!(failed(&checks(&after, &with(1, 0))), bad);
-        assert_eq!(failed(&checks(&after, &with(0, 1))), bad);
+        for (r, what) in
+            [(with(1, 0), "the repeats"), (with(0, 1), "the corrupt frames"), (with(1, 1), "the repeats and the corrupt frames")]
+        {
+            let c = checks(&after, &r);
+            assert_eq!(failed(&c), bad);
+            let detail = &c.iter().find(|c| c.name == "bit-exact and in order").unwrap().detail;
+            assert!(detail.contains("; the gaps alone could be among the counted skips (inconclusive: "), "{detail}");
+            assert!(detail.ends_with(&format!("driver-wide), but the check fails on {what}")), "{detail}");
+        }
         // Another check failing makes the verdict FAIL, the gaps still inconclusive.
         let c = verify_checks(&before, &after, &gap(1, 334), &StreamSeen { discontinuities: 1, ..seen });
         assert_eq!(failed(&c), ["bit-exact and in order: inconclusive", "the capture stream"]);
@@ -4238,6 +4347,83 @@ mod tests {
         assert_eq!(failed(&checks(&two, &gap(1, 529))), unsure);
         assert_eq!(failed(&checks(&two, &gap(1, 267))), unsure);
         assert_eq!(failed(&checks(&two, &gap(1, 797))), bad);
+    }
+
+    /// A recording with a skip of each kind (the fix's review, 2026-11-24, from three.sh's B runs on today's driver): a 480-frame
+    /// reader stops, the 160-frame stream takes the slot (its skip, 283 frames say) and the Call stream plays on, skipping 320
+    /// frames; then the 160-frame recorder stops while the Call stream still records, and the Call stream takes the slot too
+    /// (its skip, 209). Its two gaps, 529 frames, are one of each count: the handoffs' count holds the other taker's skip as
+    /// well, so neither count alone matches, nor do both together. Each kind's part may be under its count: INCONCLUSIVE, not
+    /// FAIL (before this, FAIL). With only this stream's skips counted, its gaps are both counts exactly: a PASS (our
+    /// proposal; the owner may prefer INCONCLUSIVE).
+    #[test]
+    fn verify_splits_a_recordings_gaps_between_the_two_kinds_of_skip() {
+        let before = reading(counters(3, 1_000_000, 0));
+        let counted = |handoffs, handoff_skipped_frames, secondary_skips, secondary_skipped_frames| Stats {
+            reader_handoffs: handoffs,
+            handoff_skipped_frames,
+            secondary_skips,
+            secondary_skipped_frames,
+            ..reading(counters(3, 1_000_000 + FRAMES, 0))
+        };
+        let gap = |gaps, gap_frames| CheckReport { gaps, gap_frames, ..clean_recording() };
+        let seen = StreamSeen { packet: 240, ..Default::default() };
+        let checks = |after: &Stats, r: &CheckReport| verify_checks(&before, after, r, &seen);
+        let (unsure, bad) = (["bit-exact and in order: inconclusive"], ["bit-exact and in order"]);
+        // Both takers' skips counted (283 + 209) and the Call stream's secondary one (320).
+        let both = counted(2, 283 + 209, 1, 320);
+        let c = checks(&both, &gap(2, 209 + 320));
+        assert_eq!(failed(&c), unsure);
+        assert_eq!(verdict_of(&c), Verdict::Inconclusive);
+        // The 160-frame recorder's own gap is one handoff's, under its count: inconclusive too. A recording with all three
+        // skips' gaps is all the frames counted.
+        assert_eq!(failed(&checks(&both, &gap(1, 283))), unsure);
+        assert_eq!(verdict_of(&checks(&both, &gap(3, 283 + 209 + 320))), Verdict::Pass);
+        // Fail: a secondary gap is all the secondary count's frames (one skip, all this recording's), so two gaps can't lose
+        // less than it and a frame (or both handoffs' 492); three gaps are every skip, so they lose all 812; more than 812 fails.
+        assert_eq!(failed(&checks(&both, &gap(2, 320))), bad, "two gaps, fewer frames than any split allows");
+        assert_eq!(failed(&checks(&both, &gap(3, 529))), bad, "every skip this recording's, its frames short");
+        assert_eq!(failed(&checks(&both, &gap(2, 283 + 209 + 320 + 1))), bad, "more frames than counted");
+
+        // Only this stream's skips counted: an exact split, a PASS.
+        let own = counted(1, 209, 1, 320);
+        assert_eq!(verdict_of(&checks(&own, &gap(2, 529))), Verdict::Pass);
+        // One gap of the two counts' sum is no skip: FAIL, as before. Two gaps, a frame off: FAIL (each part is all its
+        // count's skips). Three gaps for two skips: FAIL.
+        assert_eq!(failed(&checks(&own, &gap(1, 529))), bad, "one gap, both counts' frames");
+        assert_eq!(failed(&checks(&own, &gap(2, 528))), bad, "a frame short");
+        assert_eq!(failed(&checks(&own, &gap(2, 530))), bad, "a frame more");
+        assert_eq!(failed(&checks(&own, &gap(3, 529))), bad, "three gaps for two skips");
+        // A recording with neither, or one of them exactly, passes as before.
+        assert_eq!(verdict_of(&checks(&own, &clean_recording())), Verdict::Pass);
+        assert_eq!(verdict_of(&checks(&own, &gap(1, 209))), Verdict::Pass);
+        assert_eq!(verdict_of(&checks(&own, &gap(1, 320))), Verdict::Pass);
+    }
+
+    /// gap_outcome's splits directly: Astra's 334 + 352 = 686, the single recorder's exact skip, a gap larger than the rise,
+    /// and a count's zero-frame skips (counted, no gap).
+    #[test]
+    fn gap_outcome_splits_the_gaps_between_the_counts() {
+        let (ok, unsure, fail) = (Outcome::Ok, Outcome::Inconclusive, Outcome::Fail);
+        let none = (0, 0);
+        assert_eq!(gap_outcome(0, 0, none, none), ok);
+        assert_eq!(gap_outcome(1, 334, none, (2, 686)), unsure);
+        assert_eq!(gap_outcome(1, 352, none, (2, 686)), unsure);
+        assert_eq!(gap_outcome(2, 686, none, (2, 686)), ok);
+        assert_eq!(gap_outcome(1, 334, none, (1, 334)), ok);
+        assert_eq!(gap_outcome(1, 352, none, (1, 334)), fail);
+        assert_eq!(gap_outcome(1, 687, none, (2, 686)), fail, "a gap larger than the rise");
+        assert_eq!(gap_outcome(1, 335, (1, 334), none), fail, "a gap larger than the one skip");
+        assert_eq!(gap_outcome(1, 1, none, none), fail, "a gap with nothing counted");
+        // A skip that lost no frame makes no gap, so fewer gaps than skips may lose all the count's frames; a gap loses a
+        // frame at least.
+        assert_eq!(gap_outcome(1, 320, none, (2, 320)), ok);
+        assert_eq!(gap_outcome(1, 1, none, (1, 0)), fail);
+        assert_eq!(gap_outcome(2, 1, none, (2, 1)), fail);
+        // A gap of each kind.
+        assert_eq!(gap_outcome(2, 529, (1, 209), (1, 320)), ok);
+        assert_eq!(gap_outcome(2, 529, (2, 492), (1, 320)), unsure);
+        assert_eq!(gap_outcome(1, 529, (1, 209), (1, 320)), fail);
     }
 
     #[test]
