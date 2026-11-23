@@ -396,7 +396,8 @@ protected:
         _In_    ULONGLONG       Hns
         );
 
-    // noise-filter (TODO 19): a packet's start on the stream's time line, as a QPC (StreamPassCallback says why).
+    // noise-filter (TODO 19): a packet's start on the stream's time line (its deadline less a packet), as a QPC
+    // (StreamPassCallback says why).
     __drv_maxIRQL(DISPATCH_LEVEL)
     ULONGLONG
     PacketStartQpc(

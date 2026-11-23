@@ -136,11 +136,15 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       other feed first (the ring must be this process's), and close other apps that record the endpoint: a capture stream
       already running holds the ring's reader slot, and unless it shares this one's driver stream (shared, the same mode)
       this one gets the ring's audio late, as a secondary (a check fails).
-  nf-vmic-test stamps [--packets N] [--period-frames N] [--mode raw|default|communications] [--device NAME] [--exclusive]
-      Record the capture endpoint (as latency does; no ring needed) and, after each GetBuffer for N packets (default 200)
-      past a 0.5 s warm-up, read the driver's capture-timestamp trace from STATS. Print the client's device time minus the
-      packet start the driver last answered GetCapturePacket with, minus the completion time it last notified, and minus
-      the query's own time (min, median, max in ms), the calls per packet, and the last rows.
+  nf-vmic-test stamps [--packets N] [--resumes N] [--period-frames N] [--mode raw|default|communications] [--device NAME]
+                      [--exclusive]
+      Record the capture endpoint (as latency does; no ring needed) for N packets (default 200) past a 0.5 s warm-up, then
+      stop and start the same client N times (--resumes, default 8; paused 3 to 50 ms) recording 4 packets after each.
+      After each GetBuffer it reads the driver's capture-timestamp trace from STATS, and prints the client's device time
+      minus the packet start the driver last answered GetCapturePacket with, minus the completion time it last notified
+      (any capture stream's: run one), and minus the query's own time, the calls per packet, and the last rows. PASS: every
+      packet has a device time, each stamp steps by its packet's length while the stream runs (by device position), and
+      by at least that across each resume; FAIL otherwise.
 
 Exit codes: 0 pass, 1 fail, 2 a usage or set-up error, 3 inconclusive (open: 0 opened and ran, 1 refused by the
 driver's app ring rule, 4 refused otherwise, 3 stopped).";
@@ -1283,6 +1287,8 @@ struct Packet<'a> {
     qpc_hns: Option<u64>,
     /// QueryPerformanceCounter, read just after GetBuffer returned (ticks).
     host_qpc: u64,
+    /// GetBuffer's device position: the stream frame of the packet's first frame.
+    position: u64,
 }
 
 impl Packet<'_> {
@@ -1425,7 +1431,7 @@ impl Capture {
             // SAFETY: GetBuffer handed out `frames` frames at `data`, each FRAME_BYTES long (both formats' block align: two
             // 32-bit samples), the engine's until ReleaseBuffer below; nothing writes them meanwhile.
             let bytes = unsafe { std::slice::from_raw_parts(data, frames as usize * protocol::FRAME_BYTES as usize) };
-            on_packet(&Packet { bytes, frames, silent, qpc_hns, host_qpc });
+            on_packet(&Packet { bytes, frames, silent, qpc_hns, host_qpc, position });
             // SAFETY: releases all of the packet just read; `bytes` isn't used past here.
             unsafe { self.capture.ReleaseBuffer(frames) }.map_err(|e| format!("ReleaseBuffer returned {}", hresult::name(e.code())))?;
         }
@@ -2544,23 +2550,78 @@ fn latency_feed(
     Ok((end, window))
 }
 
-/// One stamps packet: GetBuffer's times beside the driver's capture-timestamp trace, read from STATS just after.
+/// One stamps packet: GetBuffer's times and device position beside the driver's capture-timestamp trace, read from STATS
+/// just after. `segment` counts the Stop/Start cycles before it (0: the first run).
 #[derive(Clone, Copy)]
 struct StampRow {
     host_qpc: u64,
     device_hns: Option<u64>,
+    position: u64,
     frames: u32,
+    segment: u32,
     trace: CaptureTrace,
 }
 
+/// The pauses stamps' resumes hold the stream stopped for (ms), in turn: Astra's 3-8 ms (the review, 2026-11-23), then longer.
+const RESUME_PAUSES_MS: [u64; 8] = [3, 4, 5, 6, 7, 8, 20, 50];
+/// Packets recorded after each resume.
+const RESUME_PACKETS: usize = 4;
+/// How far a stamp's step may stray from its packet's length: the QPC's tick and the rounding of its conversion.
+const STAMP_SLACK_HNS: i64 = 100;
+
+/// What [`check_steps`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StepCheck {
+    /// Steps between packets whose positions follow on (the frames of the first, then the second), checked.
+    checked: usize,
+    /// Of them, inside one run: stamps that didn't step by the first packet's length (index of the second row).
+    wrong: Vec<usize>,
+    /// Across a Stop/Start: stamps that stepped by less than the first packet's length (a resumed stamp overlapping).
+    overlapping: Vec<usize>,
+    /// Packets with no device time (AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR).
+    no_time: usize,
+    /// Steps not checked: the positions didn't follow on (frames lost, or a position the device restarted).
+    gaps: usize,
+}
+
+/// Each packet's stamp must step by exactly the frames before it while the stream runs (the device position says which
+/// packets follow on), and by at least that across a Stop/Start (by the pause too, as the time line paused with it).
+fn check_steps(rows: &[StampRow]) -> StepCheck {
+    let mut c = StepCheck { no_time: rows.iter().filter(|r| r.device_hns.is_none()).count(), ..Default::default() };
+    for (i, w) in rows.windows(2).enumerate() {
+        let (a, b) = (&w[0], &w[1]);
+        let (Some(ta), Some(tb)) = (a.device_hns, b.device_hns) else { continue };
+        if b.position != a.position + u64::from(a.frames) {
+            c.gaps += 1;
+            continue;
+        }
+        c.checked += 1;
+        let step = tb as i64 - ta as i64;
+        let expected = (u64::from(a.frames) * 10_000_000 / u64::from(protocol::SAMPLE_RATE)) as i64;
+        if a.segment == b.segment {
+            if (step - expected).abs() > STAMP_SLACK_HNS {
+                c.wrong.push(i + 1);
+            }
+        } else if step < expected - STAMP_SLACK_HNS {
+            c.overlapping.push(i + 1);
+        }
+    }
+    c
+}
+
 /// stamps: what capture time the client sees for each packet, beside what the driver told ACX (TODO 19, the capture
-/// timestamps reading a packet late). No ring needed: the stream's silence carries the same stamps.
+/// timestamps reading a packet late), and whether the stamps step as the audio does, across Stop/Start too (Astra's review).
+/// No ring needed: the stream's silence carries the same stamps.
 fn stamps(args: &[String]) -> Result<Verdict, String> {
-    let valued = ["--packets", "--period-frames", "--mode", "--device"];
+    let valued = ["--packets", "--period-frames", "--mode", "--device", "--resumes"];
     let o = Opts::parse(args, &valued, &["--exclusive"])?;
     let packets: usize = o.value("--packets", 200)?;
     if !(1..=100_000).contains(&packets) {
         return Err(format!("--packets {packets}: from 1 to 100000"));
+    }
+    let resumes: usize = o.value("--resumes", 8)?;
+    if resumes > 1_000 {
+        return Err(format!("--resumes {resumes}: from 0 to 1000"));
     }
     let name: String = o.value("--device", ENDPOINT.to_string())?;
     let spec = StreamSpec {
@@ -2574,27 +2635,74 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     let _com = Com::mta()?;
     let mut capture = Capture::open(&name, spec)?;
     println!("recording {name:?}: {}", capture.describe());
-    let mut rows = Vec::with_capacity(packets);
+    let mut rows = Vec::with_capacity(packets + resumes * RESUME_PACKETS);
     let mut error = None;
-    capture.start()?;
     let warm_until = Instant::now() + Duration::from_millis(500);
-    while rows.len() < packets && error.is_none() {
-        capture.read_packets(|p| {
-            if Instant::now() < warm_until || rows.len() >= packets || error.is_some() {
-                return;
-            }
-            match device.stats() {
-                Ok(s) => rows.push(StampRow { host_qpc: p.host_qpc, device_hns: p.qpc_hns, frames: p.frames, trace: s.capture_trace }),
-                Err(e) => error = Some(format!("STATS: {e}")),
-            }
-        })?;
+    for segment in 0..=resumes {
+        if segment > 0 {
+            // The same client, stopped and started again without a Reset: its device position carries on.
+            capture.stop();
+            std::thread::sleep(Duration::from_millis(RESUME_PAUSES_MS[(segment - 1) % RESUME_PAUSES_MS.len()]));
+        }
+        capture.start()?;
+        let want = rows.len() + if segment == 0 { packets } else { RESUME_PACKETS };
+        while rows.len() < want && error.is_none() {
+            capture.read_packets(|p| {
+                if (segment == 0 && Instant::now() < warm_until) || rows.len() >= want || error.is_some() {
+                    return;
+                }
+                match device.stats() {
+                    Ok(s) => rows.push(StampRow {
+                        host_qpc: p.host_qpc,
+                        device_hns: p.qpc_hns,
+                        position: p.position,
+                        frames: p.frames,
+                        segment: segment as u32,
+                        trace: s.capture_trace,
+                    }),
+                    Err(e) => error = Some(format!("STATS: {e}")),
+                }
+            })?;
+        }
+        if error.is_some() {
+            break;
+        }
     }
     capture.stop();
     if let Some(e) = error {
         return Err(e);
     }
     print_stamps(&rows, frequency);
-    Ok(Verdict::Pass)
+    let c = check_steps(&rows);
+    println!(
+        "steps: {} checked ({} across a resume), {} in a run that weren't a packet's length, {} resumed stamps overlapping the \
+         packet before, {} packets without a device time, {} not checked (positions not following on)",
+        c.checked,
+        resumes,
+        c.wrong.len(),
+        c.overlapping.len(),
+        c.no_time,
+        c.gaps
+    );
+    let at = |i: usize| {
+        let (a, b) = (&rows[i - 1], &rows[i]);
+        let step = b.device_hns.unwrap_or(0) as f64 - a.device_hns.unwrap_or(0) as f64;
+        format!("    packet {i} (run {}): stepped {:.4} ms after {} frames", b.segment, step / 10_000.0, a.frames)
+    };
+    for &i in c.wrong.iter().chain(&c.overlapping).take(12) {
+        println!("{}", at(i));
+    }
+    let verdict = if c.no_time > 0 || !c.wrong.is_empty() || !c.overlapping.is_empty() {
+        println!("FAIL: the stamps don't follow the audio");
+        Verdict::Fail
+    } else if c.checked + 1 < rows.len() / 2 {
+        println!("INCONCLUSIVE: too few packets followed on to check ({} of {})", c.checked, rows.len().saturating_sub(1));
+        Verdict::Inconclusive
+    } else {
+        println!("PASS: every stamp stepped by its packet's length, and across each resume by at least that");
+        Verdict::Pass
+    };
+    Ok(verdict)
 }
 
 /// stamps' report: each difference's min, median and max, then the last rows as they came.
@@ -2940,6 +3048,37 @@ fn print_latency(r: &LatencyReport, log: &CaptureLog, w: &Window, frequency: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(position: u64, device_ms: f64, segment: u32) -> StampRow {
+        StampRow {
+            host_qpc: 0,
+            device_hns: Some((device_ms * 10_000.0).round() as u64),
+            position,
+            frames: 480,
+            segment,
+            trace: CaptureTrace::default(),
+        }
+    }
+
+    /// stamps' verdict (Astra's review, 2026-11-23): a run's stamps step by exactly a packet; a resumed one may step by more
+    /// (the pause) but not less; a position that doesn't follow on isn't checked; a missing device time fails.
+    #[test]
+    fn stamps_step_by_their_packets_and_never_overlap_across_a_resume() {
+        let steady = [row(0, 0.0, 0), row(480, 10.0, 0), row(960, 20.0, 0)];
+        assert_eq!(check_steps(&steady), StepCheck { checked: 2, ..Default::default() });
+        // The bug: the second resumed packet only 1.32 ms after the first.
+        let short = [row(0, 0.0, 0), row(480, 15.0, 1), row(960, 16.32, 1)];
+        let c = check_steps(&short);
+        assert_eq!((c.checked, c.wrong.clone(), c.overlapping.clone()), (2, vec![2], vec![]));
+        // A resume's own step: the pause on top is fine, less than a packet overlaps.
+        assert!(check_steps(&[row(0, 0.0, 0), row(480, 13.0, 1)]).overlapping.is_empty());
+        assert_eq!(check_steps(&[row(0, 0.0, 0), row(480, 6.0, 1)]).overlapping, vec![1]);
+        // Frames lost: not checked. No device time: counted.
+        assert_eq!(check_steps(&[row(0, 0.0, 0), row(1440, 30.0, 0)]).gaps, 1);
+        let mut none = row(480, 10.0, 0);
+        none.device_hns = None;
+        assert_eq!(check_steps(&[row(0, 0.0, 0), none]).no_time, 1);
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

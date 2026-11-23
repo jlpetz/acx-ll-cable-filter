@@ -686,6 +686,24 @@ CStreamEngine::StreamPassCallback()
     ScheduleNextPass();
 }
 
+//
+// noise-filter (TODO 19, Astra's review 2026-11-23): Value x Mul / Div without the 64-bit product. The schedule's bytes
+// times 10^7 (and the position's 100 ns units times its bytes a second) overflowed after 55.6 days of one stream at 48 kHz
+// stereo float32 (384,000 bytes a second): 2^64 / 10^7 / 384,000 s. Split into whole Divs and the rest, as LoopbackHnsToFrames
+// does: exact (the floor of the full product's quotient), and the rest times Mul stays far below 2^64 for these units.
+//
+static
+FORCEINLINE
+ULONGLONG
+NfScaleU64(
+    _In_ ULONGLONG  Value,
+    _In_ ULONGLONG  Mul,
+    _In_ ULONGLONG  Div
+)
+{
+    return (Value / Div) * Mul + ((Value % Div) * Mul) / Div;
+}
+
 _Use_decl_annotations_
 VOID
 CStreamEngine::ScheduleNextPass()
@@ -712,7 +730,7 @@ CStreamEngine::ScheduleNextPass()
     nextPacketPositionFromLastPause = nextPacketStartPosition - m_StartPosition;
 
     // Convert from bytes to HNS (to prevent truncation, multiply first then divide)
-    nextPacketTimeFromLastPauseHns = nextPacketPositionFromLastPause * HNS_PER_SEC / bytesPerSecond;
+    nextPacketTimeFromLastPauseHns = NfScaleU64(nextPacketPositionFromLastPause, HNS_PER_SEC, bytesPerSecond);
 
     // Next packet time is Time @ resume from Pause, offset for lost time due to glitch, with next packet time added
     nextPacketTime = m_StartTime + m_GlitchAdjust + nextPacketTimeFromLastPauseHns;
@@ -777,7 +795,7 @@ CStreamEngine::UpdatePosition(
     //
     ULONGLONG elapsed = currentTime - m_StartTime;
     elapsed = (elapsed > m_GlitchAdjust) ? elapsed - m_GlitchAdjust : 0;
-    ULONGLONG position = m_StartPosition + elapsed * bytesPerSecond / HNS_PER_SEC;
+    ULONGLONG position = m_StartPosition + NfScaleU64(elapsed, bytesPerSecond, HNS_PER_SEC);
     ULONGLONG packetEnd = ((ULONGLONG)m_CurrentPacket + 1) * m_PacketSize;
     m_Position = MIN(position, packetEnd);
 }
@@ -828,13 +846,22 @@ CStreamEngine::PacketStartQpc(
     ULONGLONG   Packet
 )
 {
-    ULONGLONG position = Packet * m_PacketSize;
-    ULONGLONG fromRun;
+    ULONG     bytesPerSecond = GetBytesPerSecond();
+    ULONGLONG end = (Packet + 1) * m_PacketSize;
+    ULONGLONG toEnd = (end > m_StartPosition) ? end - m_StartPosition : 0;
+    ULONGLONG deadline;
+    ULONGLONG packetHns;
 
-    // ScheduleNextPass's time line: the latest Run's time and position, the glitch adjustments, the nominal rate. A packet
-    // begun before that Run (a Pause inside it) starts at the Run.
-    fromRun = (position > m_StartPosition) ? position - m_StartPosition : 0;
-    return HnsToQpc(m_StartTime + m_GlitchAdjust + fromRun * HNS_PER_SEC / GetBytesPerSecond());
+    //
+    // The packet's deadline on ScheduleNextPass's time line (the latest Run's time and position, the glitch adjustments, the
+    // nominal rate: the same sum, so the very time the pass was armed for), less one packet. So the stamps step by exactly a
+    // packet, and across a Pause by a packet plus the pause. The first packet after a Run inside one completes early, after
+    // only the rest of it, and its stamp falls before the Run by what the packet held before the Pause. (Astra's review,
+    // 2026-11-23: stamped from the Run itself, the first two packets after a resume stepped 1.3-6.6 ms for 10 ms of audio.)
+    //
+    deadline = m_StartTime + m_GlitchAdjust + NfScaleU64(toEnd, HNS_PER_SEC, bytesPerSecond);
+    packetHns = NfScaleU64(m_PacketSize, HNS_PER_SEC, bytesPerSecond);
+    return HnsToQpc((deadline > packetHns) ? deadline - packetHns : 0);
 }
 
 _Use_decl_annotations_
