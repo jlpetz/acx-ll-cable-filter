@@ -90,11 +90,11 @@ The ring's rules:
       a stream gives the slot up as its Pause starts, while its timer still runs, and may hold it again only after its next
       Run). Only the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of the
       packets it delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture stream
-      running in 48 kHz float32 stereo plays that copy a lag behind: the reader's packet plus 1 ms and a frame (a stream that
-      has played the copy behind more than one reader since it last ran keeps the longest of their packets). More than one
+      running in 48 kHz float32 stereo plays that copy a lag behind: the reader's packet plus 1 ms and a frame. More than one
       capture stream can run at once: the microphones of two of the driver's devices share the one app ring, and the audio
       engine opens a device stream per processing mode (a RAW and a DEFAULT client make two). The other streams' passes are
-      counted in NF_VMIC_STATS only (NotReaderPackets, SecondaryFramesCopied, SecondaryUnderrunFrames).
+      counted in NF_VMIC_STATS only (NotReaderPackets, SecondaryFramesCopied, SecondaryUnderrunFrames, SecondarySkips,
+      SecondarySkippedFrames).
     - No capture stream gets any of the ring's frames twice. The copy holds the ring's frames in the order they were
       delivered, none left out at a handoff: a new reader whose packet starts before the copy's end takes that part from the
       copy, and reads the ring on from there. A stream playing the copy keeps its place in it and never goes back: where its
@@ -104,11 +104,14 @@ The ring's rules:
       starts at its own place on the time line, a lag ahead of its place in the copy, so what the copy held between the two
       never reaches it (its lag at most: 209 frames behind 160-frame readers), counted in ReaderHandoffs and
       HandoffSkippedFrames (the owner, 2026-11-20: a one-time skip for now; a gapless handoff is a follow-up). Any other
-      stream plays on through a handoff, skipping and repeating nothing: it gets silence where the new reader's packet is
-      longer (its place moves back by the difference) or the readers' time lines leave a gap; where it is shorter, it keeps
-      the longer lag until it next runs rather than skip the difference (ours, 2026-11-23, after Astra's review, which found
-      such a stream moving back and playing the difference again, 320 frames from a 160-frame reader to a 480-frame one; the
-      owner's to confirm). A jump in a stream's time line (a late timer's glitch adjustment,
+      stream plays on through a handoff, repeating nothing: it gets silence where the new reader's packet is longer (its place
+      moves back by the difference) or the readers' time lines leave a gap; where it is shorter, it moves on to the new
+      reader's lag at once and skips the difference once (320 frames from a 480-frame reader to a 160-frame one), counted in
+      SecondarySkips and SecondarySkippedFrames, apart from the taker's skip, so each stream's gap has its own count (the
+      owner, 2026-11-23: lower latency over a one-time skip; from a66d8ab to e801320 it kept the longer lag until it next
+      ran, after Astra's review had found such a stream moving back and playing the difference again, 320 frames from a
+      160-frame reader to a 480-frame one). A stream that is pausing (it gave the slot up and its timer is stopping) keeps
+      its lag. A jump in a stream's time line (a late timer's glitch adjustment,
       Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses) moves the copy's audio by its length: the reader's inserts that much silence
       in the other streams (its own output doesn't show it), another stream's skips that much of the copy. So does what the
       copy didn't hold in time for a stream (the reader's timer later than its own by more than the 1 ms): silence there,
@@ -161,11 +164,11 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
-NF_VMIC_STATS (640 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
+NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
-       0     4  Magic, 4 Version, 8 StatsBytes (640), 12 Flags (NF_VMIC_STATS_*)
+       0     4  Magic, 4 Version, 8 StatsBytes (672), 12 Flags (NF_VMIC_STATS_*)
       16     8  QpcFrequency             KeQueryPerformanceCounter's frequency
       24     8  QpcNow                   the QPC when the snapshot was taken
       32     4  AttachedPid              the attached app's process id (0: none)
@@ -186,6 +189,14 @@ NF_VMIC_STATS (640 bytes; all counters cumulative since the driver loaded; times
                                          recorded gaps not)
      320   256  Stream[2]                NF_VMIC_STREAM_STATS: [NF_VMIC_KIND_RENDER], [NF_VMIC_KIND_CAPTURE]
      576    64  CaptureTrace             NF_VMIC_CAPTURE_TRACE: what capture streams told ACX of their packets' times
+     640     8  SecondarySkips           times a capture stream playing the copy moved on at once to a shorter reader packet's
+                                         lag (it skipped the difference once; the taker's skip is HandoffSkippedFrames)
+     648     8  SecondarySkippedFrames   the copy's frames those skips passed over (the last reader's underrun silence there
+                                         included; its recorded gaps not)
+     656     8  LoopbackLeadSkips        times a loopback capture read moved on at once to a shorter render lead (valid with
+                                         NF_VMIC_STATS_LOOPBACK, as Loopback is: the first-registered device's)
+     664     8  LoopbackLeadSkippedFrames
+                                         the loopback ring's audio those skips passed over (the difference in leads at most)
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
@@ -207,7 +218,19 @@ NF_VMIC_STATS (640 bytes; all counters cumulative since the driver loaded; times
     owner's to confirm). The driver remembers the latest 32 jumps, which covers a 10 ms stream beside a 2 ms reader that
     jumps at every pass (a 1 ms one in the 96-frame trial build); beyond that, the older ones' silence counts as copied. A
     stream other than the reader in another format gets silence, counted in the ring's MismatchPackets.
-    Ring.NotReaderPackets counts all their passes.
+    Ring.NotReaderPackets counts all their passes. SecondarySkips counts the times one of them moved on to a shorter reader
+    packet's lag (a handoff to a reader with a shorter packet: the owner, 2026-11-23), and SecondarySkippedFrames the copy's
+    frames it so passed over, counted as HandoffSkippedFrames is: from the copy's valid start to its end, less its recorded
+    gaps. So a recording that played on through a handoff has a gap of exactly those frames, and one that took the slot a
+    gap of HandoffSkippedFrames (the last reader's underrun silence in either span counts but is no gap). The copy holds the
+    whole span unless the new reader's timer is later than the skipping stream's by more than the 1 ms, which leaves that
+    stream's read short too (SecondaryUnderrunFrames).
+
+    The loopback's capture side (spike check 7) takes a change in the render lead at once (the owner, 2026-11-23, for a new
+    render run's lead; within a run, following the owner's app-ring decision of 2026-11-23). A fall moves the read on by the
+    difference: LoopbackLeadSkips counts it, and LoopbackLeadSkippedFrames the render audio the ring held between the reads
+    at the two leads (what it doesn't hold yet there, only where a client released a packet too late to go early, isn't
+    counted: the shorter lead's read underruns there too, Loopback.UnderrunFrames).
 
     NF_VMIC_STREAM_STATS (128 bytes), per stream kind: TimerPasses (passes the stream's timer started), GlitchPasses (passes
     run at once because the next was already due: each is one glitch adjustment of the stream's time line), GlitchHns (their
@@ -396,6 +419,10 @@ typedef struct _NF_VMIC_STATS {
     UINT64                  HandoffSkippedFrames;       // 312
     NF_VMIC_STREAM_STATS    Stream[NF_VMIC_KINDS];      // 320
     NF_VMIC_CAPTURE_TRACE   CaptureTrace;               // 576
+    UINT64                  SecondarySkips;             // 640
+    UINT64                  SecondarySkippedFrames;     // 648
+    UINT64                  LoopbackLeadSkips;          // 656
+    UINT64                  LoopbackLeadSkippedFrames;  // 664
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
 C_ASSERT(sizeof(NF_VMIC_ATTACH_IN) == 16);
@@ -426,7 +453,11 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, HandoffSkippedFrames) == 312);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, Stream) == 320);
 C_ASSERT(sizeof(NF_VMIC_CAPTURE_TRACE) == 64);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, CaptureTrace) == 576);
-C_ASSERT(sizeof(NF_VMIC_STATS) == 640);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondarySkips) == 640);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondarySkippedFrames) == 648);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, LoopbackLeadSkips) == 656);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, LoopbackLeadSkippedFrames) == 664);
+C_ASSERT(sizeof(NF_VMIC_STATS) == 672);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
 C_ASSERT(NF_VMIC_IOCTL_STATS == 0x00226004);
 

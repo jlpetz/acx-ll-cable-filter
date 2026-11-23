@@ -39,9 +39,8 @@ Environment:
 // later (a glitch adjustment, a handoff), which the other streams count as underruns, not as the ring's audio. A whole reader
 // packet follows each gap, so at most (its packet + its timer's lateness + the lag) / the reader's packet + 1 gaps end after
 // the start of another stream's read: 11 for a 10 ms stream (lateness under 10 ms) beside a 2 ms reader (the default build's
-// shortest packet, PacketSize.cpp) whose time line jumps at every pass, 22 beside a 1 ms one (the 96-frame trial build's floor);
-// 15 and 31 if that stream keeps a 10 ms reader's lag from before (StreamEngine.cpp, AppRingOtherPass). Should more than 32 do,
-// the older ones' silence counts as copied.
+// shortest packet, PacketSize.cpp) whose time line jumps at every pass, 22 beside a 1 ms one (the 96-frame trial build's floor).
+// Should more than 32 do, the older ones' silence counts as copied.
 //
 #define NF_APP_HISTORY_GAPS     32u
 
@@ -87,8 +86,8 @@ typedef struct _NF_APP_RING {
     //
     // The reader's copy (g_NfAppHistory), reset at ATTACH: the packets the reader delivered, each at its frames on the QPC
     // time line (as LOOPBACK_RING's positions: frame n is n / 48000 s of QPC time, in slot n & (NF_APP_HISTORY_FRAMES - 1)).
-    // The other capture streams read it HistoryLeadFrames (or a longer reader packet they keep) plus 1 ms and a frame behind
-    // their own place on that time line, and never at a frame they have had (StreamEngine.cpp, AppRingPlayCopy).
+    // The other capture streams read it HistoryLeadFrames plus 1 ms and a frame behind their own place on that time line, and
+    // never at a frame they have had (StreamEngine.cpp, AppRingPlayCopy); a pausing one keeps the lag it has.
     //
     BOOLEAN                 HistoryValid;           // a reader in the ring's format has written since ATTACH
     ULONG                   HistoryLeadFrames;      // the packet of the reader that wrote last, in frames (0: none yet)
@@ -106,6 +105,8 @@ typedef struct _NF_APP_RING {
     ULONGLONG               SecondaryUnderrunFrames;
     ULONGLONG               ReaderHandoffs;         // NF_VMIC_STATS's: a stream playing the copy took the slot another held
     ULONGLONG               HandoffSkippedFrames;   // the copy's frames such a stream never delivered (its lag at most)
+    ULONGLONG               SecondarySkips;         // NF_VMIC_STATS's: a stream playing the copy moved on to a shorter reader packet
+    ULONGLONG               SecondarySkippedFrames; // the copy's frames such a stream passed over (the packets' difference at most)
 
     BOOLEAN                 Removing;               // the control device is being deleted: no new attachment
 

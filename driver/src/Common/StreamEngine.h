@@ -578,15 +578,15 @@ protected:
 
     // noise-filter (TODO 19): the capture half of the loopback pair.
     ULONG           m_LbLagFrames;      // LOOPBACK_LAG_HNS in frames, rounded up, plus one
-    ULONG           m_LbAnchorLead;     // the render lead it reads behind: LOOPBACK_RING.RenderLeadFrames, or a longer one it keeps
-    ULONG           m_LbAnchorRun;      // the run that set that lead (LOOPBACK_RING.RenderLeadRun): it keeps a lead in that run only
+    ULONG           m_LbAnchorLead;     // the render lead it reads behind (LOOPBACK_RING.RenderLeadFrames at its latest pass)
     ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
     // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
     BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied
     ULONGLONG       m_AppEnd;           // its place on the copy's time line: the end of what it has had (AppRingPlayCopy)
     ULONGLONG       m_AppEndAttach;     // the attachment m_AppEnd is from (NF_VMIC_RING_STATS.Attaches; 0: none yet)
-    ULONG           m_AppOtherLead;     // the longest reader packet it has played the copy behind this run (AppRingOtherPass)
+    ULONG           m_AppOtherLead;     // the reader packet its latest pass played the copy behind (AppRingOtherPass: a shorter
+                                        // one next is a counted skip, a longer one counted silence)
     BOOLEAN         m_AppOtherValid;    // its latest pass this run played the copy: a handoff to this stream counts what it skips
     BOOLEAN         m_AppNoSlot;        // it gave the reader slot up (AppRingReaderStop) and may take it only after its next Run
 
@@ -611,7 +611,8 @@ protected:
         _In_                            ULONG   PacketSize
         );
 
-    // The pass of a stream that isn't the reader: the reader's copy, a lag behind. App ring lock held (AppRingCapturePass).
+    // The pass of a stream that isn't the reader: the reader's copy, the reader's packet and a lag behind, moving on at once
+    // (a counted skip) when that packet shrinks. App ring lock held (AppRingCapturePass).
     __drv_requiresIRQL(DISPATCH_LEVEL)
     VOID
     AppRingOtherPass(

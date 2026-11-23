@@ -1022,9 +1022,12 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         a.refused_capture_opens.saturating_sub(b.refused_capture_opens)
     );
     println!(
-        "  reader handoffs +{}, skipping +{} frames of the ring's audio",
+        "  reader handoffs +{}, skipping +{} frames of the ring's audio; streams playing on through them moved on to a shorter \
+         lag +{}, skipping +{} frames",
         after.reader_handoffs.saturating_sub(before.reader_handoffs),
-        after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames)
+        after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames),
+        after.secondary_skips.saturating_sub(before.secondary_skips),
+        after.secondary_skipped_frames.saturating_sub(before.secondary_skipped_frames)
     );
     for (index, left, right) in &r.first_corrupt {
         let (l, rt) = (f32::from_bits(*left), f32::from_bits(*right));
@@ -1065,17 +1068,23 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     let underrun = reader_underrun + secondary_underrun;
     let underrun_text = format!("{underrun} frames (the reader {reader_underrun}, secondary streams {secondary_underrun})");
     let silence = r.zeros_before_signal + r.zeros_inside + r.zeros_after_signal;
-    // A handoff skips once (the owner, 2026-11-20): gaps are allowed only for handoffs the driver counted over the recording, at
-    // most one each, and only if they lost exactly the frames it counted as skipped. The counts are for every stream and the
-    // driver can't say which stream took the slot (a client's engine period needn't be its device stream's packet: a DEFAULT
-    // client told 3.33 ms ran 480-frame packets), so the exact match is what ties a gap to a handoff: a bystander's own
-    // discontinuity, or a gap for any other reason, would have to equal the taker's skip to the frame. A stream that plays the
-    // driver's copy on through a handoff skips nothing (nf_vmic.h): where the new reader's packet is longer it gets the
-    // difference as silence, counted in SecondaryUnderrunFrames, so its recording has no gap, and any repeat fails it. With
-    // three streams, record one handoff at a time: another stream's take in the window adds its skip to the count.
+    // A handoff skips once in the stream that takes the slot (the owner, 2026-11-20): gaps are allowed for handoffs the driver
+    // counted over the recording, at most one each, if they lost exactly the frames it counted as skipped. The counts are for
+    // every stream and the driver can't say which stream took the slot (a client's engine period needn't be its device
+    // stream's packet: a DEFAULT client told 3.33 ms ran 480-frame packets), so the exact match is what ties a gap to a
+    // handoff: a bystander's own discontinuity, or a gap for any other reason, would have to equal the taker's skip to the
+    // frame. A stream that plays the driver's copy on through a handoff (nf_vmic.h) gets the difference as silence where the
+    // new reader's packet is longer, counted in SecondaryUnderrunFrames, with no gap; where it is shorter it moves on to the
+    // new lag at once and skips the difference once (the owner, 2026-11-23), counted apart (SecondarySkips,
+    // SecondarySkippedFrames), and its gaps are tied to that count the same way. Each count stands alone: a gap matching
+    // their sum fails, and any repeat fails. With three streams, record one handoff at a time: another stream's take in the
+    // window adds its skip to the count.
     let handoffs = after.reader_handoffs.saturating_sub(before.reader_handoffs);
     let skipped = after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames);
-    let gaps_ok = r.gaps == 0 || (r.gaps <= handoffs && r.gap_frames == skipped);
+    let secondary_skips = after.secondary_skips.saturating_sub(before.secondary_skips);
+    let secondary_skipped = after.secondary_skipped_frames.saturating_sub(before.secondary_skipped_frames);
+    let gaps_ok =
+        r.gaps == 0 || (r.gaps <= handoffs && r.gap_frames == skipped) || (r.gaps <= secondary_skips && r.gap_frames == secondary_skipped);
     vec![
         Check {
             ok: is_reading(before),
@@ -1138,8 +1147,9 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             name: "bit-exact and in order",
             detail: format!(
                 "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one; reader \
-                 handoffs over the recording {handoffs} ({skipped} frames skipped by the driver's count: gaps are allowed only \
-                 for those, one each, losing exactly that many frames)",
+                 handoffs over the recording {handoffs} ({skipped} frames skipped by the driver's count), streams playing on \
+                 that moved on to a shorter lag {secondary_skips} ({secondary_skipped} frames): gaps are allowed only for one of \
+                 those, one each, losing exactly its frames",
                 r.gaps, r.gap_frames, r.repeats, r.repeat_frames, r.corrupt_frames, r.first_code, r.last_code, r.steps_ok
             ),
         },
@@ -1606,6 +1616,10 @@ fn print_stats(s: &Stats) {
         "  reader handoffs {} (a stream took the slot another had held), skipping {} frames of the ring's audio",
         s.reader_handoffs, s.handoff_skipped_frames
     );
+    println!(
+        "  streams playing on through handoffs: moved on to a shorter reader packet's lag {}, skipping {} frames of the ring's audio",
+        s.secondary_skips, s.secondary_skipped_frames
+    );
     if s.flags & STATS_LOOPBACK != 0 {
         let l = &s.loopback;
         println!(
@@ -1617,6 +1631,10 @@ fn print_stats(s: &Stats) {
             l.capture_anchors, l.render_restarts, l.render_gap_fills, l.render_late_packets, l.render_lost_packets, l.render_not_owner
         );
         println!("  stream creations refused {} (a format other than one open on the other endpoint)", l.refused_opens);
+        println!(
+            "  capture reads moved on to a shorter render lead {}, skipping {} frames of the render audio",
+            s.loopback_lead_skips, s.loopback_lead_skipped_frames
+        );
     } else {
         println!("loopback: no device");
     }
@@ -3524,9 +3542,10 @@ mod tests {
         assert_eq!(failed(&verify_checks(&b, &a, &edges, &own)), Vec::<&str>::new());
     }
 
-    /// Three capture streams and one handoff (Astra's review, 2026-11-23): a 160-frame reader stops, a 480-frame stream takes the
-    /// slot and a 240-frame one plays on as another stream. The taker loses its counted skip (its lag at most: 209 frames); the
-    /// one that plays on gets the difference in the readers' packets as silence, counted, with no gap and no repeat.
+    /// Three capture streams and one handoff (Astra's review, 2026-11-23; run A of nf-scratch's three.sh): a 160-frame reader
+    /// stops, a 480-frame stream takes the slot and a 240-frame one plays on as another stream. The taker loses its counted skip
+    /// (its lag at most: 209 frames); the one that plays on gets the difference in the readers' packets as silence, counted,
+    /// with no gap and no repeat.
     #[test]
     fn verify_judges_each_stream_of_a_three_stream_handoff() {
         let before = Stats { reader_packet_frames: 160, ..reading(counters(3, 1_000_000, 0)) };
@@ -3570,6 +3589,56 @@ mod tests {
             ..clean_recording()
         };
         assert_eq!(failed(&verify_checks(&before, &live_after, &live, &seen)), ["bit-exact and in order"]);
+        // A secondary skip counted in the window (another stream's, say) allows a gap of exactly its frames, and no other.
+        let skipped_too = Stats { secondary_skips: 1, secondary_skipped_frames: 80, ..after };
+        let gap = |gaps, gap_frames| CheckReport { gaps, gap_frames, ..on.clone() };
+        assert_eq!(failed(&verify_checks(&before, &skipped_too, &gap(1, 81), &seen)), ["bit-exact and in order"]);
+        assert_eq!(failed(&verify_checks(&before, &skipped_too, &gap(1, 80), &seen)), Vec::<&str>::new());
+    }
+
+    /// The other way (run B of nf-scratch's three.sh; the owner, 2026-11-23): a 480-frame reader stops, a 160-frame stream takes
+    /// the slot and a 240-frame one plays on. The taker loses its counted skip (449 frames here, its lag of 529 at most); the one
+    /// that plays on moves on to the new reader's lag at once and loses the difference in the readers' packets, 320 frames,
+    /// once, counted apart (SecondarySkips, SecondarySkippedFrames), with no silence and no repeat. Each gap is tied to its
+    /// own count, exactly.
+    #[test]
+    fn verify_judges_each_stream_of_a_handoff_to_a_shorter_packet() {
+        let before = reading(counters(3, 1_000_000, 0));
+        let after = Stats {
+            reader_packet_frames: 160,
+            reader_handoffs: 1,
+            handoff_skipped_frames: 449,
+            secondary_skips: 1,
+            secondary_skipped_frames: 320,
+            ..reading(counters(3, 1_000_000 + FRAMES, 0))
+        };
+        let gap = |gaps, gap_frames| CheckReport { gaps, gap_frames, ..clean_recording() };
+        let seen = StreamSeen { packet: 240, ..Default::default() };
+        let judge = |after: &Stats, r: &CheckReport| failed(&verify_checks(&before, after, r, &seen));
+        assert_eq!(judge(&after, &gap(1, 449)), Vec::<&str>::new(), "the taker");
+        assert_eq!(judge(&after, &gap(1, 320)), Vec::<&str>::new(), "the stream that plays on");
+        assert_eq!(judge(&after, &clean_recording()), Vec::<&str>::new(), "no gap at all (the stopping reader's own recording)");
+        // Off by a frame, two gaps for one skip, the two counts' sum, a repeat: all fail.
+        let bad = ["bit-exact and in order"];
+        assert_eq!(judge(&after, &gap(1, 321)), bad, "larger than counted");
+        assert_eq!(judge(&after, &gap(1, 319)), bad, "smaller than counted");
+        assert_eq!(judge(&after, &gap(2, 320)), bad, "two gaps, one skip");
+        assert_eq!(judge(&after, &gap(1, 769)), bad, "the taker's and the bystander's skips together");
+        assert_eq!(judge(&after, &CheckReport { repeats: 1, repeat_frames: 320, ..clean_recording() }), bad);
+        // The same gap with the skip uncounted (the driver before 2026-11-23 kept the longer lag and had no gap; one that skipped
+        // uncounted would fail here), or with the frames counted as the taker's: it is tied only to the count it equals.
+        let uncounted = Stats { secondary_skips: 0, secondary_skipped_frames: 0, ..after };
+        assert_eq!(judge(&uncounted, &gap(1, 320)), bad);
+        let as_taker = Stats { handoff_skipped_frames: 320, ..uncounted };
+        assert_eq!(judge(&as_taker, &gap(1, 320)), Vec::<&str>::new());
+        // A window holding two such skips (two handoffs to shorter packets) allows two gaps losing both.
+        let two = Stats { secondary_skips: 2, secondary_skipped_frames: 320 + 80, ..after };
+        assert_eq!(judge(&two, &gap(2, 400)), Vec::<&str>::new());
+        assert_eq!(judge(&two, &gap(3, 400)), bad);
+        // A skip that passed over nothing the copy held counts as a skip with no frames: no gap is allowed for it.
+        let empty = Stats { secondary_skips: 1, secondary_skipped_frames: 0, handoff_skipped_frames: 0, reader_handoffs: 0, ..after };
+        assert_eq!(judge(&empty, &gap(1, 1)), bad);
+        assert_eq!(judge(&empty, &clean_recording()), Vec::<&str>::new());
     }
 
     #[test]

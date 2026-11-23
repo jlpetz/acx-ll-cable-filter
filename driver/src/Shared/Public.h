@@ -83,9 +83,8 @@ typedef struct _LOOPBACK_RING {
     LOOPBACK_FORMAT RenderFormat;           // the last owner's format (kept after it stops, so its tail can still be read)
     BOOLEAN         RenderActive;           // the owner is running and has written in this run
     ULONG           RenderLeadFrames;       // 0: packets copied as released (a period early); else a packet: copied as they complete.
-                                            // Set by a pass that copied; a capture stream keeps a longer one set in the same run
-                                            // while a shorter one would skip audio the ring holds (LoopbackCapturePass)
-    ULONG           RenderLeadRun;          // the run that set it: RenderRestarts' count then (each run counts itself as it starts)
+                                            // Set by a pass that copied; a capture stream takes a change at once, a fall as a
+                                            // counted one-time skip (LoopbackCapturePass, LeadSkips)
     ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
     ULONGLONG       WritePos;
 
@@ -110,6 +109,8 @@ typedef struct _LOOPBACK_RING {
     ULONG           RenderLatePackets;      // render packets copied as they completed: the client released them too late
     ULONG           RenderLostPackets;      // render packets gone from the buffer before they were copied (zeroed; not expected)
     ULONG           RenderNotOwner;         // passes of a second render stream (not looped back)
+    ULONG           LeadSkips;              // capture reads moved on at once by a fall in the render lead: a one-time skip
+    ULONGLONG       LeadSkippedFrames;      // the ring's audio such skips passed over (the difference in leads at most)
 } LOOPBACK_RING, *PLOOPBACK_RING;
 
 //

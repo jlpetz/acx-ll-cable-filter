@@ -1640,14 +1640,12 @@ CRenderStreamEngine::LoopbackRenderPass(
     //
     // The lead (how early this stream's packets reach the ring), from a pass that copied. The pass at Run before the client has
     // released a packet copies nothing: its packet as the lead moved every capture stream running a packet back, and then on
-    // again, skipping the start of this stream's audio. The first pass that copies says how this stream's packets are copied,
-    // and stamps the run it set the lead in (RenderLeadRun: the anchor block above counted the run in RenderRestarts as it
-    // started), so a capture stream keeps a longer lead only through a fall within one run (LoopbackCapturePass).
+    // again, skipping the start of this stream's audio. The first pass that copies says how this stream's packets are copied;
+    // a capture stream takes a change at once (LoopbackCapturePass: a fall skips the difference once, counted).
     //
     if (copied)
     {
         ring->RenderLeadFrames = lookAhead ? 0 : m_LbPacketFrames;
-        ring->RenderLeadRun = ring->RenderRestarts;
         ring->RenderActive = TRUE;
     }
 
@@ -1696,7 +1694,6 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_EnableWaveCapture(0),
     m_LbLagFrames(0),
     m_LbAnchorLead(0),
-    m_LbAnchorRun(0),
     m_LbReadBase(0),
     m_AppFormatOk(FALSE),
     m_AppEnd(0),
@@ -1913,15 +1910,14 @@ CCaptureStreamEngine::LoopbackCapturePass(
     // early: LoopbackRenderPass) and when another render stream claims the ring, which starts a new run there. So a longer
     // lead moves the read back only onto a new run: silence before its start, and after it the new owner's audio, which this
     // stream hasn't had (the ring held the last owner's there, or nothing), so no frame of the ring comes out twice. A shorter
-    // one moves the read on and skips the difference. Within the run that set the lead this stream reads behind, that is the
-    // start of the owner's audio: while the ring holds audio there, the read stays where it is instead, and the stream keeps
-    // the longer lead (and that much more latency) until the ring holds none it would skip (the render stream stopped) or it
-    // next runs (ours, 2026-11-23, after Astra's review; the owner's to confirm against a skip that keeps the lag shortest). A
-    // lead set in another run (RenderLeadRun: a new owner, or the owner's restart) is taken at once: kept across runs, the
-    // last run's longer lead held a new owner's whole run a packet behind whenever its audio began before the shorter lead's
-    // read, as an overlapping render stream's does when it claims the ring (Astra's review of 5de56b9). A fall there skips at
-    // most the difference: silence before the new run's start, or the new run's first frames before the shorter lead's read
-    // (the owner, 2026-11-23).
+    // one is taken at once too: the read moves on by the difference and the stream skips it, once, counted (LeadSkips, and
+    // the ring's audio between its reads at the two leads in LeadSkippedFrames). Within a run that is the owner's audio
+    // where its packets begin to go a period early; at a new run (another owner, or the owner's restart), silence before the
+    // run's start or its first frames before the shorter lead's read. A new run's lead is the owner's rule (2026-11-23); a
+    // fall within a run follows the owner's app-ring decision of 2026-11-23 (lower latency over a one-time skip): from
+    // 5de56b9 to e801320 a stream kept the longer lead there while the ring held audio it would skip, a packet more latency
+    // until that audio ended or it next ran. What the ring doesn't hold yet between the two reads isn't counted: there the
+    // shorter lead's read underruns too (a client that released a packet too late to go early, RenderLatePackets).
     //
 
     // The audio the ring still holds of the current render run.
@@ -1934,15 +1930,18 @@ CCaptureStreamEngine::LoopbackCapturePass(
 
     anchor = LoopbackAnchor();
     lead = ring->RenderLeadFrames;
-    if (m_LbAnchorValid && lead < m_LbAnchorLead && ring->RenderLeadRun == m_LbAnchorRun)
+    if (m_LbAnchorValid && lead < m_LbAnchorLead)
     {
-        // This pass's read at the lead kept, and at the shorter one: the frames between them would be skipped.
-        ULONGLONG   keptStart = anchor - m_LbLagFrames - m_LbAnchorLead + (ULONGLONG)Packet * m_LbPacketFrames;
-        ULONGLONG   shortStart = keptStart + (m_LbAnchorLead - lead);
+        // This pass's read at the old lead, and at the new one: what the ring holds between them never reaches this stream.
+        ULONGLONG   oldStart = anchor - m_LbLagFrames - m_LbAnchorLead + (ULONGLONG)Packet * m_LbPacketFrames;
+        ULONGLONG   newStart = oldStart + (m_LbAnchorLead - lead);
+        ULONGLONG   skipLo = MAX(oldStart, validLo);
+        ULONGLONG   skipHi = MIN(newStart, validHi);
 
-        if (MIN(shortStart, validHi) > MAX(keptStart, validLo))
+        ring->LeadSkips++;
+        if (skipHi > skipLo)
         {
-            lead = m_LbAnchorLead;
+            ring->LeadSkippedFrames += skipHi - skipLo;
         }
     }
     if (!m_LbAnchorValid || anchor != m_LbAnchor || lead != m_LbAnchorLead)
@@ -1953,9 +1952,6 @@ CCaptureStreamEngine::LoopbackCapturePass(
         m_LbAnchorValid = TRUE;
         ring->CaptureAnchors++;
     }
-
-    // The run of the lead read behind: kept, the lead is from the same run (above), so this is the ring's lead's run either way.
-    m_LbAnchorRun = ring->RenderLeadRun;
 
     readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
     readEnd = readStart + m_LbPacketFrames;
@@ -2042,20 +2038,20 @@ CCaptureStreamEngine::Pause()
 // be running too. The reader also writes each packet it delivers into the driver's copy (g_NfAppHistory) at its frames on the
 // stream engine's QPC time line, and every other stream reads that copy at its own place on the time line, a lag behind: the
 // reader writes a packet at the pass that ends it, so the copy holds the time line up to that pass, a packet and a late timer
-// behind now at worst. The lag is the reader's packet (NF_APP_RING.HistoryLeadFrames; for a stream that has played the copy
-// behind more than one reader this run, the longest of their packets) plus LOOPBACK_LAG_HNS and a frame (m_LbLagFrames), as the
-// loopback's capture side reads a render stream that copies its packets as they complete. Every time line is the same QPC
-// clock at the same nominal rate, so nothing drifts and no fill control is needed. The app's protocol doesn't change: one
-// ReadFrame, paced by the reader.
+// behind now at worst. The lag is the reader's packet (NF_APP_RING.HistoryLeadFrames) plus LOOPBACK_LAG_HNS and a frame
+// (m_LbLagFrames), as the loopback's capture side reads a render stream that copies its packets as they complete. Every time
+// line is the same QPC clock at the same nominal rate, so nothing drifts and no fill control is needed. The app's protocol
+// doesn't change: one ReadFrame, paced by the reader.
 //
 // No stream has the ring's audio twice. The copy holds the ring's frames in the order the readers delivered them, none left
 // out at a handoff: a new reader takes what the copy already holds for its packet's time from the copy, and reads the ring on
 // from the copy's end. And no stream has the same frame of the copy twice: each keeps its place in it (m_AppEnd), and gets silence
 // rather than anything before it (AppRingPlayCopy). So a stream playing the copy skips the ring's audio only where its own time
-// line jumps (Run, a glitch adjustment), where the copy didn't hold its frames in time (silence, counted as underruns), and
-// once as it takes the reader slot (counted, HandoffSkippedFrames). (Astra's review, 2026-11-23: a stream that stayed another
-// one through a handoff to a reader with a longer packet moved back by the difference and played it again, 320 frames from 160
-// to 480; and a new reader whose packet started before the last one's end left that much of the ring out of the copy.)
+// line jumps (Run, a glitch adjustment), where the copy didn't hold its frames in time (silence, counted as underruns), once as
+// it takes the reader slot (counted, HandoffSkippedFrames), and once as it plays on behind a new reader with a shorter packet
+// (counted, SecondarySkippedFrames: AppRingOtherPass). (Astra's review, 2026-11-23: a stream that stayed another one through a
+// handoff to a reader with a longer packet moved back by the difference and played it again, 320 frames from 160 to 480; and a
+// new reader whose packet started before the last one's end left that much of the ring out of the copy.)
 //
 
 //
@@ -2421,17 +2417,23 @@ CCaptureStreamEngine::AppRingCapturePass(
 
 //
 // A stream that isn't the reader reads the reader's copy, as LoopbackCapturePass reads the loopback ring: from its own place
-// on the time line, the lag behind (m_LbLagFrames and m_AppOtherLead). That place moves only with its time line (Run, a glitch
-// adjustment) or a longer lag, so between those it advances exactly a packet a pass and plays the readers' audio
-// continuously, across handoffs too.
+// on the time line, the lag behind (m_LbLagFrames and the reader's packet, HistoryLeadFrames). That place moves only with its
+// time line (Run, a glitch adjustment) or the reader's packet (a handoff), so between those it advances exactly a packet a pass
+// and plays the readers' audio continuously.
 //
-// The lag holds the longest reader packet the stream has played the copy behind this run. At a handoff to a reader with a
-// longer packet its place moves back by the difference, and it gets that much silence (AppRingPlayCopy), not the audio it has
-// had again: counted as an underrun. To one with a shorter packet the place stays where it is, rather than move on and skip
-// the difference: the stream keeps the longer lag until it next runs (ours, 2026-11-23, Astra's review: no gap and no repeat
-// in a recording through any handoff it isn't part of; the owner's to confirm against a skip that keeps the lag shortest).
-// What the copy doesn't hold (not yet written, or already overwritten) is silence, and so is what it holds for a gap in the
-// reader's time line: both counted as underruns.
+// At a handoff to a reader with a longer packet its place moves back by the difference, and it gets that much silence
+// (AppRingPlayCopy), not the audio it has had again: counted as an underrun. To one with a shorter packet it moves on by the
+// difference at once and skips it, once: what the copy holds between its place and its new read never reaches it, counted
+// (SecondarySkips, SecondarySkippedFrames) apart from the taker's skip (HandoffSkippedFrames), so a recording's gap can be tied
+// to the stream that had it (the owner, 2026-11-23: a recorder playing on jumps forward to the new reader's lag, lower latency
+// over a one-time skip; from a66d8ab to e801320 it kept the longer lag until it next ran). Counted as a handoff's skip is: from
+// the copy's valid start at the earliest to its end at the latest, less its recorded gaps (silence no reader delivered), the
+// last reader's underrun silence there included. The copy holds the whole span unless the new reader's timer is later than
+// this one's by more than the 1 ms, which leaves this stream's own read short too (silence, counted as underruns). A stream
+// that is pausing (m_AppNoSlot: it gave the slot up, and its timer stops after a pass or so) keeps its lag instead: its client
+// is stopping, and a skip of its would count in the window of the streams that play on. What the copy doesn't hold (not yet
+// written, or already overwritten) is silence, and so is what it holds for a gap in the reader's time line: both counted as
+// underruns.
 //
 _Use_decl_annotations_
 VOID
@@ -2442,6 +2444,8 @@ CCaptureStreamEngine::AppRingOtherPass(
 )
 {
     PNF_APP_RING    ring = &g_NfAppRing;
+    ULONG           lead = ring->HistoryLeadFrames;
+    ULONGLONG       from;
 
     if (!m_AppFormatOk || m_LbPacketFrames == 0 || (ULONGLONG)m_LbPacketFrames * NF_VMIC_FRAME_BYTES != PacketSize)
     {
@@ -2453,16 +2457,45 @@ CCaptureStreamEngine::AppRingOtherPass(
         return;
     }
 
-    if (!m_AppOtherValid || ring->HistoryLeadFrames > m_AppOtherLead)
+    if (m_AppOtherValid && m_AppNoSlot && lead < m_AppOtherLead)
     {
-        m_AppOtherLead = ring->HistoryLeadFrames;
+        lead = m_AppOtherLead;
     }
 
     // m_LbLagFrames: LOOPBACK_LAG_HNS and a frame (Run; m_AppFormatOk implies m_LbFormat.Valid, which sets it).
-    AppRingPlayCopy(LoopbackAnchor() - m_LbLagFrames - m_AppOtherLead + (ULONGLONG)Packet * m_LbPacketFrames, m_LbPacketFrames,
-                    PacketBuffer);
+    from = LoopbackAnchor() - m_LbLagFrames - lead + (ULONGLONG)Packet * m_LbPacketFrames;
 
-    // Its place (m_AppEnd) is now from this run, for the skip a handoff to it counts (AppRingCapturePass).
+    //
+    // A shorter reader packet than its latest pass played behind: this pass's read at the old lag would have started the
+    // difference earlier. What lies between its place (or that read, if later: a jump in its time line is not this skip)
+    // and this read is skipped. m_AppOtherValid: its latest pass was this run's and played the copy; the attachment check,
+    // that its place is in this copy (an ATTACH between two passes starts the copy and its lead again).
+    //
+    if (m_AppOtherValid && lead < m_AppOtherLead && m_AppEndAttach == ring->Stats.Attaches)
+    {
+        ULONGLONG   start = MAX(from - (m_AppOtherLead - lead), m_AppEnd);
+
+        if (from > start)
+        {
+            ULONGLONG   end = from;
+
+            ring->SecondarySkips++;
+            if (ring->HistoryValid)
+            {
+                start = MAX(start, AppRingHistoryValidFrom(ring));
+                end = MIN(end, ring->HistoryEnd);
+                if (end > start)
+                {
+                    ring->SecondarySkippedFrames += end - start - AppRingGapFrames(ring, start, end);
+                }
+            }
+        }
+    }
+    m_AppOtherLead = lead;
+
+    AppRingPlayCopy(from, m_LbPacketFrames, PacketBuffer);
+
+    // Its place (m_AppEnd) is now from this run, for the skips a handoff or a shorter lag count (AppRingCapturePass, above).
     m_AppOtherValid = TRUE;
 }
 

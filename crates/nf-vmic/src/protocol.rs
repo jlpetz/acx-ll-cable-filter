@@ -401,12 +401,24 @@ pub struct Stats {
     /// Times a capture stream that was playing the driver's copy took the reader slot another stream had held (a handoff).
     pub reader_handoffs: u64,
     /// The copy's frames such a stream never delivered: between its place in the copy and its first packet as the reader (a
-    /// handoff's one-time skip, its lag at most; the last reader's underrun silence there included). The other streams skip
-    /// nothing at a handoff.
+    /// handoff's one-time skip, its lag at most; the last reader's underrun silence there included). A stream that plays on
+    /// skips only behind a new reader with a shorter packet, counted apart ([`Stats::secondary_skipped_frames`]).
     pub handoff_skipped_frames: u64,
     /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
     pub stream: [StreamStats; KINDS],
     pub capture_trace: CaptureTrace,
+    /// Times a capture stream playing the driver's copy moved on at once to a shorter reader packet's lag (a handoff to a reader
+    /// with a shorter packet), skipping the difference once (the owner, 2026-11-23: lower latency over a one-time skip). The
+    /// taker's skip is [`Stats::handoff_skipped_frames`].
+    pub secondary_skips: u64,
+    /// The copy's frames those skips passed over (the readers' packets' difference at most; the last reader's underrun silence
+    /// there included, the copy's recorded gaps not): a recording that played on through such a handoff has a gap of exactly this.
+    pub secondary_skipped_frames: u64,
+    /// Times a loopback capture read moved on at once to a shorter render lead, skipping the difference once (valid with
+    /// [`STATS_LOOPBACK`], as [`Stats::loopback`] is).
+    pub loopback_lead_skips: u64,
+    /// The render audio the loopback ring held between those reads at the two leads (the difference in leads at most).
+    pub loopback_lead_skipped_frames: u64,
 }
 
 // The header's offsets (nf_vmic.h's layout tables and C_ASSERTs).
@@ -460,8 +472,12 @@ const _: () = {
 
     assert!(size_of::<CaptureTrace>() == 64);
     assert!(offset_of!(CaptureTrace, last_notify_qpc) == 40);
-    assert!(size_of::<Stats>() == 640);
+    assert!(size_of::<Stats>() == 672);
     assert!(offset_of!(Stats, capture_trace) == 576);
+    assert!(offset_of!(Stats, secondary_skips) == 640);
+    assert!(offset_of!(Stats, secondary_skipped_frames) == 648);
+    assert!(offset_of!(Stats, loopback_lead_skips) == 656);
+    assert!(offset_of!(Stats, loopback_lead_skipped_frames) == 664);
     assert!(offset_of!(Stats, qpc_frequency) == 16);
     assert!(offset_of!(Stats, attached_pid) == 32);
     assert!(offset_of!(Stats, attached_read_frame) == 40);
@@ -578,5 +594,16 @@ mod tests {
         assert_eq!((offset_of!(Stats, secondary_frames_copied), offset_of!(Stats, secondary_underrun_frames)), (288, 296));
         assert_eq!((offset_of!(Stats, reader_handoffs), offset_of!(Stats, handoff_skipped_frames)), (304, 312));
         assert_eq!(offset_of!(Stats, handoff_skipped_frames) + 8, offset_of!(Stats, stream));
+    }
+
+    /// The skip counters of 2026-11-23 are appended: every earlier offset stands, and the size grows by their 32 bytes (no
+    /// version bump: the owner's rule of 2026-11-23 bumps only for ATTACH, the ring's header or rules the app must follow).
+    #[test]
+    fn the_skip_counters_are_appended() {
+        assert_eq!(offset_of!(Stats, capture_trace) + size_of::<CaptureTrace>(), offset_of!(Stats, secondary_skips));
+        assert_eq!((offset_of!(Stats, secondary_skips), offset_of!(Stats, secondary_skipped_frames)), (640, 648));
+        assert_eq!((offset_of!(Stats, loopback_lead_skips), offset_of!(Stats, loopback_lead_skipped_frames)), (656, 664));
+        assert_eq!(offset_of!(Stats, loopback_lead_skipped_frames) + 8, size_of::<Stats>());
+        assert_eq!((size_of::<Stats>(), VERSION), (672, 1));
     }
 }

@@ -540,6 +540,8 @@ NfVmic_Stats(
     out->SecondaryUnderrunFrames = ring->SecondaryUnderrunFrames;
     out->ReaderHandoffs = ring->ReaderHandoffs;
     out->HandoffSkippedFrames = ring->HandoffSkippedFrames;
+    out->SecondarySkips = ring->SecondarySkips;
+    out->SecondarySkippedFrames = ring->SecondarySkippedFrames;
     if (ring->Header != NULL)
     {
         out->Flags |= NF_VMIC_STATS_ATTACHED;
@@ -581,6 +583,8 @@ NfVmic_Stats(
         out->Loopback.RenderLostPackets = loopback->RenderLostPackets;
         out->Loopback.RenderNotOwner = loopback->RenderNotOwner;
         out->Loopback.RefusedOpens = loopback->RefusedOpens;
+        out->LoopbackLeadSkips = loopback->LeadSkips;
+        out->LoopbackLeadSkippedFrames = loopback->LeadSkippedFrames;
         KeReleaseSpinLockFromDpcLevel(&loopback->Lock);
         out->Flags |= NF_VMIC_STATS_LOOPBACK;
     }
