@@ -26,7 +26,7 @@ lead (a packet where packets are copied as they complete, else none). The lead c
 or another claims the ring, which starts a new run there, so no frame comes out twice. When it falls within a run, a capture
 stream keeps the longer lead while the shorter one would skip audio the ring holds, rather than skip it, until that audio
 ends or it next runs; a lead set in a new run (another owner, or the owner's restart) is taken at once, skipping at most the
-difference, so a kept lead never outlasts its run's audio (both ours, 2026-11-23; the owner's to confirm).
+difference, so a kept lead never outlasts its run's audio (the first ours, 2026-11-23, the owner's to confirm; the second the owner's, 2026-11-23).
 Both endpoints offer 48 kHz stereo with float32 first and signed 24-in-32 PCM second. On the Server 2025 spike Windows
 stored float32 on both endpoints and the filter opened exclusive float output. Float32 alone left both interfaces disabled.
 The loopback copies raw bytes between matching formats only, so a stream is refused at creation (STATUS_NOT_SUPPORTED,

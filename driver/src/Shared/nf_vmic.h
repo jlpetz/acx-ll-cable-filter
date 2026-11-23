@@ -8,7 +8,7 @@
     the ring's rules for the app's side: its positions, WriteFrame and ReadFrame, the fill, the State bits). NF_VMIC_STATS
     also carries its size (StatsBytes), which a reader checks with the version, so it has grown without one; and the driver's
     handling of its other capture streams (the reader's copy, handoffs, their counters) can change without one, as it has
-    at version 1 (ours, 2026-11-23: the owner's to confirm).
+    at version 1 (the owner, 2026-11-23).
 
 Module Name:
 

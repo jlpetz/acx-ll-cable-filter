@@ -1921,7 +1921,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
     // last run's longer lead held a new owner's whole run a packet behind whenever its audio began before the shorter lead's
     // read, as an overlapping render stream's does when it claims the ring (Astra's review of 5de56b9). A fall there skips at
     // most the difference: silence before the new run's start, or the new run's first frames before the shorter lead's read
-    // (ours, 2026-11-23; the owner's to confirm).
+    // (the owner, 2026-11-23).
     //
 
     // The audio the ring still holds of the current render run.
