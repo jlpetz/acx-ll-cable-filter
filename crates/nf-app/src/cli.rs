@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use nf_engine::{GateMode, HighBand, LatencyMode};
+use nf_vmic::variant::Variant;
 
 use crate::lab::playlist::{self, DEFAULT_CLIP_S, MAX_CLIP_S, MIN_CLIP_S};
 use crate::quality::QualityTest;
@@ -35,6 +36,10 @@ pub enum Command {
         sid: Option<String>,
         helper: bool,
     },
+    /// `mic sessions`: which apps record from the driver's microphones, and which microphone suits each (TODO 19).
+    MicSessions,
+    /// `mic variant [both|call|low-latency]`: the driver's variant, or a switch to another (TODO 19).
+    MicVariant(MicVariantArgs),
 }
 
 impl Command {
@@ -251,6 +256,21 @@ pub const MAX_BENCH_SECONDS: f32 = 300.0;
 /// (defined in nf-mem, which the window's button shares). It's left out of `--help`.
 pub use nf_mem::privilege::HELPER_FLAG;
 
+/// The hidden option `mic variant`'s elevated relaunch takes: the named pipe it reports its steps through, to the process that
+/// asked for elevation (report_pipe.rs). Left out of `--help`, like [`HELPER_FLAG`].
+pub const REPORT_FLAG: &str = "--report";
+
+/// `mic variant`'s arguments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MicVariantArgs {
+    /// The variant to switch to; `None` says which is installed.
+    pub target: Option<Variant>,
+    /// [`HELPER_FLAG`]: the elevated relaunch, which never relaunches itself again.
+    pub helper: bool,
+    /// [`REPORT_FLAG`]'s pipe.
+    pub report: Option<String>,
+}
+
 /// A command line that doesn't parse, worded for the user.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageError(pub String);
@@ -286,6 +306,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "bench" => return parse_bench(&mut p).map(Command::Bench),
         "lab" => return parse_lab(&mut p).map(Command::Lab),
         "setup-large-pages" => return parse_setup(&mut p),
+        "mic" => return parse_mic(&mut p),
         other if other.starts_with('-') => return Err(usage(format!("unknown option '{other}'"))),
         other => return Err(usage(format!("unknown command '{other}'"))),
     };
@@ -868,6 +889,44 @@ fn parse_setup(p: &mut Parser<'_>) -> Result<Command, UsageError> {
     Ok(Command::SetupLargePages { sid, helper })
 }
 
+/// `mic sessions` or `mic variant [VARIANT]`.
+fn parse_mic(p: &mut Parser<'_>) -> Result<Command, UsageError> {
+    const WHICH: &str = "'mic' takes sessions or variant: `noise-filter mic sessions`, `noise-filter mic variant [both|call|low-latency]`";
+    match p.next() {
+        Some(Arg::Positional("sessions")) => {
+            p.command = "mic sessions";
+            p.finish()?;
+            Ok(Command::MicSessions)
+        }
+        Some(Arg::Positional("variant")) => parse_mic_variant(p).map(Command::MicVariant),
+        Some(Arg::Positional(other)) => Err(usage(format!("{WHICH}; '{other}' isn't one"))),
+        Some(Arg::Flag(flag, _)) => Err(p.unknown(flag)),
+        None => Err(usage(WHICH)),
+    }
+}
+
+fn parse_mic_variant(p: &mut Parser<'_>) -> Result<MicVariantArgs, UsageError> {
+    p.command = "mic variant";
+    let mut a = MicVariantArgs { target: None, helper: false, report: None };
+    while let Some(arg) = p.next() {
+        match arg {
+            Arg::Flag(HELPER_FLAG, inline) => a.helper = switch(HELPER_FLAG, inline)?,
+            Arg::Flag(REPORT_FLAG, inline) => a.report = Some(text(REPORT_FLAG, p.value(REPORT_FLAG, inline)?)?),
+            Arg::Flag(flag, _) => return Err(p.unknown(flag)),
+            Arg::Positional(v) if a.target.is_none() => {
+                let variant =
+                    Variant::from_arg(v).ok_or_else(|| usage(format!("'mic variant' takes both, call or low-latency, not '{v}'")))?;
+                a.target = Some(variant);
+            }
+            Arg::Positional(v) => return Err(usage(format!("'mic variant' takes one variant; '{v}' is a second"))),
+        }
+    }
+    if a.target.is_none() && (a.helper || a.report.is_some()) {
+        return Err(usage(format!("{HELPER_FLAG} and {REPORT_FLAG} are for a switch: name the variant (both, call or low-latency)")));
+    }
+    Ok(a)
+}
+
 /// `--help`'s text.
 pub fn help_text() -> String {
     format!(
@@ -913,6 +972,14 @@ Usage:
                                  differences with 95% CIs
   noise-filter setup-large-pages [--sid SID]
                                  Grant the lock-pages privilege (asks for elevation)
+  noise-filter mic sessions      List the apps recording from noise-filter's microphones (the
+                                 AudioCodec Device ones), and which microphone suits each
+  noise-filter mic variant [both|call|low-latency]
+                                 Say which microphones the AudioCodec driver has, or switch it to
+                                 both, the call microphone only (a 5 ms default period, for call
+                                 apps) or the low-latency one only (IAudioClient3's small periods).
+                                 A switch re-creates the device: it asks for elevation, and the
+                                 microphones are gone for a few seconds
   noise-filter --help | --version
 
 FLIGHT RECORDER (run --flight; always on in devices --check):
@@ -1030,10 +1097,11 @@ LAB (offline, no devices):
   --jobs N           Worker threads (default: the CPU's, up to 8)
   --config FILE and PROCESSING (but --model, --aec and --ns) apply to every model
 
-Exit codes: 0 OK, 1 usage error, 2 engine, device or file error, 3 no result (latency: no
-valid repetition; quality: the recording didn't line up with the scene; latency, quality,
-run --seconds or devices --check: cancelled), 4 the large-page helper started without
-elevation, 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2, FMA), which noise-filter is built for,
+Exit codes: 0 OK, 1 usage error, 2 engine, device or file error (mic variant: a Windows call,
+named), 3 no result (latency: no valid repetition; quality: the recording didn't line up with
+the scene; latency, quality, run --seconds or devices --check: cancelled; mic variant: the
+elevation prompt declined), 4 the large-page or mic variant helper started without elevation,
+5 this CPU lacks x86-64-v3 (AVX2, BMI1/2, FMA), which noise-filter is built for,
 6 run --seconds: the soak wasn't clean (mic glitches or stalls, output underruns or coarse
 drops, a fault that stopped it, or real-time heap allocations; the summary says which). A
 run without --seconds exits 0.
@@ -1549,6 +1617,44 @@ mod tests {
         assert!(err(&["setup-large-pages", "--sid", "Administrator"]).starts_with("--sid takes a SID"));
         assert_eq!(err(&["setup-large-pages", "--sid"]), "--sid needs a value");
         assert_eq!(err(&["setup-large-pages", "now"]), "'setup-large-pages' takes no argument 'now'");
+    }
+
+    /// `mic sessions`, and `mic variant` with no variant (say which) or one of the three; the relaunch's hidden options.
+    #[test]
+    fn mic_takes_sessions_or_a_variant() {
+        assert_eq!(p(&["mic", "sessions"]), Ok(Command::MicSessions));
+        let variant = |args: &[&str]| match p(args) {
+            Ok(Command::MicVariant(a)) => a,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(variant(&["mic", "variant"]), MicVariantArgs { target: None, helper: false, report: None });
+        for (word, v) in [("both", Variant::Both), ("call", Variant::Call), ("low-latency", Variant::LowLatency), ("CALL", Variant::Call)] {
+            assert_eq!(variant(&["mic", "variant", word]).target, Some(v), "{word}");
+        }
+        // The elevated relaunch's command line parses back as the helper, with its pipe
+        let pipe = r"\\.\pipe\noise-filter-report-42-00ff";
+        let a = variant(&["mic", "variant", "low-latency", HELPER_FLAG, REPORT_FLAG, pipe]);
+        assert_eq!(a, MicVariantArgs { target: Some(Variant::LowLatency), helper: true, report: Some(pipe.into()) });
+        assert_eq!(variant(&["mic", "variant", "call", &format!("{REPORT_FLAG}={pipe}")]).report.as_deref(), Some(pipe));
+        // Usage errors
+        assert!(err(&["mic"]).starts_with("'mic' takes sessions or variant"));
+        assert!(err(&["mic", "list"]).ends_with("'list' isn't one"));
+        assert_eq!(err(&["mic", "--all"]), "'mic' has no option '--all'");
+        assert_eq!(err(&["mic", "sessions", "now"]), "'mic sessions' takes no argument 'now'");
+        assert_eq!(err(&["mic", "sessions", "--all"]), "'mic sessions' has no option '--all'");
+        assert_eq!(err(&["mic", "variant", "fast"]), "'mic variant' takes both, call or low-latency, not 'fast'");
+        assert_eq!(err(&["mic", "variant", "lowlatency"]), "'mic variant' takes both, call or low-latency, not 'lowlatency'");
+        assert_eq!(err(&["mic", "variant", "call", "both"]), "'mic variant' takes one variant; 'both' is a second");
+        assert_eq!(err(&["mic", "variant", "--force"]), "'mic variant' has no option '--force'");
+        assert_eq!(err(&["mic", "variant", "call", "--report"]), "--report needs a value");
+        assert_eq!(err(&["mic", "variant", "call", "--elevated-helper=1"]), "--elevated-helper takes no value");
+        assert!(err(&["mic", "variant", HELPER_FLAG]).starts_with("--elevated-helper and --report are for a switch"));
+        assert_eq!(p(&["mic", "variant", "--help"]), Ok(Command::Help));
+        // Neither runs the engine; the hidden options stay out of --help
+        assert!(!p(&["mic", "sessions"]).unwrap().needs_memory() && !p(&["mic", "variant", "call"]).unwrap().needs_memory());
+        let help = help_text();
+        assert!(help.contains("noise-filter mic sessions") && help.contains("noise-filter mic variant [both|call|low-latency]"));
+        assert!(!help.contains(REPORT_FLAG));
     }
 
     /// `run --seconds N` stops after N seconds (a soak); without it, it runs until Ctrl+C.

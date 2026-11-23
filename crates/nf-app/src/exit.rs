@@ -6,12 +6,12 @@ pub enum Exit {
     Ok = 0,
     /// The command line doesn't parse, or misses something it needs.
     Usage = 1,
-    /// The engine, a device or a file failed.
+    /// The engine, a device or a file failed (for `mic variant`, a Windows call, named in the message).
     Error = 2,
-    /// The latency test ran but found no valid repetition.
+    /// The latency test ran but found no valid repetition; or the user cancelled: a test, or `mic variant`'s elevation prompt.
     NoResult = 3,
-    /// The large-page helper (`setup-large-pages --elevated-helper`) started without elevation,
-    /// e.g. with UAC turned off. Its caller reads this code (`setup::helper_result`).
+    /// The large-page helper (`setup-large-pages --elevated-helper`) or `mic variant`'s started without elevation, e.g. with
+    /// UAC turned off. Their callers read this code (`setup::helper_result`, `mic::helper_result`).
     NotElevated = 4,
     /// This CPU lacks a feature of x86-64-v3, which noise-filter is built for (cpu_check.rs). The
     /// launcher exits with it too.

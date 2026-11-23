@@ -19,6 +19,11 @@ wasapi.workspace = true
 # (the waitable timer, MMCSS), System_Console (Ctrl+C handlers), System_JobObjects (kill-test's job for its children),
 # System_Performance (latency's QPC), and Media_Audio(_Endpoints), Com, Com_StructuredStorage and Variant for the endpoint volume
 # (IMMDevice::Activate's signature) and the raw capture and render clients (GetService, CoTaskMemFree).
+# The library's variants and sessions (TODO 19): Devices_DeviceAndDriverInstallation (SetupDi, DiInstallDevice, DiUninstallDevice,
+# CM_Get_DevNode_Status), Devices_Properties (the driver's INF and version), System_Diagnostics_Debug and System_SystemInformation
+# (SetupQueryInfOriginalFileInformationW's and SetupGetInfDriverStoreLocationW's signatures), Media_Audio, Com,
+# UI_Shell_PropertiesSystem and Devices_FunctionDiscovery (the endpoints' names and IAudioSessionManager2), System_Threading
+# (OpenProcess, QueryFullProcessImageNameW).
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -34,4 +39,10 @@ windows = { workspace = true, features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell_PropertiesSystem",
 ] }

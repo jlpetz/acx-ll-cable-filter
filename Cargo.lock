@@ -341,6 +341,7 @@ dependencies = [
  "nf-mem",
  "nf-ort",
  "nf-stages",
+ "nf-vmic",
  "serde_json",
  "windows",
 ]

@@ -14,6 +14,11 @@
 //! - [`device`]: [`Device`] (open, STATS) and [`Attachment`] (the pending ATTACH; detached by cancelling it, with one wait).
 //! - [`latency`]: the arithmetic of the tool's latency mode: preallocated logs, a packet's frames decoded back to frame
 //!   numbers, publication-to-receipt latency per frame, and nearest-rank percentiles.
+//! - [`variant`]: the driver's three variants (one INF, three hardware IDs: both microphones, the call one, the low-latency one):
+//!   which is installed, and the elevated switch between them (`noise-filter mic variant`).
+//! - [`sessions`]: which apps record from our microphones (Windows' audio sessions), and which microphone suits each
+//!   (`noise-filter mic sessions`).
+//! - [`win_error`]: a failed Windows call, named for the user.
 //!
 //! The tool `nf-vmic-test` (src/bin) feeds, verifies, prints the statistics, kills feeders, opens an endpoint in a chosen format
 //! (the format-refusal tests) and measures the ring's latency. Nothing in the tests opens the driver or an audio device: they
@@ -25,7 +30,10 @@ pub mod latency;
 pub mod memory;
 pub mod protocol;
 pub mod ring;
+pub mod sessions;
 pub mod signal;
+pub mod variant;
+pub mod win_error;
 
 pub use device::{AttachError, Attachment, DETACH_WAIT_MS, Device};
 pub use memory::{RingMemory, Writer, top_up};

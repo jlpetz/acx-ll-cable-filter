@@ -209,7 +209,30 @@ pub fn helper_args(sid: &str) -> [&str; 4] {
 /// drives, so a current directory on one of those fails the launch with 267 ("The directory name
 /// is invalid"). The exe's folder has to resolve elevated anyway, since the exe is started from it.
 pub fn run_elevated(args: &[&str]) -> Result<u32, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("couldn't find this program's path ({e})"))?;
+    run_elevated_checked(args).map_err(|e| e.to_string())
+}
+
+/// Why [`run_elevated_checked`] didn't get an exit code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElevationError {
+    /// The user answered No at the UAC prompt (`ShellExecuteExW`'s ERROR_CANCELLED, 1223).
+    Declined,
+    /// Anything else, worded for the user.
+    Failed(String),
+}
+
+impl std::fmt::Display for ElevationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Declined => write!(f, "the elevation prompt was declined ({})", ERROR_CANCELLED.0),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// [`run_elevated`], telling a declined prompt apart from a launch that failed.
+pub fn run_elevated_checked(args: &[&str]) -> Result<u32, ElevationError> {
+    let exe = std::env::current_exe().map_err(|e| ElevationError::Failed(format!("couldn't find this program's path ({e})")))?;
     let dir = helper_dir(&exe);
     let params = join_args(args);
     // A thread of our own: ShellExecuteEx wants an STA with COM initialised, which the caller's
@@ -217,9 +240,9 @@ pub fn run_elevated(args: &[&str]) -> Result<u32, String> {
     std::thread::Builder::new()
         .name("nf-elevate".into())
         .spawn(move || shell_runas(&exe, &params, dir.as_deref()))
-        .map_err(|e| format!("couldn't start the elevation thread ({e})"))?
+        .map_err(|e| ElevationError::Failed(format!("couldn't start the elevation thread ({e})")))?
         .join()
-        .map_err(|_| "the elevation thread panicked".to_string())?
+        .map_err(|_| ElevationError::Failed("the elevation thread panicked".into()))?
 }
 
 /// The elevated helper's working directory: the exe's folder (see [`run_elevated`]).
@@ -258,7 +281,7 @@ impl Drop for ComApartment {
     }
 }
 
-fn shell_runas(exe: &Path, params: &str, dir: Option<&Path>) -> Result<u32, String> {
+fn shell_runas(exe: &Path, params: &str, dir: Option<&Path>) -> Result<u32, ElevationError> {
     let exe_w = HSTRING::from(exe);
     let params_w = HSTRING::from(params);
     let dir_w = dir.map(HSTRING::from);
@@ -279,21 +302,24 @@ fn shell_runas(exe: &Path, params: &str, dir: Option<&Path>) -> Result<u32, Stri
     };
     // SAFETY: `info` is fully initialised with its size; the strings it points to outlive the
     // call. With SEE_MASK_NOCLOSEPROCESS the process handle (if any) is ours to close.
-    unsafe { ShellExecuteExW(&mut info) }
-        .map_err(|e| launch_error(win32_code(&e), dir).unwrap_or_else(|| describe("couldn't start the elevated helper", &e)))?;
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| match win32_code(&e) {
+        c if c == ERROR_CANCELLED.0 => ElevationError::Declined,
+        c => ElevationError::Failed(launch_error(c, dir).unwrap_or_else(|| describe("couldn't start the elevated helper", &e))),
+    })?;
     if info.hProcess.is_invalid() {
-        return Err("the elevated helper didn't start".into());
+        return Err(ElevationError::Failed("the elevated helper didn't start".into()));
     }
     // SAFETY: a real process handle (checked above), owned by us and closed once by Owned.
     let child = unsafe { Owned::new(info.hProcess) };
-    // SAFETY: a valid process handle; INFINITE: the helper only grants a right and exits.
+    // SAFETY: a valid process handle; INFINITE: the helpers (a privilege grant, a device switch) finish on their own.
     if unsafe { WaitForSingleObject(*child, INFINITE) } != WAIT_OBJECT_0 {
         // SAFETY: read straight after the failed wait.
-        return Err(format!("couldn't wait for the elevated helper ({})", unsafe { GetLastError() }.0));
+        return Err(ElevationError::Failed(format!("couldn't wait for the elevated helper ({})", unsafe { GetLastError() }.0)));
     }
     let mut code = 0u32;
     // SAFETY: a valid process handle; `code` is a live out-pointer.
-    unsafe { GetExitCodeProcess(*child, &mut code) }.map_err(|e| describe("couldn't read the helper's exit code", &e))?;
+    unsafe { GetExitCodeProcess(*child, &mut code) }
+        .map_err(|e| ElevationError::Failed(describe("couldn't read the helper's exit code", &e)))?;
     Ok(code)
 }
 
@@ -424,6 +450,9 @@ mod tests {
         assert!(launch_error(3, Some(dir)).unwrap().contains(r"can't find noise-filter in Z:\tools\nf"));
         assert!(launch_error(2, Some(dir)).is_some());
         assert_eq!(launch_error(1223, None).as_deref(), Some("the elevation prompt was declined (1223)"));
+        // The typed error words a declined prompt the same way, for run_elevated's callers
+        assert_eq!(ElevationError::Declined.to_string(), "the elevation prompt was declined (1223)");
+        assert_eq!(ElevationError::Failed("no".into()).to_string(), "no");
         assert_eq!(launch_error(5, Some(dir)), None, "the system's message");
     }
 

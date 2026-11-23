@@ -69,6 +69,7 @@ mod lab;
 mod logger;
 mod mutex;
 mod quality;
+mod report_pipe;
 mod wav;
 
 use std::ffi::CStr;
@@ -127,11 +128,14 @@ fn app_main() -> ExitCode {
         Ok(Command::SetupLargePages { sid, helper }) => *helper || (sid.is_some() && nf_mem::privilege::is_elevated()),
         _ => false,
     };
+    // `mic variant`'s elevated helper reports through its caller's pipe (report_pipe.rs) and takes no console at all: attached
+    // to its caller's, it would print its error a second time beside the caller's own.
+    let detached = matches!(&parsed, Ok(Command::MicVariant(m)) if m.helper);
 
     let _ = logger::init(logger::default_path());
     logger::install_panic_hook(window);
     log::info!("noise-filter {} started (pid {}) with {args:?}", env!("CARGO_PKG_VERSION"), std::process::id());
-    let console = if window { console::Console::default() } else { console::attach(helper) };
+    let console = if window || detached { console::Console::default() } else { console::attach(helper) };
 
     // One window per session, claimed before the pool is locked; kept until the process exits
     let _instance = if window {

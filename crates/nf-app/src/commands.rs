@@ -6,6 +6,7 @@ mod check;
 mod devices;
 mod lab;
 mod latency;
+mod mic;
 mod process;
 mod quality;
 mod run;
@@ -34,6 +35,8 @@ pub fn run_cli(command: &Command) -> Result<(), Failure> {
         Command::Bench(args) => bench::bench(args),
         Command::Lab(args) => lab::lab(args),
         Command::SetupLargePages { sid, helper } => setup::setup_large_pages(sid.as_deref(), *helper),
+        Command::MicSessions => mic::sessions(),
+        Command::MicVariant(args) => mic::variant(args),
         Command::Gui => Err(Failure::usage("the window isn't a CLI command")),
     }
 }

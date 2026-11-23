@@ -36,6 +36,7 @@ nf-stages = { path = "crates/nf-stages" }
 nf-ort = { path = "crates/nf-ort" }
 nf-engine = { path = "crates/nf-engine" }
 nf-gui = { path = "crates/nf-gui" }
+nf-vmic = { path = "crates/nf-vmic" }
 # Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
 nnnoiseless = { version = "=0.5.2", default-features = false }
 # Patched below (vendor/README.md): its per-call FTZ/DAZ is the `denormal-guard` feature, off unless nf-stages'
