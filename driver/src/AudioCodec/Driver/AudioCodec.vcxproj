@@ -30,10 +30,13 @@
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
-    <!-- noise-filter: the INF's DriverVer date, if given (Build-Driver.ps1 passes today's UTC date: inf2cat refuses a date after
-         UTC today, which the WDK's default, the local date, is east of Greenwich after local midnight). -->
+    <!-- noise-filter: the INF's DriverVer, if given. Build-Driver.ps1 passes the build's start in UTC: the date (inf2cat refuses
+         a date after UTC today, which the WDK's default, the local date, is east of Greenwich after local midnight) and the time
+         of day as the version, H.m.s.ms, so that by date, then version, a later build ranks newer (the WDK's default version,
+         the local time of day, put a build after local midnight below the evening's before it, of the same UTC date). -->
     <Inf Include="AudioCodec.inf">
       <DateStamp Condition="'$(NfInfDate)' != ''">$(NfInfDate)</DateStamp>
+      <TimeStamp Condition="'$(NfInfVersion)' != ''">$(NfInfVersion)</TimeStamp>
     </Inf>
   </ItemGroup>
   <PropertyGroup Label="Globals">

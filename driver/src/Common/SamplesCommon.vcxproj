@@ -146,6 +146,20 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
+  <!-- noise-filter (TODO 19): a trial packet size, if given (Build-Driver.ps1 -PacketFrames 96 passes NfPacketFrames 96 and
+       NfMinPacketPeriodHns 10000; without them PacketSize.cpp's defaults, 128 frames and a 2 ms floor, hold). Defines on cl's
+       command line, which MSBuild records for each file: a build whose defines differ from the last one's recompiles the
+       library, and AudioCodec.sys is linked again. -->
+  <ItemDefinitionGroup Condition="'$(NfPacketFrames)' != ''">
+    <ClCompile>
+      <PreprocessorDefinitions>NF_PACKET_FRAMES=$(NfPacketFrames);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(NfMinPacketPeriodHns)' != ''">
+    <ClCompile>
+      <PreprocessorDefinitions>NF_MIN_PACKET_PERIOD_HNS=$(NfMinPacketPeriodHns);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>

@@ -56,7 +56,8 @@ Environment:
 // streams. 128 frames: 2.667 ms at 48 kHz, 2.902 ms at 44.1 kHz. It is the inbox HDAudio driver's minimum.
 //
 // Both can be set at build time for a trial (Build-Driver.ps1 -PacketFrames 96 defines NF_PACKET_FRAMES 96 and a 1 ms floor,
-// NF_MIN_PACKET_PERIOD_HNS 10000, through the CL environment variable); the C_ASSERTs below keep the floor under the packet.
+// NF_MIN_PACKET_PERIOD_HNS 10000, through the MSBuild properties NfPacketFrames and NfMinPacketPeriodHns, which
+// SamplesCommon.vcxproj makes defines); the C_ASSERTs below keep the floor under the packet.
 //
 #ifndef NF_MIN_PACKET_PERIOD_HNS
 #define NF_MIN_PACKET_PERIOD_HNS    (2 * HNSTIME_PER_MILLISECOND)
