@@ -76,6 +76,8 @@ pub struct CheckReport {
     /// Frames carrying a code, exactly.
     pub signal_frames: u64,
     pub first_code: Option<u32>,
+    /// The first code's frame index in the recording: with `first_code`, the code each frame before it would carry.
+    pub first_code_index: Option<u64>,
     pub last_code: Option<u32>,
     /// Signal frames exactly one code after the previous signal frame.
     pub steps_ok: u64,
@@ -152,7 +154,7 @@ impl SequenceChecker {
         self.pending_runs = 0;
         r.signal_frames += 1;
         match due {
-            None => r.first_code = Some(k),
+            None => (r.first_code, r.first_code_index) = (Some(k), Some(index)),
             Some(d) if k == d => r.steps_ok += 1,
             Some(d) => {
                 let ahead = k.wrapping_sub(d) & CODE_MASK;
@@ -334,5 +336,18 @@ mod tests {
         assert_eq!((r.corrupt_frames, r.first_corrupt[0].0, r.first_corrupt[1].0), (2, 3, 6));
         // Each corrupt frame kept its place: no gap after it.
         assert_eq!(r.gaps, 0);
+    }
+
+    /// A stream's first frames scaled (a render engine's fade-in): silence, then non-codes, then the codes; the first
+    /// code's index says which code each frame before it would carry.
+    #[test]
+    fn first_code_index_places_the_frames_before_it() {
+        let mut frames: Vec<[f32; 2]> = vec![[0.0, 0.0]; 3];
+        frames.extend((0..8).map(|n| frame(n).map(|s| s * n as f32 / 8.0)));
+        frames.extend((8..12).map(frame));
+        let c = check(frames);
+        let r = c.report();
+        assert_eq!((r.zeros_before_signal, r.corrupt_frames, r.first_code, r.first_code_index), (4, 7, Some(8), Some(11)));
+        assert_eq!(r.first_corrupt[0].0, 4);
     }
 }
