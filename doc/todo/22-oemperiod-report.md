@@ -36,6 +36,28 @@ packet's first frame's time (GetBuffer's `pu64QPCPosition`, to the tick). Its do
 completion time", and the AudioCodec sample passes the completion time, so a driver that follows both stamps every capture
 packet one packet late. We now pass the packet's start. Question: which is intended, and should the docs and the sample say so?
 
+### A first packet with a different timestamp after Stop/Start
+
+On the dev box (Server 2025, build 26100, 2026-11-23), open the low-latency microphone in exclusive mode at 48 kHz
+stereo float32, 480 frames per packet. Read and release a packet on its event, wait 3–8 ms **before Stop**, then
+restart the same client after a pause, without Reset. Record the first two nonempty `GetBuffer` results, their flags,
+frame positions and timestamps. Varying how long the stream is stopped tests a different part of the timing.
+
+The original probe saw a backward step on 8/8 restarts. A follow-up also sampled the driver's last notification
+and timer-pass count. On 13/16 restarts the first two packets matched successive notifications 10.000 ms apart.
+On the other three (two DEFAULT, one RAW), the first 480-frame packet arrived within 0.54 ms of Start, while the
+driver still showed its pre-Start notification and pass count. The next packet matched the new notification,
+with its timestamp 0.82–9.89 ms **earlier** than the first. Frame positions advanced by 480 and Windows reported
+zero flags. In each of these three cases one notification had occurred between the last client read and Stop completing.
+
+As a comparison, VB-CABLE accepted exclusive DEFAULT at the same rate and period in PCM16. All eight timestamp
+steps were 10.000 ms and the first packet arrived 11.74–12.32 ms after Start. VB-CABLE refused float32.
+The ACX driver supplies the first-frame time to its completion notification as described above. When an unread
+packet spans Stop/Start, which component supplies its first-frame timestamp? How should an ACX driver ensure
+that the timestamps a client sees on consecutive packets keep advancing? Physical Windows 11 confirmation is pending.
+[WASAPI capture packet timestamps](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)
+and [ACX packet completion timestamps](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/acxstreams/nf-acxstreams-acxrtstreamnotifypacketcomplete).
+
 ## Where to report (to choose)
 - Feedback Hub, Developer Platform → Audio (reaches the audio team; needs a Microsoft account).
 - An issue on MicrosoftDocs/windows-driver-docs, for the documentation side: the OEMPeriod page dates from Windows 7 and says
