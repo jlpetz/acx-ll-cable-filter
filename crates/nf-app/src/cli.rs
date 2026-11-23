@@ -988,7 +988,10 @@ Usage:
                                  both, the call microphone only (a 5 ms default period, for call
                                  apps) or the low-latency one only (IAudioClient3's small periods).
                                  A switch re-creates the device: it asks for elevation, and the
-                                 microphones are gone for a few seconds
+                                 microphones are gone for a few seconds. The variant already there
+                                 is re-created too if it doesn't run the driver store's newest
+                                 AudioCodec package (an upgrade). A switch ends once the device
+                                 works on that package and Windows has made its microphones
   noise-filter --help | --version
 
 FLIGHT RECORDER (run --flight; always on in devices --check):
@@ -1107,9 +1110,11 @@ LAB (offline, no devices):
   --config FILE and PROCESSING (but --model, --aec and --ns) apply to every model
 
 Exit codes: 0 OK, 1 usage error, 2 engine, device or file error (mic variant: a Windows call,
-named), 3 no result (latency: no valid repetition; quality: the recording didn't line up with
-the scene; latency, quality, run --seconds or devices --check: cancelled; mic variant: the
-elevation prompt declined), 4 the large-page or mic variant helper started without elevation,
+named, a new device not working on the chosen driver, its microphones not made in 15 s, or
+another switch running for over 60 s), 3 no result (latency: no valid repetition; quality:
+the recording didn't line up with the scene; latency, quality, run --seconds or devices
+--check: cancelled; mic variant: the elevation prompt declined), 4 the large-page or mic
+variant helper started without elevation,
 5 this CPU lacks x86-64-v3 (AVX2, BMI1/2, FMA), which noise-filter is built for,
 6 run --seconds: the soak wasn't clean (mic glitches or stalls, output underruns or coarse
 drops, a fault that stopped it, or real-time heap allocations; the summary says which). A

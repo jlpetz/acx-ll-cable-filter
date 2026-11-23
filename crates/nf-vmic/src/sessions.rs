@@ -10,12 +10,15 @@
 //!
 //! [`classify`] (pure) sorts an app by its exe's name with [`KNOWN_APPS`]; [`fit`] says whether the microphone it records
 //! from suits it.
+//!
+//! [`capture_endpoints`] reads our capture endpoints alone, active or disabled, without their sessions: what `mic variant`
+//! shows, and what its switch waits for (`variant::check_mics`).
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::Audio::{
-    AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive, DEVICE_STATE_ACTIVE, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
+    IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
@@ -231,9 +234,33 @@ pub fn fit(app: AppKind, on: Mic) -> Fit {
 /// The apps recording from each of our active capture endpoints. On a thread of its own, in the MTA, so any caller (the
 /// window's STA thread too) may call it.
 pub fn list() -> Result<Vec<Endpoint>, WinError> {
+    on_mta_thread(list_on_this_thread)
+}
+
+/// One of our capture endpoints, as [`capture_endpoints`] finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureEndpoint {
+    /// `{0.0.1.00000000}.{...}`: a new device's endpoints get new ones.
+    pub id: String,
+    /// "Call Microphone (AudioCodec Device)".
+    pub name: String,
+    /// Active; otherwise disabled (in the Sound panel's Recording tab).
+    pub active: bool,
+}
+
+/// Our capture endpoints, active or disabled (an absent device's aren't listed). On a thread of its own, as [`list`].
+pub fn capture_endpoints() -> Result<Vec<CaptureEndpoint>, WinError> {
+    on_mta_thread(capture_endpoints_on_this_thread)
+}
+
+/// Runs `work` on a thread of its own, in the MTA.
+fn on_mta_thread<T: Send + 'static>(work: fn() -> Result<T, WinError>) -> Result<T, WinError> {
     let worker = std::thread::Builder::new()
         .name("nf-sessions".into())
-        .spawn(list_on_this_thread)
+        .spawn(move || {
+            let _com = Mta::enter()?;
+            work()
+        })
         .map_err(|e| WinError { call: "CreateThread", code: e.raw_os_error().unwrap_or(0) as u32 })?;
     worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
@@ -257,13 +284,32 @@ impl Drop for Mta {
 }
 
 fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
-    let _com = Mta::enter()?;
-    // SAFETY: COM is initialised on this thread; a plain in-process creation.
+    let mut out = Vec::new();
+    for (device, name) in our_capture_endpoints(DEVICE_STATE_ACTIVE)? {
+        out.push(Endpoint { id: device_id(&device)?, mic: mic_of(&name), sessions: sessions_of(&device)?, name });
+    }
+    Ok(out)
+}
+
+fn capture_endpoints_on_this_thread() -> Result<Vec<CaptureEndpoint>, WinError> {
+    let mut out = Vec::new();
+    for (device, name) in our_capture_endpoints(DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0))? {
+        // One that went away meanwhile isn't listed
+        // SAFETY: a live device.
+        let Ok(state) = (unsafe { device.GetState() }) else { continue };
+        out.push(CaptureEndpoint { id: device_id(&device)?, name, active: state == DEVICE_STATE_ACTIVE });
+    }
+    Ok(out)
+}
+
+/// Our capture endpoints in `states`, with their names. COM must be initialised on this thread.
+fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<(IMMDevice, String)>, WinError> {
+    // SAFETY: COM is initialised on this thread (the caller's); a plain in-process creation.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
     // SAFETY: a live enumerator; constant arguments.
-    let endpoints = unsafe { enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) }
-        .map_err(WinError::of("IMMDeviceEnumerator::EnumAudioEndpoints"))?;
+    let endpoints =
+        unsafe { enumerator.EnumAudioEndpoints(eCapture, states) }.map_err(WinError::of("IMMDeviceEnumerator::EnumAudioEndpoints"))?;
     // SAFETY: a live collection.
     let count = unsafe { endpoints.GetCount() }.map_err(WinError::of("IMMDeviceCollection::GetCount"))?;
     let mut out = Vec::new();
@@ -272,10 +318,9 @@ fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
         let device = unsafe { endpoints.Item(i) }.map_err(WinError::of("IMMDeviceCollection::Item"))?;
         // An endpoint that went away meanwhile, or whose name can't be read, isn't ours to list
         let Ok(name) = friendly_name(&device) else { continue };
-        if !is_ours(&name) {
-            continue;
+        if is_ours(&name) {
+            out.push((device, name));
         }
-        out.push(Endpoint { id: device_id(&device)?, mic: mic_of(&name), sessions: sessions_of(&device)?, name });
     }
     Ok(out)
 }

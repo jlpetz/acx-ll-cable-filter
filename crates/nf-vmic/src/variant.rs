@@ -5,41 +5,58 @@
 //! "Speakers (AudioCodec Device)". Windows reads a microphone's default period only when it creates the endpoint (TODO 22),
 //! so a switch removes the root device and creates a new one with the other hardware ID, which needs Administrator access.
 //!
-//! - [`present`] reads which of our devices are there, their state and driver (any user may).
+//! - [`present`] reads which of our devices are there, their state and driver, and the newest of our packages the driver store
+//!   has for each (any user may; the read of the driver store is the compatible-driver search on the device itself).
 //! - [`plan`] decides what a switch does (pure).
 //! - [`switch`] does it, elevated: what `devcon remove` and `devcon install` do, with the driver taken from the driver store
 //!   (the package must have been added to it, by `pnputil /add-driver` or the installer).
 //!
 //! # The switch, in order
+//! 0. Take the lock, `Global\noise-filter-mic-variant` (a named mutex), held to the end, so two switches at once (two prompts
+//!    approved, or an administrator's terminal beside the helper) can't both create a device. A second switch waits up to
+//!    [`LOCK_WAIT`], then stops; one whose holder's process ended mid-switch (an abandoned mutex) goes on, reading afresh.
 //! 1. Find our devices: every present device (`SetupDiGetClassDevsW`, all classes) whose `SPDRP_HARDWAREID` lists one of the
-//!    three IDs.
+//!    three IDs, and for each, the newest of our packages compatible with it (as in step 2, on the device itself). A device of
+//!    the target variant is kept only if it is working and runs that package (its `DEVPKEY_Device_DriverInfPath` is the
+//!    package's `oemNN.inf` and its `DEVPKEY_Device_DriverVersion` the package's). One on an older package is re-created: the
+//!    single-microphone driver before the second capture circuit (f2e7d15) had `ROOT\AudioCodec` too, so a working old
+//!    install reads as `both`. Re-created rather than updated in place, because Windows makes an endpoint, and reads the
+//!    properties the INF gives it (the call microphone's default period), only when it creates it (TODO 22: of the changes
+//!    tried, only uninstalling and reinstalling applied a new period), and a driver update keeps the device and its endpoints.
 //! 2. The new device first, not yet registered (`SetupDiCreateDeviceInfoW` under class MEDIA with `DICD_GENERATE_ID`, as devcon
 //!    does: `ROOT\MEDIA\NNNN`; the hardware ID by `SetupDiSetDeviceRegistryPropertyW`), and its driver: the compatible-driver
 //!    search over the driver store (`SetupDiBuildDriverInfoList(SPDIT_COMPATDRIVER)`), which is how Plug and Play itself
 //!    matches a hardware ID to an INF, keeping the nodes whose INF (`C:\Windows\INF\oemNN.inf`) has the original name
 //!    `audiocodec.inf` (`SetupGetInfInformationW` + `SetupQueryInfOriginalFileInformationW`), the newest by date, then version.
 //!    So a missing driver stops the switch before anything is removed. An element that isn't registered yet is a phantom:
-//!    destroying the set deletes it. (That the compatible-driver search works on an element not yet registered is our
-//!    inference, from the hardware ID being in its registry key; not yet run.)
-//! 3. Remove the old devices (`DiUninstallDevice`, what `pnputil /remove-device` does). If Windows needs a restart to finish a
-//!    removal, stop there: the old driver may still be loaded. The new device is registered only after this, so that its
-//!    endpoints are made while the old ones are gone, and the driver never runs twice.
+//!    destroying the set deletes it.
+//! 3. Note our capture endpoints (active or disabled), then remove the old devices (`DiUninstallDevice`, what
+//!    `pnputil /remove-device` does). If Windows needs a restart to finish a removal, stop there: the old driver may still be
+//!    loaded. The new device is registered only after this, so that its endpoints are made while the old ones are gone, and
+//!    the driver never runs twice.
 //! 4. Register the new device (`SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`) and install the chosen driver on it
 //!    (`DiInstallDevice`, documented for a driver already in the driver store). `UpdateDriverForPlugAndPlayDevicesW`, devcon's
 //!    call, wants the package's own folder rather than a system one (its documentation), and would also touch every other
-//!    device with that hardware ID. If the install fails, the new device is removed again (unless Plug and Play put the
-//!    driver on it by itself meanwhile), so no device without a driver is left to read as that variant.
+//!    device with that hardware ID. Then up to [`DRIVER_WAIT`] for the device to be working, and [`judge_install`]: it must
+//!    be working on the chosen package (its INF and version, as in step 1), whatever DiInstallDevice returned, as Plug and Play
+//!    may have put a driver on it by itself meanwhile. Otherwise it is removed again, so no device without the right driver is
+//!    left to read as that variant, and the switch fails; unless Windows asked for a restart to finish, which leaves it.
+//! 5. Up to [`MICS_WAIT`] for Windows to make the variant's microphones, by name ([`check_mics`]): each there (active, or
+//!    disabled in the Sound panel) and not one of the endpoints noted in step 3, and no other endpoint of ours still active
+//!    (a removed device's, going). A microphone that doesn't come is an error; another endpoint still there is reported.
+//!    A switch that only removes devices (it keeps one) checks the same, with nothing noted.
 //!
 //! A failure after the old devices are removed leaves none: the steps say which were removed, and a second run of the switch
 //! creates the device afresh.
 
 use std::fmt;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_PROB, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES, DIGCF_PRESENT,
-    DIIDFLAG_NOFINISHINSTALLUI, DN_HAS_PROBLEM, DN_STARTED, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA, HDEVINFO,
-    INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W,
+    CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_PROB, CM_PROB_NEED_RESTART, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES,
+    DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DN_HAS_PROBLEM, DN_STARTED, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA,
+    HDEVINFO, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W,
     SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_HARDWAREID, SetupDiBuildDriverInfoList,
     SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
     SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW,
@@ -47,9 +64,16 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupQueryInfOriginalFileInformationW,
 };
 use windows::Win32::Devices::Properties::{DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_DriverVersion, DEVPROPTYPE};
-use windows::Win32::Foundation::{DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HWND};
+use windows::Win32::Foundation::{
+    DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GetLastError, HANDLE, HWND, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows::Win32::System::Threading::{
+    CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows::core::{BOOL, HSTRING, Owned, PCWSTR, w};
 
+use crate::sessions::{self, CaptureEndpoint};
 use crate::win_error::{WinError, configret_name, problem_name, win32_code};
 
 /// What every endpoint of the driver has in its name ("Microphone (AudioCodec Device)"): the device's description.
@@ -60,6 +84,18 @@ pub const MICROPHONE: &str = "Microphone (AudioCodec Device)";
 pub const CALL_MICROPHONE: &str = "Call Microphone (AudioCodec Device)";
 /// The INF's file name as built; the driver store publishes it as `oemNN.inf` and remembers this one.
 pub const INF_NAME: &str = "audiocodec.inf";
+
+/// The named mutex a switch holds from start to end, across sessions.
+pub const LOCK_NAME: &str = r"Global\noise-filter-mic-variant";
+/// How long a switch waits for another to end: a switch takes a few seconds, and at most [`DRIVER_WAIT`] and [`MICS_WAIT`]
+/// more.
+pub const LOCK_WAIT: Duration = Duration::from_secs(60);
+/// How long a new device has, after DiInstallDevice, to be working.
+pub const DRIVER_WAIT: Duration = Duration::from_secs(5);
+/// How long Windows has, once the device works, to make its microphones.
+pub const MICS_WAIT: Duration = Duration::from_secs(15);
+/// How often the two waits look.
+const POLL: Duration = Duration::from_millis(250);
 
 /// One of the driver's three variants, by the hardware ID its root device has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -120,6 +156,16 @@ impl Variant {
             Variant::LowLatency => &[MICROPHONE],
         }
     }
+
+    /// `"Microphone (AudioCodec Device)" and "Call Microphone (AudioCodec Device)"`.
+    pub fn microphones_text(self) -> String {
+        quoted(self.microphones().iter().copied())
+    }
+}
+
+/// Names in quotes, joined by "and": `"a" and "b"`.
+pub fn quoted<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names.map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(" and ")
 }
 
 /// Our variant among a device's hardware IDs, if any.
@@ -181,21 +227,70 @@ pub struct OurDevice {
     /// The driver's published INF (`oem12.inf`), if it has a driver.
     pub inf: Option<String>,
     pub driver_version: Option<String>,
+    /// The newest of our packages in the driver store for its hardware ID (the compatible-driver search on the device, as
+    /// [`choose`] ranks them): `None` if there's none; the error if the search failed.
+    pub newest: Result<Option<Candidate>, WinError>,
 }
 
 impl OurDevice {
     /// "ROOT\MEDIA\0003: both microphones (ROOT\AudioCodec), working, driver oem12.inf 1.0.0.0".
     pub fn describe(&self) -> String {
-        let driver = match (&self.inf, &self.driver_version) {
-            (Some(inf), Some(v)) => format!("driver {inf} {v}"),
-            (Some(inf), None) => format!("driver {inf}"),
-            (None, _) => "no driver".into(),
-        };
-        format!("{}: {} ({}), {}, {driver}", self.instance_id, self.variant.describe(), self.variant.hardware_id(), self.health.describe())
+        format!(
+            "{}: {} ({}), {}, {}",
+            self.instance_id,
+            self.variant.describe(),
+            self.variant.hardware_id(),
+            self.health.describe(),
+            driver_text(self.inf.as_deref(), self.driver_version.as_deref())
+        )
+    }
+
+    /// Whether it runs the package `c` (see [`runs`]).
+    pub fn runs(&self, c: &Candidate) -> bool {
+        runs(self.inf.as_deref(), self.driver_version.as_deref(), c)
+    }
+
+    /// Whether it runs the newest of our packages in the driver store.
+    pub fn is_current(&self) -> bool {
+        matches!(&self.newest, Ok(Some(c)) if self.runs(c))
+    }
+
+    /// Its driver against the driver store's newest: "it runs the newest AudioCodec package in the driver store", or what the
+    /// newest is.
+    pub fn package_note(&self) -> String {
+        match &self.newest {
+            Ok(Some(c)) if self.runs(c) => "it runs the newest AudioCodec package in the driver store".into(),
+            Ok(Some(c)) => format!("it doesn't run the newest AudioCodec package in the driver store, {}", c.describe()),
+            Ok(None) => format!("no AudioCodec package in the driver store has {}", self.variant.hardware_id()),
+            Err(e) => format!("the driver store's packages for it couldn't be read: {e}"),
+        }
     }
 }
 
-/// The present devices with one of our hardware IDs. Any user may call it.
+/// "driver oem12.inf 1.0.0.0", "no driver".
+fn driver_text(inf: Option<&str>, version: Option<&str>) -> String {
+    match (inf, version) {
+        (Some(inf), Some(v)) => format!("driver {inf} {v}"),
+        (Some(inf), None) => format!("driver {inf}"),
+        (None, _) => "no driver".into(),
+    }
+}
+
+/// Whether a device whose driver Windows reports as `inf` (`DEVPKEY_Device_DriverInfPath`: `oem12.inf`) and `version`
+/// (`DEVPKEY_Device_DriverVersion`: "12.40.56.342") runs the package `c`: the same published INF, any case, and the same
+/// version. The version too, because the driver store reuses an `oemNN.inf` name once its package is deleted.
+pub fn runs(inf: Option<&str>, version: Option<&str>, c: &Candidate) -> bool {
+    let (Some(inf), Some(version)) = (inf, version) else { return false };
+    file_name(inf.trim()).eq_ignore_ascii_case(file_name(&c.inf)) && parse_version(version) == Some(c.version)
+}
+
+/// A path's file name: what follows the last `\` or `/`.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// The present devices with one of our hardware IDs, each with the driver store's newest package for it. Any user may call
+/// it.
 pub fn present() -> Result<Vec<OurDevice>, WinError> {
     let set = DeviceSet::all_present()?;
     Ok(set.ours()?.into_iter().map(|(_, d)| d).collect())
@@ -204,25 +299,26 @@ pub fn present() -> Result<Vec<OurDevice>, WinError> {
 /// What a switch to `target` does with the devices there now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// A working device of the target variant, kept as it is.
+    /// A device of the target variant, working on the newest package, kept as it is.
     pub keep: Option<usize>,
     /// Every other device of ours, removed.
     pub remove: Vec<usize>,
-    /// No working device of the target variant: create one.
+    /// No such device to keep: create one.
     pub create: bool,
 }
 
 impl Plan {
-    /// The target variant is already the only one there, and working.
+    /// The target variant is already the only one there, working on the newest package.
     pub fn is_nothing(&self) -> bool {
         self.remove.is_empty() && !self.create
     }
 }
 
-/// Keeps the first working device of the target variant and removes the rest; creates one when none is working (a disabled
-/// or broken device of the target variant is replaced, which also enables it).
+/// Keeps the first device of the target variant that is working and runs the newest of our packages in the driver store,
+/// and removes the rest; creates one when there's none such. A disabled or broken device of the target variant is replaced
+/// (which also enables it), and so is one on an older package (an upgrade), or one whose packages couldn't be read.
 pub fn plan(devices: &[OurDevice], target: Variant) -> Plan {
-    let keep = devices.iter().position(|d| d.variant == target && d.health == Health::Working);
+    let keep = devices.iter().position(|d| d.variant == target && d.health == Health::Working && d.is_current());
     let remove = (0..devices.len()).filter(|&i| Some(i) != keep).collect();
     Plan { keep, remove, create: keep.is_none() }
 }
@@ -230,9 +326,9 @@ pub fn plan(devices: &[OurDevice], target: Variant) -> Plan {
 /// What [`switch`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The target variant was already the only one there: nothing changed.
+    /// The target variant was already the only one there, working on the newest package: nothing changed.
     Nothing,
-    /// Switched. `restart`: Windows asked for a restart to finish the install.
+    /// Switched. `restart`: Windows asked for a restart to finish the install, so the microphones weren't waited for.
     Switched { restart: bool },
 }
 
@@ -245,6 +341,28 @@ pub enum SwitchError {
     NoDriver { hardware_id: &'static str },
     /// Windows will finish removing `device` at the next restart, so the new device wasn't created.
     RestartFirst { device: String },
+    /// Another switch held the lock for [`LOCK_WAIT`]. Nothing was changed.
+    Busy,
+    /// Our capture endpoints couldn't be read before the change, and the check after it needs them. Nothing was removed.
+    NoEndpoints(WinError),
+    /// The new device wasn't working on the chosen package, so it was removed again. The old devices were removed before it
+    /// was made.
+    Install(Box<NotKept>),
+    /// The device works on the newest package, but Windows hadn't made these microphones after [`MICS_WAIT`]. `seen`: our
+    /// endpoints at the last look; `read`: the last look's error, if it failed.
+    Mics { missing: Vec<&'static str>, seen: Vec<String>, read: Option<WinError> },
+}
+
+/// A new device that wasn't kept ([`SwitchError::Install`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotKept {
+    /// `ROOT\MEDIA\0004`.
+    pub device: String,
+    /// The package it was given, described.
+    pub chosen: String,
+    pub failure: InstallFailure,
+    /// How removing it again went.
+    pub removed: Result<(), WinError>,
 }
 
 impl From<WinError> for SwitchError {
@@ -266,6 +384,46 @@ impl fmt::Display for SwitchError {
             SwitchError::RestartFirst { device } => {
                 write!(f, "Windows will finish removing {device} when it restarts: restart Windows, then run the switch again")
             }
+            SwitchError::Busy => write!(
+                f,
+                "another switch has held {LOCK_NAME} for {} s: let it end, then run this one again (it reads the devices afresh). \
+                 Nothing was changed.",
+                LOCK_WAIT.as_secs()
+            ),
+            SwitchError::NoEndpoints(e) => write!(
+                f,
+                "the audio endpoints couldn't be read ({e}), and the switch checks the new microphones with them: nothing was \
+                 removed. Is the Windows Audio Endpoint Builder service running?"
+            ),
+            SwitchError::Install(not_kept) => {
+                let NotKept { device, chosen, failure, removed } = not_kept.as_ref();
+                write!(f, "the new device {device} isn't working on the chosen driver ({chosen}): {failure}. ")?;
+                match removed {
+                    Ok(()) => write!(
+                        f,
+                        "It was removed again, and the old devices before it, so none of ours is installed now: run the switch \
+                         again, or see what's there with `noise-filter mic variant`."
+                    ),
+                    Err(e) => write!(
+                        f,
+                        "Removing it again failed too ({e}): remove it in Device Manager, or with pnputil /remove-device {device}, \
+                         then run the switch again."
+                    ),
+                }
+            }
+            SwitchError::Mics { missing, seen, read } => {
+                let seen = if seen.is_empty() { "none".to_string() } else { quoted(seen.iter().map(String::as_str)) };
+                write!(
+                    f,
+                    "the device is working on the newest package, but after {} s Windows hasn't made {} (ours there: {seen})",
+                    MICS_WAIT.as_secs(),
+                    quoted(missing.iter().copied())
+                )?;
+                if let Some(e) = read {
+                    write!(f, "; the last look at the endpoints failed: {e}")?;
+                }
+                write!(f, ". The Sound panel's Recording tab and `noise-filter mic variant` show what's there now.")
+            }
         }
     }
 }
@@ -273,8 +431,9 @@ impl fmt::Display for SwitchError {
 impl std::error::Error for SwitchError {}
 
 /// Switches to `target` (see the module's docs for the steps), reporting each step and each Windows error through `say`, as
-/// it happens. Needs elevation: without it, the first change fails with ERROR_ACCESS_DENIED.
+/// it happens. Needs elevation: without it, the lock or the first change fails with ERROR_ACCESS_DENIED.
 pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, SwitchError> {
+    let _lock = SwitchLock::take(LOCK_NAME, LOCK_WAIT, say)?;
     let ids: Vec<&str> = Variant::ALL.iter().map(|v| v.hardware_id()).collect();
     say(&format!("Looking for the AudioCodec device ({})", ids.join(", ")));
     let set = DeviceSet::all_present()?;
@@ -284,16 +443,20 @@ pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, Swi
     }
     for (_, d) in &ours {
         say(&format!("  {}", d.describe()));
+        say(&format!("    ({})", d.package_note()));
     }
     let devices: Vec<OurDevice> = ours.iter().map(|(_, d)| d.clone()).collect();
     let plan = plan(&devices, target);
     if plan.is_nothing() {
-        say(&format!("Already {} ({}): nothing to do.", target.describe(), target.hardware_id()));
+        say(&format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id()));
         return Ok(Outcome::Nothing);
     }
     if let Some(k) = plan.keep {
         say(&format!("Keeping {}", devices[k].instance_id));
     }
+    // A new device's microphones are endpoints that weren't there before; read them before anything changes, as the check
+    // after needs them
+    let before = if plan.create { capture_endpoint_ids()? } else { Vec::new() };
     // The new device and its driver before anything is removed: no driver, no change
     let pending = if plan.create { Some(Pending::prepare(target, say)?) } else { None };
     for &i in &plan.remove {
@@ -308,11 +471,165 @@ pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, Swi
         }
         say("  removed");
     }
-    let restart = match pending {
-        Some(p) => p.install(say)?,
-        None => false,
+    if let Some(p) = pending
+        && p.install(say)? == Installed::Restart
+    {
+        say("  Windows needs a restart to finish the install: the microphones come after it (`noise-filter mic variant` shows them).");
+        return Ok(Outcome::Switched { restart: true });
+    }
+    wait_for_mics(target, &before, say)?;
+    Ok(Outcome::Switched { restart: false })
+}
+
+/// The ids of our capture endpoints there now, active or disabled.
+fn capture_endpoint_ids() -> Result<Vec<String>, SwitchError> {
+    let endpoints = sessions::capture_endpoints().map_err(SwitchError::NoEndpoints)?;
+    Ok(endpoints.into_iter().map(|e| e.id).collect())
+}
+
+/// Up to [`MICS_WAIT`] for Windows to make `target`'s microphones ([`check_mics`]; `before`: the endpoints there before the
+/// change), saying which came.
+fn wait_for_mics(target: Variant, before: &[String], say: &mut dyn FnMut(&str)) -> Result<(), SwitchError> {
+    say(&format!("Waiting for Windows to make {} (up to {} s)", target.microphones_text(), MICS_WAIT.as_secs()));
+    let start = Instant::now();
+    // The last look that read the endpoints, and the last look's error, if it failed
+    let mut last = None::<MicCheck>;
+    let failed = loop {
+        let failed = match sessions::capture_endpoints() {
+            Ok(now) => {
+                last = Some(check_mics(target, &now, before));
+                None
+            }
+            Err(e) => Some(e),
+        };
+        let done = failed.is_none() && last.as_ref().is_some_and(MicCheck::is_done);
+        if done || start.elapsed() >= MICS_WAIT {
+            break failed;
+        }
+        std::thread::sleep(POLL);
     };
-    Ok(Outcome::Switched { restart })
+    match last {
+        Some(check) if check.missing.is_empty() => {
+            for &(mic, active) in &check.found {
+                say(&format!("  \"{mic}\": {}", if active { "there" } else { "there, disabled in the Sound panel's Recording tab" }));
+            }
+            if !check.extra.is_empty() {
+                let extra = quoted(check.extra.iter().map(String::as_str));
+                say(&format!("  also still active: {extra} (a removed device's, going, or another device of the same name)"));
+            }
+            say(&format!("  after {:.1} s", start.elapsed().as_secs_f64()));
+            Ok(())
+        }
+        Some(check) => Err(SwitchError::Mics { missing: check.missing, seen: check.seen, read: failed }),
+        None => Err(SwitchError::Mics { missing: target.microphones().to_vec(), seen: Vec::new(), read: failed }),
+    }
+}
+
+/// What Windows has of a variant's microphones after a switch ([`check_mics`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MicCheck {
+    /// Each microphone there, and whether it's active (if not, it's disabled in the Sound panel).
+    pub found: Vec<(&'static str, bool)>,
+    /// The microphones not there.
+    pub missing: Vec<&'static str>,
+    /// Our other active endpoints: one there before the change (a removed device's, going), a second of the same name, or one
+    /// the variant doesn't have.
+    pub extra: Vec<String>,
+    /// Every endpoint of ours, by name ("(disabled)" after a disabled one's).
+    pub seen: Vec<String>,
+}
+
+impl MicCheck {
+    /// Every microphone there, and nothing else of ours active.
+    pub fn is_done(&self) -> bool {
+        self.missing.is_empty() && self.extra.is_empty()
+    }
+}
+
+/// Judges our capture endpoints `now` against `target`'s microphones: each must be there, by its name (any case), and not
+/// one of `before` (the ids there before the change: a new device's endpoints are new); an active one is taken before a
+/// disabled one (disabled in the Sound panel, it is there still). The endpoints left over that are active are `extra`.
+pub fn check_mics(target: Variant, now: &[CaptureEndpoint], before: &[String]) -> MicCheck {
+    let is_new = |e: &CaptureEndpoint| !before.iter().any(|id| id.eq_ignore_ascii_case(&e.id));
+    let seen = now.iter().map(|e| if e.active { e.name.clone() } else { format!("{} (disabled)", e.name) }).collect();
+    let mut check = MicCheck { seen, ..MicCheck::default() };
+    let mut used = vec![false; now.len()];
+    for &mic in target.microphones() {
+        let find = |active: bool| {
+            (0..now.len()).find(|&i| !used[i] && now[i].active == active && is_new(&now[i]) && now[i].name.trim().eq_ignore_ascii_case(mic))
+        };
+        let pick = find(true).or_else(|| find(false));
+        match pick {
+            Some(i) => {
+                used[i] = true;
+                check.found.push((mic, now[i].active));
+            }
+            None => check.missing.push(mic),
+        }
+    }
+    check.extra = (0..now.len()).filter(|&i| !used[i] && now[i].active).map(|i| now[i].name.clone()).collect();
+    check
+}
+
+/// How a wait for the lock ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockWait {
+    Taken,
+    /// Its last holder's thread ended without releasing it: ours now, as if taken.
+    Abandoned,
+    /// Still held by another at the end of the wait.
+    Busy,
+    Failed,
+}
+
+fn lock_wait(event: WAIT_EVENT) -> LockWait {
+    match event {
+        e if e == WAIT_OBJECT_0 => LockWait::Taken,
+        e if e == WAIT_ABANDONED => LockWait::Abandoned,
+        e if e == WAIT_TIMEOUT => LockWait::Busy,
+        _ => LockWait::Failed,
+    }
+}
+
+/// The switch's lock, a named mutex; released when dropped.
+struct SwitchLock(Owned<HANDLE>);
+
+impl SwitchLock {
+    /// Takes the mutex `name`, waiting up to `wait` for another holder.
+    fn take(name: &str, wait: Duration, say: &mut dyn FnMut(&str)) -> Result<Self, SwitchError> {
+        let name = HSTRING::from(name);
+        // Enough to wait on it and release it
+        let access = SYNCHRONIZATION_SYNCHRONIZE.0 | MUTEX_MODIFY_STATE.0;
+        // SAFETY: no security attributes, so the creator's default DACL (an elevated administrator's lets Administrators and
+        // SYSTEM in); a NUL-terminated name; not owned on creation, so it is waited for below whoever made it.
+        let handle = unsafe { CreateMutexExW(None, &name, 0, access) }.map_err(WinError::of("CreateMutexExW"))?;
+        // SAFETY: a valid handle that nothing else owns; Owned closes it once.
+        let handle = unsafe { Owned::new(handle) };
+        // SAFETY: our handle; no wait.
+        let mut event = unsafe { WaitForSingleObject(*handle, 0) };
+        if event == WAIT_TIMEOUT {
+            say(&format!("Another switch is running: waiting for it to end (up to {} s)", wait.as_secs()));
+            // SAFETY: as above.
+            event = unsafe { WaitForSingleObject(*handle, u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1)) };
+        }
+        match lock_wait(event) {
+            LockWait::Taken => Ok(Self(handle)),
+            LockWait::Abandoned => {
+                say("(The last switch's process ended in the middle of its switch: this one reads the devices afresh.)");
+                Ok(Self(handle))
+            }
+            LockWait::Busy => Err(SwitchError::Busy),
+            // SAFETY: no arguments; read straight after the failed wait.
+            LockWait::Failed => Err(WinError { call: "WaitForSingleObject", code: unsafe { GetLastError() }.0 }.into()),
+        }
+    }
+}
+
+impl Drop for SwitchLock {
+    fn drop(&mut self) {
+        // SAFETY: our handle, to a mutex this thread owns (take returns one only then); Owned closes the handle after this.
+        let _ = unsafe { ReleaseMutex(*self.0) };
+    }
 }
 
 /// A device information set, destroyed on drop (which also deletes an element in it that was never registered).
@@ -356,16 +673,37 @@ impl DeviceSet {
             let Some(variant) = self.registry_multi_sz(&data, SPDRP_HARDWAREID).ok().and_then(|ids| variant_of(&ids)) else {
                 continue;
             };
+            let Bound { health, inf, driver_version } = self.bound(&data);
             let device = OurDevice {
                 instance_id: self.instance_id(&data)?,
                 variant,
-                health: health(data.DevInst),
-                inf: self.string_property(&data, &DEVPKEY_Device_DriverInfPath),
-                driver_version: self.string_property(&data, &DEVPKEY_Device_DriverVersion),
+                health,
+                inf,
+                driver_version,
+                newest: self.newest_for(&mut data),
             };
             out.push((data, device));
         }
         Ok(out)
+    }
+
+    /// An element's state and driver, as Windows reports them now.
+    fn bound(&self, data: &SP_DEVINFO_DATA) -> Bound {
+        Bound {
+            health: health(data.DevInst),
+            inf: self.string_property(data, &DEVPKEY_Device_DriverInfPath),
+            driver_version: self.string_property(data, &DEVPKEY_Device_DriverVersion),
+        }
+    }
+
+    /// The newest of our packages compatible with an element: the compatible-driver search on it (which only reads the
+    /// driver store), then [`choose`].
+    fn newest_for(&self, data: &mut SP_DEVINFO_DATA) -> Result<Option<Candidate>, WinError> {
+        // SAFETY: an element of our set.
+        unsafe { SetupDiBuildDriverInfoList(self.get(), Some(data), SPDIT_COMPATDRIVER) }
+            .map_err(WinError::of("SetupDiBuildDriverInfoList"))?;
+        let candidates: Vec<Candidate> = self.compat_drivers(data)?.into_iter().map(|(_, c)| c).collect();
+        Ok(choose(&candidates).map(|i| candidates[i].clone()))
     }
 
     fn instance_id(&self, data: &SP_DEVINFO_DATA) -> Result<String, WinError> {
@@ -495,14 +833,83 @@ pub fn choose(candidates: &[Candidate]) -> Option<usize> {
     best
 }
 
+/// A device's state and driver, as Windows reports them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub health: Health,
+    /// `DEVPKEY_Device_DriverInfPath`: `oem12.inf`.
+    pub inf: Option<String>,
+    /// `DEVPKEY_Device_DriverVersion`: "12.40.56.342".
+    pub driver_version: Option<String>,
+}
+
+impl Bound {
+    /// "working, driver oem12.inf 12.40.56.342".
+    pub fn describe(&self) -> String {
+        format!("{}, {}", self.health.describe(), driver_text(self.inf.as_deref(), self.driver_version.as_deref()))
+    }
+}
+
+/// What a new device's install came to, when it's kept ([`judge_install`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Installed {
+    /// Working, on the chosen package.
+    Working,
+    /// Windows asked for a restart to finish: the device is left for it.
+    Restart,
+}
+
+/// Why a new device isn't kept ([`judge_install`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallFailure {
+    /// DiInstallDevice failed, and the device (`now`) isn't working on the chosen package.
+    Call { error: WinError, now: Bound },
+    /// DiInstallDevice succeeded, but the device (`now`) wasn't working [`DRIVER_WAIT`] later.
+    NotWorking { now: Bound },
+    /// The device (`now`) is working, on another package than the chosen one: Plug and Play's own choice, say, after
+    /// DiInstallDevice failed (`error`).
+    OtherPackage { error: Option<WinError>, now: Bound },
+}
+
+impl fmt::Display for InstallFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InstallFailure::Call { error, now } => write!(f, "{error}; the device now: {}", now.describe()),
+            InstallFailure::NotWorking { now } => {
+                write!(f, "{} s after DiInstallDevice, the device: {}", DRIVER_WAIT.as_secs(), now.describe())
+            }
+            InstallFailure::OtherPackage { error, now } => {
+                if let Some(e) = error {
+                    write!(f, "{e}; ")?;
+                }
+                write!(f, "the device now: {}, another package (Plug and Play's own choice)", now.describe())
+            }
+        }
+    }
+}
+
+/// Judges a new device's install: `call` is what DiInstallDevice returned, `restart` whether it asked for a restart, `now`
+/// the device afterwards, `chosen` the package it was given. Kept only when working on the chosen package (whatever the call
+/// returned: Plug and Play may have put the same driver on it by itself), or when Windows asked for a restart to finish.
+pub fn judge_install(call: Result<(), &WinError>, restart: bool, now: &Bound, chosen: &Candidate) -> Result<Installed, InstallFailure> {
+    let on_chosen = runs(now.inf.as_deref(), now.driver_version.as_deref(), chosen);
+    let needs_restart = restart || (on_chosen && now.health == Health::Problem(CM_PROB_NEED_RESTART.0));
+    match call {
+        Ok(()) if needs_restart => Ok(Installed::Restart),
+        _ if now.health == Health::Working && on_chosen => Ok(Installed::Working),
+        _ if now.health == Health::Working => Err(InstallFailure::OtherPackage { error: call.err().cloned(), now: now.clone() }),
+        Err(e) => Err(InstallFailure::Call { error: e.clone(), now: now.clone() }),
+        Ok(()) => Err(InstallFailure::NotWorking { now: now.clone() }),
+    }
+}
+
 /// The new device, not yet registered, with its driver chosen.
 struct Pending {
     set: DeviceSet,
     data: SP_DEVINFO_DATA,
     node: SP_DRVINFO_DATA_V2_W,
     instance_id: String,
-    inf: String,
-    target: Variant,
+    chosen: Candidate,
 }
 
 impl Pending {
@@ -547,50 +954,59 @@ impl Pending {
             say(&format!("  {}{mark}", c.describe()));
         }
         let Some(chosen) = chosen else { return Err(SwitchError::NoDriver { hardware_id: target.hardware_id() }) };
-        let inf = candidates[chosen].inf.clone();
-        match store_location(&inf) {
+        match store_location(&candidates[chosen].inf) {
             Ok(path) => say(&format!("  stored at {path}")),
             Err(e) => say(&format!("  (its driver-store folder is unknown: {e})")),
         }
-        Ok(Self { set, data, node: nodes[chosen].0, instance_id, inf, target })
+        Ok(Self { set, data, node: nodes[chosen].0, instance_id, chosen: candidates[chosen].clone() })
     }
 
-    /// Registers the device and installs the chosen driver on it. `Ok(true)`: Windows wants a restart to finish.
-    fn install(self, say: &mut dyn FnMut(&str)) -> Result<bool, SwitchError> {
-        let Pending { set, data, node, instance_id, inf, target } = self;
+    /// Registers the device, installs the chosen driver on it, and judges the result ([`judge_install`]). A device that
+    /// isn't kept is removed again: one without the right driver would read as this variant next time.
+    fn install(self, say: &mut dyn FnMut(&str)) -> Result<Installed, SwitchError> {
+        let Pending { set, data, node, instance_id, chosen } = self;
         say(&format!("Creating {instance_id} (SetupDiCallClassInstaller(DIF_REGISTERDEVICE))"));
         // SAFETY: an element of our set.
         unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set.get(), Some(&data)) }
             .map_err(WinError::of("SetupDiCallClassInstaller(DIF_REGISTERDEVICE)"))?;
-        say(&format!("Installing the driver from {inf} on it (DiInstallDevice)"));
+        say(&format!("Installing the driver from {} on it (DiInstallDevice)", chosen.inf));
         let mut restart = BOOL(0);
         // No finish-install pages: the helper has no window to show them from.
         // SAFETY: a registered element of our set and a driver node from its own list; `restart` is a live out-pointer.
-        let installed = unsafe { DiInstallDevice(None, set.get(), &data, Some(&node), DIIDFLAG_NOFINISHINSTALLUI, Some(&mut restart)) };
-        let state = health(data.DevInst);
-        if let Err(e) = installed {
-            let e = WinError::new("DiInstallDevice", &e);
+        let call = unsafe { DiInstallDevice(None, set.get(), &data, Some(&node), DIIDFLAG_NOFINISHINSTALLUI, Some(&mut restart)) }
+            .map_err(|e| WinError::new("DiInstallDevice", &e));
+        if let Err(e) = &call {
             say(&format!("  {e}"));
-            // Plug and Play may have put the same driver on the new device by itself meanwhile
-            if state != Health::Working {
-                // A device without a driver would read as this variant next time: take it away again
-                say(&format!("Removing {instance_id} again, as it is {}", state.describe()));
-                // SAFETY: as above; no window, no restart flag wanted.
-                match unsafe { DiUninstallDevice(HWND::default(), set.get(), &data, 0, None) } {
-                    Ok(()) => say("  removed"),
-                    Err(e2) => say(&format!("  {}", WinError::new("DiUninstallDevice", &e2))),
+        }
+        let restart = call.is_ok() && restart.as_bool();
+        // Plug and Play may still be starting it, or, after a failed call, putting a driver on it by itself
+        let deadline = Instant::now() + DRIVER_WAIT;
+        let mut now = set.bound(&data);
+        while !restart && now.health != Health::Working && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+            now = set.bound(&data);
+        }
+        say(&format!("  {instance_id}: {}", now.describe()));
+        match judge_install(call.as_ref().map(|_| ()), restart, &now, &chosen) {
+            Ok(Installed::Working) => {
+                if call.is_err() {
+                    say("  on the chosen package all the same: Plug and Play installed it by itself");
                 }
-                return Err(e.into());
+                Ok(Installed::Working)
             }
-            say(&format!("  but {instance_id} is working: Windows installed its driver by itself"));
+            Ok(Installed::Restart) => Ok(Installed::Restart),
+            Err(failure) => {
+                say(&format!("Removing {instance_id} again: {failure}"));
+                // SAFETY: as above; no window, no restart flag wanted.
+                let removed = unsafe { DiUninstallDevice(HWND::default(), set.get(), &data, 0, None) }
+                    .map_err(|e| WinError::new("DiUninstallDevice", &e));
+                match &removed {
+                    Ok(()) => say("  removed"),
+                    Err(e) => say(&format!("  {e}")),
+                }
+                Err(SwitchError::Install(Box::new(NotKept { device: instance_id, chosen: chosen.describe(), failure, removed })))
+            }
         }
-        say(&format!("  installed: {instance_id} is {}", state.describe()));
-        if restart.as_bool() {
-            say("  Windows needs a restart to finish the install.");
-        }
-        let mics = target.microphones().iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(" and ");
-        say(&format!("Windows adds the endpoints in a few seconds: {mics}, and \"Speakers (AudioCodec Device)\"."));
-        Ok(restart.as_bool())
     }
 }
 
@@ -668,6 +1084,22 @@ pub fn multi_sz_bytes(strings: &[&str]) -> Vec<u8> {
 /// A DriverVer version's four parts: "1.0.0.0".
 pub fn version_text(v: u64) -> String {
     format!("{}.{}.{}.{}", v >> 48, (v >> 32) & 0xFFFF, (v >> 16) & 0xFFFF, v & 0xFFFF)
+}
+
+/// A driver version as Windows gives it ("12.40.56.342"): one to four parts of 0-65535, the missing ones 0, as DriverVer's
+/// four 16-bit parts. Compared as numbers, so "1.02" is 1.2.0.0.
+pub fn parse_version(s: &str) -> Option<u64> {
+    let mut parts = s.trim().split('.');
+    let mut v = 0u64;
+    for i in 0..4 {
+        let part = match parts.next() {
+            Some(p) => p.trim().parse::<u16>().ok()?,
+            None if i > 0 => 0,
+            None => return None,
+        };
+        v = (v << 16) | u64::from(part);
+    }
+    parts.next().is_none().then_some(v)
 }
 
 /// A FILETIME's date (100 ns ticks since 1601-01-01 UTC) as "2026-11-23".
@@ -750,15 +1182,35 @@ mod tests {
         assert_eq!(from_wide(&[b'h' as u16, b'i' as u16, 0, b'x' as u16]), "hi");
     }
 
+    const V1: u64 = 1 << 48;
+
+    /// The driver store's newest package in these tests: oem12.inf, 1.0.0.0.
+    fn newest() -> Candidate {
+        candidate(r"C:\Windows\INF\oem12.inf", "audiocodec.inf", 200, V1)
+    }
+
+    /// A device on the newest package.
     fn dev(variant: Variant, health: Health) -> OurDevice {
-        OurDevice { instance_id: r"ROOT\MEDIA\0003".into(), variant, health, inf: Some("oem12.inf".into()), driver_version: None }
+        OurDevice {
+            instance_id: r"ROOT\MEDIA\0003".into(),
+            variant,
+            health,
+            inf: Some("oem12.inf".into()),
+            driver_version: Some("1.0.0.0".into()),
+            newest: Ok(Some(newest())),
+        }
+    }
+
+    /// A device on an older package than the newest: the single-microphone driver, say, which had `ROOT\AudioCodec` too.
+    fn old(variant: Variant, health: Health) -> OurDevice {
+        OurDevice { inf: Some("oem3.inf".into()), driver_version: Some("0.9.0.300".into()), ..dev(variant, health) }
     }
 
     #[test]
     fn the_plan_keeps_one_working_target_and_removes_the_rest() {
         use Health::*;
         use Variant::*;
-        // Already the only one, working: nothing
+        // Already the only one, working on the newest package: nothing
         let p = plan(&[dev(Call, Working)], Call);
         assert_eq!(p, Plan { keep: Some(0), remove: vec![], create: false });
         assert!(p.is_nothing());
@@ -777,6 +1229,227 @@ mod tests {
             assert_eq!(plan(&[dev(Call, broken)], Call), Plan { keep: None, remove: vec![0], create: true }, "{broken:?}");
         }
         assert_eq!(plan(&[dev(Call, Problem(28)), dev(Call, Working)], Call), Plan { keep: Some(1), remove: vec![0], create: false });
+    }
+
+    /// Astra's review: a working single-microphone install has `ROOT\AudioCodec`, so it read as `both` and the switch did
+    /// nothing. Only a device on the driver store's newest package is kept.
+    #[test]
+    fn the_plan_replaces_a_device_on_an_older_package() {
+        use Health::*;
+        use Variant::*;
+        let replace = Plan { keep: None, remove: vec![0], create: true };
+        assert_eq!(plan(&[old(Both, Working)], Both), replace);
+        assert!(!plan(&[old(Both, Working)], Both).is_nothing());
+        // The same published INF with another version: the driver store reused the name for a newer package
+        let reused = OurDevice { driver_version: Some("0.9.0.300".into()), ..dev(Both, Working) };
+        assert_eq!(plan(&[reused], Both), replace);
+        // The driver store's packages unread, or none of ours there: not known to be current, so replaced (the new device's
+        // own search then says whether there is a driver, before anything is removed)
+        let unread = OurDevice { newest: Err(WinError { call: "SetupDiBuildDriverInfoList", code: 5 }), ..dev(Both, Working) };
+        assert_eq!(plan(&[unread], Both), replace);
+        assert_eq!(plan(&[OurDevice { newest: Ok(None), ..dev(Both, Working) }], Both), replace);
+        // An old one beside a current one of the target: keep the current one
+        assert_eq!(plan(&[old(Both, Working), dev(Both, Working)], Both), Plan { keep: Some(1), remove: vec![0], create: false });
+        // The INF's name in any case, or as a path, is the same INF
+        let upper = OurDevice { inf: Some(r"C:\WINDOWS\INF\OEM12.INF".into()), ..dev(Call, Working) };
+        assert!(upper.is_current());
+        assert!(plan(&[upper], Call).is_nothing());
+    }
+
+    #[test]
+    fn a_device_runs_a_package_by_its_inf_and_version() {
+        let c = newest();
+        assert!(runs(Some("oem12.inf"), Some("1.0.0.0"), &c));
+        assert!(runs(Some(" OEM12.inf "), Some("1.0"), &c), "any case; the version as numbers");
+        assert!(!runs(Some("oem12.inf"), Some("1.0.0.300"), &c));
+        assert!(!runs(Some("oem1.inf"), Some("1.0.0.0"), &c), "the whole name, not a prefix");
+        assert!(!runs(Some("oem12.inf"), None, &c) && !runs(None, Some("1.0.0.0"), &c) && !runs(None, None, &c));
+        assert!(!runs(Some("oem12.inf"), Some("one"), &c));
+        let d = dev(Variant::Both, Health::Working);
+        assert!(d.runs(&c) && d.is_current());
+        assert!(!old(Variant::Both, Health::Working).is_current());
+    }
+
+    #[test]
+    fn the_package_note_says_what_the_device_runs() {
+        assert_eq!(dev(Variant::Both, Health::Working).package_note(), "it runs the newest AudioCodec package in the driver store");
+        let note = old(Variant::Both, Health::Working).package_note();
+        assert!(
+            note.starts_with(
+                r"it doesn't run the newest AudioCodec package in the driver store, C:\Windows\INF\oem12.inf (audiocodec.inf)"
+            ),
+            "{note}"
+        );
+        let none = OurDevice { newest: Ok(None), ..dev(Variant::Call, Health::Working) };
+        assert_eq!(none.package_note(), r"no AudioCodec package in the driver store has ROOT\AudioCodecCall");
+        let unread =
+            OurDevice { newest: Err(WinError { call: "SetupDiBuildDriverInfoList", code: 5 }), ..dev(Variant::Both, Health::Working) };
+        let note = unread.package_note();
+        assert!(
+            note.starts_with(
+                "the driver store's packages for it couldn't be read: SetupDiBuildDriverInfoList failed: ERROR_ACCESS_DENIED (5)"
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn versions_parse_as_windows_gives_them() {
+        assert_eq!(parse_version("12.40.56.342"), Some((12 << 48) | (40 << 32) | (56 << 16) | 342));
+        assert_eq!(parse_version(" 1.2.3.4 "), Some((1 << 48) | (2 << 32) | (3 << 16) | 4));
+        assert_eq!(parse_version("1.02.0.0"), Some((1 << 48) | (2 << 32)));
+        assert_eq!(parse_version("1"), Some(1 << 48));
+        assert_eq!(parse_version("1.0"), Some(1 << 48));
+        assert_eq!(parse_version("65535.0.0.65535"), Some((65_535 << 48) | 65_535));
+        for bad in ["", " ", "1.2.3.4.5", "65536.0.0.0", "1..2", "a.b", "-1.0", "1.0."] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
+        for v in [0, V1, (12 << 48) | (40 << 32) | (56 << 16) | 342, u64::MAX] {
+            assert_eq!(parse_version(&version_text(v)), Some(v));
+        }
+    }
+
+    fn bound(health: Health, inf: &str, version: &str) -> Bound {
+        Bound { health, inf: Some(inf.into()), driver_version: Some(version.into()) }
+    }
+
+    /// Astra's review: the install accepted a failed bind if Windows started the device with some driver.
+    #[test]
+    fn an_install_is_kept_only_when_working_on_the_chosen_package() {
+        use Health::*;
+        let c = newest();
+        let failed = WinError { call: "DiInstallDevice", code: 0xE000_022F };
+        let on_chosen = bound(Working, "oem12.inf", "1.0.0.0");
+        assert_eq!(judge_install(Ok(()), false, &on_chosen, &c), Ok(Installed::Working));
+        // The call failed, but Plug and Play put the chosen package on it by itself
+        assert_eq!(judge_install(Err(&failed), false, &on_chosen, &c), Ok(Installed::Working));
+        // Working on another package, the call failed or not: not kept
+        let other = bound(Working, "oem3.inf", "0.9.0.300");
+        assert_eq!(
+            judge_install(Err(&failed), false, &other, &c),
+            Err(InstallFailure::OtherPackage { error: Some(failed.clone()), now: other.clone() })
+        );
+        assert_eq!(judge_install(Ok(()), false, &other, &c), Err(InstallFailure::OtherPackage { error: None, now: other.clone() }));
+        let reused = bound(Working, "oem12.inf", "0.9.0.300");
+        assert!(matches!(judge_install(Ok(()), false, &reused, &c), Err(InstallFailure::OtherPackage { .. })));
+        // Not working
+        let bare = Bound { health: Problem(28), inf: None, driver_version: None };
+        assert_eq!(judge_install(Err(&failed), false, &bare, &c), Err(InstallFailure::Call { error: failed.clone(), now: bare.clone() }));
+        for state in [NotStarted, Problem(10), Problem(28), Unknown(13)] {
+            let now = Bound { health: state, ..on_chosen.clone() };
+            assert_eq!(judge_install(Ok(()), false, &now, &c), Err(InstallFailure::NotWorking { now: now.clone() }), "{state:?}");
+        }
+        // A restart to finish: left for it
+        assert_eq!(judge_install(Ok(()), true, &bare, &c), Ok(Installed::Restart));
+        assert_eq!(judge_install(Ok(()), false, &Bound { health: Problem(14), ..on_chosen.clone() }, &c), Ok(Installed::Restart));
+        // ... but not when the call failed, or Code 14 on another package
+        assert!(matches!(judge_install(Err(&failed), true, &bare, &c), Err(InstallFailure::Call { .. })));
+        assert!(matches!(
+            judge_install(Ok(()), false, &Bound { health: Problem(14), ..other.clone() }, &c),
+            Err(InstallFailure::NotWorking { .. })
+        ));
+    }
+
+    #[test]
+    fn install_failures_say_what_the_device_is() {
+        let failed = WinError { call: "DiInstallDevice", code: 5 };
+        let other = bound(Health::Working, "oem3.inf", "0.9.0.300");
+        let text = InstallFailure::OtherPackage { error: Some(failed.clone()), now: other.clone() }.to_string();
+        assert!(text.starts_with("DiInstallDevice failed: ERROR_ACCESS_DENIED (5)"), "{text}");
+        assert!(
+            text.ends_with("; the device now: working, driver oem3.inf 0.9.0.300, another package (Plug and Play's own choice)"),
+            "{text}"
+        );
+        let text = InstallFailure::OtherPackage { error: None, now: other }.to_string();
+        assert_eq!(text, "the device now: working, driver oem3.inf 0.9.0.300, another package (Plug and Play's own choice)");
+        let bare = Bound { health: Health::Problem(28), inf: None, driver_version: None };
+        let text = InstallFailure::Call { error: failed, now: bare.clone() }.to_string();
+        assert!(text.ends_with("; the device now: no driver installed (Code 28), no driver"), "{text}");
+        let text = InstallFailure::NotWorking { now: Bound { health: Health::NotStarted, ..bare } }.to_string();
+        assert_eq!(text, "5 s after DiInstallDevice, the device: not started, no driver");
+    }
+
+    fn ep(id: &str, name: &str, active: bool) -> CaptureEndpoint {
+        CaptureEndpoint { id: id.into(), name: name.into(), active }
+    }
+
+    /// Astra's review: check the capabilities before declaring success. A new device's microphones are new endpoints.
+    #[test]
+    fn the_microphones_are_new_endpoints_of_the_variants_names() {
+        use Variant::*;
+        let both_new = [ep("{n1}", MICROPHONE, true), ep("{n2}", CALL_MICROPHONE, true)];
+        let check = check_mics(Both, &both_new, &[]);
+        assert_eq!(check.found, [(MICROPHONE, true), (CALL_MICROPHONE, true)]);
+        assert!(check.is_done() && check.missing.is_empty() && check.extra.is_empty());
+        // The upgrade from the single-microphone driver: its Microphone, still active, doesn't count, and is waited out
+        let before = ["{old}".to_string()];
+        let midway = [ep("{old}", MICROPHONE, true), ep("{n1}", MICROPHONE, true)];
+        let check = check_mics(Both, &midway, &before);
+        assert_eq!(
+            (check.found, check.missing, check.extra),
+            (vec![(MICROPHONE, true)], vec![CALL_MICROPHONE], vec![MICROPHONE.to_string()])
+        );
+        let check = check_mics(Both, &[ep("{OLD}", MICROPHONE, true)], &before);
+        assert_eq!(check.missing, [MICROPHONE, CALL_MICROPHONE], "an old endpoint, its id in any case, isn't the new device's");
+        let mut after: Vec<CaptureEndpoint> = both_new.to_vec();
+        assert!(check_mics(Both, &after, &before).is_done());
+        // One disabled in the Sound panel is there (the user's choice); an active one is taken before it
+        let check = check_mics(Call, &[ep("{n2}", CALL_MICROPHONE, false)], &[]);
+        assert!(check.is_done() && check.found == [(CALL_MICROPHONE, false)]);
+        assert_eq!(check.seen, [format!("{CALL_MICROPHONE} (disabled)")]);
+        let check = check_mics(Call, &[ep("{a}", CALL_MICROPHONE, false), ep("{b}", CALL_MICROPHONE, true)], &[]);
+        assert!(check.is_done() && check.found == [(CALL_MICROPHONE, true)], "{check:?}");
+        // A second active one of the same name, or one the variant doesn't have: waited out
+        let check = check_mics(Call, &[ep("{a}", CALL_MICROPHONE, true), ep("{b}", CALL_MICROPHONE, true)], &[]);
+        assert!(check.missing.is_empty() && check.extra == [CALL_MICROPHONE] && !check.is_done());
+        after.push(ep("{x}", "Speakers (AudioCodec Device)", true));
+        let check = check_mics(LowLatency, &after, &[]);
+        assert_eq!(check.found, [(MICROPHONE, true)]);
+        assert_eq!(check.extra, [CALL_MICROPHONE, "Speakers (AudioCodec Device)"]);
+        // Names in any case; a numbered or renamed one isn't the microphone
+        assert!(check_mics(Call, &[ep("{a}", "call microphone (audiocodec device)", true)], &[]).is_done());
+        let check = check_mics(LowLatency, &[ep("{a}", "Microphone (2- AudioCodec Device)", true)], &[]);
+        assert_eq!((check.missing, check.extra), (vec![MICROPHONE], vec!["Microphone (2- AudioCodec Device)".to_string()]));
+        // Nothing yet
+        let check = check_mics(Both, &[], &[]);
+        assert_eq!((check.missing, check.seen.len()), (vec![MICROPHONE, CALL_MICROPHONE], 0));
+    }
+
+    #[test]
+    fn a_wait_for_the_lock_ends_as_windows_says() {
+        assert_eq!(lock_wait(WAIT_OBJECT_0), LockWait::Taken);
+        assert_eq!(lock_wait(WAIT_ABANDONED), LockWait::Abandoned);
+        assert_eq!(lock_wait(WAIT_TIMEOUT), LockWait::Busy);
+        assert_eq!(lock_wait(windows::Win32::Foundation::WAIT_FAILED), LockWait::Failed);
+    }
+
+    /// Astra's review: two switches at once could both create a device. The lock, on a mutex of the test's own (Local\, this
+    /// process's id), so a real switch is never in the way: held, another thread waits and gives up; released, it takes it;
+    /// abandoned by a thread that ended holding it, the next takes it and says so.
+    #[test]
+    fn the_lock_lets_one_switch_in_at_a_time() {
+        let name = format!(r"Local\noise-filter-test-mic-variant-{}", std::process::id());
+        let take_elsewhere = |wait: Duration| {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let mut lines = Vec::new();
+                let taken = SwitchLock::take(&name, wait, &mut |l| lines.push(l.to_string())).map(drop);
+                (taken, lines)
+            })
+            .join()
+            .unwrap()
+        };
+        let held = SwitchLock::take(&name, Duration::ZERO, &mut |_| {}).unwrap();
+        let (taken, lines) = take_elsewhere(Duration::from_millis(50));
+        assert_eq!(taken, Err(SwitchError::Busy));
+        assert_eq!(lines, ["Another switch is running: waiting for it to end (up to 0 s)"]);
+        drop(held);
+        assert_eq!(take_elsewhere(Duration::ZERO), (Ok(()), vec![]));
+        let n = name.clone();
+        std::thread::spawn(move || std::mem::forget(SwitchLock::take(&n, Duration::ZERO, &mut |_| {}).unwrap())).join().unwrap();
+        let (taken, lines) = take_elsewhere(Duration::ZERO);
+        assert_eq!(taken, Ok(()));
+        assert_eq!(lines, ["(The last switch's process ended in the middle of its switch: this one reads the devices afresh.)"]);
     }
 
     #[test]
@@ -856,5 +1529,51 @@ mod tests {
         assert!(e.to_string().contains(r"finish removing ROOT\MEDIA\0003 when it restarts"));
         let e = SwitchError::from(WinError { call: "DiInstallDevice", code: 5 });
         assert!(e.to_string().starts_with("DiInstallDevice failed: ERROR_ACCESS_DENIED (5)"));
+        let text = SwitchError::Busy.to_string();
+        assert!(text.starts_with(r"another switch has held Global\noise-filter-mic-variant for 60 s: let it end"), "{text}");
+        assert!(text.ends_with("Nothing was changed."));
+        let text = SwitchError::NoEndpoints(WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 }).to_string();
+        assert!(text.starts_with("the audio endpoints couldn't be read (IMMDeviceEnumerator::EnumAudioEndpoints failed"), "{text}");
+        assert!(text.contains("nothing was removed"));
+
+        let failure = InstallFailure::NotWorking { now: Bound { health: Health::NotStarted, inf: None, driver_version: None } };
+        let install = |removed| {
+            SwitchError::Install(Box::new(NotKept {
+                device: r"ROOT\MEDIA\0004".into(),
+                chosen: newest().describe(),
+                failure: failure.clone(),
+                removed,
+            }))
+        };
+        let text = install(Ok(())).to_string();
+        assert!(
+            text.starts_with(
+                r"the new device ROOT\MEDIA\0004 isn't working on the chosen driver (C:\Windows\INF\oem12.inf (audiocodec.inf)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("): 5 s after DiInstallDevice, the device: not started, no driver. It was removed again"), "{text}");
+        assert!(
+            text.ends_with("none of ours is installed now: run the switch again, or see what's there with `noise-filter mic variant`.")
+        );
+        let text = install(Err(WinError { call: "DiUninstallDevice", code: 5 })).to_string();
+        assert!(text.contains(r"Removing it again failed too (DiUninstallDevice failed: ERROR_ACCESS_DENIED (5)"), "{text}");
+        assert!(text.contains(r"pnputil /remove-device ROOT\MEDIA\0004"), "{text}");
+
+        let e = SwitchError::Mics { missing: vec![CALL_MICROPHONE], seen: vec![MICROPHONE.into()], read: None };
+        assert_eq!(
+            e.to_string(),
+            "the device is working on the newest package, but after 15 s Windows hasn't made \"Call Microphone (AudioCodec Device)\" \
+             (ours there: \"Microphone (AudioCodec Device)\"). The Sound panel's Recording tab and `noise-filter mic variant` show \
+             what's there now."
+        );
+        let e = SwitchError::Mics { missing: vec![MICROPHONE, CALL_MICROPHONE], seen: vec![], read: Some(WinError { call: "X", code: 5 }) };
+        let text = e.to_string();
+        assert!(
+            text.contains("hasn't made \"Microphone (AudioCodec Device)\" and \"Call Microphone (AudioCodec Device)\" (ours there: none)")
+        );
+        assert!(text.contains("; the last look at the endpoints failed: X failed: ERROR_ACCESS_DENIED (5)"), "{text}");
+        assert_eq!(Variant::Both.microphones_text(), "\"Microphone (AudioCodec Device)\" and \"Call Microphone (AudioCodec Device)\"");
+        assert_eq!(Variant::Call.microphones_text(), "\"Call Microphone (AudioCodec Device)\"");
     }
 }
