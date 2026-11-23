@@ -162,6 +162,35 @@ Reading it against the engine test (the report's "compare with" line says the sa
   when it can. If VB-CABLE's stamps depend on the client's period, cable(A) can differ from the input path for that alone:
   compare the periods on the two reports' conditions lines. A low-latency capture option for cable-only would test it.
 
+## The readout against the sweeps, with our driver as the reference (2026-11-23)
+The 2026-11-01 runs' parts didn't add up: the readout + the chain + the output cable alone came to 8-10 ms more than the
+sweep's "app + output cable" ("Budget" below). Rerun with TODO 19's driver as the output cable, whose own path is fixed
+and known (its loopback: 1 ms behind on one QPC time line; the cable alone 1.91 ms, spread 0.18), beside VB-CABLE. The
+sweeps time both ends by capture stamps, right on both cables since TODO 19's 9a32c5c. `nf-scratch/latency/compare.sh`;
+mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
+
+| Output (all shared 10 ms, fixed target, unless said) | App + output cable | Readout (+ chain) | Output cable alone | Left over |
+|---|---|---|---|---|
+| Ours, run 1 | 67.82 | 47.72 (57.72) | 1.91 | 8.2 |
+| Ours, runs 2-4 | 64.71 / 66.99 / 66.60 | 53.89 / 47.25 / 45.86 | 1.91 | -1.1 / 7.8 / 8.8 |
+| VB-CABLE | 123.47 | 54.16 (64.16) | 50.72 | 8.6 |
+| Ours, exclusive output 3.33 ms and mic (today's defaults) | 38.56 | 24.61 (34.61) | 1.91 (shared) | about 2 |
+| VB-CABLE, exclusive output 2 ms and mic | 63.70 | 24.57 (34.57) | 50.72 (shared; exclusive is 20-30 ms less) | - |
+
+- With shared output, what the readout leaves out changes from run to run, from -1 to +9 ms, on our fixed cable as on
+  VB-CABLE: when the readout's render side read 13.5 ms the parts added up; at 7-8 ms, 8 ms was missing. The sweeps held
+  65-67 ms throughout. So the shared output's readout carries a per-run offset, early by up to about a period: not the
+  cable, not the chain (exclusive output leaves about 2 ms). So the 2026-11-01 gap was this offset plus VB-CABLE's own
+  run-to-run wander (its cable alone read 60-62 ms then, 50.7 now), which turned its sign.
+- Our guess, not checked: the shared stream's device position against the frames the pipeline wrote (`index` =
+  `written_total` + pending) starts by a varying amount: silence the engine played before the prefill reached it, or the
+  phase of the engine's 10 ms period at the start. The exclusive path takes its inserted silence off the clock
+  (exclusive.rs); the shared path can't see it.
+- Exclusive output is the default (2026-11-02), so the readout users see is within about 2 ms there; the shared fallback
+  can read up to a period low.
+- Next: log the shared output's first clock readings beside `written_total` across starts, to find where the offset comes
+  from; then the 2 ms left with exclusive output (its own cable-alone figure, which `--cable-only` can't open yet).
+
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the
 definitions): **mic delivery + wait + output queue + render side = the readout**, block for block (`pipeline/tests/budget.rs`),
