@@ -7,7 +7,8 @@ pub enum Exit {
     /// The command line doesn't parse, or misses something it needs.
     Usage = 1,
     /// The engine, a device or a file failed (for `mic variant`, a Windows call, named in the message, a new device not working
-    /// on the chosen driver, its microphones not made, or another switch holding the lock).
+    /// on the chosen driver, its microphones not made, a device kept whose package lacks one of them, or another switch holding
+    /// the lock).
     Error = 2,
     /// The latency test ran but found no valid repetition; or the user cancelled: a test, or `mic variant`'s elevation prompt.
     NoResult = 3,
@@ -20,6 +21,9 @@ pub enum Exit {
     /// `run --seconds`: the soak wasn't clean (mic glitches or stalls, output underruns or coarse drops, a fault that stopped
     /// it, or real-time heap allocations), so it reads as one code. A `run` without `--seconds` exits [`Exit::Ok`].
     Glitched = 6,
+    /// `mic variant`: the new device is installed, but Windows needs a restart to finish, so its microphones weren't checked:
+    /// restart, then run `mic variant` to check them (ours, the owner's to confirm). Not 0, as the switch isn't done.
+    RestartPending = 7,
 }
 
 impl Exit {
@@ -60,6 +64,10 @@ impl Failure {
     pub fn glitched(message: impl Into<String>) -> Self {
         Self { exit: Exit::Glitched, message: message.into() }
     }
+
+    pub fn restart_pending(message: impl Into<String>) -> Self {
+        Self { exit: Exit::RestartPending, message: message.into() }
+    }
 }
 
 #[cfg(test)]
@@ -68,8 +76,18 @@ mod tests {
 
     #[test]
     fn the_codes_are_app_mds() {
-        let all = [Exit::Ok, Exit::Usage, Exit::Error, Exit::NoResult, Exit::NotElevated, Exit::UnsupportedCpu, Exit::Glitched];
-        assert_eq!(all.map(Exit::code), [0, 1, 2, 3, 4, 5, 6]);
+        let all = [
+            Exit::Ok,
+            Exit::Usage,
+            Exit::Error,
+            Exit::NoResult,
+            Exit::NotElevated,
+            Exit::UnsupportedCpu,
+            Exit::Glitched,
+            Exit::RestartPending,
+        ];
+        assert_eq!(all.map(Exit::code), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(Failure::restart_pending("r").exit, Exit::RestartPending);
         assert_eq!(Failure::glitched("g").exit, Exit::Glitched);
         assert_eq!(Failure::usage("u").exit, Exit::Usage);
         assert_eq!(Failure::error("e").exit, Exit::Error);

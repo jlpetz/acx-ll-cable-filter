@@ -13,31 +13,45 @@
 //!
 //! [`capture_endpoints`] reads our capture endpoints alone, active or disabled, without their sessions: what `mic variant`
 //! shows, and what its switch waits for (`variant::check_mics`).
+//!
+//! Which microphone an endpoint is, and which device it's on, come from the KS filter it's connected to ([`identify`]): the
+//! filter's device interface path holds the device's instance ID (`root#media#0004`) and the circuit's reference string
+//! (`microphone0` the low-latency one, `microphone1` the call one), which hold whatever the endpoint is named. Windows numbers
+//! a second device's names ("Microphone (2- AudioCodec Device)"), and the user may rename an endpoint in the Sound panel;
+//! only when the filter can't be read does the name decide ([`mic_of`]). The endpoint is ours by its name: a rename in the
+//! Sound panel changes the part before the brackets, not the device's name in them.
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::S_OK;
+use windows::Win32::Foundation::{PROPERTYKEY, S_OK};
 use windows::Win32::Media::Audio::{
     AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
-    IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    IAudioSessionControl2, IAudioSessionManager2, IDeviceTopology, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, STGM_READ,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
-use windows::core::{Interface, Owned, PWSTR};
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::{GUID, Interface, Owned, PWSTR};
 
-use crate::variant::DEVICE_NAME;
+use crate::variant::{CALL_MICROPHONE_FILTER, DEVICE_NAME, MICROPHONE_FILTER};
 use crate::win_error::WinError;
 
-/// Which of our microphones an endpoint is, by its name.
+/// The endpoint's copy of the KS filter path it's connected to, in its property store: not documented; seen on Windows
+/// build 26100 as `{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0`, on a disabled endpoint too.
+/// [`identify`] reads it only when the documented route (the endpoint's device topology) gives nothing.
+const PKEY_ENDPOINT_FILTER: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x233164c8_1b2c_4c7d_bc68_b671687a2567), pid: 1 };
+
+/// Which of our microphones an endpoint is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mic {
     /// "Microphone (AudioCodec Device)": IAudioClient3's small periods (2.67-10 ms), for apps that ask for them.
     LowLatency,
     /// "Call Microphone (AudioCodec Device)": a 5 ms default period, for apps that ask for none (call apps).
     Call,
-    /// An AudioCodec endpoint by another name (renamed in the Sound panel, say).
+    /// Another AudioCodec endpoint: one whose filter isn't either microphone's, or, without its filter, one by another name
+    /// (renamed in the Sound panel, say).
     Other,
 }
 
@@ -52,7 +66,8 @@ impl Mic {
     }
 }
 
-/// An endpoint's [`Mic`], from its friendly name.
+/// An endpoint's [`Mic`], from its friendly name (when its filter can't be read: [`identify`]). A numbered name
+/// ("Microphone (2- AudioCodec Device)") is still the microphone; a renamed one is [`Mic::Other`].
 pub fn mic_of(endpoint_name: &str) -> Mic {
     let name = endpoint_name.trim_start().to_ascii_lowercase();
     if name.starts_with("call microphone") {
@@ -67,6 +82,44 @@ pub fn mic_of(endpoint_name: &str) -> Mic {
 /// Whether an endpoint is one of the driver's (its name has "AudioCodec Device" in it, any case).
 pub fn is_ours(endpoint_name: &str) -> bool {
     endpoint_name.to_ascii_lowercase().contains(&DEVICE_NAME.to_ascii_lowercase())
+}
+
+/// The microphone a KS filter's reference string names: the driver's capture circuits (`microphone0`, `microphone1`; any
+/// case, as the path has them in lower case).
+pub fn mic_of_filter(reference: &str) -> Mic {
+    if reference.eq_ignore_ascii_case(MICROPHONE_FILTER) {
+        Mic::LowLatency
+    } else if reference.eq_ignore_ascii_case(CALL_MICROPHONE_FILTER) {
+        Mic::Call
+    } else {
+        Mic::Other
+    }
+}
+
+/// A KS filter's device interface path, with or without DeviceTopology's `{2}.` before it
+/// (`{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0`), as its device's instance ID
+/// (`root\media\0004`, in the path's case) and its reference string (`microphone0`; empty if it has none).
+pub fn parse_filter(path: &str) -> Option<(String, String)> {
+    let path = path.trim();
+    let path = match path.strip_prefix('{') {
+        Some(rest) => rest.split_once("}.")?.1,
+        None => path,
+    };
+    let rest = path.strip_prefix(r"\\?\")?;
+    // The instance ID's `\` are `#` in the path, so the first `\` starts the reference string
+    let (head, reference) = rest.split_once('\\').unwrap_or((rest, ""));
+    let class = head.rfind("#{")?;
+    let instance = head[..class].replace('#', r"\");
+    (!instance.is_empty()).then(|| (instance, reference.to_string()))
+}
+
+/// An endpoint's microphone and the instance ID of the device it's on, from the KS filter it's connected to (`filter`, a
+/// device interface path), or, if that wasn't read, its microphone by its name and no device.
+pub fn identify(filter: Option<&str>, name: &str) -> (Mic, Option<String>) {
+    match filter.and_then(parse_filter) {
+        Some((instance, reference)) => (mic_of_filter(&reference), Some(instance)),
+        None => (mic_of(name), None),
+    }
 }
 
 /// One of our capture endpoints and the sessions on it.
@@ -242,13 +295,19 @@ pub fn list() -> Result<Vec<Endpoint>, WinError> {
 pub struct CaptureEndpoint {
     /// `{0.0.1.00000000}.{...}`: a new device's endpoints get new ones.
     pub id: String,
-    /// "Call Microphone (AudioCodec Device)".
+    /// "Call Microphone (AudioCodec Device)", as Windows names it now (numbered, or renamed in the Sound panel).
     pub name: String,
     /// Active; otherwise disabled (in the Sound panel's Recording tab).
     pub active: bool,
+    /// Which microphone it is ([`identify`]).
+    pub mic: Mic,
+    /// The instance ID of the device it's on (`root\media\0004`), if its filter was read ([`identify`]).
+    pub device: Option<String>,
 }
 
-/// Our capture endpoints, active or disabled (an absent device's aren't listed). On a thread of its own, as [`list`].
+/// Our capture endpoints, active or disabled (an absent device's aren't listed). On a thread of its own, as [`list`]. Any
+/// user may call it (the enumeration, the property store and the device topology read nothing an administrator alone may:
+/// to be confirmed live from a standard user's prompt).
 pub fn capture_endpoints() -> Result<Vec<CaptureEndpoint>, WinError> {
     on_mta_thread(capture_endpoints_on_this_thread)
 }
@@ -285,25 +344,47 @@ impl Drop for Mta {
 
 fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
     let mut out = Vec::new();
-    for (device, name) in our_capture_endpoints(DEVICE_STATE_ACTIVE)? {
-        out.push(Endpoint { id: device_id(&device)?, mic: mic_of(&name), sessions: sessions_of(&device)?, name });
+    for ours in our_capture_endpoints(DEVICE_STATE_ACTIVE)? {
+        // One that went away meanwhile isn't listed
+        let Ok(id) = device_id(&ours.device) else { continue };
+        let (mic, _) = ours.identify();
+        out.push(Endpoint { id, mic, sessions: sessions_of(&ours.device)?, name: ours.name });
     }
     Ok(out)
 }
 
 fn capture_endpoints_on_this_thread() -> Result<Vec<CaptureEndpoint>, WinError> {
     let mut out = Vec::new();
-    for (device, name) in our_capture_endpoints(DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0))? {
-        // One that went away meanwhile isn't listed
+    for ours in our_capture_endpoints(DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0))? {
+        // One that went away meanwhile isn't listed, as one whose name couldn't be read isn't
         // SAFETY: a live device.
-        let Ok(state) = (unsafe { device.GetState() }) else { continue };
-        out.push(CaptureEndpoint { id: device_id(&device)?, name, active: state == DEVICE_STATE_ACTIVE });
+        let Ok(state) = (unsafe { ours.device.GetState() }) else { continue };
+        let Ok(id) = device_id(&ours.device) else { continue };
+        let (mic, device) = ours.identify();
+        out.push(CaptureEndpoint { id, active: state == DEVICE_STATE_ACTIVE, mic, device, name: ours.name });
     }
     Ok(out)
 }
 
+/// One of our endpoints, as [`our_capture_endpoints`] reads it.
+struct Ours {
+    device: IMMDevice,
+    name: String,
+    /// The filter path the endpoint's property store keeps ([`PKEY_ENDPOINT_FILTER`]), if it has one.
+    cached_filter: Option<String>,
+}
+
+impl Ours {
+    /// Its microphone and device ([`identify`]): by the filter its device topology is connected to, else the property
+    /// store's copy, else by its name.
+    fn identify(&self) -> (Mic, Option<String>) {
+        let filter = connected_filter(&self.device).filter(|p| parse_filter(p).is_some()).or_else(|| self.cached_filter.clone());
+        identify(filter.as_deref(), &self.name)
+    }
+}
+
 /// Our capture endpoints in `states`, with their names. COM must be initialised on this thread.
-fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<(IMMDevice, String)>, WinError> {
+fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
     // SAFETY: COM is initialised on this thread (the caller's); a plain in-process creation.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
@@ -317,12 +398,28 @@ fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<(IMMDevice, String)
         // SAFETY: a live collection and an index below its count.
         let device = unsafe { endpoints.Item(i) }.map_err(WinError::of("IMMDeviceCollection::Item"))?;
         // An endpoint that went away meanwhile, or whose name can't be read, isn't ours to list
-        let Ok(name) = friendly_name(&device) else { continue };
+        // SAFETY: a live device; read access only.
+        let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
+        let Ok(name) = string_property(&store, &PKEY_Device_FriendlyName) else { continue };
         if is_ours(&name) {
-            out.push((device, name));
+            let cached_filter = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
+            out.push(Ours { device, name, cached_filter });
         }
     }
     Ok(out)
+}
+
+/// The device interface path of the KS filter an endpoint is connected to: its device topology's one connector, and the
+/// device on the other side (`IConnector::GetDeviceIdConnectedTo`). `None` if any step fails (a disabled endpoint's may:
+/// to be confirmed live), or the path is empty.
+fn connected_filter(device: &IMMDevice) -> Option<String> {
+    // SAFETY: a live device; no activation parameters.
+    let topology: IDeviceTopology = unsafe { device.Activate(CLSCTX_ALL, None) }.ok()?;
+    // SAFETY: a live topology; an endpoint's has a single connector, index 0.
+    let connector = unsafe { topology.GetConnector(0) }.ok()?;
+    // SAFETY: a live connector; the string is COM's, freed once by take_string.
+    let id = take_string(unsafe { connector.GetDeviceIdConnectedTo() }.ok()?);
+    (!id.is_empty()).then_some(id)
 }
 
 /// A string COM handed us, freed with CoTaskMemFree.
@@ -341,11 +438,10 @@ fn device_id(device: &IMMDevice) -> Result<String, WinError> {
     Ok(take_string(id))
 }
 
-fn friendly_name(device: &IMMDevice) -> Result<String, WinError> {
-    // SAFETY: a live device; read access only.
-    let store = unsafe { device.OpenPropertyStore(STGM_READ) }.map_err(WinError::of("IMMDevice::OpenPropertyStore"))?;
-    // SAFETY: a live store; the key is a constant.
-    let mut value = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.map_err(WinError::of("IPropertyStore::GetValue"))?;
+/// A string property of an endpoint's (an empty string for an empty value).
+fn string_property(store: &IPropertyStore, key: &PROPERTYKEY) -> Result<String, WinError> {
+    // SAFETY: a live store; the key outlives the call.
+    let mut value = unsafe { store.GetValue(key) }.map_err(WinError::of("IPropertyStore::GetValue"))?;
     // SAFETY: `value` is the PROPVARIANT the store returned, converted, then cleared once.
     let text = unsafe { PropVariantToStringAlloc(&value) };
     // SAFETY: as above.
@@ -455,8 +551,42 @@ mod tests {
         assert!(!is_ours("CABLE Output (VB-Audio Virtual Cable)") && !is_ours("Microphone (USB Audio Device)"));
         assert_eq!(mic_of(crate::variant::MICROPHONE), Mic::LowLatency);
         assert_eq!(mic_of(crate::variant::CALL_MICROPHONE), Mic::Call);
+        // Windows numbers a second device's names in the brackets
+        assert!(is_ours("Microphone (2- AudioCodec Device)"));
+        assert_eq!(mic_of("Microphone (2- AudioCodec Device)"), Mic::LowLatency);
+        assert_eq!(mic_of("Call Microphone (2- AudioCodec Device)"), Mic::Call);
         assert_eq!(mic_of("2- Microphone (AudioCodec Device)"), Mic::Other);
         assert_eq!(mic_of("Studio mic (AudioCodec Device)"), Mic::Other);
+    }
+
+    /// Astra's review: the switch matched endpoints by their exact names, so a numbered or renamed one never counted. The KS
+    /// filter an endpoint is connected to says which microphone it is, and on which device.
+    #[test]
+    fn an_endpoint_is_known_by_its_filter_whatever_its_name() {
+        // As the endpoint's property store has it (build 26100), and as GetDeviceIdConnectedTo may give it, without the prefix
+        let low = r"{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0";
+        assert_eq!(parse_filter(low), Some((r"root\media\0004".into(), "microphone0".into())));
+        let call = r"\\?\ROOT#MEDIA#0012#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\Microphone1";
+        assert_eq!(parse_filter(call), Some((r"ROOT\MEDIA\0012".into(), "Microphone1".into())));
+        assert_eq!(
+            parse_filter(r" \\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196} "),
+            Some((r"root\media\0004".into(), String::new())),
+            "no reference string"
+        );
+        for bad in ["", r"ROOT\MEDIA\0004", r"{1}.ROOT\MEDIA\0004", "{2}.", r"{2\\?\root#media#0004#{x}\a", r"\\?\#{x}\a", r"\\?\root\a"] {
+            assert_eq!(parse_filter(bad), None, "{bad:?}");
+        }
+        assert_eq!(mic_of_filter("microphone0"), Mic::LowLatency);
+        assert_eq!(mic_of_filter("MICROPHONE1"), Mic::Call);
+        assert_eq!(mic_of_filter("speaker0"), Mic::Other);
+        assert_eq!(mic_of_filter(""), Mic::Other);
+        // The filter decides, whatever the name: renamed, numbered, or another microphone's
+        assert_eq!(identify(Some(low), "Studio mic (AudioCodec Device)"), (Mic::LowLatency, Some(r"root\media\0004".into())));
+        assert_eq!(identify(Some(call), crate::variant::MICROPHONE), (Mic::Call, Some(r"ROOT\MEDIA\0012".into())));
+        // Without one that parses, the name, and no device
+        assert_eq!(identify(None, "Call Microphone (2- AudioCodec Device)"), (Mic::Call, None));
+        assert_eq!(identify(Some("garbage"), crate::variant::MICROPHONE), (Mic::LowLatency, None));
+        assert_eq!(identify(None, "Studio mic (AudioCodec Device)"), (Mic::Other, None));
     }
 
     #[test]

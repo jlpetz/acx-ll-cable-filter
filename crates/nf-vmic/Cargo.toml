@@ -23,10 +23,12 @@ wasapi.workspace = true
 # CM_Get_DevNode_Status), Devices_Properties (the driver's INF and version), System_Diagnostics_Debug and System_SystemInformation
 # (SetupQueryInfOriginalFileInformationW's and SetupGetInfDriverStoreLocationW's signatures), Media_Audio, Com,
 # UI_Shell_PropertiesSystem and Devices_FunctionDiscovery (the endpoints' names and IAudioSessionManager2), System_Threading
-# (OpenProcess, QueryFullProcessImageNameW).
+# (OpenProcess, QueryFullProcessImageNameW). The switch's lock (variant.rs): System_Threading (the private namespace and its
+# mutex), Security (the Administrators SID), Security_Authorization (their security descriptor, from SDDL).
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Memory",

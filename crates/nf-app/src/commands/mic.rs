@@ -2,22 +2,26 @@
 //! the driver's variant (both microphones, the call one only, the low-latency one only). The work is nf-vmic's
 //! (`sessions`, `variant`); this is the printing and the elevation.
 //!
-//! `mic variant X`, not elevated, first reads what's installed (any user may) and does nothing if X is already the only
-//! variant there, working on the driver store's newest AudioCodec package (one on an older package, such as the
-//! single-microphone driver's, which had `ROOT\AudioCodec` too, is re-created). Otherwise it relaunches itself elevated, one
-//! UAC prompt, as `mic variant X --elevated-helper --report PIPE`, waits, and exits with the helper's code (3 if the prompt
-//! was declined). The helper reports each step through the named pipe (report_pipe.rs) and this side prints them as they
-//! come. Elevated already (an administrator terminal), it switches in-process. Either way the switch (nf-vmic's) holds a
-//! system-wide lock, and succeeds only once the new device works on the chosen package and Windows has made its
-//! microphones. The helper never opens or attaches a console (main.rs); one that finds itself not elevated (UAC turned off)
-//! stops with exit code 4 instead of relaunching itself, as setup-large-pages' helper does.
+//! `mic variant X`, not elevated, first reads what's installed and the microphones Windows has (any user may: to be
+//! confirmed live from a standard user's prompt), and does nothing if X is already the only variant there, working on the
+//! driver store's newest AudioCodec package (one on an older package, such as the single-microphone driver's, which had
+//! `ROOT\AudioCodec` too, is re-created), with each of X's microphones (by kind, whatever it's named). A microphone missing
+//! there is one that package doesn't have (the single-microphone package alone in the driver store): it says so and exits 2,
+//! with no prompt. Otherwise it relaunches itself elevated, one UAC prompt, as `mic variant X --elevated-helper --report
+//! PIPE`, waits, and exits with the helper's code (3 if the prompt was declined). The helper reports each step through the
+//! named pipe (report_pipe.rs) and this side prints them as they come. Elevated already (an administrator terminal), it
+//! switches in-process. Either way the switch (nf-vmic's) holds a system-wide lock, checks a device it keeps the same way,
+//! and succeeds only once the new device works on the chosen package and Windows has made its microphones; one Windows
+//! must restart to finish exits 7, unchecked (ours, the owner's to confirm). The helper never opens or attaches a console
+//! (main.rs); one that finds itself not elevated (UAC turned off) stops with exit code 4 instead of relaunching itself, as
+//! setup-large-pages' helper does.
 
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use nf_mem::privilege::{self, ElevationError};
 use nf_vmic::sessions::{self, CaptureEndpoint, Endpoint, Fit, Mic, Session};
-use nf_vmic::variant::{self, Health, OurDevice, Outcome, Variant};
+use nf_vmic::variant::{self, Health, OurDevice, Outcome, SwitchError, Variant};
 use nf_vmic::win_error::WinError;
 
 use crate::cli::{HELPER_FLAG, MicVariantArgs, REPORT_FLAG};
@@ -157,8 +161,27 @@ fn format_variant(devices: &[OurDevice], mics: &Result<Vec<CaptureEndpoint>, Win
             let _ = writeln!(s, "Variant: {}, {} ({})", d.variant.arg(), d.variant.describe(), d.variant.hardware_id());
             let _ = writeln!(s, "  {}", d.describe());
             let _ = writeln!(s, "  ({})", d.package_note());
-            if d.is_current() {
-                let _ = writeln!(s, "  Microphones: {}", d.variant.microphones_text());
+            if d.is_current() && d.health == Health::Working {
+                // What Windows has of them, by kind: the newest package may still lack one (the single-microphone one's)
+                match variant::check_kept(d.variant, d, mics) {
+                    Ok(check) => {
+                        let names = variant::quoted(check.found.iter().map(|f| f.name.as_str()));
+                        let _ = writeln!(s, "  Microphones: {names}");
+                        for line in variant::found_lines(&check).iter().filter(|l| l.starts_with("  warning: ")) {
+                            let _ = writeln!(s, "{line}");
+                        }
+                    }
+                    Err(SwitchError::PackageLacks { missing, .. }) => {
+                        let _ =
+                            writeln!(s, "  Missing: {}: {}", variant::mics_text(&missing), variant::package_advice(&missing, d.variant));
+                    }
+                    // Read below
+                    Err(_) => {
+                        let _ = writeln!(s, "  The variant's microphones: {}", d.variant.microphones_text());
+                    }
+                }
+            } else if d.is_current() {
+                let _ = writeln!(s, "  The variant's microphones, once it works: {}", d.variant.microphones_text());
             } else if matches!(d.newest, Ok(Some(_))) {
                 // An older package (the single-microphone driver's, say) may not have them
                 let _ = writeln!(s, "  Microphones with the newest package: {}", d.variant.microphones_text());
@@ -213,13 +236,17 @@ fn switch(target: Variant, report: Option<&str>) -> Result<(), Failure> {
     let result = variant::switch(target, &mut step);
     match result {
         Ok(Outcome::Nothing) => Ok(()),
-        Ok(Outcome::Switched { restart }) => {
-            step(if restart {
-                "Done, but restart Windows to finish."
-            } else {
-                "Done: the device works on the newest package, with its microphones."
-            });
+        Ok(Outcome::Switched) => {
+            step("Done: the device works on the newest package, with its microphones.");
             Ok(())
+        }
+        Ok(Outcome::RestartPending { device }) => {
+            let message = restart_message(target, &device);
+            // As an error's: the caller reads it from the report, and gets the code
+            if report.is_some() {
+                step(&message);
+            }
+            Err(Failure::restart_pending(message))
         }
         Err(e) => {
             let message = format!("The switch to {} stopped: {e}", target.arg());
@@ -232,12 +259,28 @@ fn switch(target: Variant, report: Option<&str>) -> Result<(), Failure> {
     }
 }
 
+/// A switch Windows must restart to finish (exit code 7; ours, the owner's to confirm).
+fn restart_message(target: Variant, device: &str) -> String {
+    format!(
+        "The switch to {} isn't finished: Windows needs a restart to finish installing {device}. Restart Windows, then run \
+         `noise-filter mic variant` to check its microphones.",
+        target.arg()
+    )
+}
+
 /// Not elevated: relaunches itself elevated as the helper, prints its report, and exits with its code.
 fn elevate(target: Variant) -> Result<(), Failure> {
     let devices = read_devices()?;
-    if variant::plan(&devices, target).is_nothing() {
-        say!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id());
-        return Ok(());
+    match nothing_to_do(&devices, target, &sessions::capture_endpoints()) {
+        Kept::Nothing(lines) => {
+            for line in lines {
+                say!("{line}");
+            }
+            return Ok(());
+        }
+        Kept::Lacks(e) => return Err(Failure::error(format!("The switch to {} stopped: {e}", target.arg()))),
+        Kept::Unchecked(e) => say!("note: the microphones couldn't be read here ({e}); the elevated switch reads them again."),
+        Kept::No => {}
     }
     if let Some(note) = upgrade_note(&devices, target) {
         say!("{note}");
@@ -278,6 +321,35 @@ fn elevate(target: Variant) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Whether a switch to `target` has nothing to do, before any prompt ([`nothing_to_do`]).
+#[derive(Debug, PartialEq)]
+enum Kept {
+    /// The target is already the only variant there, on the newest package, with its microphones: what to say.
+    Nothing(Vec<String>),
+    /// It would be, but Windows lacks one of its microphones: its package doesn't have it, which a switch can't mend.
+    Lacks(SwitchError),
+    /// It would be, but the microphones couldn't be read here: the elevated switch checks them.
+    Unchecked(WinError),
+    /// The switch has something to do.
+    No,
+}
+
+/// The not-elevated side's check: nothing to do only when the plan keeps everything and the device kept has the variant's
+/// microphones (`mics`, as Windows has them; the single-microphone package alone in the driver store has no Call Microphone).
+fn nothing_to_do(devices: &[OurDevice], target: Variant, mics: &Result<Vec<CaptureEndpoint>, WinError>) -> Kept {
+    let plan = variant::plan(devices, target);
+    let Some(k) = plan.keep.filter(|_| plan.is_nothing()) else { return Kept::No };
+    match variant::check_kept(target, &devices[k], mics) {
+        Ok(check) => {
+            let mut lines = vec![format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id())];
+            lines.extend(variant::found_lines(&check));
+            Kept::Nothing(lines)
+        }
+        Err(SwitchError::NoEndpoints(e)) => Kept::Unchecked(e),
+        Err(e) => Kept::Lacks(e),
+    }
+}
+
 /// Why a switch to the variant already there goes ahead: its device works, but not on the newest package (an upgrade).
 fn upgrade_note(devices: &[OurDevice], target: Variant) -> Option<String> {
     let d = devices.iter().find(|d| d.variant == target && d.health == Health::Working && !d.is_current())?;
@@ -296,6 +368,10 @@ fn helper_result(code: u32) -> Result<(), Failure> {
             log()
         ))),
         c if c == u32::from(Exit::NotElevated.code()) => Err(Failure::not_elevated(NOT_ELEVATED)),
+        c if c == u32::from(Exit::RestartPending.code()) => Err(Failure::restart_pending(
+            "The elevated switch isn't finished (exit code 7): Windows needs a restart to finish installing the new device. \
+             Restart Windows, then run `noise-filter mic variant` to check its microphones.",
+        )),
         c => Err(Failure::error(format!("The elevated switch stopped unexpectedly (exit code 0x{c:X}). The log may say why: {}", log()))),
     }
 }
@@ -400,8 +476,20 @@ mod tests {
         OurDevice { inf: Some("oem3.inf".into()), driver_version: Some("0.9.0.300".into()), ..dev(variant, Health::Working) }
     }
 
+    /// One of our endpoints on the device [`dev`] makes (its filter path has the instance ID in lower case), of the kind its
+    /// name says.
     fn ep(name: &str, active: bool) -> CaptureEndpoint {
-        CaptureEndpoint { id: format!("{{0.0.1.00000000}}.{{{name}}}"), name: name.into(), active }
+        ep_as(name, sessions::mic_of(name), active)
+    }
+
+    fn ep_as(name: &str, mic: Mic, active: bool) -> CaptureEndpoint {
+        CaptureEndpoint {
+            id: format!("{{0.0.1.00000000}}.{{{name}}}"),
+            name: name.into(),
+            active,
+            mic,
+            device: Some(r"root\media\0003".into()),
+        }
     }
 
     #[test]
@@ -424,10 +512,19 @@ mod tests {
         assert!(both.contains("Microphones: \"Microphone (AudioCodec Device)\" and \"Call Microphone (AudioCodec Device)\""));
         assert!(
             both.contains(
+                "\n  warning: \"Call Microphone (AudioCodec Device)\" is disabled in the Sound panel, so apps don't see it: enable it"
+            ),
+            "{both}"
+        );
+        assert!(
+            both.contains(
                 "Windows has: \"Microphone (AudioCodec Device)\", \"Call Microphone (AudioCodec Device)\" (disabled in the Sound panel)"
             ),
             "{both}"
         );
+        // Not working: what it would have
+        let off = format_variant(&[dev(Variant::Call, Health::Problem(22))], &no_mics);
+        assert!(off.contains("  The variant's microphones, once it works: \"Call Microphone (AudioCodec Device)\""), "{off}");
         let two = format_variant(&[dev(Variant::Both, Health::Working), dev(Variant::LowLatency, Health::Problem(28))], &no_mics);
         assert!(two.starts_with("2 AudioCodec devices are installed:\n"), "{two}");
         assert!(two.contains("no driver installed (Code 28)"));
@@ -479,6 +576,78 @@ mod tests {
         assert_eq!(upgrade_note(&[old(Variant::Both)], Variant::Call), None, "another variant: a plain switch");
         assert_eq!(upgrade_note(&[OurDevice { health: Health::Problem(22), ..old(Variant::Both) }], Variant::Both), None);
         assert!(!variant::plan(&[old(Variant::Both)], Variant::Both).is_nothing(), "the caller elevates for it");
+        assert_eq!(nothing_to_do(&[old(Variant::Both)], Variant::Both, &Ok(vec![ep(MICROPHONE, true)])), Kept::No);
+    }
+
+    /// Astra's review: with the single-microphone package alone in the driver store, its device runs the newest package, so
+    /// `mic variant both` said there was nothing to do and `mic variant` listed both microphones.
+    #[test]
+    fn a_device_without_the_variants_microphones_says_so() {
+        let single = Ok(vec![ep(MICROPHONE, true)]);
+        let text = format_variant(&[dev(Variant::Both, Health::Working)], &single);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], "  (it runs the newest AudioCodec package in the driver store)");
+        assert!(
+            lines[3].starts_with(
+                "  Missing: \"Call Microphone (AudioCodec Device)\": the package it runs doesn't have it (the single-microphone \
+                 driver's has the Microphone alone). Add the package with the three variants to the driver store"
+            ),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[3].ends_with("then run `noise-filter mic variant both`: it re-creates the device with that package."),
+            "{}",
+            lines[3]
+        );
+        assert_eq!(lines[4], "Windows has: \"Microphone (AudioCodec Device)\"");
+
+        // No prompt for it: the switch can't mend it, so it says so and fails
+        let Kept::Lacks(e) = nothing_to_do(&[dev(Variant::Both, Health::Working)], Variant::Both, &single) else { panic!() };
+        assert!(e.to_string().starts_with(r"ROOT\MEDIA\0003 works on the driver store's newest AudioCodec package"), "{e}");
+        // The low-latency variant has what it needs
+        let Kept::Nothing(lines) = nothing_to_do(&[dev(Variant::LowLatency, Health::Working)], Variant::LowLatency, &single) else {
+            panic!()
+        };
+        assert_eq!(lines, [
+            r"Already the low-latency microphone only (ROOT\AudioCodecLowLatency) on the newest package: nothing to do.",
+            "  the Microphone: \"Microphone (AudioCodec Device)\"",
+        ]);
+        // Unread here: the elevated switch checks
+        let unread = Err(WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 });
+        assert!(matches!(nothing_to_do(&[dev(Variant::Both, Health::Working)], Variant::Both, &unread), Kept::Unchecked(_)));
+        // Something to do
+        assert_eq!(nothing_to_do(&[dev(Variant::Both, Health::Working)], Variant::Call, &single), Kept::No);
+        assert_eq!(nothing_to_do(&[], Variant::Call, &single), Kept::No);
+    }
+
+    /// Astra's review: Windows' numbered names and the user's own never counted. By kind, with the name Windows has.
+    #[test]
+    fn the_microphones_are_shown_by_the_names_they_have() {
+        let named =
+            Ok(vec![ep_as("Studio mic (2- AudioCodec Device)", Mic::LowLatency, true), ep("Call Microphone (2- AudioCodec Device)", true)]);
+        let text = format_variant(&[dev(Variant::Both, Health::Working)], &named);
+        assert!(
+            text.contains("\n  Microphones: \"Studio mic (2- AudioCodec Device)\" and \"Call Microphone (2- AudioCodec Device)\"\n"),
+            "{text}"
+        );
+        let Kept::Nothing(lines) = nothing_to_do(&[dev(Variant::Both, Health::Working)], Variant::Both, &named) else { panic!() };
+        assert_eq!(&lines[1..], [
+            "  the Microphone: \"Studio mic (2- AudioCodec Device)\"",
+            "  the Call Microphone: \"Call Microphone (2- AudioCodec Device)\"",
+        ]);
+    }
+
+    #[test]
+    fn a_switch_windows_must_restart_to_finish_isnt_done() {
+        let text = restart_message(Variant::Call, r"ROOT\MEDIA\0004");
+        assert_eq!(
+            text,
+            r"The switch to call isn't finished: Windows needs a restart to finish installing ROOT\MEDIA\0004. Restart Windows, then run `noise-filter mic variant` to check its microphones."
+        );
+        let e = helper_result(7).unwrap_err();
+        assert_eq!(e.exit, Exit::RestartPending);
+        assert!(e.message.starts_with("The elevated switch isn't finished (exit code 7): Windows needs a restart"), "{}", e.message);
     }
 
     /// As setup-large-pages' (app-privilege F3): a helper that isn't elevated stops; a user's own run asks for elevation.

@@ -12,45 +12,59 @@
 //!   (the package must have been added to it, by `pnputil /add-driver` or the installer).
 //!
 //! # The switch, in order
-//! 0. Take the lock, `Global\noise-filter-mic-variant` (a named mutex), held to the end, so two switches at once (two prompts
-//!    approved, or an administrator's terminal beside the helper) can't both create a device. A second switch waits up to
-//!    [`LOCK_WAIT`], then stops; one whose holder's process ended mid-switch (an abandoned mutex) goes on, reading afresh.
+//! 0. Take the lock ([`LOCK`]), held to the end, so two switches at once (two prompts approved, or an administrator's terminal
+//!    beside the helper) can't both create a device: a mutex in a private namespace bounded by BUILTIN\Administrators
+//!    (`CreateBoundaryDescriptorW` + `AddSIDToBoundaryDescriptor`, then `CreatePrivateNamespaceW`, or `OpenPrivateNamespaceW`
+//!    when another switch made it), whose security descriptor lets Administrators and SYSTEM in. A process that isn't an
+//!    elevated administrator's can neither make nor open it, so it can't hold the lock to block the switches, as any process
+//!    could a `Global\` mutex; it gets [`SwitchError::LockDenied`] itself. A second switch waits up to [`LOCK_WAIT`], then
+//!    stops; one whose holder's process ended mid-switch (an abandoned mutex) goes on, reading afresh.
 //! 1. Find our devices: every present device (`SetupDiGetClassDevsW`, all classes) whose `SPDRP_HARDWAREID` lists one of the
-//!    three IDs, and for each, the newest of our packages compatible with it (as in step 2, on the device itself). A device of
+//!    three IDs, and for each, the newest of our packages compatible with it (as in step 3, on the device itself). A device of
 //!    the target variant is kept only if it is working and runs that package (its `DEVPKEY_Device_DriverInfPath` is the
 //!    package's `oemNN.inf` and its `DEVPKEY_Device_DriverVersion` the package's). One on an older package is re-created: the
 //!    single-microphone driver before the second capture circuit (f2e7d15) had `ROOT\AudioCodec` too, so a working old
 //!    install reads as `both`. Re-created rather than updated in place, because Windows makes an endpoint, and reads the
 //!    properties the INF gives it (the call microphone's default period), only when it creates it (TODO 22: of the changes
 //!    tried, only uninstalling and reinstalling applied a new period), and a driver update keeps the device and its endpoints.
-//! 2. The new device first, not yet registered (`SetupDiCreateDeviceInfoW` under class MEDIA with `DICD_GENERATE_ID`, as devcon
-//!    does: `ROOT\MEDIA\NNNN`; the hardware ID by `SetupDiSetDeviceRegistryPropertyW`), and its driver: the compatible-driver
-//!    search over the driver store (`SetupDiBuildDriverInfoList(SPDIT_COMPATDRIVER)`), which is how Plug and Play itself
-//!    matches a hardware ID to an INF, keeping the nodes whose INF (`C:\Windows\INF\oemNN.inf`) has the original name
-//!    `audiocodec.inf` (`SetupGetInfInformationW` + `SetupQueryInfOriginalFileInformationW`), the newest by date, then version.
-//!    So a missing driver stops the switch before anything is removed. An element that isn't registered yet is a phantom:
-//!    destroying the set deletes it.
-//! 3. Note our capture endpoints (active or disabled), then remove the old devices (`DiUninstallDevice`, what
-//!    `pnputil /remove-device` does). If Windows needs a restart to finish a removal, stop there: the old driver may still be
-//!    loaded. The new device is registered only after this, so that its endpoints are made while the old ones are gone, and
-//!    the driver never runs twice.
-//! 4. Register the new device (`SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`) and install the chosen driver on it
+//! 2. A device kept is checked once, before anything changes ([`check_kept`]): it has been working, so Windows has made its
+//!    endpoints, and a microphone of the variant without one is a microphone its package doesn't have (the newest package in
+//!    the driver store may be the single-microphone driver's, as when it is the only one there). That stops the switch
+//!    ([`SwitchError::PackageLacks`]), the nothing-to-do one too; a microphone disabled in the Sound panel passes, with a
+//!    warning (ours, the owner's to confirm). With nothing else to do, the switch ends here.
+//! 3. Note our capture endpoints (active or disabled) if a device is to be created, then the new device, not yet registered
+//!    (`SetupDiCreateDeviceInfoW` under class MEDIA with `DICD_GENERATE_ID`, as devcon does: `ROOT\MEDIA\NNNN`; the hardware ID
+//!    by `SetupDiSetDeviceRegistryPropertyW`), and its driver: the compatible-driver search over the driver store
+//!    (`SetupDiBuildDriverInfoList(SPDIT_COMPATDRIVER)`), which is how Plug and Play itself matches a hardware ID to an INF,
+//!    keeping the nodes whose INF (`C:\Windows\INF\oemNN.inf`) has the original name `audiocodec.inf`
+//!    (`SetupGetInfInformationW` + `SetupQueryInfOriginalFileInformationW`), the newest by date, then version. So endpoints
+//!    that can't be read, or a missing driver, stop the switch before anything is removed. An element that isn't registered
+//!    yet is a phantom: destroying the set deletes it.
+//! 4. Remove the old devices (`DiUninstallDevice`, what `pnputil /remove-device` does). If Windows needs a restart to finish a
+//!    removal, stop there: the old driver may still be loaded. The new device is registered only after this, so that its
+//!    endpoints are made while the old ones are gone, and the driver never runs twice.
+//! 5. Register the new device (`SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`) and install the chosen driver on it
 //!    (`DiInstallDevice`, documented for a driver already in the driver store). `UpdateDriverForPlugAndPlayDevicesW`, devcon's
 //!    call, wants the package's own folder rather than a system one (its documentation), and would also touch every other
 //!    device with that hardware ID. Then up to [`DRIVER_WAIT`] for the device to be working, and [`judge_install`]: it must
 //!    be working on the chosen package (its INF and version, as in step 1), whatever DiInstallDevice returned, as Plug and Play
 //!    may have put a driver on it by itself meanwhile. Otherwise it is removed again, so no device without the right driver is
-//!    left to read as that variant, and the switch fails; unless Windows asked for a restart to finish, which leaves it.
-//! 5. Up to [`MICS_WAIT`] for Windows to make the variant's microphones, by name ([`check_mics`]): each there (active, or
-//!    disabled in the Sound panel) and not one of the endpoints noted in step 3, and no other endpoint of ours still active
-//!    (a removed device's, going). A microphone that doesn't come is an error; another endpoint still there is reported.
-//!    A switch that only removes devices (it keeps one) checks the same, with nothing noted.
+//!    left to read as that variant, and the switch fails. If Windows asked for a restart to finish, the device is left for it
+//!    and the switch ends there ([`Outcome::RestartPending`]), its microphones unchecked.
+//! 6. Up to [`MICS_WAIT`] for Windows to make the variant's microphones ([`check_mics`]): each there by its kind (the KS
+//!    filter its endpoint is connected to, whatever the endpoint is named: [`sessions::identify`]), on the new device (or the
+//!    one kept), active or disabled in the Sound panel, and not one of the endpoints noted in step 3; and no other endpoint of
+//!    ours still active (a removed device's, going). A microphone that doesn't come is an error; another endpoint still there
+//!    is reported.
 //!
-//! A failure after the old devices are removed leaves none: the steps say which were removed, and a second run of the switch
-//! creates the device afresh.
+//! What a failure leaves: before step 4, nothing changed. One in step 4 leaves the devices not yet removed (the steps say
+//! which were), one in step 5 none of ours (the device that didn't install is removed again); a second run of the switch
+//! creates the device afresh. One in step 6 leaves the new device, working on the chosen package, without the microphones
+//! that didn't come.
 
 use std::fmt;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -65,15 +79,21 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Devices::Properties::{DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_DriverVersion, DEVPROPTYPE};
 use windows::Win32::Foundation::{
-    DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GetLastError, HANDLE, HWND, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    DEVPROPKEY, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS,
+    ERROR_PATH_NOT_FOUND, GetLastError, HANDLE, HLOCAL, HWND, LocalFree, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+use windows::Win32::Security::{
+    CreateWellKnownSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, WELL_KNOWN_SID_TYPE,
+    WinBuiltinAdministratorsSid,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexExW, CreatePrivateNamespaceW,
+    DeleteBoundaryDescriptor, MUTEX_MODIFY_STATE, OpenPrivateNamespaceW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::core::{BOOL, HSTRING, Owned, PCWSTR, w};
 
-use crate::sessions::{self, CaptureEndpoint};
+use crate::sessions::{self, CaptureEndpoint, Mic};
 use crate::win_error::{WinError, configret_name, problem_name, win32_code};
 
 /// What every endpoint of the driver has in its name ("Microphone (AudioCodec Device)"): the device's description.
@@ -82,11 +102,14 @@ pub const DEVICE_NAME: &str = "AudioCodec Device";
 pub const MICROPHONE: &str = "Microphone (AudioCodec Device)";
 /// The call microphone's endpoint (a 5 ms default period, for apps that ask for none).
 pub const CALL_MICROPHONE: &str = "Call Microphone (AudioCodec Device)";
+/// The low-latency microphone's KS filter, by its device interface's reference string: the INF's `KSNAME_Microphone`, the
+/// driver's `captureCircuitName` (DriverSettings.h). The single-microphone driver's one microphone has it too.
+pub const MICROPHONE_FILTER: &str = "Microphone0";
+/// The call microphone's KS filter: the INF's `KSNAME_CallMicrophone`, the driver's `capture2CircuitName`.
+pub const CALL_MICROPHONE_FILTER: &str = "Microphone1";
 /// The INF's file name as built; the driver store publishes it as `oemNN.inf` and remembers this one.
 pub const INF_NAME: &str = "audiocodec.inf";
 
-/// The named mutex a switch holds from start to end, across sessions.
-pub const LOCK_NAME: &str = r"Global\noise-filter-mic-variant";
 /// How long a switch waits for another to end: a switch takes a few seconds, and at most [`DRIVER_WAIT`] and [`MICS_WAIT`]
 /// more.
 pub const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -161,6 +184,29 @@ impl Variant {
     pub fn microphones_text(self) -> String {
         quoted(self.microphones().iter().copied())
     }
+
+    /// The microphones it makes, by kind, in [`microphones`](Self::microphones)' order.
+    pub fn mics(self) -> &'static [Mic] {
+        match self {
+            Variant::Both => &[Mic::LowLatency, Mic::Call],
+            Variant::Call => &[Mic::Call],
+            Variant::LowLatency => &[Mic::LowLatency],
+        }
+    }
+}
+
+/// The name Windows gives a microphone of ours by default (it numbers a second device's, and the user may rename it).
+pub fn default_name(mic: Mic) -> &'static str {
+    match mic {
+        Mic::LowLatency => MICROPHONE,
+        Mic::Call => CALL_MICROPHONE,
+        Mic::Other => DEVICE_NAME,
+    }
+}
+
+/// Microphones by their default names, in quotes: `"Call Microphone (AudioCodec Device)"`.
+pub fn mics_text(mics: &[Mic]) -> String {
+    quoted(mics.iter().map(|&m| default_name(m)))
 }
 
 /// Names in quotes, joined by "and": `"a" and "b"`.
@@ -326,10 +372,13 @@ pub fn plan(devices: &[OurDevice], target: Variant) -> Plan {
 /// What [`switch`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The target variant was already the only one there, working on the newest package: nothing changed.
+    /// The target variant was already the only one there, working on the newest package, with its microphones: nothing
+    /// changed.
     Nothing,
-    /// Switched. `restart`: Windows asked for a restart to finish the install, so the microphones weren't waited for.
-    Switched { restart: bool },
+    /// Switched: the device works on the chosen package, and Windows has made its microphones.
+    Switched,
+    /// Windows asked for a restart to finish installing `device`: the device is left for it, its microphones unchecked.
+    RestartPending { device: String },
 }
 
 /// Why [`switch`] stopped.
@@ -343,14 +392,21 @@ pub enum SwitchError {
     RestartFirst { device: String },
     /// Another switch held the lock for [`LOCK_WAIT`]. Nothing was changed.
     Busy,
-    /// Our capture endpoints couldn't be read before the change, and the check after it needs them. Nothing was removed.
+    /// The lock's namespace or mutex refused this process (access denied): it isn't an elevated administrator's. Nothing
+    /// was changed.
+    LockDenied(WinError),
+    /// Our capture endpoints couldn't be read, and the switch checks the microphones with them. Nothing was changed.
     NoEndpoints(WinError),
+    /// The device that would be kept (`device`, of the `target` variant, its driver `driver`) works on the driver store's
+    /// newest package, but Windows has no endpoint of it for these microphones: that package doesn't have them (the
+    /// single-microphone driver's has the Microphone alone). Nothing was changed.
+    PackageLacks { device: String, target: Variant, driver: String, missing: Vec<Mic> },
     /// The new device wasn't working on the chosen package, so it was removed again. The old devices were removed before it
     /// was made.
     Install(Box<NotKept>),
     /// The device works on the newest package, but Windows hadn't made these microphones after [`MICS_WAIT`]. `seen`: our
-    /// endpoints at the last look; `read`: the last look's error, if it failed.
-    Mics { missing: Vec<&'static str>, seen: Vec<String>, read: Option<WinError> },
+    /// endpoints at the last look; `read`: the last look's error, if it failed. The device stays.
+    Mics { missing: Vec<Mic>, seen: Vec<String>, read: Option<WinError> },
 }
 
 /// A new device that wasn't kept ([`SwitchError::Install`]).
@@ -386,14 +442,26 @@ impl fmt::Display for SwitchError {
             }
             SwitchError::Busy => write!(
                 f,
-                "another switch has held {LOCK_NAME} for {} s: let it end, then run this one again (it reads the devices afresh). \
-                 Nothing was changed.",
+                "another switch has held the switch's lock for {} s: let it end, then run this one again (it reads the devices \
+                 afresh). Nothing was changed.",
                 LOCK_WAIT.as_secs()
+            ),
+            SwitchError::LockDenied(e) => write!(
+                f,
+                "the switch's lock refused this process ({e}): it is for elevated administrators, so run the switch from an \
+                 administrator prompt, or approve its UAC prompt. Nothing was changed."
             ),
             SwitchError::NoEndpoints(e) => write!(
                 f,
-                "the audio endpoints couldn't be read ({e}), and the switch checks the new microphones with them: nothing was \
-                 removed. Is the Windows Audio Endpoint Builder service running?"
+                "the audio endpoints couldn't be read ({e}), and the switch checks the microphones with them: nothing was \
+                 changed. Is the Windows Audio Endpoint Builder service running?"
+            ),
+            SwitchError::PackageLacks { device, target, driver, missing } => write!(
+                f,
+                "{device} works on the driver store's newest AudioCodec package ({driver}), but Windows has no {} on it: {} \
+                 Nothing was changed.",
+                mics_text(missing),
+                package_advice(missing, *target)
             ),
             SwitchError::Install(not_kept) => {
                 let NotKept { device, chosen, failure, removed } = not_kept.as_ref();
@@ -417,12 +485,12 @@ impl fmt::Display for SwitchError {
                     f,
                     "the device is working on the newest package, but after {} s Windows hasn't made {} (ours there: {seen})",
                     MICS_WAIT.as_secs(),
-                    quoted(missing.iter().copied())
+                    mics_text(missing)
                 )?;
                 if let Some(e) = read {
                     write!(f, "; the last look at the endpoints failed: {e}")?;
                 }
-                write!(f, ". The Sound panel's Recording tab and `noise-filter mic variant` show what's there now.")
+                write!(f, ". The device stays: `noise-filter mic variant` and the Sound panel's Recording tab show what's there now.")
             }
         }
     }
@@ -431,9 +499,9 @@ impl fmt::Display for SwitchError {
 impl std::error::Error for SwitchError {}
 
 /// Switches to `target` (see the module's docs for the steps), reporting each step and each Windows error through `say`, as
-/// it happens. Needs elevation: without it, the lock or the first change fails with ERROR_ACCESS_DENIED.
+/// it happens. Needs elevation: without it, the lock refuses the caller ([`SwitchError::LockDenied`]).
 pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, SwitchError> {
-    let _lock = SwitchLock::take(LOCK_NAME, LOCK_WAIT, say)?;
+    let _lock = SwitchLock::take(&LOCK, LOCK_WAIT, say)?;
     let ids: Vec<&str> = Variant::ALL.iter().map(|v| v.hardware_id()).collect();
     say(&format!("Looking for the AudioCodec device ({})", ids.join(", ")));
     let set = DeviceSet::all_present()?;
@@ -447,15 +515,24 @@ pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, Swi
     }
     let devices: Vec<OurDevice> = ours.iter().map(|(_, d)| d.clone()).collect();
     let plan = plan(&devices, target);
-    if plan.is_nothing() {
-        say(&format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id()));
-        return Ok(Outcome::Nothing);
-    }
     if let Some(k) = plan.keep {
-        say(&format!("Keeping {}", devices[k].instance_id));
+        // It has been working, so its endpoints are made: one missing is a microphone its package lacks. Checked before
+        // anything changes.
+        let check = check_kept(target, &devices[k], &sessions::capture_endpoints())?;
+        if plan.is_nothing() {
+            say(&format!("Already {} ({}) on the newest package: nothing to do.", target.describe(), target.hardware_id()));
+        } else {
+            say(&format!("Keeping {}", devices[k].instance_id));
+        }
+        for line in found_lines(&check) {
+            say(&line);
+        }
+        if plan.is_nothing() {
+            return Ok(Outcome::Nothing);
+        }
     }
-    // A new device's microphones are endpoints that weren't there before; read them before anything changes, as the check
-    // after needs them
+    // A new device's microphones are endpoints that weren't there before: read them first, before the new device's element
+    // is prepared and anything is removed, as the check after needs them
     let before = if plan.create { capture_endpoint_ids()? } else { Vec::new() };
     // The new device and its driver before anything is removed: no driver, no change
     let pending = if plan.create { Some(Pending::prepare(target, say)?) } else { None };
@@ -471,14 +548,24 @@ pub fn switch(target: Variant, say: &mut dyn FnMut(&str)) -> Result<Outcome, Swi
         }
         say("  removed");
     }
-    if let Some(p) = pending
-        && p.install(say)? == Installed::Restart
-    {
-        say("  Windows needs a restart to finish the install: the microphones come after it (`noise-filter mic variant` shows them).");
-        return Ok(Outcome::Switched { restart: true });
-    }
-    wait_for_mics(target, &before, say)?;
-    Ok(Outcome::Switched { restart: false })
+    // The device whose microphones are waited for: the new one, or the one kept (plan.create is plan.keep.is_none())
+    let device = match pending {
+        Some(p) => {
+            let id = p.instance_id.clone();
+            if p.install(say)? == Installed::Restart {
+                say(&format!(
+                    "  Windows needs a restart to finish installing {id}: the microphones come after it (`noise-filter mic variant` \
+                     checks them)."
+                ));
+                return Ok(Outcome::RestartPending { device: id });
+            }
+            id
+        }
+        None => plan.keep.map(|k| devices[k].instance_id.clone()).unwrap_or_default(),
+    };
+    let wanted = Wanted { target, device: &device, before: &before };
+    wait_for_mics(&wanted, MICS_WAIT, &mut sessions::capture_endpoints, &mut SystemClock::start(), say)?;
+    Ok(Outcome::Switched)
 }
 
 /// The ids of our capture endpoints there now, active or disabled.
@@ -487,53 +574,102 @@ fn capture_endpoint_ids() -> Result<Vec<String>, SwitchError> {
     Ok(endpoints.into_iter().map(|e| e.id).collect())
 }
 
-/// Up to [`MICS_WAIT`] for Windows to make `target`'s microphones ([`check_mics`]; `before`: the endpoints there before the
-/// change), saying which came.
-fn wait_for_mics(target: Variant, before: &[String], say: &mut dyn FnMut(&str)) -> Result<(), SwitchError> {
-    say(&format!("Waiting for Windows to make {} (up to {} s)", target.microphones_text(), MICS_WAIT.as_secs()));
-    let start = Instant::now();
+/// The waits' clock: the time since the wait began, and a sleep. Tests pass their own.
+pub trait Clock {
+    fn elapsed(&self) -> Duration;
+    fn sleep(&mut self, d: Duration);
+}
+
+/// The system's clock, counting from [`SystemClock::start`].
+pub struct SystemClock(Instant);
+
+impl SystemClock {
+    pub fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Clock for SystemClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// Up to `wait` on `clock` for Windows to make `wanted`'s microphones ([`check_mics`]), reading our capture endpoints with
+/// `read` every [`POLL`], and saying which came. Done once each is there and nothing else of ours is active; at the deadline,
+/// the microphones alone will do (another of ours still active is reported). A read that fails is looked at again; the
+/// last good look decides, and the last failure is reported with a microphone missing.
+fn wait_for_mics(
+    wanted: &Wanted, wait: Duration, read: &mut dyn FnMut() -> Result<Vec<CaptureEndpoint>, WinError>, clock: &mut dyn Clock,
+    say: &mut dyn FnMut(&str),
+) -> Result<(), SwitchError> {
+    say(&format!("Waiting for Windows to make {} on {} (up to {} s)", wanted.target.microphones_text(), wanted.device, wait.as_secs()));
     // The last look that read the endpoints, and the last look's error, if it failed
     let mut last = None::<MicCheck>;
     let failed = loop {
-        let failed = match sessions::capture_endpoints() {
+        let failed = match read() {
             Ok(now) => {
-                last = Some(check_mics(target, &now, before));
+                last = Some(check_mics(wanted, &now));
                 None
             }
             Err(e) => Some(e),
         };
         let done = failed.is_none() && last.as_ref().is_some_and(MicCheck::is_done);
-        if done || start.elapsed() >= MICS_WAIT {
+        if done || clock.elapsed() >= wait {
             break failed;
         }
-        std::thread::sleep(POLL);
+        clock.sleep(POLL);
     };
     match last {
         Some(check) if check.missing.is_empty() => {
-            for &(mic, active) in &check.found {
-                say(&format!("  \"{mic}\": {}", if active { "there" } else { "there, disabled in the Sound panel's Recording tab" }));
+            for line in found_lines(&check) {
+                say(&line);
             }
             if !check.extra.is_empty() {
                 let extra = quoted(check.extra.iter().map(String::as_str));
-                say(&format!("  also still active: {extra} (a removed device's, going, or another device of the same name)"));
+                say(&format!("  also still active: {extra} (a removed device's, going, or another device's)"));
             }
-            say(&format!("  after {:.1} s", start.elapsed().as_secs_f64()));
+            say(&format!("  after {:.1} s", clock.elapsed().as_secs_f64()));
             Ok(())
         }
         Some(check) => Err(SwitchError::Mics { missing: check.missing, seen: check.seen, read: failed }),
-        None => Err(SwitchError::Mics { missing: target.microphones().to_vec(), seen: Vec::new(), read: failed }),
+        None => Err(SwitchError::Mics { missing: wanted.target.mics().to_vec(), seen: Vec::new(), read: failed }),
     }
 }
 
-/// What Windows has of a variant's microphones after a switch ([`check_mics`]).
+/// What a check waits for: `target`'s microphones on `device`, none of them one of `before`.
+#[derive(Clone, Copy, Debug)]
+pub struct Wanted<'a> {
+    pub target: Variant,
+    /// The instance ID of the device that makes them (`ROOT\MEDIA\0004`): the new one, or the one kept.
+    pub device: &'a str,
+    /// The ids of our endpoints before the change (a new device's are new); none for a device kept.
+    pub before: &'a [String],
+}
+
+/// One of a variant's microphones, as a check found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub mic: Mic,
+    /// Its endpoint's name now ("Call Microphone (2- AudioCodec Device)", or the user's).
+    pub name: String,
+    /// Active; otherwise disabled in the Sound panel.
+    pub active: bool,
+}
+
+/// What Windows has of a variant's microphones ([`check_mics`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MicCheck {
-    /// Each microphone there, and whether it's active (if not, it's disabled in the Sound panel).
-    pub found: Vec<(&'static str, bool)>,
+    /// Each microphone there.
+    pub found: Vec<Found>,
     /// The microphones not there.
-    pub missing: Vec<&'static str>,
-    /// Our other active endpoints: one there before the change (a removed device's, going), a second of the same name, or one
-    /// the variant doesn't have.
+    pub missing: Vec<Mic>,
+    /// Our other active endpoints: a removed device's (going), another device's, a second of the same kind, or one the
+    /// variant doesn't have.
     pub extra: Vec<String>,
     /// Every endpoint of ours, by name ("(disabled)" after a disabled one's).
     pub seen: Vec<String>,
@@ -546,29 +682,82 @@ impl MicCheck {
     }
 }
 
-/// Judges our capture endpoints `now` against `target`'s microphones: each must be there, by its name (any case), and not
-/// one of `before` (the ids there before the change: a new device's endpoints are new); an active one is taken before a
-/// disabled one (disabled in the Sound panel, it is there still). The endpoints left over that are active are `extra`.
-pub fn check_mics(target: Variant, now: &[CaptureEndpoint], before: &[String]) -> MicCheck {
-    let is_new = |e: &CaptureEndpoint| !before.iter().any(|id| id.eq_ignore_ascii_case(&e.id));
+/// Judges our capture endpoints `now` against `wanted`: each of the target's microphones must be there, by its kind (its
+/// filter's, or its name's: [`sessions::identify`]), whatever it's named; on the wanted device (an endpoint whose device
+/// wasn't read may be on it), and not one of `before`. An active one is taken before a disabled one (disabled in the Sound
+/// panel, it is there still; ours, the owner's to confirm: it passes, with a warning, [`found_lines`]). The endpoints left
+/// over that are active are `extra`.
+pub fn check_mics(wanted: &Wanted, now: &[CaptureEndpoint]) -> MicCheck {
+    let eligible = |e: &CaptureEndpoint| {
+        let new = !wanted.before.iter().any(|id| id.eq_ignore_ascii_case(&e.id));
+        new && e.device.as_deref().is_none_or(|d| d.eq_ignore_ascii_case(wanted.device))
+    };
     let seen = now.iter().map(|e| if e.active { e.name.clone() } else { format!("{} (disabled)", e.name) }).collect();
     let mut check = MicCheck { seen, ..MicCheck::default() };
     let mut used = vec![false; now.len()];
-    for &mic in target.microphones() {
-        let find = |active: bool| {
-            (0..now.len()).find(|&i| !used[i] && now[i].active == active && is_new(&now[i]) && now[i].name.trim().eq_ignore_ascii_case(mic))
-        };
-        let pick = find(true).or_else(|| find(false));
-        match pick {
+    for &mic in wanted.target.mics() {
+        let find = |active: bool| (0..now.len()).find(|&i| !used[i] && now[i].active == active && now[i].mic == mic && eligible(&now[i]));
+        match find(true).or_else(|| find(false)) {
             Some(i) => {
                 used[i] = true;
-                check.found.push((mic, now[i].active));
+                check.found.push(Found { mic, name: now[i].name.clone(), active: now[i].active });
             }
             None => check.missing.push(mic),
         }
     }
     check.extra = (0..now.len()).filter(|&i| !used[i] && now[i].active).map(|i| now[i].name.clone()).collect();
     check
+}
+
+/// One look at the microphones of a device kept as it is (`device`, of the target variant, working on the newest package):
+/// its endpoints were made when it started, so a microphone missing is one its package doesn't have
+/// ([`SwitchError::PackageLacks`]). `now`: our capture endpoints, as [`sessions::capture_endpoints`] read them.
+pub fn check_kept(target: Variant, device: &OurDevice, now: &Result<Vec<CaptureEndpoint>, WinError>) -> Result<MicCheck, SwitchError> {
+    let now = now.as_ref().map_err(|e| SwitchError::NoEndpoints(e.clone()))?;
+    let check = check_mics(&Wanted { target, device: &device.instance_id, before: &[] }, now);
+    if !check.missing.is_empty() {
+        return Err(SwitchError::PackageLacks {
+            device: device.instance_id.clone(),
+            target,
+            driver: driver_text(device.inf.as_deref(), device.driver_version.as_deref()),
+            missing: check.missing,
+        });
+    }
+    Ok(check)
+}
+
+/// Why a device on the newest package lacks `missing`, and what to do, for a switch to `target`: "the package it runs
+/// doesn't have it (...). Add the package with the three variants to the driver store (...), then run `noise-filter mic
+/// variant both`: ...".
+pub fn package_advice(missing: &[Mic], target: Variant) -> String {
+    format!(
+        "the package it runs doesn't have {} (the single-microphone driver's has the Microphone alone). Add the package with the \
+         three variants to the driver store (from an administrator prompt in its folder, driver\\out\\Release\\AudioCodec once \
+         driver\\scripts\\Build-Driver.ps1 has built it: pnputil /add-driver AudioCodec.inf), then run `noise-filter mic variant \
+         {}`: it re-creates the device with that package.",
+        if missing.len() == 1 { "it" } else { "them" },
+        target.arg()
+    )
+}
+
+/// A check's microphones, a line each (`  the Call Microphone: "Call Microphone (2- AudioCodec Device)"`), then a warning for
+/// each disabled in the Sound panel.
+pub fn found_lines(check: &MicCheck) -> Vec<String> {
+    let mut lines: Vec<String> = check
+        .found
+        .iter()
+        .map(|f| format!("  {}: \"{}\"{}", f.mic.describe(), f.name, if f.active { "" } else { ", disabled in the Sound panel" }))
+        .collect();
+    lines.extend(check.found.iter().filter(|f| !f.active).map(|f| format!("  warning: {}", disabled_note(&f.name))));
+    lines
+}
+
+/// What to do about a microphone disabled in the Sound panel.
+pub fn disabled_note(name: &str) -> String {
+    format!(
+        "\"{name}\" is disabled in the Sound panel, so apps don't see it: enable it there (mmsys.cpl, the Recording tab: right-click \
+         it, Enable; right-click the list, Show Disabled Devices, if it isn't listed)"
+    )
 }
 
 /// How a wait for the lock ended.
@@ -591,44 +780,202 @@ fn lock_wait(event: WAIT_EVENT) -> LockWait {
     }
 }
 
-/// The switch's lock, a named mutex; released when dropped.
-struct SwitchLock(Owned<HANDLE>);
+/// Where the switch's lock lives: a mutex in a private namespace (`CreatePrivateNamespaceW`), which only a caller within its
+/// boundary may create or open (its token must hold the boundary's SID), so no other process can squat the name, as any could
+/// a `Global\` one (creating a `Global\` mutex needs no privilege).
+#[derive(Clone, Copy, Debug)]
+pub struct LockSpace<'a> {
+    /// The boundary descriptor's name: with [`sid`](Self::sid), what identifies the namespace.
+    pub boundary: &'a str,
+    /// The SID a caller's token must hold.
+    pub sid: WELL_KNOWN_SID_TYPE,
+    /// The namespace's and the mutex's security descriptor, in SDDL.
+    pub sddl: &'a str,
+    /// The start of the namespace's prefix in this process ([`fresh_alias`]): the mutex is `prefix\mutex`.
+    pub alias: &'a str,
+    pub mutex: &'a str,
+}
+
+/// The switch's lock: bounded by BUILTIN\Administrators (an elevated administrator, or SYSTEM, is within it), and open to
+/// Administrators and SYSTEM, whichever account's switch made it.
+pub const LOCK: LockSpace<'static> = LockSpace {
+    boundary: "noise-filter-mic-variant",
+    sid: WinBuiltinAdministratorsSid,
+    sddl: "D:P(A;;GA;;;BA)(A;;GA;;;SY)",
+    alias: "noise-filter",
+    mutex: "mic-variant",
+};
+
+/// How often a switch looks for the namespace again when it went away between a create that found it and the open.
+const NAMESPACE_TRIES: usize = 4;
+
+/// A boundary descriptor, deleted on drop.
+struct Boundary(HANDLE);
+
+impl Drop for Boundary {
+    fn drop(&mut self) {
+        // SAFETY: our descriptor, deleted once.
+        unsafe { DeleteBoundaryDescriptor(self.0) };
+    }
+}
+
+/// An open private namespace, closed on drop but not destroyed (a switch waiting in it still uses it).
+struct Namespace(HANDLE);
+
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        // SAFETY: our namespace handle, closed once; no PRIVATE_NAMESPACE_FLAG_DESTROY.
+        let _ = unsafe { ClosePrivateNamespace(self.0, 0) };
+    }
+}
+
+/// A security descriptor made from SDDL, freed on drop.
+struct Descriptor(PSECURITY_DESCRIPTOR);
+
+impl Descriptor {
+    fn from_sddl(sddl: &str) -> Result<Self, WinError> {
+        let sddl = HSTRING::from(sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a NUL-terminated string; `sd` is a live out-pointer, freed by Drop.
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None) }
+            .map_err(WinError::of("ConvertStringSecurityDescriptorToSecurityDescriptorW"))?;
+        Ok(Self(sd))
+    }
+
+    /// Attributes that point at it: valid while it lives.
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0.0,
+            bInheritHandle: false.into(),
+        }
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor ConvertStringSecurityDescriptorToSecurityDescriptorW allocated with LocalAlloc, freed once.
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+    }
+}
+
+/// A well-known SID, in a buffer aligned for one.
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u32>, WinError> {
+    let mut sid = vec![0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<u32>())];
+    let mut size = (sid.len() * size_of::<u32>()) as u32;
+    // SAFETY: no domain; the buffer holds `size` bytes and is aligned for a SID; `size` is a live in-out pointer.
+    unsafe { CreateWellKnownSid(kind, None, Some(PSID(sid.as_mut_ptr().cast())), &mut size) }
+        .map_err(WinError::of("CreateWellKnownSid"))?;
+    Ok(sid)
+}
+
+/// A lock call that failed with `code`: access denied is a caller outside the boundary, or one the descriptor keeps out.
+fn lock_error(call: &'static str, code: u32) -> SwitchError {
+    let e = WinError { call, code };
+    if code == ERROR_ACCESS_DENIED.0 { SwitchError::LockDenied(e) } else { SwitchError::Windows(e) }
+}
+
+/// A namespace prefix this process hasn't used yet (`noise-filter-0`): Windows refuses a process a second open of a namespace
+/// under a prefix it has open (ERROR_DUP_NAME), as two takes in one process would be (the tests' threads).
+fn fresh_alias(start: &str) -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    format!("{start}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The last error, for a call that failed.
+fn last_error() -> u32 {
+    // SAFETY: no arguments; the callers read it straight after the failed call.
+    unsafe { GetLastError() }.0
+}
+
+impl Namespace {
+    /// Creates the namespace, or opens it if it's there (another switch's).
+    fn open(space: &LockSpace, alias: &str, sd: &Descriptor) -> Result<Self, SwitchError> {
+        let name = HSTRING::from(space.boundary);
+        // SAFETY: a NUL-terminated name; no flags. Null on failure.
+        let mut boundary = Boundary(unsafe { CreateBoundaryDescriptorW(&name, 0) });
+        if boundary.0.is_invalid() {
+            return Err(WinError { call: "CreateBoundaryDescriptorW", code: last_error() }.into());
+        }
+        let mut sid = well_known_sid(space.sid)?;
+        // SAFETY: our descriptor, which the call may reallocate through the pointer; a SID that outlives the call (it's copied).
+        unsafe { AddSIDToBoundaryDescriptor(&mut boundary.0, PSID(sid.as_mut_ptr().cast())) }
+            .map_err(WinError::of("AddSIDToBoundaryDescriptor"))?;
+        let alias = HSTRING::from(alias);
+        let attributes = sd.attributes();
+        let descriptor = boundary.0.0.cast_const();
+        for _ in 0..NAMESPACE_TRIES {
+            // SAFETY: attributes whose descriptor lives in `sd`; our boundary descriptor; a NUL-terminated prefix. Null on failure.
+            let created = unsafe { CreatePrivateNamespaceW(Some(&attributes), descriptor, &alias) };
+            if !created.is_invalid() {
+                return Ok(Self(created));
+            }
+            let code = last_error();
+            if code != ERROR_ALREADY_EXISTS.0 {
+                return Err(lock_error("CreatePrivateNamespaceW", code));
+            }
+            // SAFETY: as above.
+            let opened = unsafe { OpenPrivateNamespaceW(descriptor, &alias) };
+            if !opened.is_invalid() {
+                return Ok(Self(opened));
+            }
+            let code = last_error();
+            // Gone between the two calls (its last holder closed it): create it again
+            if code != ERROR_FILE_NOT_FOUND.0 && code != ERROR_PATH_NOT_FOUND.0 {
+                return Err(lock_error("OpenPrivateNamespaceW", code));
+            }
+        }
+        Err(WinError { call: "OpenPrivateNamespaceW", code: ERROR_FILE_NOT_FOUND.0 }.into())
+    }
+}
+
+/// The switch's lock, a mutex in its private namespace; released when dropped.
+struct SwitchLock {
+    mutex: Owned<HANDLE>,
+    /// Kept open while the mutex is held, so a switch that comes meanwhile opens this namespace rather than making another.
+    _namespace: Namespace,
+}
 
 impl SwitchLock {
-    /// Takes the mutex `name`, waiting up to `wait` for another holder.
-    fn take(name: &str, wait: Duration, say: &mut dyn FnMut(&str)) -> Result<Self, SwitchError> {
-        let name = HSTRING::from(name);
+    /// Takes the mutex in `space`, waiting up to `wait` for another holder.
+    fn take(space: &LockSpace, wait: Duration, say: &mut dyn FnMut(&str)) -> Result<Self, SwitchError> {
+        let sd = Descriptor::from_sddl(space.sddl)?;
+        let alias = fresh_alias(space.alias);
+        let namespace = Namespace::open(space, &alias, &sd)?;
+        let name = HSTRING::from(format!(r"{alias}\{}", space.mutex));
         // Enough to wait on it and release it
         let access = SYNCHRONIZATION_SYNCHRONIZE.0 | MUTEX_MODIFY_STATE.0;
-        // SAFETY: no security attributes, so the creator's default DACL (an elevated administrator's lets Administrators and
-        // SYSTEM in); a NUL-terminated name; not owned on creation, so it is waited for below whoever made it.
-        let handle = unsafe { CreateMutexExW(None, &name, 0, access) }.map_err(WinError::of("CreateMutexExW"))?;
+        let attributes = sd.attributes();
+        // SAFETY: attributes whose descriptor lives in `sd`; a NUL-terminated name in the namespace just opened; not owned on
+        // creation, so it is waited for below whoever made it.
+        let handle =
+            unsafe { CreateMutexExW(Some(&attributes), &name, 0, access) }.map_err(|e| lock_error("CreateMutexExW", win32_code(&e)))?;
         // SAFETY: a valid handle that nothing else owns; Owned closes it once.
-        let handle = unsafe { Owned::new(handle) };
+        let mutex = unsafe { Owned::new(handle) };
         // SAFETY: our handle; no wait.
-        let mut event = unsafe { WaitForSingleObject(*handle, 0) };
+        let mut event = unsafe { WaitForSingleObject(*mutex, 0) };
         if event == WAIT_TIMEOUT {
             say(&format!("Another switch is running: waiting for it to end (up to {} s)", wait.as_secs()));
             // SAFETY: as above.
-            event = unsafe { WaitForSingleObject(*handle, u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1)) };
+            event = unsafe { WaitForSingleObject(*mutex, u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1)) };
         }
         match lock_wait(event) {
-            LockWait::Taken => Ok(Self(handle)),
+            LockWait::Taken => Ok(Self { mutex, _namespace: namespace }),
             LockWait::Abandoned => {
                 say("(The last switch's process ended in the middle of its switch: this one reads the devices afresh.)");
-                Ok(Self(handle))
+                Ok(Self { mutex, _namespace: namespace })
             }
             LockWait::Busy => Err(SwitchError::Busy),
-            // SAFETY: no arguments; read straight after the failed wait.
-            LockWait::Failed => Err(WinError { call: "WaitForSingleObject", code: unsafe { GetLastError() }.0 }.into()),
+            LockWait::Failed => Err(WinError { call: "WaitForSingleObject", code: last_error() }.into()),
         }
     }
 }
 
 impl Drop for SwitchLock {
     fn drop(&mut self) {
-        // SAFETY: our handle, to a mutex this thread owns (take returns one only then); Owned closes the handle after this.
-        let _ = unsafe { ReleaseMutex(*self.0) };
+        // SAFETY: our handle, to a mutex this thread owns (take returns one only then). The fields drop after this: the
+        // mutex's handle is closed, then the namespace's.
+        let _ = unsafe { ReleaseMutex(*self.mutex) };
     }
 }
 
@@ -1128,6 +1475,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Security::{
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+        TOKEN_IMPERSONATE, TOKEN_QUERY, WinAuthenticatedUserSid, WinWorldSid,
+    };
+    use windows::Win32::System::Threading::{CREATE_MUTEX_INITIAL_OWNER, GetCurrentProcess, OpenProcessToken};
+
     use super::*;
 
     // Nothing here touches a device or the driver store: the mapping, the plan and the formats only.
@@ -1369,50 +1722,213 @@ mod tests {
         assert_eq!(text, "5 s after DiInstallDevice, the device: not started, no driver");
     }
 
-    fn ep(id: &str, name: &str, active: bool) -> CaptureEndpoint {
-        CaptureEndpoint { id: id.into(), name: name.into(), active }
+    /// The new device's instance ID in these tests, as SetupDi gives it; its endpoints' filter paths have it in lower case.
+    const NEW_ID: &str = r"ROOT\MEDIA\0005";
+    const NEW: &str = r"root\media\0005";
+    /// The old device's (the one [`dev`] and [`old`] make).
+    const OLD: &str = r"root\media\0003";
+
+    /// An endpoint of ours, of kind `mic`, on `device` (`""`: its filter wasn't read, so its device is unknown).
+    fn ep(id: &str, name: &str, mic: Mic, device: &str, active: bool) -> CaptureEndpoint {
+        CaptureEndpoint { id: id.into(), name: name.into(), active, mic, device: (!device.is_empty()).then(|| device.into()) }
     }
 
-    /// Astra's review: check the capabilities before declaring success. A new device's microphones are new endpoints.
+    fn found(mic: Mic, name: &str, active: bool) -> Found {
+        Found { mic, name: name.into(), active }
+    }
+
+    fn wanted(target: Variant, before: &[String]) -> Wanted<'_> {
+        Wanted { target, device: NEW_ID, before }
+    }
+
+    /// Both microphones of the new device, active, by their default names.
+    fn both_new() -> Vec<CaptureEndpoint> {
+        vec![ep("{n1}", MICROPHONE, Mic::LowLatency, NEW, true), ep("{n2}", CALL_MICROPHONE, Mic::Call, NEW, true)]
+    }
+
+    /// Astra's review: check the capabilities before declaring success. A new device's microphones are its endpoints, by kind,
+    /// whatever they're named.
     #[test]
-    fn the_microphones_are_new_endpoints_of_the_variants_names() {
-        use Variant::*;
-        let both_new = [ep("{n1}", MICROPHONE, true), ep("{n2}", CALL_MICROPHONE, true)];
-        let check = check_mics(Both, &both_new, &[]);
-        assert_eq!(check.found, [(MICROPHONE, true), (CALL_MICROPHONE, true)]);
+    fn the_microphones_are_the_devices_by_kind() {
+        use Mic::*;
+        let check = check_mics(&wanted(Variant::Both, &[]), &both_new());
+        assert_eq!(check.found, [found(LowLatency, MICROPHONE, true), found(Call, CALL_MICROPHONE, true)]);
         assert!(check.is_done() && check.missing.is_empty() && check.extra.is_empty());
-        // The upgrade from the single-microphone driver: its Microphone, still active, doesn't count, and is waited out
+        // The upgrade from the single-microphone driver: its Microphone, still active on the old device, doesn't count, and is
+        // waited out
         let before = ["{old}".to_string()];
-        let midway = [ep("{old}", MICROPHONE, true), ep("{n1}", MICROPHONE, true)];
-        let check = check_mics(Both, &midway, &before);
+        let midway = [ep("{old}", MICROPHONE, LowLatency, OLD, true), ep("{n1}", MICROPHONE, LowLatency, NEW, true)];
+        let check = check_mics(&wanted(Variant::Both, &before), &midway);
         assert_eq!(
             (check.found, check.missing, check.extra),
-            (vec![(MICROPHONE, true)], vec![CALL_MICROPHONE], vec![MICROPHONE.to_string()])
+            (vec![found(LowLatency, MICROPHONE, true)], vec![Call], vec![MICROPHONE.to_string()])
         );
-        let check = check_mics(Both, &[ep("{OLD}", MICROPHONE, true)], &before);
-        assert_eq!(check.missing, [MICROPHONE, CALL_MICROPHONE], "an old endpoint, its id in any case, isn't the new device's");
-        let mut after: Vec<CaptureEndpoint> = both_new.to_vec();
-        assert!(check_mics(Both, &after, &before).is_done());
+        assert!(check_mics(&wanted(Variant::Both, &before), &both_new()).is_done());
+        // Another device's, new or not, isn't this one's
+        let other = [ep("{x}", MICROPHONE, LowLatency, OLD, true)];
+        assert_eq!(check_mics(&wanted(Variant::LowLatency, &[]), &other).missing, [LowLatency]);
+        // Its device unread: it counts if it's new, and an old id, in any case, isn't
+        let unknown = [ep("{OLD}", MICROPHONE, LowLatency, "", true)];
+        assert_eq!(check_mics(&wanted(Variant::LowLatency, &before), &unknown).missing, [LowLatency]);
+        assert!(check_mics(&wanted(Variant::LowLatency, &[]), &unknown).is_done());
+        // By kind, numbered or renamed in the Sound panel, and reported by the name it has
+        let renamed = [
+            ep("{n1}", "Studio mic (2- AudioCodec Device)", LowLatency, NEW, true),
+            ep("{n2}", "Call Microphone (2- AudioCodec Device)", Call, NEW, true),
+        ];
+        let check = check_mics(&wanted(Variant::Both, &[]), &renamed);
+        assert!(check.is_done(), "{check:?}");
+        assert_eq!(check.found, [
+            found(LowLatency, "Studio mic (2- AudioCodec Device)", true),
+            found(Call, "Call Microphone (2- AudioCodec Device)", true)
+        ]);
+        // ... and a name doesn't make one the other kind
+        let check = check_mics(&wanted(Variant::Call, &[]), &[ep("{n1}", CALL_MICROPHONE, LowLatency, NEW, true)]);
+        assert_eq!((check.missing, check.extra), (vec![Call], vec![CALL_MICROPHONE.to_string()]));
         // One disabled in the Sound panel is there (the user's choice); an active one is taken before it
-        let check = check_mics(Call, &[ep("{n2}", CALL_MICROPHONE, false)], &[]);
-        assert!(check.is_done() && check.found == [(CALL_MICROPHONE, false)]);
+        let check = check_mics(&wanted(Variant::Call, &[]), &[ep("{n2}", CALL_MICROPHONE, Call, NEW, false)]);
+        assert!(check.is_done() && check.found == [found(Call, CALL_MICROPHONE, false)]);
         assert_eq!(check.seen, [format!("{CALL_MICROPHONE} (disabled)")]);
-        let check = check_mics(Call, &[ep("{a}", CALL_MICROPHONE, false), ep("{b}", CALL_MICROPHONE, true)], &[]);
-        assert!(check.is_done() && check.found == [(CALL_MICROPHONE, true)], "{check:?}");
-        // A second active one of the same name, or one the variant doesn't have: waited out
-        let check = check_mics(Call, &[ep("{a}", CALL_MICROPHONE, true), ep("{b}", CALL_MICROPHONE, true)], &[]);
+        let two = [ep("{a}", CALL_MICROPHONE, Call, NEW, false), ep("{b}", "Calls (AudioCodec Device)", Call, NEW, true)];
+        let check = check_mics(&wanted(Variant::Call, &[]), &two);
+        assert!(check.is_done() && check.found == [found(Call, "Calls (AudioCodec Device)", true)], "{check:?}");
+        // A second active one of the same kind, or one the variant doesn't have: waited out
+        let two = [ep("{a}", CALL_MICROPHONE, Call, NEW, true), ep("{b}", CALL_MICROPHONE, Call, NEW, true)];
+        let check = check_mics(&wanted(Variant::Call, &[]), &two);
         assert!(check.missing.is_empty() && check.extra == [CALL_MICROPHONE] && !check.is_done());
-        after.push(ep("{x}", "Speakers (AudioCodec Device)", true));
-        let check = check_mics(LowLatency, &after, &[]);
-        assert_eq!(check.found, [(MICROPHONE, true)]);
-        assert_eq!(check.extra, [CALL_MICROPHONE, "Speakers (AudioCodec Device)"]);
-        // Names in any case; a numbered or renamed one isn't the microphone
-        assert!(check_mics(Call, &[ep("{a}", "call microphone (audiocodec device)", true)], &[]).is_done());
-        let check = check_mics(LowLatency, &[ep("{a}", "Microphone (2- AudioCodec Device)", true)], &[]);
-        assert_eq!((check.missing, check.extra), (vec![MICROPHONE], vec!["Microphone (2- AudioCodec Device)".to_string()]));
+        let mut after = both_new();
+        after.push(ep("{x}", "Line (AudioCodec Device)", Other, NEW, true));
+        let check = check_mics(&wanted(Variant::LowLatency, &[]), &after);
+        assert_eq!(check.found, [found(LowLatency, MICROPHONE, true)]);
+        assert_eq!(check.extra, [CALL_MICROPHONE, "Line (AudioCodec Device)"]);
         // Nothing yet
-        let check = check_mics(Both, &[], &[]);
-        assert_eq!((check.missing, check.seen.len()), (vec![MICROPHONE, CALL_MICROPHONE], 0));
+        let check = check_mics(&wanted(Variant::Both, &[]), &[]);
+        assert_eq!((check.missing, check.seen.len()), (vec![LowLatency, Call], 0));
+    }
+
+    /// Astra's review: with the single-microphone package alone in the driver store, its device runs the newest package, so
+    /// `mic variant both` said there was nothing to do. A device kept is checked once, before anything changes.
+    #[test]
+    fn a_kept_device_must_have_the_variants_microphones() {
+        use Mic::*;
+        let d = dev(Variant::Both, Health::Working);
+        let e = check_kept(Variant::Both, &d, &Ok(vec![ep("{m}", MICROPHONE, LowLatency, OLD, true)])).unwrap_err();
+        assert_eq!(e, SwitchError::PackageLacks {
+            device: r"ROOT\MEDIA\0003".into(),
+            target: Variant::Both,
+            driver: "driver oem12.inf 1.0.0.0".into(),
+            missing: vec![Call]
+        });
+        let text = e.to_string();
+        assert!(
+            text.starts_with(
+                r#"ROOT\MEDIA\0003 works on the driver store's newest AudioCodec package (driver oem12.inf 1.0.0.0), but Windows has no "Call Microphone (AudioCodec Device)" on it: the package it runs doesn't have it (the single-microphone driver's"#
+            ),
+            "{text}"
+        );
+        assert!(text.contains("pnputil /add-driver AudioCodec.inf), then run `noise-filter mic variant both`: it re-creates"), "{text}");
+        assert!(text.ends_with("with that package. Nothing was changed."), "{text}");
+        let none = check_kept(Variant::Both, &d, &Ok(vec![])).unwrap_err();
+        assert!(none.to_string().contains(r#"no "Microphone (AudioCodec Device)" and "Call Microphone (AudioCodec Device)" on it"#));
+        assert!(none.to_string().contains("doesn't have them"));
+        // Both there: kept; one disabled passes, with a warning
+        let both = Ok(vec![ep("{m}", MICROPHONE, LowLatency, OLD, true), ep("{c}", CALL_MICROPHONE, Call, OLD, false)]);
+        let lines = found_lines(&check_kept(Variant::Both, &d, &both).unwrap());
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "  the Microphone: \"Microphone (AudioCodec Device)\"");
+        assert_eq!(lines[1], "  the Call Microphone: \"Call Microphone (AudioCodec Device)\", disabled in the Sound panel");
+        assert!(
+            lines[2].starts_with(
+                "  warning: \"Call Microphone (AudioCodec Device)\" is disabled in the Sound panel, so apps don't see it: enable it \
+                 there"
+            ),
+            "{}",
+            lines[2]
+        );
+        // Another device's microphone isn't the kept one's
+        let call = dev(Variant::Call, Health::Working);
+        let elsewhere = Ok(vec![ep("{c}", CALL_MICROPHONE, Call, NEW, true)]);
+        assert!(matches!(check_kept(Variant::Call, &call, &elsewhere), Err(SwitchError::PackageLacks { .. })));
+        // Unread: not checked, so it stops, nothing changed
+        let unread = WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 };
+        assert_eq!(check_kept(Variant::Both, &d, &Err(unread.clone())), Err(SwitchError::NoEndpoints(unread)));
+    }
+
+    /// A clock that moves only when slept on.
+    struct FakeClock(Duration);
+
+    impl Clock for FakeClock {
+        fn elapsed(&self) -> Duration {
+            self.0
+        }
+
+        fn sleep(&mut self, d: Duration) {
+            self.0 += d;
+        }
+    }
+
+    /// What [`wait_for_mics`] does for both microphones on the new device over `looks` (a read each, the last one again
+    /// after the list), with 1 s to wait: its result, its lines, and the time it took.
+    fn wait_over(looks: &[Result<Vec<CaptureEndpoint>, WinError>]) -> (Result<(), SwitchError>, Vec<String>, Duration) {
+        let mut reads = 0;
+        let mut read = || {
+            reads += 1;
+            looks[(reads - 1).min(looks.len() - 1)].clone()
+        };
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut lines = Vec::new();
+        let result =
+            wait_for_mics(&wanted(Variant::Both, &[]), Duration::from_secs(1), &mut read, &mut clock, &mut |l| lines.push(l.to_string()));
+        (result, lines, clock.0)
+    }
+
+    /// Astra's review: the wait's loop had no test.
+    #[test]
+    fn the_wait_for_the_microphones_ends_as_it_should() {
+        let low_only = vec![ep("{n1}", MICROPHONE, Mic::LowLatency, NEW, true)];
+        let failed = WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 };
+        // Done on the first look: no sleep
+        let (result, lines, took) = wait_over(&[Ok(both_new())]);
+        assert_eq!((result, took), (Ok(()), Duration::ZERO));
+        assert_eq!(lines, [
+            r#"Waiting for Windows to make "Microphone (AudioCodec Device)" and "Call Microphone (AudioCodec Device)" on ROOT\MEDIA\0005 (up to 1 s)"#,
+            r#"  the Microphone: "Microphone (AudioCodec Device)""#,
+            r#"  the Call Microphone: "Call Microphone (AudioCodec Device)""#,
+            "  after 0.0 s",
+        ]);
+        // Done later, a look every POLL
+        let (result, lines, took) = wait_over(&[Ok(vec![]), Ok(low_only.clone()), Ok(both_new())]);
+        assert_eq!((result, took), (Ok(()), POLL * 2));
+        assert_eq!(lines.last().unwrap(), "  after 0.5 s");
+        // A failed read is looked at again
+        let (result, _, took) = wait_over(&[Err(failed.clone()), Ok(both_new())]);
+        assert_eq!((result, took), (Ok(()), POLL));
+        // A failed last read, after a look that missed one: the last good look's, with the failure
+        let (result, _, took) = wait_over(&[Ok(low_only.clone()), Err(failed.clone())]);
+        assert_eq!(took, Duration::from_secs(1));
+        assert_eq!(result, Err(SwitchError::Mics { missing: vec![Mic::Call], seen: vec![MICROPHONE.into()], read: Some(failed.clone()) }));
+        // Every read failed
+        let (result, _, _) = wait_over(&[Err(failed.clone())]);
+        assert_eq!(result, Err(SwitchError::Mics { missing: vec![Mic::LowLatency, Mic::Call], seen: vec![], read: Some(failed.clone()) }));
+        // At the deadline with the microphones there and an old one still active: done, and it says so
+        let mut going = both_new();
+        going.push(ep("{old}", MICROPHONE, Mic::LowLatency, OLD, true));
+        let (result, lines, took) = wait_over(&[Ok(going.clone())]);
+        assert_eq!((result, took), (Ok(()), Duration::from_secs(1)));
+        assert!(
+            lines.contains(
+                &r#"  also still active: "Microphone (AudioCodec Device)" (a removed device's, going, or another device's)"#.into()
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(lines.last().unwrap(), "  after 1.0 s");
+        // ... the same when the last read failed after them
+        let (result, _, _) = wait_over(&[Ok(going), Err(failed)]);
+        assert_eq!(result, Ok(()));
+        // A microphone that never comes: a timeout
+        let (result, _, took) = wait_over(&[Ok(low_only)]);
+        assert_eq!(took, Duration::from_secs(1));
+        assert_eq!(result, Err(SwitchError::Mics { missing: vec![Mic::Call], seen: vec![MICROPHONE.into()], read: None }));
     }
 
     #[test]
@@ -1423,33 +1939,150 @@ mod tests {
         assert_eq!(lock_wait(windows::Win32::Foundation::WAIT_FAILED), LockWait::Failed);
     }
 
-    /// Astra's review: two switches at once could both create a device. The lock, on a mutex of the test's own (Local\, this
-    /// process's id), so a real switch is never in the way: held, another thread waits and gives up; released, it takes it;
-    /// abandoned by a thread that ended holding it, the next takes it and says so.
+    /// A lock of the test's own, so a real switch is never in the way: a boundary named for this process and `which`, with
+    /// the Everyone SID (every token has it) and a descriptor that lets everyone in, so the test needn't be elevated. The
+    /// switch's own ([`LOCK`]) differs in those alone.
+    fn test_lock(which: &str) -> String {
+        format!("noise-filter-test-{which}-{}", std::process::id())
+    }
+
+    fn space(boundary: &str) -> LockSpace<'_> {
+        // The alias is the boundary's name: the tests run on threads of one process, each with its own namespace
+        LockSpace { boundary, sid: WinWorldSid, sddl: "D:P(A;;GA;;;WD)", alias: boundary, mutex: "mic-variant" }
+    }
+
+    /// Takes the lock on another thread, as a second switch would: whether it got it, and what it said.
+    fn take_elsewhere(boundary: &str, wait: Duration) -> (Result<(), SwitchError>, Vec<String>) {
+        let boundary = boundary.to_string();
+        std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let taken = SwitchLock::take(&space(&boundary), wait, &mut |l| lines.push(l.to_string())).map(drop);
+            (taken, lines)
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Astra's review: two switches at once could both create a device. Held, another thread waits and gives up; released,
+    /// it takes it; abandoned by a thread that ended holding it, the next takes it and says so.
     #[test]
     fn the_lock_lets_one_switch_in_at_a_time() {
-        let name = format!(r"Local\noise-filter-test-mic-variant-{}", std::process::id());
-        let take_elsewhere = |wait: Duration| {
-            let name = name.clone();
-            std::thread::spawn(move || {
-                let mut lines = Vec::new();
-                let taken = SwitchLock::take(&name, wait, &mut |l| lines.push(l.to_string())).map(drop);
-                (taken, lines)
-            })
-            .join()
-            .unwrap()
-        };
-        let held = SwitchLock::take(&name, Duration::ZERO, &mut |_| {}).unwrap();
-        let (taken, lines) = take_elsewhere(Duration::from_millis(50));
+        let boundary = test_lock("one-at-a-time");
+        let held = SwitchLock::take(&space(&boundary), Duration::ZERO, &mut |_| {}).unwrap();
+        let (taken, lines) = take_elsewhere(&boundary, Duration::from_millis(50));
         assert_eq!(taken, Err(SwitchError::Busy));
         assert_eq!(lines, ["Another switch is running: waiting for it to end (up to 0 s)"]);
         drop(held);
-        assert_eq!(take_elsewhere(Duration::ZERO), (Ok(()), vec![]));
-        let n = name.clone();
-        std::thread::spawn(move || std::mem::forget(SwitchLock::take(&n, Duration::ZERO, &mut |_| {}).unwrap())).join().unwrap();
-        let (taken, lines) = take_elsewhere(Duration::ZERO);
+        assert_eq!(take_elsewhere(&boundary, Duration::ZERO), (Ok(()), vec![]));
+        let b = boundary.clone();
+        std::thread::spawn(move || std::mem::forget(SwitchLock::take(&space(&b), Duration::ZERO, &mut |_| {}).unwrap())).join().unwrap();
+        let (taken, lines) = take_elsewhere(&boundary, Duration::ZERO);
         assert_eq!(taken, Ok(()));
         assert_eq!(lines, ["(The last switch's process ended in the middle of its switch: this one reads the devices afresh.)"]);
+    }
+
+    /// The switch that made the namespace ends while another waits in it: the next still finds the waiter's lock (the
+    /// namespace lives while a holder has it open), not a new one beside it.
+    #[test]
+    fn the_lock_outlives_the_switch_that_made_its_namespace() {
+        use std::sync::mpsc;
+        let boundary = test_lock("outlives");
+        let first = SwitchLock::take(&space(&boundary), Duration::ZERO, &mut |_| {}).unwrap();
+        let (waiting, waits) = mpsc::channel::<()>();
+        let (taken, has_it) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let b = boundary.clone();
+        let second = std::thread::spawn(move || {
+            let lock = SwitchLock::take(&space(&b), Duration::from_secs(10), &mut |_| waiting.send(()).unwrap()).unwrap();
+            taken.send(()).unwrap();
+            released.recv().unwrap();
+            drop(lock);
+        });
+        waits.recv().unwrap();
+        drop(first);
+        has_it.recv().unwrap();
+        assert_eq!(take_elsewhere(&boundary, Duration::ZERO).0, Err(SwitchError::Busy), "the second switch holds it");
+        release.send(()).unwrap();
+        second.join().unwrap();
+        assert_eq!(take_elsewhere(&boundary, Duration::ZERO).0, Ok(()));
+    }
+
+    /// Astra's review: any process could squat `Global\noise-filter-mic-variant`. Neither a plain mutex of the name nor a
+    /// namespace of the same boundary name with another SID (one a squatter could make) is the lock.
+    #[test]
+    fn a_squatted_name_isnt_the_lock() {
+        let boundary = test_lock("squatted");
+        let plain = HSTRING::from(format!(r"Local\{boundary}"));
+        // SAFETY: no attributes; a NUL-terminated name; owned on creation.
+        let squatter = unsafe { CreateMutexExW(None, &plain, CREATE_MUTEX_INITIAL_OWNER, SYNCHRONIZATION_SYNCHRONIZE.0) }.unwrap();
+        // SAFETY: a valid handle that nothing else owns.
+        let _squatter = unsafe { Owned::new(squatter) };
+        // Another process's alias would be its own
+        let alias = format!("{boundary}-squatter");
+        let other_sid = LockSpace { sid: WinAuthenticatedUserSid, alias: &alias, ..space(&boundary) };
+        let squatted = SwitchLock::take(&other_sid, Duration::ZERO, &mut |_| {}).unwrap();
+        assert_eq!(take_elsewhere(&boundary, Duration::ZERO), (Ok(()), vec![]));
+        drop(squatted);
+    }
+
+    /// This process's token with BUILTIN\Administrators deny-only, as a standard user's or an unelevated administrator's has
+    /// it (or no member of it at all), and its privileges dropped.
+    fn token_without_administrators() -> Owned<HANDLE> {
+        let mut token = HANDLE::default();
+        // SAFETY: this process's pseudo handle; `token` is a live out-pointer.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE, &mut token) }.unwrap();
+        // SAFETY: a valid handle that nothing else owns; Owned closes it once.
+        let token = unsafe { Owned::new(token) };
+        let mut admins = well_known_sid(WinBuiltinAdministratorsSid).unwrap();
+        let disable = [SID_AND_ATTRIBUTES { Sid: PSID(admins.as_mut_ptr().cast()), Attributes: 0 }];
+        let mut restricted = HANDLE::default();
+        // SAFETY: our token; a SID that outlives the call; `restricted` is a live out-pointer.
+        unsafe { CreateRestrictedToken(*token, DISABLE_MAX_PRIVILEGE, Some(&disable), None, None, &mut restricted) }.unwrap();
+        // SAFETY: as above.
+        unsafe { Owned::new(restricted) }
+    }
+
+    /// Astra's review: any process could hold `Global\noise-filter-mic-variant`, and block every switch for 60 s. The switch's
+    /// own lock refuses a caller without Administrators enabled, at once and by name: a thread impersonating this process's
+    /// token with Administrators deny-only. Refused at the namespace (its boundary, or, if a switch made it meanwhile, its
+    /// descriptor), so such a caller can't make the namespace first, with a descriptor of its own, either.
+    #[test]
+    fn the_switchs_lock_refuses_a_caller_that_isnt_an_elevated_administrator() {
+        let refused = std::thread::spawn(|| {
+            let token = token_without_administrators();
+            // SAFETY: a valid token, for this thread alone, reverted below.
+            unsafe { ImpersonateLoggedOnUser(*token) }.unwrap();
+            let refused = SwitchLock::take(&LOCK, Duration::ZERO, &mut |_| {}).map(drop);
+            // SAFETY: no arguments; ends this thread's impersonation.
+            unsafe { RevertToSelf() }.unwrap();
+            refused
+        })
+        .join()
+        .unwrap();
+        match &refused {
+            Err(SwitchError::LockDenied(e)) => assert!(matches!(e.call, "CreatePrivateNamespaceW" | "OpenPrivateNamespaceW"), "{e}"),
+            _ => panic!("{refused:?}"),
+        }
+        let text = refused.unwrap_err().to_string();
+        assert!(text.starts_with("the switch's lock refused this process (") && text.contains("ERROR_ACCESS_DENIED (5)"), "{text}");
+    }
+
+    /// The microphones' filters are the INF's and the driver's.
+    #[test]
+    fn the_microphones_filters_are_the_drivers() {
+        let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/AudioCodec/Driver/");
+        let inf = std::fs::read(format!("{driver}AudioCodec.inf")).unwrap();
+        assert_eq!(inf[..2], [0xFF, 0xFE], "UTF-16LE, with a BOM");
+        let inf = String::from_utf16_lossy(&wide_of_bytes(&inf[2..]));
+        assert!(inf.contains(&format!("KSNAME_Microphone=\"{MICROPHONE_FILTER}\"")));
+        assert!(inf.contains(&format!("KSNAME_CallMicrophone=\"{CALL_MICROPHONE_FILTER}\"")));
+        let settings = std::fs::read_to_string(format!("{driver}DriverSettings.h")).unwrap();
+        assert!(settings.contains(&format!("captureCircuitName, L\"{MICROPHONE_FILTER}\")")));
+        assert!(settings.contains(&format!("capture2CircuitName, L\"{CALL_MICROPHONE_FILTER}\")")));
+        for v in Variant::ALL {
+            assert_eq!(v.mics().iter().map(|&m| default_name(m)).collect::<Vec<_>>(), v.microphones(), "{v:?}");
+        }
+        assert_eq!(mics_text(&[Mic::Call]), "\"Call Microphone (AudioCodec Device)\"");
     }
 
     #[test]
@@ -1530,11 +2163,17 @@ mod tests {
         let e = SwitchError::from(WinError { call: "DiInstallDevice", code: 5 });
         assert!(e.to_string().starts_with("DiInstallDevice failed: ERROR_ACCESS_DENIED (5)"));
         let text = SwitchError::Busy.to_string();
-        assert!(text.starts_with(r"another switch has held Global\noise-filter-mic-variant for 60 s: let it end"), "{text}");
+        assert!(text.starts_with("another switch has held the switch's lock for 60 s: let it end"), "{text}");
         assert!(text.ends_with("Nothing was changed."));
+        let text = SwitchError::LockDenied(WinError { call: "CreatePrivateNamespaceW", code: 5 }).to_string();
+        assert!(
+            text.starts_with("the switch's lock refused this process (CreatePrivateNamespaceW failed: ERROR_ACCESS_DENIED (5)"),
+            "{text}"
+        );
+        assert!(text.contains("it is for elevated administrators") && text.ends_with("Nothing was changed."), "{text}");
         let text = SwitchError::NoEndpoints(WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 }).to_string();
         assert!(text.starts_with("the audio endpoints couldn't be read (IMMDeviceEnumerator::EnumAudioEndpoints failed"), "{text}");
-        assert!(text.contains("nothing was removed"));
+        assert!(text.contains("nothing was changed"));
 
         let failure = InstallFailure::NotWorking { now: Bound { health: Health::NotStarted, inf: None, driver_version: None } };
         let install = |removed| {
@@ -1560,14 +2199,14 @@ mod tests {
         assert!(text.contains(r"Removing it again failed too (DiUninstallDevice failed: ERROR_ACCESS_DENIED (5)"), "{text}");
         assert!(text.contains(r"pnputil /remove-device ROOT\MEDIA\0004"), "{text}");
 
-        let e = SwitchError::Mics { missing: vec![CALL_MICROPHONE], seen: vec![MICROPHONE.into()], read: None };
+        let e = SwitchError::Mics { missing: vec![Mic::Call], seen: vec![MICROPHONE.into()], read: None };
         assert_eq!(
             e.to_string(),
             "the device is working on the newest package, but after 15 s Windows hasn't made \"Call Microphone (AudioCodec Device)\" \
-             (ours there: \"Microphone (AudioCodec Device)\"). The Sound panel's Recording tab and `noise-filter mic variant` show \
-             what's there now."
+             (ours there: \"Microphone (AudioCodec Device)\"). The device stays: `noise-filter mic variant` and the Sound panel's \
+             Recording tab show what's there now."
         );
-        let e = SwitchError::Mics { missing: vec![MICROPHONE, CALL_MICROPHONE], seen: vec![], read: Some(WinError { call: "X", code: 5 }) };
+        let e = SwitchError::Mics { missing: vec![Mic::LowLatency, Mic::Call], seen: vec![], read: Some(WinError { call: "X", code: 5 }) };
         let text = e.to_string();
         assert!(
             text.contains("hasn't made \"Microphone (AudioCodec Device)\" and \"Call Microphone (AudioCodec Device)\" (ours there: none)")
