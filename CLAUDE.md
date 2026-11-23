@@ -19,8 +19,12 @@ is windows-reactor (WinUI 3). Public release is the intent.
   Paths written as `TMR-APP/...` in the docs mean that folder.
 
 ## Who runs what
-- **The owner runs the app** (`cargo run`, the exe), including every live test with audio devices.
-  Don't run it unless asked for a one-off.
+- **On the dev box, run anything** (the owner, 2026-11-23): the app (`cargo run`, the exe), its live
+  tests (`latency`, `quality`, `devices --check`, soaks), driver installs and Verifier rounds, all on
+  virtual devices. Don't run two audio tests at once: they share the devices and skew each other's
+  timing. Say first if a run is long or needs the box idle.
+- **Reboots are the owner's:** a reboot ends the session, and the owner restarts it by hand. Ask for
+  one; never start it. Tests on real mics, speakers or other machines are the owner's too.
 - `cargo check`, `cargo clippy`, `cargo build` and `cargo test` are fine to run. Tests must not touch
   audio devices: they run the offline WAV harness (TODO #2).
 - Ask before `cargo bench`, and before any test that allocates large pages or exhausts memory. Tests use 4 KB pages (the arena's test mode); the large-page path runs only in the app, or in an `#[ignore]`d test the owner runs.
