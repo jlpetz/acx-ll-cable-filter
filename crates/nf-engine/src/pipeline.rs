@@ -39,8 +39,8 @@ pub(crate) type Hr = i32;
 
 /// Dither amplitude for the mic and reference blocks: about -180 dBFS. It keeps AEC3's and
 /// RNNoise's filters out of denormal range on exact digital silence (sonora #34) without FTZ/DAZ.
-/// The mic is dithered only while a stage runs (`Chain::runs_a_stage`): in bypass digital silence
-/// stays exact (TODO 10, the owner's decision of 2026-11-22; the matrix, doc/dev/dither-matrix-2026-11-21.md).
+/// The mic is dithered only while a stage runs (`Chain::runs_a_stage`): in bypass and in measurement passthrough digital
+/// silence stays exact (TODO 10, the owner's decision of 2026-11-22; the matrix, doc/dev/dither-matrix-2026-11-21.md).
 pub(crate) const DITHER: f32 = 1e-9;
 /// Mic FIFO capacity: 200 ms.
 const MIC_FIFO: usize = 9_600;
@@ -2185,6 +2185,65 @@ mod tests {
             } else {
                 assert!(spy.seen.iter().all(|&v| v.to_bits() == 0), "exact zeros in bypass");
             }
+        }
+    }
+
+    /// The real chain (AEC3 and RNNoise) behind the pipeline, keeping the mic blocks it got and its output: the mic dither is
+    /// the chain's own call (`Chain::runs_a_stage`).
+    struct ChainSpy {
+        chain: Chain,
+        mic: Vec<f32>,
+        out: Vec<f32>,
+    }
+
+    impl BlockProcessor for ChainSpy {
+        fn process<T: Ticks>(&mut self, mic: &Block, r: &Block, out: &mut Block, t: &mut T) -> ChainReport {
+            self.mic.extend_from_slice(mic);
+            let report = BlockProcessor::process(&mut self.chain, mic, r, out, t);
+            self.out.extend_from_slice(out);
+            report
+        }
+        fn aec_stats(&self) -> Option<AecStats> {
+            None
+        }
+        fn dither_mic(&self) -> bool {
+            BlockProcessor::dither_mic(&self.chain)
+        }
+    }
+
+    /// A latency test's passthrough with AEC3 and RNNoise on (TODO 10; Astra's review, 2026-11-23): delay lines stand in for
+    /// both and neither runs, so the mic isn't dithered, and once the delay lines (910 samples) hold none of the dither from
+    /// before, digital silence leaves the chain as exact zeros. The block passthrough comes on (the stages' last run, into
+    /// the crossfade) and every block from the one it goes off are dithered.
+    #[test]
+    fn a_latency_tests_passthrough_leaves_the_mic_undithered() {
+        let controls = Arc::new(ChainControls::new(&ProcessingConfig { aec_enabled: true, ..ProcessingConfig::default() }));
+        let chain = nf_stages::build_chain(controls.clone(), true).unwrap();
+        assert_eq!(chain.latency(), 910);
+        let mut spy = ChainSpy { chain, mic: Vec::new(), out: Vec::new() };
+        let mut p = pipe(false);
+        let mut sink = FakeSink::new(4800);
+        p.prefill(&mut sink).unwrap();
+        let tel = Telemetry::new();
+        let mut mic = FakeCapture::default();
+        for b in 0..12usize {
+            controls.passthrough.store((3..9).contains(&b), Relaxed);
+            mic.push((b * 480) as u64, None, vec![0.0; 480]);
+            p.drain_mic(&mut mic, 0.0).unwrap();
+            p.process_block(&mut spy, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+            sink.advance(480.0, 100_000.0);
+        }
+        let (mic, out) = (spy.mic.as_chunks::<BLOCK>().0, spy.out.as_chunks::<BLOCK>().0);
+        assert_eq!((mic.len(), out.len()), (12, 12));
+        for (b, m) in mic.iter().enumerate() {
+            if (4..9).contains(&b) {
+                assert!(m.iter().all(|&v| v.to_bits() == 0), "block {b}: in passthrough the mic passes as it came");
+            } else {
+                assert!(m.iter().all(|v| v.abs() <= 1.0001e-9) && m.iter().any(|&v| v != 0.0), "block {b}: dithered");
+            }
+        }
+        for (b, o) in out.iter().enumerate().take(9).skip(6) {
+            assert!(o.iter().all(|&v| v == 0.0), "block {b}: exact zeros out");
         }
     }
 

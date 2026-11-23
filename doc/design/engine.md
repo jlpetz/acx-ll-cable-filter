@@ -68,7 +68,8 @@ Once, when the thread starts:
 2. `AvSetMmThreadCharacteristicsW("Pro Audio")` (record failure in the status and continue);
 3. **no FTZ/DAZ** (Rust treats a persistent MXCSR change as UB): instead add `nf_core::rt::Dither` at
    1e-9 (about -180 dBFS) to every reference block, zero-filled gaps included, and to every mic block while a stage runs
-   (`Chain::runs_a_stage`: in bypass the mic passes as it came, so digital silence stays exact; TODO 10, the owner, 2026-11-22,
+   (`Chain::runs_a_stage`: in bypass, and in measurement passthrough, where delay lines stand in for the stages, the mic passes
+   as it came, so digital silence stays exact; TODO 10, the owner, 2026-11-22,
    from doc/dev/dither-matrix-2026-11-21.md: a clean mic stalls RNNoise 10x after speech); sonora 0.3.0 sets them inside
    each of its own calls and restores them, which the vendored copy does only with nf-stages' `sonora-denormal-guard`, off by
    default (sonora-nnnoiseless.md 1.11, 1.12; TODO 10).

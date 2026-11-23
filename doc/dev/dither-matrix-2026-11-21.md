@@ -39,10 +39,12 @@ others are all "bare" (nothing dithered), which is not an app setting.
 - **Float32, with today's dither:** never, in any chain. Bypass settles at -180 dBFS. The filters settle at -174 to -180
   with the gate off and -214 to -220 with the static or auto gate.
 - **24-bit** (the engine's exclusive-mode conversion; Windows' shared-mode conversion isn't modelled): exact zero in every
-  chain under every policy, and the policies differ by 10 ms at most. After speech with today's dither: bypass at once,
-  UL-UNAS from 70 ms, RNNoise from 130 ms, AEC3 chains from 330-370 ms.
-- **One case never reaches zero:** AEC3 with the far end playing and the mic at zero. AEC3 itself outputs -75 to -89 dBFS
-  there, under every policy.
+  chain under every policy after the tails, but for the case below, and the policies differ by 10 ms at most. After speech
+  with today's dither: bypass at once, UL-UNAS from 70 ms, RNNoise from 130 ms, AEC3 chains from 330-370 ms.
+- **One case never reaches zero:** AEC3 with the far end playing and the mic at zero, in every chain with AEC3. AEC3 itself
+  outputs -75 to -89 dBFS there, under every policy: with today's dither the peak over the phase's second half is -75.1 dBFS
+  with AEC3 alone, and a denoiser's gate after it brings that to -120.4 at the lowest, still above the -144.5 that 24-bit
+  rounds to zero. So no dither policy gives exact silence there; only an output guarantee does (option F).
 
 **Speech.** Each policy is compared against today's dither with another seed, the control, which measures what any -180 dB
 perturbation does.
@@ -55,19 +57,21 @@ perturbation does.
 
 | Option | Chain p99, worst phase, us (AEC3 / RNNoise / AEC3+RNNoise) | Float32 silence exact zero | 24-bit | Speech | Soundness |
 |---|---|---|---|---|---|
-| A. Today: mic and reference dithered, guard on (stock sonora) | 66 / 47 / 106 | never | yes, every chain | baseline | formally UB |
+| A. Today: mic and reference dithered, guard on (stock sonora) | 66 / 47 / 106 | never | every chain after the tails, but not AEC3's while the far end plays | baseline | formally UB |
 | B. A with the guard off | 64 / 48 / 107 | never | as A | bit-identical to A | sound; needs the vendored patch |
 | C. Reference only, guard on | 66 / 480 / 105 | bypass at once, UL-UNAS 70 ms, RNNoise 1040 ms; AEC3 chains never after speech (-181 to -182 dBFS) | as A | UL-UNAS degraded (above) | UB |
 | D. Reference only, guard off | 447 / 481 / 487 | as C | as A | as C | sound |
 | E. B, with no mic dither in bypass | as B; bypass 0.6 us p50 | bypass at once; filter chains as A | as A | as A in every filter chain | sound |
-| F. E plus an end stage writing exact zeros once the mic has been silent past the chain's tail (TODO 17) | not built | every chain, when chosen | as A or sooner | none expected while the mic is live | sound |
+| F. E plus an end stage writing exact zeros once the mic has been silent past the chain's tail (TODO 17) | not built | every chain, when chosen | every chain, AEC3's with the far end playing too | none expected while the mic is live | sound |
 
 E is assembled from measured cells: bypass under "ref" or "none", plus the filter chains under today's dither. It hasn't
 been tested as an implementation, including switching the mic dither on when a filter is switched on.
 
 ## Our recommendation (for the owner to decide)
 
-**Option E now, and F later for exact float32 silence in the studio case.**
+**Option E now, and F later for exact silence in the studio case:** float32 never gets there with a filter running, and
+24-bit doesn't with AEC3 running while the far end plays (corrected 2026-11-23, Astra's review: this said "exact float32
+silence", as if 24-bit silence came by itself).
 - **Turn the guard off.** With today's dither it saves nothing measurable and changes no output, so the formally-UB code
   buys nothing.
 - **Keep the mic dither whenever a filter runs.** A clean mic stalls RNNoise 10x in either build and degrades UL-UNAS after

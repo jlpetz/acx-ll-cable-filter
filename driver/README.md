@@ -50,6 +50,19 @@ Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|
 `NfMicrophones` from the device's hardware key): `ROOT\AudioCodec` both, `ROOT\AudioCodecCall` the call microphone,
 `ROOT\AudioCodecLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
 
+**Latency: two figures, measured at different points** (the Server 2025 VM, 2026-11-20 to 23;
+doc/todo/19-spike-2026-11-20.md):
+
+| Measured | Microphone | Call Microphone |
+|---|---|---|
+| The app's ring to the recording app's receipt, p50 / p99: `nf-vmic-test latency`, from the QPC just after the feeder stores `WriteFrame` to the QPC when the client's GetBuffer returns (every frame decoded back to its number); shared, one packet of fill | 9.8 / 10.4 ms at the default 10 ms period; 3.1 / 3.7 ms for a client that asks for 3.33 ms (160 frames, IAudioClient3) | 4.6 / 5.6 ms (the 5 ms default period) |
+| Speakers to mic, sample transit by the device timestamps at both ends: `noise-filter latency --cable-only`, from the probe's play-out by its AudioClock to the arrival by the capture packets' stamps; shared, 10 ms render | 1.91 ms (spread 0.18) | 1.62 ms |
+
+The first answers when the recording app actually has the audio: the ring's fill plus the client's wake, about a packet at a
+one-packet fill, so it follows the client's period. The second is the loopback's own transit (the capture pass reads 1 ms
+behind the render) and compares with another cable's `--cable-only` figure (VB-CABLE's: 50-62 ms on the same VM); a client
+gets each packet about a packet plus its wake after its first frame's device time (10.4 ms at a 10 ms period).
+
 The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
 (page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
 plays it instead of the loopback, frame for frame. The request ends with ERROR_OPERATION_ABORTED (a cancel, the issuing thread

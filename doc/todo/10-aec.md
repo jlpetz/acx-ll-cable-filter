@@ -333,10 +333,29 @@ the guard off, none in bypass; the exact-zero end stage later.
 - a clean mic stalls RNNoise 10x after speech (p99 481 against 47 us) in either guard build, and degrades UL-UNAS's output
   after silence;
 - with today's dither the guard changes no output bit and saves nothing measurable;
-- 24-bit output already reaches exact zero in every chain, float32 never does.
+- float32 output never reaches exact zero once a filter runs (the dither travels through). 24-bit output does in every chain
+  after the tails (UL-UNAS from 70 ms, RNNoise 130, the AEC3 chains 330-370), but not with AEC3 running while the far end
+  plays and the mic is digitally silent: AEC3 itself puts out -75 to -89 dBFS there under every policy, and no chain with it
+  reaches 24-bit zero (with today's dither, the peak over the phase's second half is -75.1 dBFS with AEC3 alone and -120.4
+  at the lowest, with UL-UNAS and its gate after AEC3; 24-bit rounds a sample to zero only under about -144.5;
+  run-20261121-005101's JSON).
 
 Ours, for the owner: keep the dither while a filter runs, turn the guard off, no mic dither in bypass, and later an end stage
 that writes exact zeros once the tails have finished (TODO 17).
+
+**Since (2026-11-23, Astra's review):**
+- The 24-bit result above was summed up here as "exact zero in every chain", which promised too much: the filters can't be
+  left to settle into exact silence. For studio use exact mute has to be an explicit output guarantee, the end stage
+  (TODO 17, "Exact mute": ours, not built), and its trigger has to be the mic's own digital silence, not the stages'
+  outputs settling or their tails finishing: with the far end playing, AEC3's reference is live and its output from a silent
+  mic doesn't settle.
+- Measurement passthrough (the latency test's) dithered the mic whenever a stage was switched on, though its delay lines run
+  no stage. `Chain::runs_a_stage` now follows whether a stage processes the block (`Slot::runs`, which mirrors `run_slot`:
+  the blocks it is wanted on, and the one block it leaves `On` for passthrough or off), so passthrough leaves the mic as it
+  came, as bypass does; a stage that resumes is reset and primed with the block before, as after bypass. Tests: nf-core's
+  `no_stage_runs_in_passthrough` and `runs_a_stage_says_whether_the_next_block_runs_one` (every pair of a mode and a want,
+  against the stage's own count of its runs), nf-engine's `a_latency_tests_passthrough_leaves_the_mic_undithered` (the real
+  chain, AEC3 and RNNoise: exact zeros out once the delay lines have flushed).
 
 The mic and reference blocks get a ~1e-9 dither (`pipeline.rs:40`, `DITHER`): it keeps AEC3's and RNNoise's filters (and our
 gate and floor) out of denormal range on exact digital silence, without FTZ/DAZ. sonora 0.3.0 also sets FTZ/DAZ inside each of

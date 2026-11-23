@@ -20,7 +20,7 @@ included. It is built to take more noise models later without touching the engin
   Devices are converted at the edge: channel downmix or upmix, plus WASAPI autoconvert when a
   device doesn't run at 48 kHz.
 - **One audio thread** (MMCSS "Pro Audio", real-time allocator scope; no FTZ/DAZ of our own (sonora 0.3.0's guard, both for the length of each of its calls, is built only with nf-stages' `sonora-denormal-guard`, off by default: TODO 10, `vendor/README.md`, `tests/mxcsr.rs`), the
-  reference blocks, and the mic's while a stage runs, are dithered at about -180 dBFS instead; in bypass silence stays exact), kept between runs and driven by the
+  reference blocks, and the mic's while a stage runs, are dithered at about -180 dBFS instead; in bypass and in measurement passthrough silence stays exact), kept between runs and driven by the
   mic's capture events. For each complete mic block:
   1. read the loopback reference (keep-alive render keeps it flowing) into the reference FIFO,
      slipped to the mic clock;

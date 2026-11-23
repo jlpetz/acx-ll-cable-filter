@@ -174,6 +174,13 @@ impl Slot {
     fn start_blocks(&self) -> u32 {
         (self.latency as usize).div_ceil(BLOCK).saturating_sub(1) as u32
     }
+
+    /// Whether [`run_slot`] runs the stage on a block that wants `want`: on every block it is wanted on (a restart and the
+    /// start-up blocks included), and on the one block it leaves `Mode::On` for passthrough or off, run once into the
+    /// crossfade. The delay line standing in for it (passthrough, a drain, a start-up cut short) runs nothing.
+    fn runs(&self, want: Want) -> bool {
+        want == Want::On || self.mode == Mode::On
+    }
 }
 
 /// The chain. Built and activated before real-time; `process` is real-time.
@@ -227,13 +234,16 @@ impl Chain {
             + self.noise.as_ref().map_or(0, |s| s.latency(c.noise.enabled.load(Relaxed)))
     }
 
-    /// Whether a stage will run on the next block: one is switched on, or was running on the last block (the block a stage is
-    /// switched off on still runs it once, into its delay line). While one does, the engine dithers the mic, so no stage's
-    /// state decays into exact-zero input, where RNNoise and AEC3 stall on subnormals; in bypass nothing runs and the mic
-    /// passes as it came, so digital silence stays exact (TODO 10, the owner's decision of 2026-11-22).
+    /// Whether a stage will process the next block: one is switched on outside measurement passthrough, or was running on the
+    /// last block (the block a stage is switched off on, or passthrough comes on, still runs it once, into the crossfade to
+    /// its delay line). While one does, the engine dithers the mic, so no stage's state decays into exact-zero input, where
+    /// RNNoise and AEC3 stall on subnormals. In bypass, and in passthrough, where a delay line stands in for each enabled
+    /// stage, nothing runs and the mic passes as it came, so digital silence stays exact (TODO 10, the owner's decision of
+    /// 2026-11-22). A stage that runs again is reset and primed with the block before, as after bypass.
     pub fn runs_a_stage(&self) -> bool {
         let c = &self.controls;
-        let runs = |slot: &Option<Slot>, want: bool| slot.as_ref().is_some_and(|s| want || matches!(s.mode, Mode::On | Mode::Starting(_)));
+        let passthrough = c.passthrough.load(Relaxed);
+        let runs = |slot: &Option<Slot>, enabled: bool| slot.as_ref().is_some_and(|s| s.runs(Want::new(enabled, passthrough)));
         runs(&self.aec, c.aec.enabled.load(Relaxed)) || runs(&self.noise, c.noise.enabled.load(Relaxed))
     }
 
@@ -671,6 +681,72 @@ mod tests {
         assert!(!chain.runs_a_stage(), "off after the switch-off block");
         let empty = Chain::new(Arc::new(ChainControls::new(&ProcessingConfig::default())), None, None);
         assert!(!empty.runs_a_stage(), "no stages at all");
+    }
+
+    /// Measurement passthrough (the latency test's) puts a delay line in each enabled stage's place, so no stage runs and the
+    /// engine leaves the mic undithered, as in bypass (TODO 10; Astra's review, 2026-11-23): runs_a_stage is false there with
+    /// the stage switched on, true on the block passthrough comes on (the stage's last run, into the crossfade), and true
+    /// again from the block passthrough goes off (the stage restarted). A chain in passthrough from its first block never runs
+    /// the stage.
+    #[test]
+    fn no_stage_runs_in_passthrough() {
+        let wired = || -> Box<dyn Stage> { Box::new(Wired::new(&[features::DENOISE], MONO_IN_OUT.clone(), false)) };
+        let c = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        let mut chain = Chain::new(c.clone(), None, Some(wired()));
+        chain.activate().unwrap();
+        feed_marked(&mut chain, 0, 2);
+        c.passthrough.store(true, Relaxed);
+        assert!(chain.runs_a_stage(), "the block passthrough comes on runs it once");
+        feed_marked(&mut chain, 2, 3);
+        assert!(!chain.runs_a_stage(), "passthrough, the stage switched on");
+        feed_marked(&mut chain, 3, 6);
+        assert!(!chain.runs_a_stage(), "still passthrough");
+        c.passthrough.store(false, Relaxed);
+        assert!(chain.runs_a_stage(), "passthrough off: the next block restarts it");
+        feed_marked(&mut chain, 6, 7);
+        assert!(chain.runs_a_stage(), "on");
+
+        let c = Arc::new(ChainControls::new(&ProcessingConfig::default()));
+        c.passthrough.store(true, Relaxed);
+        let mut chain = Chain::new(c.clone(), None, Some(wired()));
+        chain.activate().unwrap();
+        assert!(!chain.runs_a_stage(), "passthrough before the first block");
+        feed_marked(&mut chain, 0, 3);
+        assert!(!chain.runs_a_stage(), "passthrough from the first block");
+    }
+
+    /// runs_a_stage, read before a block, says whether that block runs the stage, by the stage's own count of its runs, through
+    /// every pair of a slot's mode and what the controls ask for: a stage of one block's latency, and a model pack's 2400
+    /// samples, whose start-up blocks are cut short by passthrough and by a switch-off.
+    #[test]
+    fn runs_a_stage_says_whether_the_next_block_runs_one() {
+        // (enabled, passthrough, blocks). A loud input keeps a drain going; passthrough coming on with the stage switched off
+        // ends one (test_starts), which is how the slot gets to Off.
+        #[rustfmt::skip]
+        let schedule = [
+            (true, false, 3), (true, true, 2), (true, false, 7), (false, false, 2), (true, true, 2), (false, false, 2),
+            (true, false, 2), (true, true, 1), (true, false, 2), (false, false, 2), (false, true, 1), (false, false, 1),
+            (true, false, 2), (false, false, 1), (false, true, 1), (true, true, 2), (false, true, 1), (false, false, 1),
+            (false, true, 1), (true, false, 3),
+        ];
+        for (lat, pairs) in [(480u32, 12), (2400, 15)] {
+            let mut r = rig(lat, 1.0, &ProcessingConfig::default());
+            let mut out = [0.0f32; BLOCK];
+            let mut seen = Vec::new();
+            let blocks = schedule.iter().flat_map(|&(on, pass, n)| std::iter::repeat_n((on, pass), n));
+            for (b, (on, pass)) in blocks.enumerate() {
+                r.controls.noise.enabled.store(on, Relaxed);
+                r.controls.passthrough.store(pass, Relaxed);
+                let pair = (std::mem::discriminant(&r.chain.noise.as_ref().unwrap().mode), Want::new(on, pass));
+                if r.chain.started && !seen.contains(&pair) {
+                    seen.push(pair);
+                }
+                let (runs, calls) = (r.chain.runs_a_stage(), r.calls.load(Relaxed));
+                r.chain.process(&[0.1; BLOCK], &[0.0; BLOCK], &mut out);
+                assert_eq!(runs, r.calls.load(Relaxed) > calls, "latency {lat}, block {b}: enabled {on}, passthrough {pass}");
+            }
+            assert_eq!(seen.len(), pairs, "latency {lat}: every pair of a mode and a want visited");
+        }
     }
 
     #[test]

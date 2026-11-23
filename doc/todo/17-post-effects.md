@@ -49,6 +49,22 @@ Check the speech level, peak clipping and any audible rise in background noise. 
 silence check. Measure the added sample delay, p99 block time and audio-thread allocations with the offline harness (TODO 2).
 [Sonora 0.3.0 gain controls](https://github.com/dignifiedquire/sonora/blob/sonora-v0.3.0/crates/sonora/src/config.rs#L216-L250)
 
+## Exact mute: an output guarantee (ours, 2026-11-23, from TODO 10's matrix and Astra's review; not built)
+Studio use needs exact digital silence out while the mic sends exact zeros (a mute), and the filters don't give it by
+themselves (`doc/dev/dither-matrix-2026-11-21.md`):
+- float32 never gets to zero while a filter runs: the engine's mic dither (about -180 dBFS) travels through, as it has to
+  (TODO 10: a clean mic stalls RNNoise and degrades UL-UNAS);
+- 24-bit gets there after the tails in every chain (RNNoise at 130 ms, the AEC3 chains at 330-370), but not with AEC3
+  running while the far end plays: AEC3 then puts out -75 to -89 dBFS from a silent mic (-75.1 alone, with today's dither),
+  and no gate after it gets that to 24-bit zero.
+
+So the guarantee has to be the host's, at the chain's end (the matrix's option F): once the mic as captured (before the
+engine's dither) has been exact zeros for longer than the chain's latency plus a tail, an end stage writes exact zeros, and it
+stops when the mic's first nonzero sample reaches the output, the chain's latency after it, so no live audio is cut. The
+trigger is the mic alone: the reference is live while the far end plays and AEC3's output from a silent mic doesn't settle,
+so neither the stages' outputs nor CLAP's tail extension can say when. Open: the tail to wait (the matrix's times to 24-bit
+zero above), and whether the cut from -75 dBFS is faded.
+
 ## Effects details (CLAP chosen by the owner, 2026-10-26)
 - **Models (our proposal, part of #17, awaiting the owner):** our own declarative model-pack spec (#3).
 - **Effects:** don't invent a binary plugin ABI. No plugins would exist for it on day one, and CLAP
@@ -166,3 +182,4 @@ The decisions in this section are ours, within the owner's 2026-11-02 decision, 
 2. The `.clap` export of our stages (clack-plugin, or nih-plug's ISC export), adapting the deviations above.
 3. clack-host in an fx-host process for third-party plugins, with the profile's gui, log and thread-check.
 4. VST3 hosting later.
+5. The exact-mute end stage ("Exact mute" above), the studio case's output guarantee.
