@@ -2666,6 +2666,9 @@ struct StampRow {
     /// completed after the client's last read but before Stop returned is handed out just after Start, stamped then, not
     /// with the driver's time; the next packet, the driver's, can be stamped earlier than it (TODO 22's question).
     windows_stamped: bool,
+    /// A packet the driver completed before the Stop, handed out after Start with the driver's stamp (a shared engine's
+    /// buffered packets; measured 2026-11-23): on the time line before the pause, so checked with the run before.
+    late: bool,
     /// Windows flagged the packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY (a client that fell behind, or a stream's start).
     discontinuity: bool,
     trace: CaptureTrace,
@@ -2678,12 +2681,13 @@ const RESUME_WAITS_PERCENT: [u64; 8] = [30, 40, 50, 60, 70, 80, 130, 170];
 /// How long each resume holds the stream stopped (ms), in turn.
 const RESUME_PAUSES_MS: [u64; 8] = [3, 4, 5, 6, 7, 8, 20, 50];
 /// One of stamps' Stop/Starts: the wait after the last read, the pause, whether a packet the driver completed was left
-/// unread when Stop returned (the trace's latest notification isn't the client's last packet's), and the QPC just before
-/// Start.
+/// unread when Stop returned (the trace's latest notification isn't the client's last packet's), that notification's time
+/// (100 ns units), and the QPC just before Start.
 struct Resume {
     wait_hns: u64,
     pause_ms: u64,
     pending: bool,
+    stop_notify_hns: i64,
     start_qpc: u64,
 }
 /// Packets recorded after each resume.
@@ -2719,8 +2723,10 @@ struct StepCheck {
 
 /// Each of the driver's stamps must step by exactly the frames before it while the stream runs (the device position says
 /// which packets follow on), and across a Stop/Start by at least the frames between the last packet before it and the
-/// first after (by the pause too, as the time line paused with it; the frames between include any packet left out).
+/// first after (by the pause too, as the time line paused with it; the frames between include any packet left out). A
+/// packet from before the Stop handed out after Start ([`StampRow::late`]) is on the time line of the run before.
 fn check_steps(rows: &[StampRow]) -> StepCheck {
+    let line = |r: &StampRow| r.segment - u32::from(r.late && r.segment > 0);
     let mut c = StepCheck {
         no_time: rows.iter().filter(|r| r.device_hns.is_none()).count(),
         windows_stamped: rows.iter().filter(|r| r.windows_stamped).count(),
@@ -2739,7 +2745,7 @@ fn check_steps(rows: &[StampRow]) -> StepCheck {
         let ((_, a), (i, b)) = (w[0], w[1]);
         let (Some(ta), Some(tb)) = (a.device_hns, b.device_hns) else { continue };
         let step = tb as i64 - ta as i64;
-        if a.segment != b.segment {
+        if line(a) != line(b) {
             let Some(between) = b.position.checked_sub(a.position).filter(|&d| d >= u64::from(a.frames)) else {
                 c.gaps += 1;
                 continue;
@@ -2812,7 +2818,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
             let latest = latency::qpc_to_hns(read_stats(&device)?.capture_trace.last_notify_qpc, frequency);
             let pending = last_hns.is_some_and(|d| (latest - d as i64).abs() > STAMP_SLACK_HNS);
             std::thread::sleep(Duration::from_millis(RESUME_PAUSES_MS[k]));
-            done.push(Resume { wait_hns, pause_ms: RESUME_PAUSES_MS[k], pending, start_qpc: qpc_now() });
+            done.push(Resume { wait_hns, pause_ms: RESUME_PAUSES_MS[k], pending, stop_notify_hns: latest, start_qpc: qpc_now() });
         }
         capture.start()?;
         let want = rows.len() + if segment == 0 { packets } else { RESUME_PACKETS };
@@ -2830,6 +2836,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
                         frames: p.frames,
                         segment: segment as u32,
                         windows_stamped: false,
+                        late: false,
                         discontinuity: p.discontinuity,
                         trace: s.capture_trace,
                     }),
@@ -2845,17 +2852,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     if let Some(e) = error {
         return Err(e);
     }
-    // A resume's leading packets whose stamp isn't the driver's latest notification (read just after each GetBuffer), in
-    // either mode: Windows stamped them.
-    let mut leading = false;
-    for i in 1..rows.len() {
-        leading |= rows[i].segment != rows[i - 1].segment;
-        if leading {
-            let driver = latency::qpc_to_hns(rows[i].trace.last_notify_qpc, frequency);
-            rows[i].windows_stamped = rows[i].device_hns.is_some_and(|d| (d as i64 - driver).abs() > STAMP_SLACK_HNS);
-            leading = rows[i].windows_stamped;
-        }
-    }
+    classify_stamps(&mut rows, &done, frequency);
     print_stamps(&rows, frequency);
     if o.flag("--verbose") {
         // Each resume's rows and the one before: run, device position, frames, device time and receipt (ms from the first).
@@ -2942,6 +2939,45 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     Ok(verdict)
 }
 
+/// Whose stamp each packet carries, by the driver's packet grid (its packet length from the first run's notifications: the
+/// trace's packet numbers and times, read just after each GetBuffer). A stamp the driver gave starts one of its packets: on
+/// the grid of the row's latest notification, at or before it; or, after a resume, on the grid from before the Stop, at or
+/// before the notification then (a packet completed before the Stop and handed out after Start: `late`). Any other stamp
+/// Windows gave: the shared engine's own packet, or one left unread at Stop and stamped again at Start (measured 2026-11-23;
+/// the latest notification alone missed a shared engine's buffered packets, a packet or two behind it).
+fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
+    let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency);
+    let mut lengths: Vec<i64> = rows
+        .windows(2)
+        .filter(|w| w[0].segment == 0 && w[1].segment == 0)
+        .filter_map(|w| {
+            let packets = w[1].trace.last_notify_packet.checked_sub(w[0].trace.last_notify_packet).filter(|&n| n > 0)?;
+            Some((hns(w[1].trace.last_notify_qpc) - hns(w[0].trace.last_notify_qpc)) / packets as i64)
+        })
+        .collect();
+    lengths.sort_unstable();
+    let packet = lengths.get(lengths.len() / 2).copied().filter(|&p| p > 0);
+    // At or before `reference` by a whole number of packets (with no packet length known, at it).
+    let on_grid = |stamp: i64, reference: i64| {
+        let back = reference - stamp;
+        back >= -STAMP_SLACK_HNS
+            && match packet {
+                Some(p) => {
+                    let r = back.rem_euclid(p);
+                    r <= STAMP_SLACK_HNS || p - r <= STAMP_SLACK_HNS
+                }
+                None => back <= STAMP_SLACK_HNS,
+            }
+    };
+    for r in rows.iter_mut() {
+        let Some(d) = r.device_hns.map(|d| d as i64) else { continue };
+        let stop = r.segment.checked_sub(1).and_then(|k| done.get(k as usize)).map(|x| x.stop_notify_hns);
+        r.late = stop.is_some_and(|s| d <= s + STAMP_SLACK_HNS && on_grid(d, s));
+        let current = stop.is_none_or(|s| d > s + STAMP_SLACK_HNS) && on_grid(d, hns(r.trace.last_notify_qpc));
+        r.windows_stamped = !r.late && !current;
+    }
+}
+
 /// stamps' resumes, the first 16: the wait after the last read, the pause, whether a packet was left unread at Stop, then
 /// the first two packets after Start as the client got them (receipt and stamp, ms from just before Start), whose stamp
 /// each was, and the step between them: the client's packets apart from the driver's notifications (Astra, 2026-11-23).
@@ -2958,6 +2994,8 @@ fn print_resumes(rows: &[StampRow], done: &[Resume], frequency: u64) {
             let stamp = x.device_hns.map_or("none".to_string(), |d| format!("{:+.3}", from(d as i64)));
             let whose = if x.windows_stamped {
                 format!("Windows', the driver's latest {:+.3}", from(hns(x.trace.last_notify_qpc)))
+            } else if x.late {
+                "the driver's, from before Stop".to_string()
             } else {
                 "the driver's".to_string()
             };
@@ -3337,9 +3375,59 @@ mod tests {
             frames: 480,
             segment,
             windows_stamped: false,
+            late: false,
             discontinuity: false,
             trace: CaptureTrace::default(),
         }
+    }
+
+    /// A stamps row with `frames` frames and the driver's latest notification read after it (QPC at 10 MHz: 100 ns ticks).
+    fn traced(position: u64, frames: u32, device_ms: f64, segment: u32, notify: (u64, f64)) -> StampRow {
+        let mut r = row(position, device_ms, segment);
+        r.frames = frames;
+        (r.trace.last_notify_packet, r.trace.last_notify_qpc) = (notify.0, (notify.1 * 10_000.0).round() as u64);
+        r
+    }
+
+    fn resume(stop_notify_ms: f64) -> Resume {
+        Resume { wait_hns: 0, pause_ms: 0, pending: true, stop_notify_hns: (stop_notify_ms * 10_000.0).round() as i64, start_qpc: 0 }
+    }
+
+    /// Whose stamp, by the driver's packet grid (measured 2026-11-23). Exclusive, Astra's trace: the packet left unread at
+    /// Stop comes back stamped at Start, off the grid. Shared at 5 ms (the Call Microphone): the engine hands out the
+    /// driver's packets from before the Stop after Start, a packet or two behind its latest, then the driver's new ones.
+    #[test]
+    fn stamps_tell_the_drivers_from_windows_by_its_packet_grid() {
+        let mut rows = vec![
+            traced(0, 480, 0.0, 0, (10, 0.0)),
+            traced(480, 480, 10.0, 0, (11, 10.0)),
+            traced(960, 480, 20.0, 0, (12, 20.0)),
+            traced(1440, 480, 72.93, 1, (13, 30.0)),
+            traced(1920, 480, 71.42, 1, (14, 71.42)),
+            traced(2400, 480, 81.42, 1, (15, 81.42)),
+        ];
+        classify_stamps(&mut rows, &[resume(30.0)], 10_000_000);
+        let whose: Vec<(bool, bool)> = rows.iter().map(|r| (r.windows_stamped, r.late)).collect();
+        assert_eq!(whose, [(false, false), (false, false), (false, false), (true, false), (false, false), (false, false)]);
+        let c = check_steps(&rows);
+        assert_eq!((c.checked, c.across, c.wrong.len(), c.overlapping.len(), c.backward.clone()), (4, 1, 0, 0, vec![4]));
+
+        // Shared at 5 ms: two packets notified after the last read before Stop (15 and 20 ms), handed out after Start with
+        // their own stamps, the second read after the new run's first notification; then the new run's packets.
+        let mut rows = vec![
+            traced(0, 240, 0.0, 0, (100, 0.0)),
+            traced(240, 240, 5.0, 0, (101, 5.0)),
+            traced(480, 240, 10.0, 0, (102, 10.0)),
+            traced(720, 240, 15.0, 1, (104, 20.0)),
+            traced(960, 240, 20.0, 1, (105, 46.88)),
+            traced(1200, 240, 46.88, 1, (105, 46.88)),
+            traced(1440, 240, 51.88, 1, (106, 51.88)),
+        ];
+        classify_stamps(&mut rows, &[resume(20.0)], 10_000_000);
+        let whose: Vec<(bool, bool)> = rows.iter().map(|r| (r.windows_stamped, r.late)).collect();
+        assert_eq!(whose[3..], [(false, true), (false, true), (false, false), (false, false)]);
+        let c = check_steps(&rows);
+        assert_eq!((c.windows_stamped, c.checked, c.across, c.wrong.len(), c.overlapping.len()), (0, 6, 1, 0, 0));
     }
 
     /// stamps' verdict (Astra's review and recheck, 2026-11-23): a run's stamps step by exactly a packet; across a resume
