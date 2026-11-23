@@ -105,7 +105,9 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       first capture stream to run reads the ring; the driver gives the others its audio as secondary streams. When the
       reader stops, another takes the slot with one counted skip (a gap that must match the driver's count); the rest play
       on with no repeat: silence the driver counts where the new reader's packet is longer, and one counted skip where it
-      is shorter (a gap that must match SecondarySkippedFrames).
+      is shorter (a gap that must match SecondarySkippedFrames). The counts are the driver's, for every stream: where they
+      hold skips beyond the recording's gaps (two streams playing on through one handoff, or two handoffs in the
+      recording) and its gaps could be among them, the result is INCONCLUSIVE, unless another check fails.
   nf-vmic-test stats
       Print the driver's statistics.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
@@ -150,11 +152,13 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       pause lasts 3 to 50 ms. After each GetBuffer it reads the driver's capture-timestamp trace from STATS, and prints
       the client's device time minus the packet start the driver last answered GetCapturePacket with, minus the
       completion time it last notified (any capture stream's: run one), and minus the query's own time, the calls per
-      packet, the last rows, and each resume's first two packets beside the driver's notifications. A first packet after
-      a resume whose stamp the driver didn't give (the shared engine's own, or one left unread at Stop) is left out and
-      listed. PASS: every packet has a device time, each of the driver's stamps steps by its packet's length while the
-      stream runs (by device position) and, across each resume, by at least the frames between; FAIL otherwise;
-      INCONCLUSIVE when a resume's step couldn't be compared.
+      packet, the last rows, and each resume's first two packets beside the driver's notifications. A stamp off the
+      driver's packet grid among a resume's leading packets, before the first the driver stamped after that Start (the
+      shared engine's own, or one left unread at Stop), is Windows': left out and listed. PASS: every packet has a device
+      time, each of the driver's stamps steps by its packet's length while the stream runs (by device position) and,
+      across each resume, by at least the frames between; FAIL otherwise, or for any other stamp off the grid (in the
+      first run, or after the driver's first packet since a Start: listed with its offset); INCONCLUSIVE when a resume's
+      step couldn't be compared.
   nf-vmic-test idle-test [--device NAME]
       Start an exclusive recorder twice on a live ring. Check that samples queued before each open are discarded and new
       samples reach the recorder. Requires an idle virtual capture endpoint.
@@ -279,24 +283,58 @@ impl<'a> Opts<'a> {
 #[derive(Default)]
 struct Checks {
     failed: u32,
+    inconclusive: u32,
 }
 
 impl Checks {
     fn check(&mut self, ok: bool, name: &str, detail: impl Display) -> bool {
-        println!("  {} {name}: {detail}", if ok { "ok  " } else { "FAIL" });
-        if !ok {
-            self.failed += 1;
-        }
-        ok
+        self.judge(ok.into(), name, detail) == Outcome::Ok
+    }
+
+    fn judge(&mut self, outcome: Outcome, name: &str, detail: impl Display) -> Outcome {
+        let label = match outcome {
+            Outcome::Ok => "ok  ",
+            Outcome::Inconclusive => "INCONCLUSIVE",
+            Outcome::Fail => "FAIL",
+        };
+        println!("  {label} {name}: {detail}");
+        self.failed += u32::from(outcome == Outcome::Fail);
+        self.inconclusive += u32::from(outcome == Outcome::Inconclusive);
+        outcome
     }
 }
 
-/// One check of a verdict, made by a pure function (so the tests can make it too): whether it passed, its name, its numbers.
+/// A check's outcome: passed, failed, or neither (what the driver counts can't tie the recording's numbers to it either way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    Inconclusive,
+    Fail,
+}
+
+impl From<bool> for Outcome {
+    fn from(ok: bool) -> Self {
+        if ok { Self::Ok } else { Self::Fail }
+    }
+}
+
+/// One check of a verdict, made by a pure function (so the tests can make it too): its outcome, its name, its numbers.
 #[derive(Debug)]
 struct Check {
-    ok: bool,
+    outcome: Outcome,
     name: &'static str,
     detail: String,
+}
+
+/// A verdict from its checks: FAIL if any failed, INCONCLUSIVE if none failed but one couldn't be decided, PASS otherwise.
+fn verdict_of(checks: &[Check]) -> Verdict {
+    if checks.iter().any(|c| c.outcome == Outcome::Fail) {
+        Verdict::Fail
+    } else if checks.iter().any(|c| c.outcome == Outcome::Inconclusive) {
+        Verdict::Inconclusive
+    } else {
+        Verdict::Pass
+    }
 }
 
 fn open_device() -> Result<Device, String> {
@@ -1064,8 +1102,9 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
     println!("checks:");
     let seen =
         StreamSeen { lost_frames: capture.lost_frames, discontinuities: capture.discontinuities, packet: capture.opened.period_frames() };
-    for check in verify_checks(&before, &after, r, &seen) {
-        c.check(check.ok, check.name, check.detail);
+    let checks = verify_checks(&before, &after, r, &seen);
+    for check in &checks {
+        c.judge(check.outcome, check.name, &check.detail);
     }
     let not_reader = a.not_reader_packets.saturating_sub(b.not_reader_packets);
     println!(
@@ -1099,13 +1138,17 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         println!("  corrupt at frame {index}: left {left:#010x} ({l}), right {right:#010x} ({rt})");
     }
     capture.print_counters();
-    if c.failed == 0 {
-        println!("PASS: the app ring fed the recording, bit-exact on both channels, in order, nothing lost or repeated");
-        Ok(Verdict::Pass)
-    } else {
-        println!("FAIL: {} of the checks", c.failed);
-        Ok(Verdict::Fail)
+    let verdict = verdict_of(&checks);
+    match verdict {
+        Verdict::Pass => println!("PASS: the app ring fed the recording, bit-exact on both channels, in order, nothing lost or repeated"),
+        Verdict::Inconclusive => println!(
+            "INCONCLUSIVE: nothing failed, but {} of the checks couldn't tie the recording's gaps to the driver's counts, which \
+             are for every stream and hold skips beyond this recording's (another stream's, as far as they show)",
+            c.inconclusive
+        ),
+        _ => println!("FAIL: {} of the checks", c.failed),
     }
+    Ok(verdict)
 }
 
 /// What verify's own capture stream counted: frames the engine dropped, discontinuities after its first packet, and its
@@ -1118,7 +1161,8 @@ struct StreamSeen {
 }
 
 /// verify's checks of a recording (`r`) against the driver's statistics just before and just after it, and the capture stream's
-/// own counts. All must pass for proof that the app ring fed the recording.
+/// own counts. All must pass for proof that the app ring fed the recording; with none failed, gaps the driver-wide counts can
+/// neither tie to it nor rule out make the verdict INCONCLUSIVE ([`gap_outcome`]).
 ///
 /// The recording may come from the reader or from a secondary stream (another capture stream ran first): the silence allowed is
 /// what the driver zero-filled for either (UnderrunFrames and SecondaryUnderrunFrames over the recording), and the slack at the
@@ -1142,22 +1186,31 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     // new reader's packet is longer, counted in SecondaryUnderrunFrames, with no gap; where it is shorter it moves on to the
     // new lag at once and skips the difference once (the owner, 2026-11-23), counted apart (SecondarySkips,
     // SecondarySkippedFrames), and its gaps are tied to that count the same way. Each count stands alone: a gap matching
-    // their sum fails, and any repeat fails. With three streams, record one handoff at a time: another stream's take in the
-    // window adds its skip to the count.
+    // their sum fails, and any repeat fails. Where a count holds skips this recording can't account for, another stream's
+    // (two streams playing on through one handoff to a shorter packet each skip, or two handoffs in the window: Astra's
+    // review, 2026-11-24), the gaps are INCONCLUSIVE rather than failed if they could be among them ([`gap_outcome`]).
     let handoffs = after.reader_handoffs.saturating_sub(before.reader_handoffs);
     let skipped = after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames);
     let secondary_skips = after.secondary_skips.saturating_sub(before.secondary_skips);
     let secondary_skipped = after.secondary_skipped_frames.saturating_sub(before.secondary_skipped_frames);
-    let gaps_ok =
-        r.gaps == 0 || (r.gaps <= handoffs && r.gap_frames == skipped) || (r.gaps <= secondary_skips && r.gap_frames == secondary_skipped);
+    let gaps = gap_outcome(r.gaps, r.gap_frames, &[(handoffs, skipped), (secondary_skips, secondary_skipped)]);
+    let in_order = if r.signal_frames > 0 && r.repeats == 0 && r.corrupt_frames == 0 { gaps } else { Outcome::Fail };
+    let gaps_text = match gaps {
+        Outcome::Ok => "",
+        Outcome::Inconclusive => {
+            "; the gaps could be among the counted skips, with skips beyond them another stream's, but the counts are \
+             driver-wide and can't say whose (per-stream counts in STATS, a driver change, would): inconclusive"
+        }
+        Outcome::Fail => "; the gaps are none of those",
+    };
     vec![
         Check {
-            ok: is_reading(before),
+            outcome: is_reading(before).into(),
             name: "just before the recording",
             detail: format!("process {}'s ring {}", before.attached_pid, state_text(stats_state(before), before.reader_packet_frames)),
         },
         Check {
-            ok: is_reading(after) && same,
+            outcome: (is_reading(after) && same).into(),
             name: "just after it",
             detail: format!(
                 "process {}'s ring {}; attaches +{}",
@@ -1167,7 +1220,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
         Check {
-            ok: r.frames > 0 && copied * 10 >= r.frames * 9,
+            outcome: (r.frames > 0 && copied * 10 >= r.frames * 9).into(),
             name: "the driver copied the recording",
             detail: format!(
                 "{copied} frames copied from the ring while {} were recorded ({:.1}%; 90% needed)",
@@ -1176,7 +1229,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
         Check {
-            ok: r.frames > 0 && r.signal_frames * 10 >= r.frames * 9,
+            outcome: (r.frames > 0 && r.signal_frames * 10 >= r.frames * 9).into(),
             name: "signal",
             detail: format!(
                 "{} of {} frames carry a code ({:.1}%; 90% needed)",
@@ -1186,7 +1239,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
         Check {
-            ok: r.zeros_inside <= underrun + packet,
+            outcome: (r.zeros_inside <= underrun + packet).into(),
             name: "silence inside the signal",
             detail: format!(
                 "{} frames in {} runs; the driver underran {underrun_text} over the recording (one {packet}-frame packet more \
@@ -1199,7 +1252,7 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
         // can still arrive in the recording: one packet's slack at each end. Silence nothing counted (another capture stream
         // holding the reader slot for part of the recording, say) fails here.
         Check {
-            ok: silence <= underrun + 2 * packet,
+            outcome: (silence <= underrun + 2 * packet).into(),
             name: "all the silence",
             detail: format!(
                 "{silence} frames ({} before the signal, {} inside, {} after); the driver underran {underrun_text} over the \
@@ -1208,18 +1261,18 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
         Check {
-            ok: r.signal_frames > 0 && r.repeats == 0 && r.corrupt_frames == 0 && gaps_ok,
+            outcome: in_order,
             name: "bit-exact and in order",
             detail: format!(
                 "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one; reader \
                  handoffs over the recording {handoffs} ({skipped} frames skipped by the driver's count), streams playing on \
                  that moved on to a shorter lag {secondary_skips} ({secondary_skipped} frames): gaps are allowed only for one of \
-                 those, one each, losing exactly its frames",
+                 those, one each, losing exactly its frames{gaps_text}",
                 r.gaps, r.gap_frames, r.repeats, r.repeat_frames, r.corrupt_frames, r.first_code, r.last_code, r.steps_ok
             ),
         },
         Check {
-            ok: seen.lost_frames == 0 && seen.discontinuities == 0,
+            outcome: (seen.lost_frames == 0 && seen.discontinuities == 0).into(),
             name: "the capture stream",
             detail: format!(
                 "{} frames lost by the engine, {} discontinuities after its first packet",
@@ -1227,6 +1280,24 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             ),
         },
     ]
+}
+
+/// Whether a recording's `gaps`, losing `frames` in all, are skips the driver counted over it: `counts` holds each kind's
+/// skips and their frames (reader handoffs, streams playing on to a shorter lag), each standing alone, as a gap is one skip
+/// and a recording's gaps are tied to one count. Ok: no gap, or no more gaps than a count's skips losing exactly its frames.
+/// Inconclusive: fewer gaps than a count's skips and fewer frames, so it holds skips this recording can't account for, and
+/// its gaps could be among them: another stream's skips are in the count (Astra's four-stream model, 2026-11-24: two streams
+/// playing on through one handoff skipped 334 and 352 frames, counted 686, and neither matched alone). Only per-stream counts
+/// in STATS could tie them (a driver change; not made). Fail otherwise: more gaps than a count's skips, more frames than it
+/// counted, or as many gaps as its skips (all of them this recording's) losing other than its frames.
+fn gap_outcome(gaps: u64, frames: u64, counts: &[(u64, u64)]) -> Outcome {
+    if gaps == 0 || counts.iter().any(|&(skips, skipped)| gaps <= skips && frames == skipped) {
+        Outcome::Ok
+    } else if counts.iter().any(|&(skips, skipped)| gaps < skips && frames < skipped) {
+        Outcome::Inconclusive
+    } else {
+        Outcome::Fail
+    }
 }
 
 /// Waits (draining the stream, up to [`READING_WAIT`]) for STATS to show a capture stream reading the ring and for the stream to
@@ -2720,15 +2791,21 @@ struct StampRow {
     position: u64,
     frames: u32,
     segment: u32,
-    /// A first packet after a resume whose stamp isn't the one the driver notified (the trace's latest still the one from
-    /// before the pause), so not checked. Shared (measured 2026-11-23): the engine hands a restarted client a packet before
-    /// the device's next one, stamped about when it gives it. Exclusive (Astra's trace, 2026-11-23): a packet the driver
-    /// completed after the client's last read but before Stop returned is handed out just after Start, stamped then, not
-    /// with the driver's time; the next packet, the driver's, can be stamped earlier than it (TODO 22's question).
+    /// One of a resume's leading packets, before the first the driver stamped after that Start, whose stamp isn't on the
+    /// driver's packet grid ([`classify_stamps`]), so not checked. Shared (measured 2026-11-23): the engine hands a restarted
+    /// client a packet before the device's next one, stamped about when it gives it. Exclusive (Astra's trace, 2026-11-23):
+    /// a packet the driver completed after the client's last read but before Stop returned is handed out just after Start,
+    /// stamped then, not with the driver's time; the next packet, the driver's, can be stamped earlier than it (TODO 22's
+    /// question).
     windows_stamped: bool,
     /// A packet the driver completed before the Stop, handed out after Start with the driver's stamp (a shared engine's
     /// buffered packets; measured 2026-11-23): on the time line before the pause, so checked with the run before.
     late: bool,
+    /// A stamp off the driver's packet grid where no resume explains it (in the first run, or in a later one after the
+    /// first packet the driver stamped since its Start; Astra's review, 2026-11-24): how far it is from the nearest packet
+    /// start the driver had notified, at or before its latest notification (100 ns units, later positive; past the latest,
+    /// from it). Fails stamps, and stays in the steps checked (nothing shows it isn't the driver's).
+    unexplained: Option<i64>,
     /// Windows flagged the packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY (a client that fell behind, or a stream's start).
     discontinuity: bool,
     trace: CaptureTrace,
@@ -2771,8 +2848,11 @@ struct StepCheck {
     no_time: usize,
     /// Steps not checked: in a run, the positions didn't follow on (frames lost); across a resume, the position went back.
     gaps: usize,
-    /// First packets after a resume whose stamp the driver didn't give ([`StampRow::windows_stamped`]): left out.
+    /// A resume's leading packets whose stamp the driver didn't give ([`StampRow::windows_stamped`]): left out.
     windows_stamped: usize,
+    /// Stamps off the driver's grid that no resume explains ([`StampRow::unexplained`]): the row's index and its offset
+    /// from the grid (100 ns units). Each fails; it is checked in the steps too.
+    unexplained: Vec<(usize, i64)>,
     /// Steps into a packet Windows flagged as a discontinuity inside a run: not checked, and listed apart (index of the
     /// second row). Across a resume the step is checked, flagged or not (a resume is a discontinuity).
     flagged: Vec<usize>,
@@ -2784,12 +2864,14 @@ struct StepCheck {
 /// Each of the driver's stamps must step by exactly the frames before it while the stream runs (the device position says
 /// which packets follow on), and across a Stop/Start by at least the frames between the last packet before it and the
 /// first after (by the pause too, as the time line paused with it; the frames between include any packet left out). A
-/// packet from before the Stop handed out after Start ([`StampRow::late`]) is on the time line of the run before.
+/// packet from before the Stop handed out after Start ([`StampRow::late`]) is on the time line of the run before. Only a
+/// resume's leading packets Windows stamped are left out; an off-grid stamp anywhere else is listed, to fail.
 fn check_steps(rows: &[StampRow]) -> StepCheck {
     let line = |r: &StampRow| r.segment - u32::from(r.late && r.segment > 0);
     let mut c = StepCheck {
         no_time: rows.iter().filter(|r| r.device_hns.is_none()).count(),
         windows_stamped: rows.iter().filter(|r| r.windows_stamped).count(),
+        unexplained: rows.iter().enumerate().filter_map(|(i, r)| Some((i, r.unexplained?))).collect(),
         ..Default::default()
     };
     let hns = |frames: u64| (frames * 10_000_000 / u64::from(protocol::SAMPLE_RATE)) as i64;
@@ -2897,6 +2979,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
                         segment: segment as u32,
                         windows_stamped: false,
                         late: false,
+                        unexplained: None,
                         discontinuity: p.discontinuity,
                         trace: s.capture_trace,
                     }),
@@ -2939,8 +3022,8 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     println!(
         "steps: {} of the driver's checked ({} across a resume, of {} resumes), {} in a run that weren't a packet's length, \
          {} across a resume short of the frames between, {} packets without a device time, {} not checked (positions not \
-         following on), {} first packets after a resume stamped by Windows, not the driver (left out), {} stamps earlier \
-         than the packet before",
+         following on), {} of a resume's leading packets stamped by Windows, not the driver (left out), {} off the driver's \
+         packet grid where no resume explains it, {} stamps earlier than the packet before",
         c.checked,
         c.across,
         done.len(),
@@ -2949,6 +3032,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
         c.no_time,
         c.gaps,
         c.windows_stamped,
+        c.unexplained.len(),
         c.backward.len()
     );
     // A step's two packets: the row before (`kept`: the last the driver stamped, as check_steps compares) and this one.
@@ -2965,6 +3049,15 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     for &i in c.flagged.iter().take(12) {
         println!("{} (flagged a discontinuity: not checked)", at(i, true));
     }
+    for &(i, off) in c.unexplained.iter().take(12) {
+        let r = &rows[i];
+        let place = if r.segment == 0 { "in the first run" } else { "after the driver's first packet since Start" };
+        println!(
+            "    packet {i} (run {}): stamped {:+.4} ms off the driver's packet grid, {place}: unexplained",
+            r.segment,
+            off as f64 / 10_000.0
+        );
+    }
     for &i in c.backward.iter().filter(|&&i| rows[i - 1].windows_stamped).take(12) {
         println!("{} (the packet before stamped by Windows: a step back the client saw)", at(i, false));
     }
@@ -2975,36 +3068,56 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
             c.windows_stamped
         );
     }
-    let verdict = if c.no_time > 0 || !c.wrong.is_empty() || !c.overlapping.is_empty() {
-        println!("FAIL: the driver's stamps don't follow the audio");
-        Verdict::Fail
-    } else if c.across < done.len() {
-        println!(
-            "INCONCLUSIVE: {} of {} resumes' steps compared (the rest: positions going back, or no packet the driver stamped)",
-            c.across,
-            done.len()
-        );
-        Verdict::Inconclusive
-    } else if c.checked + 1 < rows.len() / 2 {
-        println!("INCONCLUSIVE: too few packets followed on to check ({} of {})", c.checked, rows.len().saturating_sub(1));
-        Verdict::Inconclusive
-    } else {
-        println!(
-            "PASS: every stamp the driver gave stepped by its packet's length, and across each of the {} resumes ({pending} \
-             with a packet left unread at Stop) by at least the frames between",
-            done.len()
-        );
-        Verdict::Pass
-    };
+    let (verdict, line) = stamps_verdict(&c, rows.len(), done.len(), pending);
+    println!("{line}");
     Ok(verdict)
+}
+
+/// stamps' verdict and its line, from [`check_steps`]' counts over `packets` rows and `resumes` resumes (`pending` of them
+/// with a packet left unread at Stop).
+fn stamps_verdict(c: &StepCheck, packets: usize, resumes: usize, pending: usize) -> (Verdict, String) {
+    let failures: Vec<String> = [
+        (c.no_time, "packets without a device time"),
+        (c.wrong.len(), "steps in a run that weren't a packet's length"),
+        (c.overlapping.len(), "steps across a resume short of the frames between"),
+        (c.unexplained.len(), "stamps off the driver's packet grid that no resume explains"),
+    ]
+    .into_iter()
+    .filter(|&(n, _)| n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if !failures.is_empty() {
+        (Verdict::Fail, format!("FAIL: the driver's stamps don't follow the audio: {}", failures.join(", ")))
+    } else if c.across < resumes {
+        let line = format!(
+            "INCONCLUSIVE: {} of {resumes} resumes' steps compared (the rest: positions going back, or no packet the driver stamped)",
+            c.across
+        );
+        (Verdict::Inconclusive, line)
+    } else if c.checked + 1 < packets / 2 {
+        (
+            Verdict::Inconclusive,
+            format!("INCONCLUSIVE: too few packets followed on to check ({} of {})", c.checked, packets.saturating_sub(1)),
+        )
+    } else {
+        let line = format!(
+            "PASS: every stamp the driver gave stepped by its packet's length, and across each of the {resumes} resumes ({pending} \
+             with a packet left unread at Stop) by at least the frames between; every stamp off its packet grid was one of a \
+             resume's leading packets"
+        );
+        (Verdict::Pass, line)
+    }
 }
 
 /// Whose stamp each packet carries, by the driver's packet grid (its packet length from the first run's notifications: the
 /// trace's packet numbers and times, read just after each GetBuffer). A stamp the driver gave starts one of its packets: on
 /// the grid of the row's latest notification, at or before it; or, after a resume, on the grid from before the Stop, at or
 /// before the notification then (a packet completed before the Stop and handed out after Start: `late`). Any other stamp
-/// Windows gave: the shared engine's own packet, or one left unread at Stop and stamped again at Start (measured 2026-11-23;
-/// the latest notification alone missed a shared engine's buffered packets, a packet or two behind it).
+/// among a resume's leading packets, before the first the driver stamped after that Start, Windows gave: the shared engine's
+/// own packet, or one left unread at Stop and stamped again at Start (measured 2026-11-23; the latest notification alone
+/// missed a shared engine's buffered packets, a packet or two behind it). Anywhere else, in the first run or after the
+/// driver's first packet since a Start, nothing explains it (`unexplained`): Astra's review (2026-11-24) had one stamp 1 ms
+/// off in a steady run, with no resume, left out as Windows' and passed.
 fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
     let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency);
     let mut lengths: Vec<i64> = rows
@@ -3029,12 +3142,30 @@ fn classify_stamps(rows: &mut [StampRow], done: &[Resume], frequency: u64) {
                 None => back <= STAMP_SLACK_HNS,
             }
     };
+    // How far a stamp is from the nearest packet start at or before `reference`, later positive; past `reference`, or with no
+    // packet length known, from it.
+    let offset = |stamp: i64, reference: i64| match packet {
+        Some(p) if stamp < reference => {
+            let r = (reference - stamp) % p;
+            if 2 * r > p { p - r } else { -r }
+        }
+        _ => stamp - reference,
+    };
+    // The run each row is in, and whether the driver stamped a packet in it since its Start (`late` ones are from before).
+    let mut run = (u32::MAX, false);
     for r in rows.iter_mut() {
+        if run.0 != r.segment {
+            run = (r.segment, false);
+        }
         let Some(d) = r.device_hns.map(|d| d as i64) else { continue };
+        let latest = hns(r.trace.last_notify_qpc);
         let stop = r.segment.checked_sub(1).and_then(|k| done.get(k as usize)).map(|x| x.stop_notify_hns);
         r.late = stop.is_some_and(|s| d <= s + STAMP_SLACK_HNS && on_grid(d, s));
-        let current = stop.is_none_or(|s| d > s + STAMP_SLACK_HNS) && on_grid(d, hns(r.trace.last_notify_qpc));
-        r.windows_stamped = !r.late && !current;
+        let current = stop.is_none_or(|s| d > s + STAMP_SLACK_HNS) && on_grid(d, latest);
+        let off = !r.late && !current;
+        r.windows_stamped = off && stop.is_some() && !run.1;
+        r.unexplained = (off && !r.windows_stamped).then(|| offset(d, latest));
+        run.1 |= current;
     }
 }
 
@@ -3056,6 +3187,8 @@ fn print_resumes(rows: &[StampRow], done: &[Resume], frequency: u64) {
                 format!("Windows', the driver's latest {:+.3}", from(hns(x.trace.last_notify_qpc)))
             } else if x.late {
                 "the driver's, from before Stop".to_string()
+            } else if let Some(off) = x.unexplained {
+                format!("unexplained, {:+.3} off the driver's grid", off as f64 / 10_000.0)
             } else {
                 "the driver's".to_string()
             };
@@ -3225,7 +3358,7 @@ fn latency(args: &[String]) -> Result<Verdict, String> {
         not_reader_packets: w.end.ring.not_reader_packets.saturating_sub(w.start.ring.not_reader_packets),
     };
     for check in latency_checks(&report, &log.counts, dropped, &stream) {
-        c.check(check.ok, check.name, check.detail);
+        c.judge(check.outcome, check.name, check.detail);
     }
     if c.failed == 0 && matches!(end, LatencyEnd::Done) {
         println!("PASS: measured; the latencies above are the result");
@@ -3303,7 +3436,7 @@ fn reader_check(s: &LatencyStream) -> Check {
             ),
         ),
     };
-    Check { ok, name: "this process's stream reads the ring", detail }
+    Check { outcome: ok.into(), name: "this process's stream reads the ring", detail }
 }
 
 /// latency's checks: something measured, every frame the feed's and in order, the logs big enough, the stream unbroken, and
@@ -3313,17 +3446,17 @@ fn latency_checks(r: &LatencyReport, counts: &FrameCounts, dropped: [u64; 3], st
     let (lost_frames, discontinuities) = (stream.lost_frames, stream.discontinuities);
     vec![
         Check {
-            ok: m.frames > 0,
+            outcome: (m.frames > 0).into(),
             name: "frames measured",
             detail: format!("{} frames in {} packets after the warm-up ({} of the pre-fill not measured)", m.frames, m.packets, m.skipped),
         },
         Check {
-            ok: c.gaps == 0 && c.repeats == 0,
+            outcome: (c.gaps == 0 && c.repeats == 0).into(),
             name: "every frame once and in order",
             detail: format!("gaps {} ({} frames lost), repeats {} ({} frames)", c.gaps, c.gap_frames, c.repeats, c.repeat_frames),
         },
         Check {
-            ok: counts.corrupt == 0 && counts.unmatched == 0 && m.unpublished == 0,
+            outcome: (counts.corrupt == 0 && counts.unmatched == 0 && m.unpublished == 0).into(),
             name: "every frame the feed's",
             detail: format!(
                 "{} frames neither silence nor a code, {} codes not written yet, {} frames no block published",
@@ -3331,12 +3464,12 @@ fn latency_checks(r: &LatencyReport, counts: &FrameCounts, dropped: [u64; 3], st
             ),
         },
         Check {
-            ok: dropped.iter().all(|&d| d == 0),
+            outcome: dropped.iter().all(|&d| d == 0).into(),
             name: "the logs held everything",
             detail: format!("dropped: {} blocks, {} packets, {} runs", dropped[0], dropped[1], dropped[2]),
         },
         Check {
-            ok: lost_frames == 0 && discontinuities == 0,
+            outcome: (lost_frames == 0 && discontinuities == 0).into(),
             name: "the capture stream",
             detail: format!("{lost_frames} frames lost by the engine, {discontinuities} discontinuities after its first packet"),
         },
@@ -3436,6 +3569,7 @@ mod tests {
             segment,
             windows_stamped: false,
             late: false,
+            unexplained: None,
             discontinuity: false,
             trace: CaptureTrace::default(),
         }
@@ -3488,6 +3622,90 @@ mod tests {
         assert_eq!(whose[3..], [(false, true), (false, true), (false, false), (false, false)]);
         let c = check_steps(&rows);
         assert_eq!((c.windows_stamped, c.checked, c.across, c.wrong.len(), c.overlapping.len()), (0, 6, 1, 0, 0));
+    }
+
+    /// A stamp off the driver's grid is Windows' only among a resume's leading packets, before the first the driver stamped
+    /// after that Start; anywhere else it fails, listed with its offset (Astra's review, 2026-11-24).
+    #[test]
+    fn stamps_fail_a_stamp_off_the_grid_that_no_resume_explains() {
+        let verdict = |rows: &[StampRow], resumes: usize| stamps_verdict(&check_steps(rows), rows.len(), resumes, 0).0;
+        // Astra's case: a steady 10 ms stream, no resume, one stamp 1 ms late. It was left out as Windows' and passed.
+        let steady = |shift: f64| -> Vec<StampRow> {
+            (0..10u64)
+                .map(|n| {
+                    let at = 100.0 + 10.0 * n as f64;
+                    traced(480 * n, 480, at + if n == 4 { shift } else { 0.0 }, 0, (n, at))
+                })
+                .collect()
+        };
+        let mut rows = steady(1.0);
+        classify_stamps(&mut rows, &[], 10_000_000);
+        assert!(rows.iter().all(|r| !r.windows_stamped));
+        let c = check_steps(&rows);
+        assert_eq!((c.windows_stamped, c.unexplained.clone(), c.wrong.clone()), (0, vec![(4, 10_000)], vec![4, 5]));
+        assert_eq!(verdict(&rows, 0), Verdict::Fail);
+        // 1 ms early: on no packet start either, 1 ms before the latest notification's.
+        let mut rows = steady(-1.0);
+        classify_stamps(&mut rows, &[], 10_000_000);
+        assert_eq!(check_steps(&rows).unexplained, vec![(4, -10_000)]);
+        // Where the steps can't catch it (frames lost on both sides, so neither step is checked), the listing still fails it.
+        let mut rows = steady(1.0);
+        for r in &mut rows[4..] {
+            r.position += 480;
+        }
+        for r in &mut rows[5..] {
+            r.position += 480;
+        }
+        classify_stamps(&mut rows, &[], 10_000_000);
+        let c = check_steps(&rows);
+        assert_eq!((c.gaps, c.wrong.len(), c.unexplained.clone()), (2, 0, vec![(4, 10_000)]));
+        assert_eq!(verdict(&rows, 0), Verdict::Fail);
+        // Undisplaced, it passes.
+        let mut rows = steady(0.0);
+        classify_stamps(&mut rows, &[], 10_000_000);
+        assert_eq!(verdict(&rows, 0), Verdict::Pass);
+
+        // After a resume: the exclusive trace's restamped packet, but after the driver's first packet since Start (1.51 ms
+        // past its latest notification), fails; as the resume's first packet (the test above) it is Windows'.
+        let first_run = [traced(0, 480, 0.0, 0, (10, 0.0)), traced(480, 480, 10.0, 0, (11, 10.0)), traced(960, 480, 20.0, 0, (12, 20.0))];
+        let mut rows = first_run.to_vec();
+        rows.extend([
+            traced(1440, 480, 71.42, 1, (14, 71.42)),
+            traced(1920, 480, 82.93, 1, (15, 81.42)),
+            traced(2400, 480, 91.42, 1, (16, 91.42)),
+        ]);
+        classify_stamps(&mut rows, &[resume(30.0)], 10_000_000);
+        let whose: Vec<(bool, bool, Option<i64>)> = rows[3..].iter().map(|r| (r.windows_stamped, r.late, r.unexplained)).collect();
+        assert_eq!(whose, [(false, false, None), (false, false, Some(15_100)), (false, false, None)]);
+        let c = check_steps(&rows);
+        assert_eq!((c.across, c.windows_stamped, c.unexplained.clone()), (1, 0, vec![(4, 15_100)]));
+        assert_eq!(verdict(&rows, 1), Verdict::Fail);
+        // The resume's leading packets may hold the driver's from before the Stop and then Windows' (the Call Microphone,
+        // Astra's validation run, 2026-11-24: resume 7's first packet the driver's from before Stop, its second Windows').
+        let mut rows =
+            vec![traced(0, 240, 0.0, 0, (100, 0.0)), traced(240, 240, 5.0, 0, (101, 5.0)), traced(480, 240, 10.0, 0, (102, 10.0))];
+        rows.extend([
+            traced(720, 240, 15.0, 1, (104, 20.0)),
+            traced(960, 240, 42.75, 1, (104, 20.0)),
+            traced(1200, 240, 46.88, 1, (105, 46.88)),
+            traced(1440, 240, 51.88, 1, (106, 51.88)),
+        ]);
+        classify_stamps(&mut rows, &[resume(20.0)], 10_000_000);
+        let whose: Vec<(bool, bool, Option<i64>)> = rows[3..].iter().map(|r| (r.windows_stamped, r.late, r.unexplained)).collect();
+        assert_eq!(whose, [(false, true, None), (true, false, None), (false, false, None), (false, false, None)]);
+        let c = check_steps(&rows);
+        assert_eq!((c.checked, c.across, c.windows_stamped, c.unexplained.len(), c.wrong.len()), (5, 1, 1, 0, 0));
+        assert_eq!(verdict(&rows, 1), Verdict::Pass);
+        // A stamp off the grid after the new run's first driver packet (1.37 ms past its latest notification): unexplained.
+        rows[4..].copy_from_slice(&[
+            traced(960, 240, 46.88, 1, (105, 46.88)),
+            traced(1200, 240, 48.25, 1, (105, 46.88)),
+            traced(1440, 240, 51.88, 1, (106, 51.88)),
+        ]);
+        classify_stamps(&mut rows, &[resume(20.0)], 10_000_000);
+        assert!(rows.iter().all(|r| !r.windows_stamped));
+        assert_eq!(check_steps(&rows).unexplained, vec![(5, 13_700)]);
+        assert_eq!(verdict(&rows, 1), Verdict::Fail);
     }
 
     /// stamps' verdict (Astra's review and recheck, 2026-11-23): a run's stamps step by exactly a packet; across a resume
@@ -3622,13 +3840,21 @@ mod tests {
         }
     }
 
-    /// The names of the checks that failed.
-    fn failed(checks: &[Check]) -> Vec<&'static str> {
-        checks.iter().filter(|c| !c.ok).map(|c| c.name).collect()
+    /// The names of the checks that didn't pass: a failed one's name, an inconclusive one's with ": inconclusive" (so a test
+    /// expecting either tells them apart).
+    fn failed(checks: &[Check]) -> Vec<String> {
+        checks
+            .iter()
+            .filter_map(|c| match c.outcome {
+                Outcome::Ok => None,
+                Outcome::Fail => Some(c.name.to_string()),
+                Outcome::Inconclusive => Some(format!("{}: inconclusive", c.name)),
+            })
+            .collect()
     }
 
     /// verify's checks for a recording `r` between `before` and `after`, with nothing lost and no discontinuity.
-    fn verify_failures(before: &Stats, after: &Stats, r: &CheckReport) -> Vec<&'static str> {
+    fn verify_failures(before: &Stats, after: &Stats, r: &CheckReport) -> Vec<String> {
         failed(&verify_checks(before, after, r, &StreamSeen::default()))
     }
 
@@ -3959,6 +4185,61 @@ mod tests {
         assert_eq!(judge(&empty, &clean_recording()), Vec::<&str>::new());
     }
 
+    /// Two recorders playing on through one handoff to a shorter packet (Astra's four-stream model, 2026-11-24): each skips
+    /// once, correctly (334 and 352 frames), and the driver-wide counts rise by both (SecondarySkips +2, 686 frames), so
+    /// neither recording's gap matches a count alone. Each is INCONCLUSIVE, not failed; an exact match still passes; a gap
+    /// the rise can't hold, a repeat or a corrupt frame still fails.
+    #[test]
+    fn verify_is_inconclusive_where_the_counts_hold_another_streams_skips() {
+        let before = reading(counters(3, 1_000_000, 0));
+        let after = Stats {
+            reader_packet_frames: 160,
+            reader_handoffs: 1,
+            handoff_skipped_frames: 449,
+            secondary_skips: 2,
+            secondary_skipped_frames: 334 + 352,
+            ..reading(counters(3, 1_000_000 + FRAMES, 0))
+        };
+        let gap = |gaps, gap_frames| CheckReport { gaps, gap_frames, ..clean_recording() };
+        let seen = StreamSeen { packet: 240, ..Default::default() };
+        let checks = |after: &Stats, r: &CheckReport| verify_checks(&before, after, r, &seen);
+        let unsure = ["bit-exact and in order: inconclusive"];
+        for frames in [334, 352] {
+            let c = checks(&after, &gap(1, frames));
+            assert_eq!(failed(&c), unsure, "{frames}");
+            assert_eq!(verdict_of(&c), Verdict::Inconclusive, "{frames}");
+        }
+        // The taker's gap is its count exactly; the stopping reader's recording has none; one recording with both skips'
+        // gaps is the whole count.
+        assert_eq!(verdict_of(&checks(&after, &gap(1, 449))), Verdict::Pass);
+        assert_eq!(verdict_of(&checks(&after, &clean_recording())), Verdict::Pass);
+        assert_eq!(verdict_of(&checks(&after, &gap(2, 686))), Verdict::Pass);
+        // One recorder playing on: its skip alone is the count, an exact match, and any other gap fails.
+        let one = Stats { secondary_skips: 1, secondary_skipped_frames: 334, ..after };
+        assert_eq!(verdict_of(&checks(&one, &gap(1, 334))), Verdict::Pass);
+        let bad = ["bit-exact and in order"];
+        assert_eq!(failed(&checks(&one, &gap(1, 352))), bad, "not its skip");
+        // Gaps the rise can't hold fail: more frames than counted, more gaps than skips, or a gap for each skip (all of them
+        // this recording's) losing other than their frames.
+        assert_eq!(failed(&checks(&after, &gap(1, 687))), bad, "more frames than counted");
+        assert_eq!(failed(&checks(&after, &gap(3, 600))), bad, "more gaps than skips");
+        assert_eq!(failed(&checks(&after, &gap(2, 600))), bad, "every skip this recording's, its frames short");
+        // A repeat or a corrupt frame fails, whatever the gaps.
+        let with = |repeats, corrupt_frames| CheckReport { repeats, repeat_frames: 10 * repeats, corrupt_frames, ..gap(1, 334) };
+        assert_eq!(failed(&checks(&after, &with(1, 0))), bad);
+        assert_eq!(failed(&checks(&after, &with(0, 1))), bad);
+        // Another check failing makes the verdict FAIL, the gaps still inconclusive.
+        let c = verify_checks(&before, &after, &gap(1, 334), &StreamSeen { discontinuities: 1, ..seen });
+        assert_eq!(failed(&c), ["bit-exact and in order: inconclusive", "the capture stream"]);
+        assert_eq!(verdict_of(&c), Verdict::Fail);
+        // Two handoffs in one window (Verifier round 3, 2026-11-23: a recording's one gap of 529 frames against two handoffs
+        // counting 796, the other taker's 267): it failed, and is now inconclusive; a gap past the count still fails.
+        let two = Stats { reader_handoffs: 2, handoff_skipped_frames: 796, secondary_skips: 0, secondary_skipped_frames: 0, ..after };
+        assert_eq!(failed(&checks(&two, &gap(1, 529))), unsure);
+        assert_eq!(failed(&checks(&two, &gap(1, 267))), unsure);
+        assert_eq!(failed(&checks(&two, &gap(1, 797))), bad);
+    }
+
     #[test]
     fn hresults_have_names() {
         use windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_IN_USE;
@@ -4148,8 +4429,9 @@ mod tests {
     /// there were some; in doubt (a failure) where another stream held the slot and others passed.
     #[test]
     fn latency_knows_whether_its_stream_is_the_reader() {
-        let ok =
-            |held_before, not_reader_packets| reader_check(&LatencyStream { held_before, not_reader_packets, ..Default::default() }).ok;
+        let ok = |held_before, not_reader_packets| {
+            reader_check(&LatencyStream { held_before, not_reader_packets, ..Default::default() }).outcome == Outcome::Ok
+        };
         assert!(ok(None, 0));
         assert!(ok(None, 500), "the slot was free: this stream took it, another passed as a secondary");
         assert!(ok(Some(480), 0), "the same driver stream as the holder (one mode, shared), or the holder stopped first");
