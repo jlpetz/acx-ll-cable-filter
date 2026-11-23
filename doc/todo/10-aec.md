@@ -339,6 +339,10 @@ the guard off, none in bypass; the exact-zero end stage later.
   reaches 24-bit zero (with today's dither, the peak over the phase's second half is -75.1 dBFS with AEC3 alone and -120.4
   at the lowest, with UL-UNAS and its gate after AEC3; 24-bit rounds a sample to zero only under about -144.5;
   run-20261121-005101's JSON).
+- The raw per-round files of run-20261121-005101 (20 JSONL, in a workflow worktree's ignored `target/dither-matrix`) were
+  deleted with that worktree on 2026-11-24 (our cleanup checked git status, which doesn't list ignored files). The
+  aggregates survive in `nf-scratch/dither-analysis` (all 427 cells, `full_table.txt`) with the run log; the figures above
+  are checkable against them, and recomputing from single rounds needs a rerun of `tools/dither_matrix.sh`.
 
 Ours, for the owner: keep the dither while a filter runs, turn the guard off, no mic dither in bypass, and later an end stage
 that writes exact zeros once the tails have finished (TODO 17).

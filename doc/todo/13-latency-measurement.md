@@ -204,7 +204,7 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
 
   | Options | Run medians | Run to run | What moves |
   |---|---|---|---|
-  | Today's defaults (exclusive mic and output, adaptive target) | 38.50-41.00 ms | 2.5 ms | the adaptive target settling |
+  | Today's defaults (exclusive mic and output, adaptive target) | 38.50-41.00 ms | 2.5 ms | a mic glitch, then the queue's recovery (4 runs) |
   | The mic shared (10 ms), the output exclusive | 46.70-49.42 ms | 2.7 ms | mic delivery 17.2-18.9 ms |
   | The output shared (10 ms), the mic exclusive | 52.82-59.86 ms | 7.0 ms | render side 11.4-18.4 ms |
 
@@ -212,10 +212,13 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
   at 11.4 ms, the rest 17.4-18.4), and less the shared mic's delivery phase. The readout's budget carries both, so the
   readout tracks them (run 8 of the shared output: readout 40.9 ms against 46.6-48.0). With the defaults four runs (1, 5,
   7, 8) agreed within 0.6 ms (38.50-39.08, sweeps within 1 ms); in the other four the sweeps stepped down 3.00 ms at a time
-  across the run (spread 7.9-10.3 ms) with a mean output queue of 18.3-20.3 ms against 15.3: the adaptive target still
-  coming down when the test began (ours, from the queue means; the test doesn't wait for the target to settle). Next: let
-  the latency test wait for the adaptive target to settle (or report it), then the exclusive figure against an exclusive
-  cable-only probe.
+  across the run (spread 7.9-10.3 ms). Not the adaptive target settling, as first written here (corrected by Astra's
+  review, 2026-11-24, from the saved blocks): the target was 736 frames (15.33 ms) in every block of all eight runs. Each
+  of the four had a mic glitch at one block and an output underrun at the next (160 frames of silence); the queue then
+  stood that much high, and the drift controller trimmed it back by up to about 1.5 ms a second, so sweeps two seconds
+  apart came 3 ms apart. The report's events line counts the underrun over the test but says nothing per sweep, and its
+  median mixes them in. Next: the report names a disturbed sweep and gives the clean sweeps' figure (building, 2026-11-24);
+  why the mic woke late (open); then the exclusive figure against an exclusive cable-only probe.
 
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the
