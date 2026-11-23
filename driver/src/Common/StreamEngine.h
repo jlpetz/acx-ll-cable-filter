@@ -325,7 +325,11 @@ protected:
     ULONG               m_FirstPacketOffset;
     WDFTIMER            m_NotificationTimer;
     ACX_STREAM_STATE    m_CurrentState;
-    ULONG               m_CurrentPacket;
+    // noise-filter (TODO 19, Astra's recheck 2026-11-23): packets completed since Stop, 64-bit. The sample's 32-bit count
+    // wrapped after 2^32 packets (99.4 days at 96 frames, 132.6 at 128) and the schedule, position and every pass's ring
+    // place jumped back with it. ACX's own packet numbers are 32-bit: they take its low 32 bits (GetCurrentPacket,
+    // GetCapturePacket) and compare by difference (SetRenderPacket).
+    ULONGLONG           m_CurrentPacket;
     ULONGLONG           m_Position;
     ACXSTREAM           m_Stream;
     ACXDATAFORMAT       m_StreamFormat;
@@ -486,13 +490,14 @@ protected:
     CSaveData m_SaveData;
 
     // noise-filter (TODO 19): the render half of the loopback pair.
-    ULONG               m_LbNextPacket;     // the next render packet to copy into the ring
-    volatile LONG64     m_LbReleased;       // (1 << 32) | newest packet the client released (SetRenderPacket); 0: none since Stop
+    ULONGLONG           m_LbNextPacket;     // the next render packet to copy into the ring (on m_CurrentPacket's count)
+    volatile LONG64     m_LbReleased;       // newest packet the client released (SetRenderPacket, on m_CurrentPacket's count)
+                                            // plus one; 0: none since Stop
 
     __drv_maxIRQL(DISPATCH_LEVEL)
     BOOLEAN
     LoopbackReleased(
-        _In_    ULONG           Packet
+        _In_    ULONGLONG       Packet
         );
 
     // noinline: called from PAGE code (Run, Pause, ReleaseHardware, the destructor) and takes the ring's spin lock. Inlined
@@ -595,7 +600,7 @@ protected:
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID
     LoopbackCapturePass(
-        _In_                            ULONG   Packet,
+        _In_                            ULONGLONG Packet,
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
         );
@@ -606,7 +611,7 @@ protected:
     __drv_maxIRQL(DISPATCH_LEVEL)
     BOOLEAN
     AppRingCapturePass(
-        _In_                            ULONG   Packet,
+        _In_                            ULONGLONG Packet,
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
         );
@@ -616,7 +621,7 @@ protected:
     __drv_requiresIRQL(DISPATCH_LEVEL)
     VOID
     AppRingOtherPass(
-        _In_                            ULONG   Packet,
+        _In_                            ULONGLONG Packet,
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
         );

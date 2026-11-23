@@ -660,7 +660,7 @@ CStreamEngine::StreamPassCallback()
     ProcessPacket();
 
     // We've completed a packet! Increment our currently active packet
-    completedPacket = (ULONG)InterlockedIncrement((LONG*)&m_CurrentPacket) - 1;
+    completedPacket = (ULONGLONG)InterlockedIncrement64((LONG64*)&m_CurrentPacket) - 1;
     // Save the time at which we moved to the next packet
     qpcNotify = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
 
@@ -796,7 +796,7 @@ CStreamEngine::UpdatePosition(
     ULONGLONG elapsed = currentTime - m_StartTime;
     elapsed = (elapsed > m_GlitchAdjust) ? elapsed - m_GlitchAdjust : 0;
     ULONGLONG position = m_StartPosition + NfScaleU64(elapsed, bytesPerSecond, HNS_PER_SEC);
-    ULONGLONG packetEnd = ((ULONGLONG)m_CurrentPacket + 1) * m_PacketSize;
+    ULONGLONG packetEnd = (m_CurrentPacket + 1) * m_PacketSize;
     m_Position = MIN(position, packetEnd);
 }
 
@@ -871,12 +871,13 @@ CStreamEngine::GetCurrentPacket(
     _Out_   PULONG          CurrentPacket
 )
 {
-    ULONG currentPacket;
+    ULONGLONG currentPacket;
     PAGED_CODE();
 
-    currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    currentPacket = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
 
-    *CurrentPacket = currentPacket;
+    // ACX's packet numbers are 32-bit: the count's low 32 bits (m_CurrentPacket).
+    *CurrentPacket = (ULONG)currentPacket;
 
     if (m_StatsKind == NF_VMIC_KIND_CAPTURE)
     {
@@ -1391,21 +1392,28 @@ CRenderStreamEngine::SetRenderPacket(
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    ULONG currentPacket;
+    ULONGLONG currentPacket;
+    LONG ahead;
 
     UNREFERENCED_PARAMETER(Flags);
     UNREFERENCED_PARAMETER(EosPacketLength);
 
     PAGED_CODE();
 
-    currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    currentPacket = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
 
-    if (Packet <= currentPacket)
+    //
+    // noise-filter (TODO 19, Astra's recheck 2026-11-23): Packet is ACX's 32-bit number, the count's low 32 bits, so the two
+    // compare by their difference. The sample compared them directly: at 2^32 packets the client's packet 0 was "late".
+    //
+    ahead = (LONG)(Packet - (ULONG)currentPacket);
+
+    if (ahead <= 0)
     {
         //ASSERT(FALSE);
         status = STATUS_DATA_LATE_ERROR;
     }
-    else if (Packet > currentPacket + 1)
+    else if (ahead > 1)
     {
         //ASSERT(FALSE);
         status = STATUS_DATA_OVERRUN;
@@ -1416,13 +1424,15 @@ CRenderStreamEngine::SetRenderPacket(
     // (LoopbackRenderPass). A late one (Packet <= currentPacket, e.g. a pre-roll of packet 0 before Run) counts too: its data
     // is in the buffer. One writer: the client's property calls on this stream (inference: ACX serialises them).
     //
-    if (status != STATUS_DATA_OVERRUN)
+    // Kept on the 64-bit count, plus one (0: none); a late packet from before the stream's first (no such packet) is ignored.
+    if (status != STATUS_DATA_OVERRUN && (ahead >= 0 || (ULONGLONG)(-(LONGLONG)ahead) <= currentPacket))
     {
-        LONG64 released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+        LONG64      released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+        ULONGLONG   packet = currentPacket + (ULONGLONG)(LONGLONG)ahead;
 
-        if (released == 0 || (LONG)(Packet - (ULONG)released) > 0)
+        if (released == 0 || packet + 1 > (ULONGLONG)released)
         {
-            InterlockedExchange64(&m_LbReleased, ((LONG64)1 << 32) | Packet);
+            InterlockedExchange64(&m_LbReleased, (LONG64)(packet + 1));
         }
     }
 
@@ -1490,12 +1500,12 @@ CRenderStreamEngine::Pause()
 _Use_decl_annotations_
 BOOLEAN
 CRenderStreamEngine::LoopbackReleased(
-    ULONG Packet
+    ULONGLONG Packet
 )
 {
     LONG64 released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
 
-    return (released != 0 && (LONG)((ULONG)released - Packet) >= 0) ? TRUE : FALSE;
+    return (released != 0 && (ULONGLONG)released - 1 >= Packet) ? TRUE : FALSE;
 }
 
 _Use_decl_annotations_
@@ -1506,8 +1516,8 @@ CRenderStreamEngine::LoopbackRenderPass(
 {
     PLOOPBACK_RING  ring = m_Loopback;
     KIRQL           oldIrql;
-    ULONG           current;
-    ULONG           endPacket;
+    ULONGLONG       current;
+    ULONGLONG       endPacket;
     ULONGLONG       anchor;
     BOOLEAN         lookAhead;
     BOOLEAN         copied = FALSE;
@@ -1548,7 +1558,7 @@ CRenderStreamEngine::LoopbackRenderPass(
     // presented. Without SetRenderPacket in this run (or in one-packet mode) each packet is copied as it completes.
     //
     lookAhead = (m_PacketsCount == MAX_PACKET_COUNT && InterlockedCompareExchange64(&m_LbReleased, 0, 0) != 0) ? TRUE : FALSE;
-    current = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    current = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
     if (AtRun)
     {
         // Before the first pass only the current packet is in play: the client's pre-roll.
@@ -1572,12 +1582,12 @@ CRenderStreamEngine::LoopbackRenderPass(
         ULONGLONG   maxGap = LoopbackHnsToFrames(LOOPBACK_MAX_GAP_HNS, m_LbFormat.SampleRate);
         BOOLEAN     sameRun = m_LbAnchorValid;
 
-        if (!sameRun && (LONG)(current - m_LbNextPacket) > 0)
+        if (!sameRun && current > m_LbNextPacket)
         {
             m_LbNextPacket = current;
         }
 
-        next = anchor + (ULONGLONG)m_LbNextPacket * m_LbPacketFrames;
+        next = anchor + m_LbNextPacket * m_LbPacketFrames;
 
         if (sameRun && next >= ring->WritePos && next - ring->WritePos <= maxGap)
         {
@@ -1599,24 +1609,24 @@ CRenderStreamEngine::LoopbackRenderPass(
     // Packets that left the buffer uncopied (not expected: every packet gets a pass, even in ScheduleNextPass's glitch
     // path): zeros, to keep the time line.
     //
-    if ((LONG)(current - m_LbNextPacket) > 0)
+    if (current > m_LbNextPacket)
     {
-        ULONG       lost = current - m_LbNextPacket;
-        ULONGLONG   lostFrames = (ULONGLONG)lost * m_LbPacketFrames;
+        ULONGLONG   lost = current - m_LbNextPacket;
+        ULONGLONG   lostFrames = lost * m_LbPacketFrames;
 
         LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL,
                           MIN(lostFrames, (ULONGLONG)m_LbRingFrames));
         ring->WritePos += lostFrames;
-        ring->RenderLostPackets += lost;
+        ring->RenderLostPackets += (ULONG)MIN(lost, (ULONGLONG)MAXULONG);
         m_LbNextPacket = current;
     }
 
     //
     // Copy the final packets not yet copied, in order, each at its place on the time line.
     //
-    while ((LONG)(endPacket - m_LbNextPacket) > 0)
+    while (endPacket > m_LbNextPacket)
     {
-        ULONG   packetIndex = m_LbNextPacket % m_PacketsCount;
+        ULONG   packetIndex = (ULONG)(m_LbNextPacket % m_PacketsCount);
         PBYTE   packetBuffer = (PBYTE)m_Packets[packetIndex];
 
         // Packet 0 starts at an offset if the size isn't a multiple of page_size
@@ -1774,20 +1784,21 @@ CCaptureStreamEngine::GetCapturePacket(
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    ULONG currentPacket;
+    ULONGLONG currentPacket;
     LONGLONG qpcPacketStart;
 
     PAGED_CODE();
 
-    currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    currentPacket = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
     qpcPacketStart = InterlockedCompareExchange64(&m_LastPacketStart.QuadPart, -1, -1);
 
-    *LastCapturePacket = currentPacket - 1;
+    // ACX's packet numbers are 32-bit: the count's low 32 bits (m_CurrentPacket).
+    *LastCapturePacket = (ULONG)(currentPacket - 1);
     *QPCPacketStart = (ULONGLONG)qpcPacketStart;
     *MoreData = FALSE;
 
     // noise-filter (TODO 19): the capture-timestamp trace (NF_VMIC_CAPTURE_TRACE).
-    NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, currentPacket - 1, (ULONGLONG)qpcPacketStart);
+    NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, (ULONG)(currentPacket - 1), (ULONGLONG)qpcPacketStart);
 
     return status;
 }
@@ -1796,13 +1807,13 @@ _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::ProcessPacket()
 {
-    ULONG currentPacket;
+    ULONGLONG currentPacket;
     ULONG packetIndex;
     PBYTE packetBuffer;
 
-    currentPacket = (ULONG)InterlockedCompareExchange((LONG*)&m_CurrentPacket, -1, -1);
+    currentPacket = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
 
-    packetIndex = currentPacket % m_PacketsCount;
+    packetIndex = (ULONG)(currentPacket % m_PacketsCount);
     packetBuffer = (PBYTE)m_Packets[packetIndex];
 
     // Packet 0 starts at an offset if the size isn't a multiple of page_size
@@ -1858,7 +1869,7 @@ CCaptureStreamEngine::Run()
 _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::LoopbackCapturePass(
-    ULONG   Packet,
+    ULONGLONG Packet,
     PBYTE   PacketBuffer,
     ULONG   PacketSize
 )
@@ -2230,7 +2241,7 @@ AppRingStoreCounters(
 _Use_decl_annotations_
 BOOLEAN
 CCaptureStreamEngine::AppRingCapturePass(
-    ULONG   Packet,
+    ULONGLONG Packet,
     PBYTE   PacketBuffer,
     ULONG   PacketSize
 )
@@ -2438,7 +2449,7 @@ CCaptureStreamEngine::AppRingCapturePass(
 _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::AppRingOtherPass(
-    ULONG   Packet,
+    ULONGLONG Packet,
     PBYTE   PacketBuffer,
     ULONG   PacketSize
 )
