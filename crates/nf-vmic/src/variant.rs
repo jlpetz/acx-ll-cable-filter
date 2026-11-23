@@ -36,7 +36,7 @@
 //!    owner's to confirm), the device is re-created ([`KeptCheck::Recreate`]). If not, the switch stops, the nothing-to-do one too
 //!    ([`SwitchError::PackageLacks`]): it says to add the three variants' package, or, when one of ours that makes it is
 //!    there but ranks below the newest, how DriverVer ranks them. A microphone disabled in the Sound panel passes, with a
-//!    warning (ours, the owner's to confirm). With nothing else to do, the switch ends here.
+//!    warning (the owner, 2026-11-23). With nothing else to do, the switch ends here.
 //! 3. Note our capture endpoints (active or disabled) if a device is to be created, then the new device, not yet registered
 //!    (`SetupDiCreateDeviceInfoW` under class MEDIA with `DICD_GENERATE_ID`, as devcon does: `ROOT\MEDIA\NNNN`; the hardware ID
 //!    by `SetupDiSetDeviceRegistryPropertyW`), and its driver: the compatible-driver search over the driver store
@@ -781,7 +781,7 @@ impl MicCheck {
 /// Judges our capture endpoints `now` against `wanted`: each of the target's microphones must be there, by its kind (its
 /// filter's, or its name's: [`sessions::identify`]), whatever it's named; on the wanted device (an endpoint whose device
 /// wasn't read may be on it), and not one of `before`. An active one is taken before a disabled one (disabled in the Sound
-/// panel, it is there still; ours, the owner's to confirm: it passes, with a warning, [`found_lines`]). The endpoints left
+/// panel, it is there still; the owner, 2026-11-23: it passes, with a warning, [`found_lines`]). The endpoints left
 /// over that are active are `extra`.
 pub fn check_mics(wanted: &Wanted, now: &[CaptureEndpoint]) -> MicCheck {
     let eligible = |e: &CaptureEndpoint| {

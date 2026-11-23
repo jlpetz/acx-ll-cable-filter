@@ -22,7 +22,7 @@ pub enum Exit {
     /// it, or real-time heap allocations), so it reads as one code. A `run` without `--seconds` exits [`Exit::Ok`].
     Glitched = 6,
     /// `mic variant`: the new device is installed, but Windows needs a restart to finish, so its microphones weren't checked:
-    /// restart, then run `mic variant` to check them (ours, the owner's to confirm). Not 0, as the switch isn't done.
+    /// restart, then run `mic variant` to check them (the owner, 2026-11-23). Not 0, as the switch isn't done.
     RestartPending = 7,
 }
 

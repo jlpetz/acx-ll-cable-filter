@@ -14,7 +14,7 @@
 //! reports each step through the named pipe (report_pipe.rs) and this side prints them as they come. Elevated already (an
 //! administrator terminal), it switches in-process. Either way the switch (nf-vmic's) holds a system-wide lock, checks a
 //! device it keeps the same way, and succeeds only once the new device works on the chosen package and Windows has made its
-//! microphones; one Windows must restart to finish exits 7, unchecked (ours, the owner's to confirm). The helper never opens
+//! microphones; one Windows must restart to finish exits 7, unchecked (the owner, 2026-11-23). The helper never opens
 //! or attaches a console (main.rs); one that finds itself not elevated (UAC turned off) stops with exit code 4 instead of
 //! relaunching itself, as setup-large-pages' helper does.
 
@@ -269,7 +269,7 @@ fn switch(target: Variant, report: Option<&str>) -> Result<(), Failure> {
     }
 }
 
-/// A switch Windows must restart to finish (exit code 7; ours, the owner's to confirm).
+/// A switch Windows must restart to finish (exit code 7; the owner, 2026-11-23).
 fn restart_message(target: Variant, device: &str) -> String {
     format!(
         "The switch to {} isn't finished: Windows needs a restart to finish installing {device}. Restart Windows, then run \
