@@ -2559,6 +2559,10 @@ struct StampRow {
     position: u64,
     frames: u32,
     segment: u32,
+    /// A shared client's first packet after a resume that the engine made itself: its stamp isn't one the driver notified
+    /// (the trace's latest still the one from before the pause). Measured 2026-11-23: the engine hands a restarted client a
+    /// packet before the device's next one, stamped about when it gives it; not the driver's, so not checked.
+    engine_made: bool,
     trace: CaptureTrace,
 }
 
@@ -2582,14 +2586,21 @@ struct StepCheck {
     no_time: usize,
     /// Steps not checked: the positions didn't follow on (frames lost, or a position the device restarted).
     gaps: usize,
+    /// Packets the shared engine made itself after a resume ([`StampRow::engine_made`]): left out.
+    engine_made: usize,
 }
 
 /// Each packet's stamp must step by exactly the frames before it while the stream runs (the device position says which
 /// packets follow on), and by at least that across a Stop/Start (by the pause too, as the time line paused with it).
 fn check_steps(rows: &[StampRow]) -> StepCheck {
-    let mut c = StepCheck { no_time: rows.iter().filter(|r| r.device_hns.is_none()).count(), ..Default::default() };
-    for (i, w) in rows.windows(2).enumerate() {
-        let (a, b) = (&w[0], &w[1]);
+    let mut c = StepCheck {
+        no_time: rows.iter().filter(|r| r.device_hns.is_none()).count(),
+        engine_made: rows.iter().filter(|r| r.engine_made).count(),
+        ..Default::default()
+    };
+    let kept: Vec<(usize, &StampRow)> = rows.iter().enumerate().filter(|(_, r)| !r.engine_made).collect();
+    for w in kept.windows(2) {
+        let ((_, a), (i, b)) = (w[0], w[1]);
         let (Some(ta), Some(tb)) = (a.device_hns, b.device_hns) else { continue };
         if b.position != a.position + u64::from(a.frames) {
             c.gaps += 1;
@@ -2600,10 +2611,10 @@ fn check_steps(rows: &[StampRow]) -> StepCheck {
         let expected = (u64::from(a.frames) * 10_000_000 / u64::from(protocol::SAMPLE_RATE)) as i64;
         if a.segment == b.segment {
             if (step - expected).abs() > STAMP_SLACK_HNS {
-                c.wrong.push(i + 1);
+                c.wrong.push(i);
             }
         } else if step < expected - STAMP_SLACK_HNS {
-            c.overlapping.push(i + 1);
+            c.overlapping.push(i);
         }
     }
     c
@@ -2614,7 +2625,7 @@ fn check_steps(rows: &[StampRow]) -> StepCheck {
 /// No ring needed: the stream's silence carries the same stamps.
 fn stamps(args: &[String]) -> Result<Verdict, String> {
     let valued = ["--packets", "--period-frames", "--mode", "--device", "--resumes"];
-    let o = Opts::parse(args, &valued, &["--exclusive"])?;
+    let o = Opts::parse(args, &valued, &["--exclusive", "--verbose"])?;
     let packets: usize = o.value("--packets", 200)?;
     if !(1..=100_000).contains(&packets) {
         return Err(format!("--packets {packets}: from 1 to 100000"));
@@ -2658,6 +2669,7 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
                         position: p.position,
                         frames: p.frames,
                         segment: segment as u32,
+                        engine_made: false,
                         trace: s.capture_trace,
                     }),
                     Err(e) => error = Some(format!("STATS: {e}")),
@@ -2672,17 +2684,44 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     if let Some(e) = error {
         return Err(e);
     }
+    if !spec.exclusive {
+        for i in 1..rows.len() {
+            let (prev, r) = (rows[i - 1], rows[i]);
+            let driver = latency::qpc_to_hns(r.trace.last_notify_qpc, frequency);
+            if r.segment != prev.segment && r.device_hns.is_some_and(|d| (d as i64 - driver).abs() > STAMP_SLACK_HNS) {
+                rows[i].engine_made = true;
+            }
+        }
+    }
     print_stamps(&rows, frequency);
+    if o.flag("--verbose") {
+        // Each resume's rows and the one before: run, device position, frames, device time and receipt (ms from the first).
+        let hns = |qpc: u64| latency::qpc_to_hns(qpc, frequency) as f64;
+        let base = rows.first().and_then(|r| r.device_hns).unwrap_or(0) as f64;
+        for (i, r) in rows.iter().enumerate() {
+            if r.segment > 0 || rows.get(i + 1).is_some_and(|n| n.segment > 0) {
+                let dev = r.device_hns.map_or("none".to_string(), |d| format!("{:.4}", (d as f64 - base) / 10_000.0));
+                let rec = (hns(r.host_qpc) - base) / 10_000.0;
+                let drv = (hns(r.trace.last_notify_qpc) - base) / 10_000.0;
+                println!(
+                    "    row {i:>4} run {:>2} position {:>9} frames {:>4} device {dev:>12} receipt {rec:>12.4} driver's latest {drv:>12.4}",
+                    r.segment, r.position, r.frames
+                );
+            }
+        }
+    }
     let c = check_steps(&rows);
     println!(
         "steps: {} checked ({} across a resume), {} in a run that weren't a packet's length, {} resumed stamps overlapping the \
-         packet before, {} packets without a device time, {} not checked (positions not following on)",
+         packet before, {} packets without a device time, {} not checked (positions not following on), {} first \
+         packets after a resume the shared engine made itself (left out)",
         c.checked,
         resumes,
         c.wrong.len(),
         c.overlapping.len(),
         c.no_time,
-        c.gaps
+        c.gaps,
+        c.engine_made
     );
     let at = |i: usize| {
         let (a, b) = (&rows[i - 1], &rows[i]);
@@ -3056,6 +3095,7 @@ mod tests {
             position,
             frames: 480,
             segment,
+            engine_made: false,
             trace: CaptureTrace::default(),
         }
     }
@@ -3078,6 +3118,11 @@ mod tests {
         let mut none = row(480, 10.0, 0);
         none.device_hns = None;
         assert_eq!(check_steps(&[row(0, 0.0, 0), none]).no_time, 1);
+        // A shared engine's own packet after a resume is left out: the driver's next one is checked after it.
+        let mut engine = row(480, 25.5, 1);
+        engine.engine_made = true;
+        let c = check_steps(&[row(0, 0.0, 0), engine, row(960, 25.0, 1), row(1440, 35.0, 1)]);
+        assert_eq!((c.engine_made, c.checked, c.gaps, c.wrong.len()), (1, 1, 1, 0));
     }
 
     fn args(list: &[&str]) -> Vec<String> {
