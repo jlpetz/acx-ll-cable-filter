@@ -13,8 +13,8 @@ version in full. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
 
 The deny list, `.git/info/privacy-deny`, holds private strings (one per line, case-insensitive; `#` starts a comment): the
 owner's email and domain, host and account names. It stays in .git/, so it is never committed or pushed: this script, which
-is, names none of them. `tools/privacy-allow.txt` lists literal strings that look like a finding but aren't (a version
-number shaped like an IP address).
+is, names none of them. `tools/privacy-allow.txt`, as committed at HEAD, lists literal strings that look like a finding
+but aren't (a version number shaped like an IP address).
 """
 import re
 import subprocess
@@ -63,12 +63,12 @@ def load_list(path):
 
 class Checker:
     def __init__(self):
-        top = git("rev-parse", "--show-toplevel").strip()
-        common = Path(git("rev-parse", "--git-common-dir").strip())
-        if not common.is_absolute():
-            common = Path(top) / common
+        common = Path(git("rev-parse", "--git-common-dir").strip()).resolve()
         self.deny = [d.lower() for d in load_list(common / "info" / "privacy-deny")]
-        self.allow = set(load_list(Path(top) / "tools" / "privacy-allow.txt"))
+        # The allow list as committed (a bare repo has no working tree to read it from).
+        allow = subprocess.run(["git", "show", "HEAD:tools/privacy-allow.txt"], capture_output=True)
+        lines = allow.stdout.decode("utf-8", "replace").splitlines() if allow.returncode == 0 else []
+        self.allow = {l.strip() for l in lines if l.strip() and not l.strip().startswith("#")}
         self.findings = []
 
     def text(self, where, text):
