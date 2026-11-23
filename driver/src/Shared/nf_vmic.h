@@ -3,8 +3,12 @@
     noise-filter (TODO 19, spike checks 4 and 5): the protocol between the app and the virtual microphone driver.
 
     Original to noise-filter, not from Microsoft's sample: MIT OR Apache-2.0, like the Rust crate that mirrors it
-    (crates/nf-vmic/src/protocol.rs, which checks these offsets at compile time). Change the two together, and bump
-    NF_VMIC_VERSION on any change to a layout or a rule.
+    (crates/nf-vmic/src/protocol.rs, which checks these offsets at compile time). Change the two together. Bump
+    NF_VMIC_VERSION on a change to a layout or to a rule the app must follow (ATTACH and its outcomes, the ring's header, and
+    the ring's rules for the app's side: its positions, WriteFrame and ReadFrame, the fill, the State bits). NF_VMIC_STATS
+    also carries its size (StatsBytes), which a reader checks with the version, so it has grown without one; and the driver's
+    handling of its other capture streams (the reader's copy, handoffs, their counters) can change without one, as it has
+    at version 1 (ours, 2026-11-23: the owner's to confirm).
 
 Module Name:
 
@@ -82,10 +86,11 @@ The ring's rules:
       and in order; an underrun inserts silence and drops nothing; an app that keeps 0 <= fill <= capacity never sees a re-sync.
     - The capacity, and the fill the app keeps, must be at least one capture packet (PacketFrames: 480 frames for a shared
       stream's 10 ms period), or every pass underruns. NF_VMIC_MIN_CAPACITY_FRAMES holds two such packets.
-    - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one paused). Only
-      the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of the packets it
-      delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture stream running
-      in 48 kHz float32 stereo plays that copy a lag behind: the reader's packet plus 1 ms and a frame (a stream that has
+    - One capture stream holds the reader slot at a time: the first to run after ATTACH (or after the last one began to
+      pause: a stream gives the slot up as its Pause starts, while its timer still runs, and may hold it again only after its
+      next Run). Only the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of
+      the packets it delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture
+      stream running in 48 kHz float32 stereo plays that copy a lag behind: the reader's packet plus 1 ms and a frame (a stream that has
       played the copy behind more than one reader since it last ran keeps the longest of their packets). More than one
       capture stream can run at once: the microphones of two of the driver's devices share the one app ring, and the audio
       engine opens a device stream per processing mode (a RAW and a DEFAULT client make two). The other streams' passes are
@@ -95,18 +100,21 @@ The ring's rules:
       copy, and reads the ring on from there. A stream playing the copy keeps its place in it and never goes back: where its
       place would move back (a handoff to a reader with a longer packet; a Pause and Run soon after it last played the copy
       or held the slot) it gets silence until it passes what it has had, counted in SecondaryUnderrunFrames. A handoff (the
-      reader pauses and another stream takes the slot) skips once in the stream that takes it: it starts at ReadFrame, so what
-      the copy held between its place and its first packet's start never reaches it (its lag at most: 209 frames behind
-      160-frame readers), counted in ReaderHandoffs and HandoffSkippedFrames (the owner, 2026-11-20: a one-time skip for now; a
-      gapless handoff is a follow-up). Any other stream plays on through a handoff, skipping and repeating nothing: it gets
-      silence where the new reader's packet is longer (its place moves back by the difference) or the readers' time lines
-      leave a gap; where it is shorter, it keeps the longer lag until it next runs rather than skip the difference (ours,
-      2026-11-23, after Astra's review, which found such a stream moving back and playing the difference again, 320 frames
-      from a 160-frame reader to a 480-frame one; the owner's to confirm). A jump in a stream's time line (a late timer's
+      reader pauses and another stream takes the slot) skips once in the stream that takes it: its first packet as the reader
+      starts at its own place on the time line, a lag ahead of its place in the copy, so what the copy held between the two
+      never reaches it (its lag at most: 209 frames behind 160-frame readers), counted in ReaderHandoffs and
+      HandoffSkippedFrames (the owner, 2026-11-20: a one-time skip for now; a gapless handoff is a follow-up). Any other
+      stream plays on through a handoff, skipping and repeating nothing: it gets silence where the new reader's packet is
+      longer (its place moves back by the difference) or the readers' time lines leave a gap; where it is shorter, it keeps
+      the longer lag until it next runs rather than skip the difference (ours, 2026-11-23, after Astra's review, which found
+      such a stream moving back and playing the difference again, 320 frames from a 160-frame reader to a 480-frame one; the
+      owner's to confirm). A jump in a stream's time line (a late timer's
       glitch adjustment, Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses) moves the copy's audio by its length: the reader's
       inserts that much silence in the other streams (its own output doesn't show it), another stream's skips that much of
       the copy. So does what the copy didn't hold in time for a stream (the reader's timer later than its own by more than
-      the 1 ms): silence there, counted in SecondaryUnderrunFrames, and those frames never reach it.
+      the 1 ms): silence there, counted in SecondaryUnderrunFrames, and those frames never reach it. A reader that kept the
+      slot while its timer stopped did the same to the streams that played on (55 to 111 frames lost at live handoffs,
+      2026-11-23): it now gives the slot up first.
     - While a ring is attached, creating a capture stream in any format other than 48 kHz float32 stereo fails with
       STATUS_NOT_SUPPORTED (counted in RefusedCaptureOpens; an exclusive-mode client can retry in float32). An ATTACH while
       such a stream is open fails the same way (counted in FormatRejects; the refusals above). The check and the publish (or

@@ -82,7 +82,9 @@ typedef struct _LOOPBACK_RING {
     PVOID           Owner;                  // that CRenderStreamEngine, or NULL
     LOOPBACK_FORMAT RenderFormat;           // the last owner's format (kept after it stops, so its tail can still be read)
     BOOLEAN         RenderActive;           // the owner is running and has written in this run
-    ULONG           RenderLeadFrames;       // 0: packets copied as released (a period early); else a packet: copied as they complete
+    ULONG           RenderLeadFrames;       // 0: packets copied as released (a period early); else a packet: copied as they complete.
+                                            // Set by a pass that copied; a capture stream keeps a longer one while a shorter one
+                                            // would skip audio the ring holds (LoopbackCapturePass)
     ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
     ULONGLONG       WritePos;
 

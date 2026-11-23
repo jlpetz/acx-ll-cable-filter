@@ -578,7 +578,7 @@ protected:
 
     // noise-filter (TODO 19): the capture half of the loopback pair.
     ULONG           m_LbLagFrames;      // LOOPBACK_LAG_HNS in frames, rounded up, plus one
-    ULONG           m_LbAnchorLead;     // the render lead (LOOPBACK_RING.RenderLeadFrames) the anchor was made with
+    ULONG           m_LbAnchorLead;     // the render lead it reads behind: LOOPBACK_RING.RenderLeadFrames, or a longer one it keeps
     ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
     // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
@@ -587,6 +587,7 @@ protected:
     ULONGLONG       m_AppEndAttach;     // the attachment m_AppEnd is from (NF_VMIC_RING_STATS.Attaches; 0: none yet)
     ULONG           m_AppOtherLead;     // the longest reader packet it has played the copy behind this run (AppRingOtherPass)
     BOOLEAN         m_AppOtherValid;    // its latest pass this run played the copy: a handoff to this stream counts what it skips
+    BOOLEAN         m_AppNoSlot;        // it gave the reader slot up (AppRingReaderStop) and may take it only after its next Run
 
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
     __declspec(noinline)
@@ -635,8 +636,9 @@ protected:
         _In_                                ULONGLONG   End
         );
 
-    // noinline: called from PAGE code (Pause, ReleaseHardware, the destructor) and takes the app ring's spin lock. Inlined
-    // into a PAGE function, its locked region would be pageable code at DISPATCH_LEVEL.
+    // Gives the reader slot up, if this stream holds it, and bars it from the slot until its next Run (m_AppNoSlot). noinline:
+    // called from PAGE code (Pause, ReleaseHardware, the destructor) and takes the app ring's spin lock. Inlined into a PAGE
+    // function, its locked region would be pageable code at DISPATCH_LEVEL.
     __declspec(noinline)
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID

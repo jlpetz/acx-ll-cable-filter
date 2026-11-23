@@ -13,7 +13,8 @@
 //! - `open` opens an endpoint in one format (48 kHz stereo float32, or 24-in-32 PCM), exclusive or shared, prints what
 //!   IsFormatSupported and Initialize returned by name, and holds the stream for N seconds: the format-refusal tests in either
 //!   open order, and a small-period helper. A refusal is the driver's only where its RefusedCaptureOpens rose (exit 1); any
-//!   other exits 4.
+//!   other exits 4. A float render stream can play the test signal (`--signal`), so a float capture of the microphone, which
+//!   decodes it and counts its gaps and repeats, checks the loopback bit-exact.
 //! - `latency` attaches a ring, feeds it at a fill target and records the capture endpoint in the same process, timing each
 //!   frame from the feed's publication to its receipt (the host's QPC when GetBuffer returned its packet, and the frame's
 //!   device time: GetBuffer's device QPC position plus its place in the packet), and checks that its own stream read the
@@ -113,14 +114,16 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       throughout, and its timer must still run after the last kill. --no-capture leaves the reading to another capture
       client: without one the result is INCONCLUSIVE.
   nf-vmic-test open --device NAME [--render] (--exclusive | --shared) --format float|pcm24 [--period-frames N]
-                    [--mode raw|default|communications] [--seconds N]
+                    [--mode raw|default|communications] [--seconds N] [--signal [--start N]]
       Open the endpoint (capture, or render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32
       PCM (a 32-bit container with 24 valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name (or
       that of the call after it that failed, up to Start), then hold the stream running for N seconds (default 10; Ctrl+C
-      ends it sooner): render writes silence; capture counts packets and silent packets, and for float decodes the test
-      signal and counts its codes. --period-frames: exclusive, the period (default: the device's default period); shared,
-      an IAudioClient3 engine period. --mode: the processing mode (default: DEFAULT). Shared mode converts nothing, so a
-      format other than the endpoint's mix format is refused. The driver's statistics before and after are printed where
+      ends it sooner): render writes silence, or with --signal (float only) the test signal as feed writes it, from frame
+      N (--start, default 0); capture counts packets and silent packets, and for float decodes the test signal and counts
+      its codes, gaps and repeats (the loopback's check, with no app ring attached and a --signal render stream on the
+      speakers). --period-frames: exclusive, the period (default: the device's default period); shared, an IAudioClient3
+      engine period. --mode: the processing mode (default: DEFAULT). Shared mode converts nothing, so a format other than
+      the endpoint's mix format is refused. The driver's statistics before and after are printed where
       its control device opens. Exit 0: it opened and ran. 1: the driver refused it (a capture stream while a ring is
       attached, in a format other than 48 kHz float32 stereo: its RefusedCaptureOpens rose), the expected result in some
       tests. 4: refused, but not shown to be by that rule: the outcome line names the call and its HRESULT, and says
@@ -1474,20 +1477,23 @@ struct Render {
     packets: u64,
     frames: u64,
     longest_wait: Duration,
+    /// The next frame of the test signal to write (a float stream's `--signal`), or `None`: silence.
+    signal: Option<u64>,
 }
 
 impl Render {
-    fn new(opened: Opened) -> Result<Self, Refusal> {
+    fn new(opened: Opened, signal: Option<u64>) -> Result<Self, Refusal> {
         let event = opened.client.set_get_eventhandle().map_err(|e| Refusal::at("SetEventHandle", e))?;
         // SAFETY: a COM call on an initialised client (open_client), which hands out its render interface, reference-counted.
         let render = unsafe { opened.client.as_iaudioclient().GetService::<IAudioRenderClient>() }
             .map_err(|e| Refusal::com("GetService(IAudioRenderClient)", &e))?;
-        Ok(Self { opened, render, event, packets: 0, frames: 0, longest_wait: Duration::ZERO })
+        Ok(Self { opened, render, event, packets: 0, frames: 0, longest_wait: Duration::ZERO, signal })
     }
 
-    /// Fills what the buffer has free with silence: an exclusive stream's whole buffer (its period), a shared one's free space.
-    /// A failure names its call (a refusal, where it is the fill before the start).
-    fn fill_silence(&mut self) -> Result<(), Refusal> {
+    /// Fills what the buffer has free with silence, or the test signal (`signal`, float only: open_args checks): an exclusive
+    /// stream's whole buffer (its period), a shared one's free space. A failure names its call (a refusal, where it is the
+    /// fill before the start).
+    fn fill(&mut self) -> Result<(), Refusal> {
         let o = &self.opened;
         let free = if o.exclusive {
             o.buffer_frames
@@ -1498,20 +1504,46 @@ impl Render {
             return Ok(());
         }
         // SAFETY: a COM call on our initialised render client, for no more than the free frames.
-        unsafe { self.render.GetBuffer(free) }.map_err(|e| Refusal::com("GetBuffer", &e))?;
-        // SAFETY: releases the frames just obtained, marked silent: the engine treats them as silence, so nothing is written.
-        unsafe { self.render.ReleaseBuffer(free, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) }.map_err(|e| Refusal::com("ReleaseBuffer", &e))?;
+        let data = unsafe { self.render.GetBuffer(free) }.map_err(|e| Refusal::com("GetBuffer", &e))?;
+        let flags = match self.signal {
+            Some(first) => {
+                // SAFETY: GetBuffer handed out `free` frames at `data` for us to write until ReleaseBuffer, and a float stereo
+                // frame (the only format --signal opens) is FRAME_BYTES bytes.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(data, free as usize * protocol::FRAME_BYTES as usize) };
+                write_signal(bytes, first);
+                self.signal = Some(first + u64::from(free));
+                0
+            }
+            // Marked silent: the engine treats the frames as silence, so nothing is written.
+            None => AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+        };
+        // SAFETY: releases the frames just obtained, written above or marked silent.
+        unsafe { self.render.ReleaseBuffer(free, flags) }.map_err(|e| Refusal::com("ReleaseBuffer", &e))?;
         self.packets += 1;
         self.frames += u64::from(free);
         Ok(())
     }
 
-    /// Waits for the stream's event (2 s at most), then fills the buffer with silence.
+    /// Waits for the stream's event (2 s at most), then fills the buffer.
     fn wait_and_fill(&mut self) -> Result<(), String> {
         let t = Instant::now();
         self.event.wait_for_event(2_000).map_err(|_| "no render event for 2 s: is the endpoint's stream running?".to_string())?;
         self.longest_wait = self.longest_wait.max(t.elapsed());
-        self.fill_silence().map_err(|r| r.to_string())
+        self.fill().map_err(|r| r.to_string())
+    }
+
+    /// What the stream writes, for its status lines.
+    fn what(&self) -> &'static str {
+        if self.signal.is_some() { "of the test signal" } else { "of silence" }
+    }
+}
+
+/// The test signal's frames from frame `first` into `dest`, float32 stereo little-endian, as many whole frames as it holds.
+fn write_signal(dest: &mut [u8], first: u64) {
+    for (n, f) in (first..).zip(dest.as_chunks_mut::<8>().0) {
+        let [left, right] = signal::frame(n);
+        f[..4].copy_from_slice(&left.to_le_bytes());
+        f[4..].copy_from_slice(&right.to_le_bytes());
     }
 }
 
@@ -2035,11 +2067,13 @@ struct OpenArgs {
     render: bool,
     spec: StreamSpec,
     seconds: u64,
+    /// A render stream's test signal: the first frame's number (`--signal`, `--start`); `None` writes silence.
+    signal: Option<u64>,
 }
 
 fn open_args(args: &[String]) -> Result<OpenArgs, String> {
-    let valued = ["--device", "--format", "--period-frames", "--mode", "--seconds"];
-    let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared"])?;
+    let valued = ["--device", "--format", "--period-frames", "--mode", "--seconds", "--start"];
+    let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared", "--signal"])?;
     let name: String = o.optional("--device")?.ok_or("--device NAME is required: the endpoint's name, as Sound settings shows it")?;
     let exclusive = match (o.flag("--exclusive"), o.flag("--shared")) {
         (true, false) => true,
@@ -2052,7 +2086,15 @@ fn open_args(args: &[String]) -> Result<OpenArgs, String> {
         return Err(format!("--seconds {seconds}: from 1 to 86400"));
     }
     let spec = StreamSpec { exclusive, format, period_frames: o.period_frames()?, mode: o.mode(Mode::Default)? };
-    Ok(OpenArgs { name, render: o.flag("--render"), spec, seconds })
+    let render = o.flag("--render");
+    let start: Option<u64> = o.optional("--start")?;
+    let signal = match (o.flag("--signal"), start) {
+        (false, None) => None,
+        (false, Some(_)) => return Err("--start is --signal's: the test signal's first frame".into()),
+        (true, _) if !render || format != Format::Float => return Err("--signal needs --render and --format float".into()),
+        (true, start) => Some(start.unwrap_or(0)),
+    };
+    Ok(OpenArgs { name, render, spec, seconds, signal })
 }
 
 /// How long open's stream ran once started, the events it served (each waited for and its buffer read or filled), and why it
@@ -2102,7 +2144,7 @@ fn open(args: &[String]) -> Result<Verdict, String> {
             println!("note: {note}");
         }
         println!("{}: S_OK; {}", opened.init_call, opened.describe());
-        if a.render { run_render(opened, a.seconds) } else { run_capture(opened, a.spec.format, a.seconds) }
+        if a.render { run_render(opened, a.seconds, a.signal) } else { run_capture(opened, a.spec.format, a.seconds) }
     });
     let after = stats();
     if let Err(r) = &run {
@@ -2334,12 +2376,12 @@ fn run_capture(opened: Opened, format: Format, seconds: u64) -> Result<OpenRun, 
     Ok(OpenRun { elapsed, events, error })
 }
 
-/// open's render: writes silence for `seconds` (or until Ctrl+C), the first buffer before the start. A call that fails before
-/// the stream runs (SetEventHandle, GetService, the first fill, Start) is a refusal.
-fn run_render(opened: Opened, seconds: u64) -> Result<OpenRun, Refusal> {
-    let mut render = Render::new(opened)?;
+/// open's render: writes silence, or the test signal from frame `signal`, for `seconds` (or until Ctrl+C), the first buffer
+/// before the start. A call that fails before the stream runs (SetEventHandle, GetService, the first fill, Start) is a refusal.
+fn run_render(opened: Opened, seconds: u64, signal: Option<u64>) -> Result<OpenRun, Refusal> {
+    let mut render = Render::new(opened, signal)?;
     // An event-driven stream wants its first buffer before it starts.
-    render.fill_silence()?;
+    render.fill()?;
     render.opened.client.start_stream().map_err(|e| Refusal::at("Start", e))?;
     let _pro_audio = ProAudio::join();
     let (t0, mut last) = (Instant::now(), Instant::now());
@@ -2352,15 +2394,17 @@ fn run_render(opened: Opened, seconds: u64) -> Result<OpenRun, Refusal> {
         events += 1;
         if last.elapsed() >= Duration::from_secs(1) {
             last = Instant::now();
-            println!("{:>7.1} s  {} buffers, {} frames of silence", t0.elapsed().as_secs_f64(), render.packets, render.frames);
+            println!("{:>7.1} s  {} buffers, {} frames {}", t0.elapsed().as_secs_f64(), render.packets, render.frames, render.what());
         }
     }
     let elapsed = t0.elapsed();
     let _ = render.opened.client.stop_stream();
     println!(
-        "render: {} buffers, {} frames of silence written, longest wait {:.1} ms",
+        "render: {} buffers, {} frames {} written{}, longest wait {:.1} ms",
         render.packets,
         render.frames,
+        render.what(),
+        signal.map(|first| format!(" (frames {first} to {})", first + render.frames.max(1) - 1)).unwrap_or_default(),
         render.longest_wait.as_secs_f64() * 1000.0
     );
     Ok(OpenRun { elapsed, events, error })
@@ -3486,6 +3530,26 @@ mod tests {
         // Its gap alone fails too: it matches no counted skip.
         let gap_only = CheckReport { gaps: 1, gap_frames: 151, ..clean_recording() };
         assert_eq!(failed(&verify_checks(&before, &old_after, &gap_only, &seen)), ["bit-exact and in order"]);
+        // The 320 frames fit in the one-packet slack (480) even with nothing counted, so the case above can't tell. More
+        // silence than the slack passes only where the driver counted it: 320 frames and 481 more, 801, fail uncounted.
+        let more = CheckReport { signal_frames: FRAMES - 801, zeros_inside: 801, zero_runs_inside: 1, ..clean_recording() };
+        let counted = |frames| Stats { secondary_underrun_frames: frames, ..after };
+        assert_eq!(failed(&verify_checks(&before, &counted(0), &more, &seen)), ["silence inside the signal"]);
+        assert_eq!(failed(&verify_checks(&before, &counted(320), &more, &seen)), ["silence inside the signal"]);
+        assert_eq!(failed(&verify_checks(&before, &counted(801), &more, &seen)), Vec::<&str>::new());
+        // The live run on a66d8ab (A1, 2026-11-23): the stopping reader held the slot while its timer stopped, so the stream that
+        // played on read past the copy's end and lost the 55 frames the taker then wrote there. Its silence was counted (430:
+        // the 320, and the 110 past the copy's end), its gap not (the taker's skip was 154).
+        let live_after = Stats { handoff_skipped_frames: 154, ..counted(430) };
+        let live = CheckReport {
+            signal_frames: FRAMES - 430,
+            zeros_inside: 430,
+            zero_runs_inside: 1,
+            gaps: 1,
+            gap_frames: 55,
+            ..clean_recording()
+        };
+        assert_eq!(failed(&verify_checks(&before, &live_after, &live, &seen)), ["bit-exact and in order"]);
     }
 
     #[test]
@@ -3536,14 +3600,21 @@ mod tests {
         let open = |list: &[&str]| open_args(&args(list));
         let a = open(&["--device", "Mic (X)", "--exclusive", "--format", "pcm24"]).unwrap();
         let spec = StreamSpec { exclusive: true, format: Format::Pcm24, period_frames: None, mode: Mode::Default };
-        assert_eq!(a, OpenArgs { name: "Mic (X)".into(), render: false, spec, seconds: 10 });
+        assert_eq!(a, OpenArgs { name: "Mic (X)".into(), render: false, spec, seconds: 10, signal: None });
         let a = open(&[
             "--render", "--shared", "--device", "Speakers", "--format", "float", "--period-frames", "128", "--mode", "raw", "--seconds",
             "3",
         ])
         .unwrap();
         let spec = StreamSpec { exclusive: false, format: Format::Float, period_frames: Some(128), mode: Mode::Raw };
-        assert_eq!(a, OpenArgs { name: "Speakers".into(), render: true, spec, seconds: 3 });
+        assert_eq!(a, OpenArgs { name: "Speakers".into(), render: true, spec, seconds: 3, signal: None });
+        // The test signal, from frame 0 or from --start.
+        let signal = |extra: &[&str]| {
+            let list = [&["--render", "--shared", "--device", "S", "--format", "float"][..], extra].concat();
+            open(&list).map(|a| a.signal)
+        };
+        assert_eq!(signal(&["--signal"]), Ok(Some(0)));
+        assert_eq!(signal(&["--signal", "--start", "2097152"]), Ok(Some(2_097_152)));
         for (list, why) in [
             (&["--exclusive", "--format", "float"][..], "--device NAME is required"),
             (&["--device", "M", "--format", "float"], "one of --exclusive and --shared"),
@@ -3554,6 +3625,10 @@ mod tests {
             (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "0"], "--period-frames 0"),
             (&["--device", "M", "--exclusive", "--format", "float", "--period-frames", "48001"], "--period-frames 48001"),
             (&["--device", "M", "--exclusive", "--format", "float", "--seconds", "0"], "--seconds 0"),
+            (&["--device", "M", "--shared", "--format", "float", "--signal"], "--signal needs --render and --format float"),
+            (&["--render", "--device", "M", "--shared", "--format", "pcm24", "--signal"], "--signal needs --render"),
+            (&["--render", "--device", "M", "--shared", "--format", "float", "--start", "5"], "--start is --signal's"),
+            (&["--render", "--device", "M", "--shared", "--format", "float", "--signal", "--start", "x"], "--start"),
         ] {
             let e = open(list).unwrap_err();
             assert!(e.contains(why), "{list:?}: {e}");
@@ -3571,6 +3646,22 @@ mod tests {
         let a = args(&["--mode", "communications"]);
         let o = Opts::parse(&a, &["--mode", "--period-frames"], &[]).unwrap();
         assert_eq!(o.mode(Mode::RawWhereOffered), Ok(Mode::Communications));
+    }
+
+    /// open's render `--signal` writes the frames a float capture decodes (Packet::float_frames, the same bytes back), through
+    /// the codes' wrap, and only whole frames.
+    #[test]
+    fn a_render_stream_writes_the_test_signal() {
+        let mut bytes = vec![0xAA_u8; 5 * 8 + 3];
+        write_signal(&mut bytes, signal::CODE_MODULUS - 2);
+        let packet = Packet { bytes: &bytes, frames: 5, silent: false, qpc_hns: None, host_qpc: 0, position: 0 };
+        let codes: Vec<_> = packet.float_frames().map(signal::decode).collect();
+        let top = signal::CODE_MODULUS as u32;
+        assert_eq!(codes, [Some(top - 2), Some(top - 1), Some(0), Some(1), Some(2)]);
+        assert_eq!(bytes[40..], [0xAA; 3], "no part of a frame");
+        let mut checker = SequenceChecker::new();
+        packet.float_frames().for_each(|f| checker.feed(f));
+        assert!(checker.is_clean());
     }
 
     #[test]

@@ -891,9 +891,10 @@ CStreamEngine::GetCurrentPacket(
 // noise-filter (TODO 19, spike check 7): the render-to-capture loopback pair.
 //
 // The render pass copies each packet into the device's ring at the frame its own time line presents it; the capture pass
-// copies one packet from the frame its own time line captures, minus a fixed lag. Both time lines are ScheduleNextPass's
-// (absolute QPC, nominal rate), so the two ends stay locked with no drift and no fill-level control. All integer; nothing
-// allocates; all shared state is under the ring's spin lock (held for one packet copy).
+// copies one packet from the frame its own time line captures, a lag behind (1 ms and a frame, plus the render side's lead:
+// LoopbackCapturePass). Both time lines are ScheduleNextPass's (absolute QPC, nominal rate), so the two ends stay locked with
+// no drift and no fill-level control. All integer; nothing allocates; all shared state is under the ring's spin lock (held
+// for one packet copy).
 //
 
 static
@@ -1636,9 +1637,15 @@ CRenderStreamEngine::LoopbackRenderPass(
         copied = TRUE;
     }
 
-    ring->RenderLeadFrames = lookAhead ? 0 : m_LbPacketFrames;
+    //
+    // The lead (how early this stream's packets reach the ring), from a pass that copied. The pass at Run before the client has
+    // released a packet copies nothing: its packet as the lead moved every capture stream running a packet back, and then on
+    // again, skipping the start of this stream's audio, or now held it there (LoopbackCapturePass keeps a longer lead while
+    // the ring holds audio a shorter one would skip). The first pass that copies says how this stream's packets are copied.
+    //
     if (copied)
     {
+        ring->RenderLeadFrames = lookAhead ? 0 : m_LbPacketFrames;
         ring->RenderActive = TRUE;
     }
 
@@ -1692,7 +1699,8 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_AppEnd(0),
     m_AppEndAttach(0),
     m_AppOtherLead(0),
-    m_AppOtherValid(FALSE)
+    m_AppOtherValid(FALSE),
+    m_AppNoSlot(FALSE)
 {
     PAGED_CODE();
 
@@ -1839,6 +1847,9 @@ CCaptureStreamEngine::Run()
         //
         m_AppFormatOk = (m_LbFormat.Valid && AppRingFormatIs(&m_LbFormat)) ? TRUE : FALSE;
         m_AppOtherValid = FALSE;
+
+        // It may hold the reader slot again (AppRingReaderStop barred it). No pass reads this while the timer is stopped.
+        m_AppNoSlot = FALSE;
     }
 
     return CStreamEngine::Run();
@@ -1855,6 +1866,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
     PLOOPBACK_RING  ring = m_Loopback;
     KIRQL           oldIrql;
     ULONG           blockAlign = m_LbFormat.BlockAlign;
+    ULONG           lead;
     ULONGLONG       anchor;
     ULONGLONG       readStart;
     ULONGLONG       readEnd;
@@ -1894,18 +1906,16 @@ CCaptureStreamEngine::LoopbackCapturePass(
     // advances exactly one packet a pass. An underrun or an overrun does not move it: the time line is right, the audio was
     // just not (or no longer) there.
     //
-    anchor = LoopbackAnchor();
-    if (!m_LbAnchorValid || anchor != m_LbAnchor || ring->RenderLeadFrames != m_LbAnchorLead)
-    {
-        m_LbAnchor = anchor;
-        m_LbAnchorLead = ring->RenderLeadFrames;
-        m_LbReadBase = anchor - m_LbLagFrames - m_LbAnchorLead;
-        m_LbAnchorValid = TRUE;
-        ring->CaptureAnchors++;
-    }
-
-    readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
-    readEnd = readStart + m_LbPacketFrames;
+    // The render lead changes only as a render stream starts copying (its packet, then 0 once its client releases packets
+    // early: LoopbackRenderPass) and when another render stream claims the ring, which starts a new run there. So a longer
+    // lead moves the read back only onto a new run: silence before its start, and after it the new owner's audio, which this
+    // stream hasn't had (the ring held the last owner's there, or nothing), so no frame of the ring comes out twice. A shorter
+    // one would move the read on and skip the difference, the start of the owner's audio: while the ring holds audio there,
+    // the read stays where it is instead, and the stream keeps the longer lead (and that much more latency) until the ring
+    // holds none it would skip (the render stream stopped) or it next runs (ours, 2026-11-23, after Astra's review; the
+    // owner's to confirm against a skip that keeps the lag shortest). A lead left from a render stream that has stopped
+    // costs nothing then: there is no audio to skip.
+    //
 
     // The audio the ring still holds of the current render run.
     validHi = ring->WritePos;
@@ -1914,6 +1924,31 @@ CCaptureStreamEngine::LoopbackCapturePass(
     {
         validLo = validHi - m_LbRingFrames;
     }
+
+    anchor = LoopbackAnchor();
+    lead = ring->RenderLeadFrames;
+    if (m_LbAnchorValid && lead < m_LbAnchorLead)
+    {
+        // This pass's read at the lead kept, and at the shorter one: the frames between them would be skipped.
+        ULONGLONG   keptStart = anchor - m_LbLagFrames - m_LbAnchorLead + (ULONGLONG)Packet * m_LbPacketFrames;
+        ULONGLONG   shortStart = keptStart + (m_LbAnchorLead - lead);
+
+        if (MIN(shortStart, validHi) > MAX(keptStart, validLo))
+        {
+            lead = m_LbAnchorLead;
+        }
+    }
+    if (!m_LbAnchorValid || anchor != m_LbAnchor || lead != m_LbAnchorLead)
+    {
+        m_LbAnchor = anchor;
+        m_LbAnchorLead = lead;
+        m_LbReadBase = anchor - m_LbLagFrames - m_LbAnchorLead;
+        m_LbAnchorValid = TRUE;
+        ring->CaptureAnchors++;
+    }
+
+    readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
+    readEnd = readStart + m_LbPacketFrames;
 
     copyLo = MAX(readStart, validLo);
     copyHi = MIN(readEnd, validHi);
@@ -1967,20 +2002,20 @@ PAGED_CODE_SEG
 NTSTATUS
 CCaptureStreamEngine::Pause()
 {
-    NTSTATUS status;
-
     PAGED_CODE();
 
-    status = CStreamEngine::Pause();
+    //
+    // noise-filter (TODO 19, spike check 4): give the app ring's reader slot up first, while the timer still runs; this stream
+    // holds it again only after its next Run. Given up after the base Pause, the slot stayed held while the timer was stopped
+    // (WdfTimerStop waits for a running callback and the queued DPCs) and nothing wrote the reader's copy: another stream read
+    // past the copy's end, got silence there, and never got those frames of the ring once the next reader wrote them (the live
+    // three-stream runs, 2026-11-23: 55 to 111 frames lost, the slot held 2.4 to 6.3 ms after the reader's next pass was due,
+    // its timer lateness under 1 ms). A pass of this stream before its timer stops plays the copy as another stream's. The next
+    // stream to run, another one or this one after its Run, reads on from the ring's read_frame.
+    //
+    AppRingReaderStop();
 
-    if (NT_SUCCESS(status))
-    {
-        // noise-filter (TODO 19, spike check 4): the timer has stopped (WdfTimerStop waits for its callback). Give the app
-        // ring's reader slot up: the next stream to run, this one or another, reads on from the ring's read_frame.
-        AppRingReaderStop();
-    }
-
-    return status;
+    return CStreamEngine::Pause();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2223,9 +2258,12 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     ring->Stats.Passes++;
 
-    if (ring->Reader == NULL)
+    if (ring->Reader == NULL && !m_AppNoSlot)
     {
-        // The first stream to run after ATTACH (or after the last reader paused) holds the reader slot, whatever its format.
+        //
+        // The first stream to run after ATTACH (or after the last reader began to pause) holds the reader slot, whatever its
+        // format. A stream that gave the slot up (m_AppNoSlot: it is pausing) plays the copy until its timer stops.
+        //
         ring->Reader = this;
         if (ring->AttachPasses != 0 && m_AppOtherValid && m_AppEndAttach == ring->Stats.Attaches)
         {
@@ -2474,6 +2512,9 @@ CCaptureStreamEngine::AppRingReaderStop()
     KIRQL           oldIrql;
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
+
+    // Under the lock: a pass of this stream on another processor reads it there (AppRingCapturePass).
+    m_AppNoSlot = TRUE;
 
     if (ring->Reader == this)
     {
