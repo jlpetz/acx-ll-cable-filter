@@ -8,8 +8,9 @@ Usage:
     python -I tools/privacy_check.py --range A..B            the commits in a range
     python -I tools/privacy_check.py --all [REV ...]         every commit and file in the history (default: all refs)
 
-Each commit's author and committer email, its message and every file version it adds or changes are checked, each read
-whole by its encoding; --all checks every file version in the history. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
+Each commit's author and committer (email and name), its message, and every file version it adds or changes and its path
+are checked, each read whole by its encoding; an annotated tag pushed, its name, tagger and message too. --all checks every
+commit, annotated tag, file version and path in the history. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
 
 The deny list, `.git/info/privacy-deny`, holds private strings (one per line, case-insensitive; `#` starts a comment): the
 owner's email and domain, host and account names. It stays in .git/, so it is never committed or pushed: this script, which
@@ -70,6 +71,7 @@ class Checker:
         lines = allow.stdout.decode("utf-8", "replace").splitlines() if allow.returncode == 0 else []
         self.allow = {l.strip() for l in lines if l.strip() and not l.strip().startswith("#")}
         self.findings = []
+        self.seen_paths = set()
 
     def text(self, where, text):
         for n, line in enumerate(text.splitlines(), 1):
@@ -91,15 +93,40 @@ class Checker:
                     continue
                 self.findings.append((where, name, hit, line))
 
+    def person(self, where, header):
+        """An author, committer or tagger header: its email must be an allowed identity; its name is checked as text."""
+        kind, _, rest = header.partition(" ")
+        email = rest[rest.find("<") + 1:rest.find(">")]
+        if not ALLOWED_EMAIL.match(email):
+            self.findings.append((where, f"{kind} email", email, "set user.email to your GitHub no-reply address"))
+        self.line(f"{where} {kind} name", rest[:rest.find("<")].strip())
+
     def identity(self, commit):
         raw = git("cat-file", "commit", commit)
         for header in raw.split("\n\n", 1)[0].splitlines():
             if header.startswith(("author ", "committer ")):
-                email = header[header.find("<") + 1:header.find(">")]
-                if not ALLOWED_EMAIL.match(email):
-                    self.findings.append((f"commit {commit[:10]}", f"{header.split(' ', 1)[0]} email", email,
-                                          "set user.email to your GitHub no-reply address"))
+                self.person(f"commit {commit[:10]}", header)
         self.text(f"commit {commit[:10]} message", raw.split("\n\n", 1)[1] if "\n\n" in raw else "")
+
+    def tag(self, sha):
+        """An annotated tag's name, tagger and message; returns the object it points at."""
+        head, _, message = git("cat-file", "tag", sha).partition("\n\n")
+        target = ""
+        for header in head.splitlines():
+            if header.startswith("object "):
+                target = header[7:].strip()
+            elif header.startswith("tag "):
+                self.line(f"tag {sha[:10]} name", header[4:])
+            elif header.startswith("tagger "):
+                self.person(f"tag {sha[:10]}", header)
+        self.text(f"tag {sha[:10]} message", message)
+        return target
+
+    def path(self, where, path):
+        """A file's or folder's path, once each."""
+        if path and path not in self.seen_paths:
+            self.seen_paths.add(path)
+            self.line(f"{where} path", path)
 
     def commit_diff(self, commit, seen_blobs):
         """A commit's identities and message, and every file version it adds or changes, read whole and by its encoding
@@ -114,7 +141,10 @@ class Checker:
             # -z: ":<old mode> <new mode> <old sha> <new sha> <status>" then the path, each NUL-terminated.
             for meta, path in zip(fields[0::2], fields[1::2]):
                 parts = meta.split()
-                if len(parts) < 5 or parts[4] == "D" or parts[1] == "160000":
+                if len(parts) < 5 or parts[4] == "D":
+                    continue
+                self.path(commit[:10], path)
+                if parts[1] == "160000":
                     continue
                 sha = parts[3]
                 if sha not in seen_blobs:
@@ -164,6 +194,11 @@ def main(argv):
             local_ref, local_sha, remote_ref, remote_sha = parts
             if local_sha == ZERO:
                 continue  # a deletion pushes nothing
+            # An annotated tag (or a tag of one): its own text, then what it points at.
+            while git("cat-file", "-t", local_sha).strip() == "tag":
+                local_sha = c.tag(local_sha)
+            if git("cat-file", "-t", local_sha).strip() != "commit":
+                continue  # a tag of a tree or blob: rare, and no history to walk
             if remote_sha == ZERO:
                 # A new branch: what the destination doesn't have yet, by its own remote-tracking branches (none when pushing
                 # to a URL, or to a remote never fetched: then every commit is checked). Another remote's commits count as
@@ -185,8 +220,11 @@ def main(argv):
                 continue
             seen.add(sha)
             kind = git("cat-file", "-t", sha).strip()
+            c.path("history", path)
             if kind == "commit":
                 c.identity(sha)
+            elif kind == "tag":
+                c.tag(sha)
             elif kind == "blob":
                 c.blob(sha, path)
     else:
