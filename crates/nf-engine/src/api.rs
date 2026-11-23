@@ -724,7 +724,9 @@ pub fn chain_blocks_csv(blocks: &[ChainBlock]) -> String {
 /// `mic`, `reference` and `output` are 48 kHz mono, 480 samples for each entry of `blocks`, in order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChainRecording {
-    /// The mic blocks as the chain got them: after the engine's dither (about -180 dBFS).
+    /// The mic blocks as the chain got them: with the engine's dither (about -180 dBFS) on each block a stage was to run on
+    /// (`Chain::runs_a_stage`, read before the block), and as captured, undithered, in bypass and in measurement passthrough
+    /// (TODO 10).
     pub mic: Vec<f32>,
     /// The reference blocks as the chain got them: the timeline's samples resampled to the block, dithered.
     pub reference: Vec<f32>,

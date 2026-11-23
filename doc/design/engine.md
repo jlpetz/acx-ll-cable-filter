@@ -66,15 +66,13 @@ thread.
 Once, when the thread starts:
 1. `initialize_mta` (a failure fails each run it's given);
 2. `AvSetMmThreadCharacteristicsW("Pro Audio")` (record failure in the status and continue);
-3. **no FTZ/DAZ** (Rust treats a persistent MXCSR change as UB): instead add `nf_core::rt::Dither` at
-   1e-9 (about -180 dBFS) to every reference block, zero-filled gaps included, and to every mic block while a stage runs
-   (`Chain::runs_a_stage`: in bypass, and in measurement passthrough, where delay lines stand in for the stages, the mic passes
-   as it came, so digital silence stays exact; TODO 10, the owner, 2026-11-22,
-   from doc/dev/dither-matrix-2026-11-21.md: a clean mic stalls RNNoise 10x after speech); sonora 0.3.0 sets them inside
-   each of its own calls and restores them, which the vendored copy does only with nf-stages' `sonora-denormal-guard`, off by
-   default (sonora-nnnoiseless.md 1.11, 1.12; TODO 10).
-   That prevents sonora's denormal stall (sonora #34) and denormals in RNNoise's high-pass on exact
-   digital silence;
+3. **no FTZ/DAZ** (Rust treats a persistent MXCSR change as UB): instead add `nf_core::rt::Dither` at 1e-9 (about -180 dBFS)
+   to every reference block, zero-filled gaps included, and to every mic block while a stage runs (`Chain::runs_a_stage`: in
+   bypass, and in measurement passthrough, where delay lines stand in for the stages, the mic passes as it came, so digital
+   silence stays exact; TODO 10, the owner, 2026-11-22, from doc/dev/dither-matrix-2026-11-21.md: a clean mic stalls RNNoise
+   10x after speech); sonora 0.3.0 sets them inside each of its own calls and restores them, which the vendored copy does only
+   with nf-stages' `sonora-denormal-guard`, off by default (sonora-nnnoiseless.md 1.11, 1.12; TODO 10). That prevents sonora's
+   denormal stall (sonora #34) and denormals in RNNoise's high-pass on exact digital silence;
 4. `audio::prepare_rt_thread()`: `nf_stages::warm_up_fft_thread()` first, so easyfft's leaked state
    lands on the system heap, then `nf_mem::RtScope::enter()` for the thread's whole life. Keep the
    order: inside the scope the leak would take the locked pool.
@@ -743,10 +741,11 @@ echo test places its far voice so, once it has timed a marker in the chain recor
 What the chain was fed live and what it gave, block by block, so that a live result can be told apart from the chain's own
 behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quality --save` writes it):
 - **On the audio thread**, after each block's chain call and its write (`Pipeline::record`, whether or not the write failed),
-  one item into a pre-allocated rtrb ring (400
-  blocks, 4 s, about 2.4 MB; its pages are touched when it's armed): the mic block and the reference block exactly as the chain
-  got them (the mic after the dither; the reference after the timeline, the slip resampler and the dither), the chain's output
-  block (before the output's drift loop resamples it for the device), and the block's facts, `ChainBlock`:
+  one item into a pre-allocated rtrb ring (400 blocks, 4 s, about 2.4 MB; its pages are touched when it's armed): the mic
+  block and the reference block exactly as the chain got them (the mic with the engine's dither on each block a stage was to
+  run on, `Chain::runs_a_stage`, and as captured, undithered, in bypass and in measurement passthrough; the reference after
+  the timeline, the slip resampler and the dither), the chain's output block (before the output's drift loop resamples it for
+  the device), and the block's facts, `ChainBlock`:
   - the run's block index, the mic block's capture QPC (by its stamps, NaN without), whether the mic's stamps are trusted, the
     mic stream index of its first sample, the wake that delivered it, and the mic samples still queued (a burst or a late wake);
   - the mic's moves since the block before: samples its FIFO discarded (it overflowed: the loop hadn't run for 200 ms), and device
@@ -802,14 +801,14 @@ behaviour and rerun offline exactly (`Engine::record_chain`; `noise-filter quali
   quality echo test's calibration reads its marker so, every 20 ms). Neither thread is the audio thread, which only pushes into
   the ring.
 - **Rerunning it offline:** the engine builds its chain with `models::build_chain` (the noise model of the run's config; a
-  pack's inline offline, as many blocks behind as on its worker) and warms it up with three dithered
-  silent blocks (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recorded mic and
-  reference are dithered already. So a chain built with the run's processing settings, warmed up and fed the recording block by
-  block reproduces its output sample for sample (`the_live_chain_reruns_offline_sample_for_sample`, AEC3 and RNNoise behind
-  bursty delivery with a loopback stall; without the warm-up it doesn't). `noise-filter process --warm-up` does this with the
-  saved WAVs. A recording armed while running, or with blocks lost, starts from a state the rerun doesn't have; one whose
-  settings changed matches a rerun with one config only up to the change (`ChainRecording::settings_changed_at`).
-  `reproducible` checks all three.
+  pack's inline offline, as many blocks behind as on its worker) and warms it up with three dithered silent blocks
+  (`audio::warm_up`, public as `nf_engine::warm_up_chain`) before the first block, and the recording holds the mic and
+  reference as the chain got them, with the engine's dither wherever it was added. So a chain built with the run's processing
+  settings, warmed up and fed the recording block by block reproduces its output sample for sample
+  (`the_live_chain_reruns_offline_sample_for_sample`, AEC3 and RNNoise behind bursty delivery with a loopback stall; without
+  the warm-up it doesn't). `noise-filter process --warm-up` does this with the saved WAVs. A recording armed while running, or
+  with blocks lost, starts from a state the rerun doesn't have; one whose settings changed matches a rerun with one config
+  only up to the change (`ChainRecording::settings_changed_at`). `reproducible` checks all three.
 - **The thread's facts** (`ThreadFacts`, the last of `ChainBlock`'s; the flight recorder's, below): the wake that processed
   the block, the longest gap between wakes since the block before's, the wakes (and those the exclusive output's event made)
   and stalls since then, the mic's glitches, the block's own time and a model pack's misses. `chain_blocks.csv` has them as

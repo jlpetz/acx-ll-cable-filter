@@ -234,12 +234,22 @@ impl Chain {
             + self.noise.as_ref().map_or(0, |s| s.latency(c.noise.enabled.load(Relaxed)))
     }
 
-    /// Whether a stage will process the next block: one is switched on outside measurement passthrough, or was running on the
-    /// last block (the block a stage is switched off on, or passthrough comes on, still runs it once, into the crossfade to
-    /// its delay line). While one does, the engine dithers the mic, so no stage's state decays into exact-zero input, where
-    /// RNNoise and AEC3 stall on subnormals. In bypass, and in passthrough, where a delay line stands in for each enabled
-    /// stage, nothing runs and the mic passes as it came, so digital silence stays exact (TODO 10, the owner's decision of
-    /// 2026-11-22). A stage that runs again is reset and primed with the block before, as after bypass.
+    /// Whether a stage will process the next block, by the controls as they read now (`Slot::runs`, which mirrors `run_slot`).
+    /// A slot runs its stage if the controls want it on (enabled, measurement passthrough off), or if the slot was in
+    /// `Mode::On` on the last block: the block it is switched off on, or passthrough comes on, still runs it once, into the
+    /// crossfade to its delay line. A start-up cut short (`Mode::Starting`, then switched off or into passthrough) ran the
+    /// stage on the last block, yet runs nothing: its output was the delay line already. While a stage runs, the engine
+    /// dithers the mic, so no stage's state decays into exact-zero input, where RNNoise and AEC3 stall on subnormals. In
+    /// bypass, and in passthrough, where a delay line stands in for each enabled stage, nothing runs and the mic passes as it
+    /// came, so digital silence stays exact (TODO 10, the owner's decision of 2026-11-22). A stage that runs again is reset
+    /// and primed with the block before, as after bypass.
+    ///
+    /// A known one-block race, not closed: the engine calls this before the block (nf-engine's `BlockProcessor::dither_mic`),
+    /// and [`Chain::process_timed`] then reads the controls again, so a switch landing between the two reads puts one block's
+    /// dither out of step with what runs. A stage switched on, or out of passthrough, there runs one undithered block (just
+    /// reset and primed); a stage about to run (switched on, or starting up) that is switched off, or into passthrough, there
+    /// leaves one dithered block that no stage processes, whose dither (about -180 dBFS) reaches the output. The next block's
+    /// read agrees again.
     pub fn runs_a_stage(&self) -> bool {
         let c = &self.controls;
         let passthrough = c.passthrough.load(Relaxed);

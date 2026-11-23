@@ -346,9 +346,10 @@ that writes exact zeros once the tails have finished (TODO 17).
 **Since (2026-11-23, Astra's review):**
 - The 24-bit result above was summed up here as "exact zero in every chain", which promised too much: the filters can't be
   left to settle into exact silence. For studio use exact mute has to be an explicit output guarantee, the end stage
-  (TODO 17, "Exact mute": ours, not built), and its trigger has to be the mic's own digital silence, not the stages'
-  outputs settling or their tails finishing: with the far end playing, AEC3's reference is live and its output from a silent
-  mic doesn't settle.
+  (TODO 17, "Exact mute"; not built), and its trigger has to be the mic's own digital silence, not the stages' outputs
+  settling or their tails finishing: with the far end playing, AEC3's reference is live and its output from a silent mic
+  doesn't settle. The end stage is the owner's (agreed above, for later); the guarantee and its trigger are ours, the
+  owner's to confirm.
 - Measurement passthrough (the latency test's) dithered the mic whenever a stage was switched on, though its delay lines run
   no stage. `Chain::runs_a_stage` now follows whether a stage processes the block (`Slot::runs`, which mirrors `run_slot`:
   the blocks it is wanted on, and the one block it leaves `On` for passthrough or off), so passthrough leaves the mic as it

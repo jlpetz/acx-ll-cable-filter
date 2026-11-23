@@ -49,14 +49,20 @@ Check the speech level, peak clipping and any audible rise in background noise. 
 silence check. Measure the added sample delay, p99 block time and audio-thread allocations with the offline harness (TODO 2).
 [Sonora 0.3.0 gain controls](https://github.com/dignifiedquire/sonora/blob/sonora-v0.3.0/crates/sonora/src/config.rs#L216-L250)
 
-## Exact mute: an output guarantee (ours, 2026-11-23, from TODO 10's matrix and Astra's review; not built)
+## Exact mute: an output guarantee (not built)
+Whose: the end stage itself is the owner's, agreed on 2026-11-22 for later ("the exact-zero end stage later", TODO 10's
+detail, "Dither and FTZ/DAZ": our proposal then, an end stage writing exact zeros once the tails had finished). Treating it
+as an explicit output guarantee, triggered by the mic's own digital silence (below), is ours (2026-11-23, from TODO 10's
+matrix and Astra's review), the owner's to confirm.
+
 Studio use needs exact digital silence out while the mic sends exact zeros (a mute), and the filters don't give it by
 themselves (`doc/dev/dither-matrix-2026-11-21.md`):
 - float32 never gets to zero while a filter runs: the engine's mic dither (about -180 dBFS) travels through, as it has to
   (TODO 10: a clean mic stalls RNNoise and degrades UL-UNAS);
 - 24-bit gets there after the tails in every chain (RNNoise at 130 ms, the AEC3 chains at 330-370), but not with AEC3
-  running while the far end plays: AEC3 then puts out -75 to -89 dBFS from a silent mic (-75.1 alone, with today's dither),
-  and no gate after it gets that to 24-bit zero.
+  running while the far end plays: AEC3 then puts out -75 to -89 dBFS from a silent mic, and no gate after it gets that to
+  24-bit zero (with today's dither, the peak over the phase's second half is -75.1 dBFS with AEC3 alone and -120.4 at the
+  lowest, UL-UNAS and its gate after AEC3; 24-bit rounds a sample to zero only under about -144.5).
 
 So the guarantee has to be the host's, at the chain's end (the matrix's option F): once the mic as captured (before the
 engine's dither) has been exact zeros for longer than the chain's latency plus a tail, an end stage writes exact zeros, and it
@@ -182,4 +188,5 @@ The decisions in this section are ours, within the owner's 2026-11-02 decision, 
 2. The `.clap` export of our stages (clack-plugin, or nih-plug's ISC export), adapting the deviations above.
 3. clack-host in an fx-host process for third-party plugins, with the profile's gui, log and thread-check.
 4. VST3 hosting later.
-5. The exact-mute end stage ("Exact mute" above), the studio case's output guarantee.
+5. The exact-mute end stage ("Exact mute" above; the owner's, for later), the studio case's output guarantee (ours, the
+   owner's to confirm).
