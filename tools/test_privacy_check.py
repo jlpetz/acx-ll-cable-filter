@@ -1,5 +1,6 @@
 """Tests for tools/privacy_check.py on a throwaway repository: what a push or --all must refuse (Astra's recheck,
-2026-11-23: a file's path, a commit's display name, an annotated tag's tagger and message), and a clean one passing.
+2026-11-23: a file's path, a commit's display name, an annotated tag's tagger and message; Astra's review, 2026-11-24: a
+branch's or lightweight tag's name, and a path whose contents another path also holds), and a clean one passing.
 
 The private-looking strings are built at run time, so this file never holds one (the check reads it too).
 
@@ -18,6 +19,7 @@ NOREPLY = "someone" + "@users.noreply.github.com"
 HOST = "ip-" + "-".join(["10", "1", "2", "3"])
 EMAIL = "someone" + "@" + "example.com"
 DENIED = "zq" + "secretname"
+ZERO = "0" * 40
 
 
 def git(repo, *args, env=None):
@@ -57,8 +59,8 @@ class PrivacyCheck(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", str(CHECK), *args], cwd=self.repo, capture_output=True, text=True, input=stdin)
         return r.returncode, r.stdout
 
-    def push(self, sha, ref="refs/heads/main", base="0" * 40):
-        return self.check("--pre-push", "origin", "url", stdin=f"{ref} {sha} {ref} {base}\n")
+    def push(self, sha, ref="refs/heads/main", base=ZERO, remote_ref=None):
+        return self.check("--pre-push", "origin", "url", stdin=f"{ref} {sha} {remote_ref or ref} {base}\n")
 
     def test_clean_history_passes(self):
         self.assertEqual(self.check("--all"), (0, "privacy check: clean\n"))
@@ -67,10 +69,64 @@ class PrivacyCheck(unittest.TestCase):
         sha = self.commit(f"logs/{HOST}.txt", "nothing here\n", "a log")
         code, out = self.push(sha)
         self.assertEqual(code, 1)
-        self.assertIn("path: internal or cloud host name", out)
+        self.assertIn(f"{sha[:10]} path: internal or cloud host name", out)
         code, out = self.check("--all")
         self.assertEqual(code, 1)
-        self.assertIn("history path: internal or cloud host name", out)
+        self.assertIn(f"{sha[:10]} path: internal or cloud host name", out)
+
+    def test_a_path_whose_contents_another_holds_is_checked(self):
+        # rev-list --objects names each object once, by the first path it meets ("a.txt", "docs"): never by these two.
+        self.commit("a.txt", "same\n", "a file")
+        file = self.commit(f"logs/{HOST}.txt", "same\n", "the same contents, a private name")
+        self.commit("docs/x.txt", "x\n", "a folder")
+        folder = self.commit(f"{HOST}/x.txt", "x\n", "the same folder, a private name")
+        code, out = self.check("--all")
+        self.assertEqual(code, 1)
+        self.assertIn(f"{file[:10]} path: internal or cloud host name", out)
+        self.assertIn(f"{folder[:10]} path: internal or cloud host name", out)
+        self.assertEqual(out.count("internal or cloud host name"), 2)
+        code, out = self.push(folder)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.count("internal or cloud host name"), 2)
+
+    def test_a_branch_name_is_checked(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        code, out = self.push(head, ref=f"refs/heads/{DENIED}")
+        self.assertEqual(code, 1)
+        self.assertIn("pushed ref name: deny-listed string", out)
+        self.assertEqual(out.count("deny-listed string"), 1)  # the local name is the same: once
+        # Renamed on the way: the remote's name, and the local one (not sent, but one plain push from published).
+        code, out = self.push(head, remote_ref=f"refs/heads/{DENIED}")
+        self.assertEqual(code, 1)
+        self.assertIn("pushed ref name: deny-listed string", out)
+        code, out = self.push(head, ref=f"refs/heads/{DENIED}", remote_ref="refs/heads/public")
+        self.assertEqual(code, 1)
+        self.assertIn("local ref name: deny-listed string", out)
+        # Deleting a ref the remote has sends a name already published, and taking it down is the fix: it passes. Deleting one
+        # the remote hasn't got (git push origin :refs/heads/x) would send the name for nothing: refused.
+        self.assertEqual(self.push(ZERO, ref="(delete)", base=head, remote_ref=f"refs/heads/{DENIED}"), (0, "privacy check: clean\n"))
+        code, out = self.push(ZERO, ref="(delete)", remote_ref=f"refs/heads/{DENIED}")
+        self.assertEqual(code, 1)
+        self.assertIn("deleted ref name: deny-listed string", out)
+        # --all: every ref's name; with REVs, the names of the refs they name.
+        git(self.repo, "branch", DENIED)
+        code, out = self.check("--all")
+        self.assertEqual(code, 1)
+        self.assertIn("ref name: deny-listed string", out)
+        self.assertEqual(self.check("--all", "main"), (0, "privacy check: clean\n"))
+        self.assertEqual(self.check("--all", DENIED)[0], 1)
+        self.assertEqual(self.check("--all", "--branches")[0], 1)
+
+    def test_a_lightweight_tag_name_is_checked(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "tag", HOST)
+        code, out = self.push(head, ref=f"refs/tags/{HOST}")
+        self.assertEqual(code, 1)
+        self.assertIn("pushed ref name: internal or cloud host name", out)
+        code, out = self.check("--all")
+        self.assertEqual(code, 1)
+        self.assertIn("ref name: internal or cloud host name", out)
+        self.assertEqual(self.check("--all", "--tags")[0], 1)
 
     def test_a_display_name_is_checked(self):
         sha = self.commit("a.txt", "a\n", "a change", name=f"Someone {DENIED}")
@@ -92,6 +148,10 @@ class PrivacyCheck(unittest.TestCase):
         code, out = self.check("--all")
         self.assertEqual(code, 1)
         self.assertIn("tagger email", out)
+
+    def test_a_git_error_is_exit_2(self):
+        self.assertEqual(self.check("--all", "nosuchref")[0], 2)
+        self.assertEqual(self.check("--range", "nosuchref..main")[0], 2)
 
     def test_a_clean_tag_passes(self):
         git(self.repo, "tag", "-a", "v1", "-m", "release one")

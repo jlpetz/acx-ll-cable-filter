@@ -9,8 +9,10 @@ Usage:
     python -I tools/privacy_check.py --all [REV ...]         every commit and file in the history (default: all refs)
 
 Each commit's author and committer (email and name), its message, and every file version it adds or changes and its path
-are checked, each read whole by its encoding; an annotated tag pushed, its name, tagger and message too. --all checks every
-commit, annotated tag, file version and path in the history. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
+are checked, each read whole by its encoding; an annotated tag pushed, its name, tagger and message too; and a push's ref
+names, the remote's and the local one (a deletion's only when the remote hasn't the ref). --all checks every commit,
+annotated tag, file version and ref name (with REVs, the names of the refs they name) and every path of every commit's
+tree. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
 
 The deny list, `.git/info/privacy-deny`, holds private strings (one per line, case-insensitive; `#` starts a comment): the
 owner's email and domain, host and account names. It stays in .git/, so it is never committed or pushed: this script, which
@@ -50,7 +52,9 @@ VERSION_CONTEXT = re.compile(r"(?i)(version|\bver\b|driverver|\bv|release|build|
 def git(*args, binary=False, stdin=None):
     r = subprocess.run(["git", *args], capture_output=True, input=stdin)
     if r.returncode != 0:
-        raise SystemExit(f"privacy_check: git {' '.join(args)} failed: {r.stderr.decode('utf-8', 'replace').strip()}")
+        # Exit 2, as the usage says (SystemExit with a message exits 1, a finding's code).
+        print(f"privacy_check: git {' '.join(args)} failed: {r.stderr.decode('utf-8', 'replace').strip()}", file=sys.stderr)
+        raise SystemExit(2)
     return r.stdout if binary else r.stdout.decode("utf-8", "replace")
 
 
@@ -178,6 +182,25 @@ def commits_in(rev_range):
     return git("rev-list", "--reverse", rev_range).split()
 
 
+def history_paths(revs):
+    """(commit, path) for each file a commit of REVs adds or changes against its first parent (a root commit: all its files),
+    newest first: so every path of every commit's tree, a merge's too (a path a commit shares with its first parent is the
+    parent's, back to the commit that brought it)."""
+    fields = git("log", "--format=%H", "--raw", "-z", "--no-renames", "--no-relative", "--root", "--diff-merges=first-parent",
+                 "--no-show-signature", "--no-color", *revs).split("\0")
+    # -z: each commit's id, then per file ":<old mode> <new mode> <old sha> <new sha> <status>" and its path, each NUL-terminated
+    # (a commit's first after a newline). A file's metadata starts with ":", an id never.
+    commit, i = "", 0
+    while i < len(fields):
+        field = fields[i].lstrip("\n")
+        if not field.startswith(":"):
+            commit, i = field, i + 1
+            continue
+        if field.split()[-1] != "D":  # a deleted file is in the parent's tree, not this one's
+            yield commit, fields[i + 1]
+        i += 2
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -193,7 +216,18 @@ def main(argv):
                 continue
             local_ref, local_sha, remote_ref, remote_sha = parts
             if local_sha == ZERO:
-                continue  # a deletion pushes nothing
+                # A deletion pushes no objects, and the name it sends is one the remote already shows: refusing it would only
+                # keep a name that leaked from being taken down. Deleting a ref the remote hasn't got (git push origin
+                # :refs/heads/x; a short name is refused before the hook) sends a name it has never seen, for nothing: checked.
+                if remote_sha == ZERO:
+                    c.line("deleted ref name", remote_ref)
+                continue
+            # The ref names, a branch's or a lightweight tag's as much as an annotated tag's: the remote's is published. The
+            # local one isn't sent (git push origin a:b publishes b), but a private name on a branch that's pushed is one plain
+            # push from published; in a plain push the two are the same, checked once.
+            c.line("pushed ref name", remote_ref)
+            if local_ref != remote_ref:
+                c.line("local ref name", local_ref)
             # An annotated tag (or a tag of one): its own text, then what it points at.
             while git("cat-file", "-t", local_sha).strip() == "tag":
                 local_sha = c.tag(local_sha)
@@ -213,14 +247,25 @@ def main(argv):
             c.commit_diff(commit, seen_blobs)
     elif mode == "--all":
         revs = argv[2:] or ["--all"]
-        seen = set()
+        # Every ref's name; with REVs, the names of the refs they name (main, origin/main, --tags; not a negative's, ^main).
+        if argv[2:]:
+            names = [n for n in git("rev-parse", "--revs-only", "--symbolic-full-name", *revs).splitlines() if n.startswith("refs/")]
+        else:
+            names = git("for-each-ref", "--format=%(refname)").splitlines()
+        for name in names:
+            c.line("ref name", name)
+        # Every path, before the objects: rev-list --objects names each object once, by the first path it meets, so a file
+        # whose contents another path also holds (or a folder whose tree another also is) never appears there by its own path.
+        for commit, path in history_paths(revs):
+            c.path(commit[:10], path)
+        # Then each object once (rev-list --objects lists none twice): a commit's identities and message, an annotated tag's
+        # text, a file's contents. A tree's or file's path is checked already, unless it's in a tree a ref names directly
+        # (a tag of a tree), in no commit's; a tag's "path" is its ref's name, checked above.
         for line in git("rev-list", "--objects", *revs).splitlines():
             sha, _, path = line.partition(" ")
-            if sha in seen:
-                continue
-            seen.add(sha)
             kind = git("cat-file", "-t", sha).strip()
-            c.path("history", path)
+            if kind in ("tree", "blob"):
+                c.path("history", path)
             if kind == "commit":
                 c.identity(sha)
             elif kind == "tag":
