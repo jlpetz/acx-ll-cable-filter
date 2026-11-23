@@ -89,6 +89,11 @@ while one is open fails with ERROR_NOT_SUPPORTED (`FormatRejects`); the app then
 ring's lock, with the loopback's lock nested inside it at stream creation. Shared-mode streams run at the device format
 (float32), so the refusals meet exclusive-mode clients only; the mismatch zero-fill stays as the fallback.
 
+**DriverVer's version is the build's UTC time of day** (since e3026e5; before, StampInf's local time of day, which ranked a
+build after local midnight older than the evening's builds). On 2026-11-23 only, packages built before that change carry
+the larger, local-time versions and outrank later builds of the same date until UTC midnight: clear the driver store
+(`Uninstall-Driver.ps1`) before installing a newer build that day.
+
 ## Building and installing (an elevated Windows PowerShell)
 
 1. `scripts\Setup-TestSigning.ps1 [-Ems]`: a test certificate (`CN=Noise Filter Test Driver`), trusted, and test signing

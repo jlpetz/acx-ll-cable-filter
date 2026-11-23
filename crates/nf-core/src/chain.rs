@@ -246,8 +246,9 @@ impl Chain {
     ///
     /// A known one-block race, not closed: the engine calls this before the block (nf-engine's `BlockProcessor::dither_mic`),
     /// and [`Chain::process_timed`] then reads the controls again, so a switch landing between the two reads puts one block's
-    /// dither out of step with what runs. A stage switched on, or out of passthrough, there runs one undithered block (just
-    /// reset and primed); a stage about to run (switched on, or starting up) that is switched off, or into passthrough, there
+    /// dither out of step with what runs. A stage switched on, or out of passthrough, there runs one undithered block (reset
+    /// and primed first, unless it was still starting up); a stage about to run (switched on, out of passthrough, or starting
+    /// up) that is switched off, or into passthrough, there
     /// leaves one dithered block that no stage processes, whose dither (about -180 dBFS) reaches the output. The next block's
     /// read agrees again.
     pub fn runs_a_stage(&self) -> bool {

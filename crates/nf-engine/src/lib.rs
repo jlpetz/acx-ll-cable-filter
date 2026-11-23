@@ -1,6 +1,6 @@
 //! nf-engine: WASAPI streams, the MMCSS audio thread, clocks, telemetry and the latency test.
 //!
-//! Everything public is in [`api`] (re-exported at the crate root); the modules behind it are
+//! Everything public is in `api` (re-exported at the crate root); the modules behind it are
 //! private and free to change.
 //!
 //! - `devices`: enumeration, by-id and default lookup.

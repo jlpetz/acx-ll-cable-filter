@@ -72,29 +72,38 @@ $sizeProps = @(if ($PacketFrames -ne 128) { "-p:NfPacketFrames=$PacketFrames"; '
 $now = [DateTime]::UtcNow
 $infDate = $now.ToString('MM/dd/yyyy', [Globalization.CultureInfo]::InvariantCulture)
 $infVersion = '{0}.{1}.{2}.{3}' -f $now.Hour, $now.Minute, $now.Second, $now.Millisecond
+# InfVerif refuses a DriverVer version of 0.0.0.0 (error 1217): a build in a UTC day's first millisecond takes 0.0.0.1.
+if ($infVersion -eq '0.0.0.0') { $infVersion = '0.0.0.1' }
 # CL and _CL_ reach cl.exe without MSBuild recording them: cleared for the build, so only the projects set the objects' defines.
-$savedCl = $env:CL
-$savedClAfter = $env:_CL_
-$env:CL = $null
-$env:_CL_ = $null
+# NfPacketFrames and NfMinPacketPeriodHns too: MSBuild takes environment variables as properties, so either in the environment
+# would reach a 128-frame build, which passes none.
+$savedEnv = @{}
+foreach ($name in 'CL', '_CL_', 'NfPacketFrames', 'NfMinPacketPeriodHns') {
+    $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
 try {
     & $msbuild $Solution "-t:$target" "-p:Configuration=$Configuration" '-p:Platform=x64' '-p:SignMode=Off' `
         '-p:SkipPackageVerification=true' '-p:ApiValidator_Enable=false' "-p:NfInfDate=$infDate" "-p:NfInfVersion=$infVersion" `
         @sizeProps '-m' '-nologo' '-v:minimal'
     if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed.' }
 } finally {
-    $env:CL = $savedCl
-    $env:_CL_ = $savedClAfter
+    foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name], 'Process') }
 }
 
 $built = Join-Path $ProjectDir "x64\$Configuration"
-Write-Step "Package: $pkg (DriverVer $infDate,$infVersion)"
+Write-Step "Package: $pkg"
 New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 foreach ($f in "$PackageName.sys", $InfName) {
     $src = Join-Path $built $f
     if (-not (Test-Path $src)) { throw "missing build output: $src" }
     Copy-Item $src $pkg
 }
+# The DriverVer the INF has, not the one asked for: StampInf stamps only when MSBuild's tracking says so.
+$stamped = (Select-String -Path (Join-Path $pkg $InfName) -Encoding Unicode -Pattern '^\s*DriverVer\s*=\s*(.+)$' |
+    Select-Object -First 1).Matches.Groups[1].Value.Trim()
+Write-Note "DriverVer $stamped"
+if ($stamped -ne "$infDate,$infVersion") { Write-Warning "DriverVer is $stamped, not the $infDate,$infVersion asked for" }
 $pdb = Join-Path $built "$PackageName.pdb"
 if (Test-Path $pdb) { Copy-Item $pdb $out }
 # The build has finished: its objects and the package's .sys are of this size. (A build stopped below, at InfVerif or the

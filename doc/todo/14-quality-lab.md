@@ -313,7 +313,8 @@ Notes:
   - **Its small first part, the chain recorder (built 2026-11-01, for #10):** `Engine::record_chain` records what the chain
     got and gave live, block by block, from the run's first block when armed before the start (engine.md, "The chain
     recorder"). `quality --save` writes it beside the scene's WAVs: `chain_mic.wav` and `chain_ref.wav` (the mic and the
-    reference as the chain got them, after the timeline and the dither), `chain_out.wav`, `chain_blocks.csv` (a row a
+    reference as the chain got them: the mic dithered on the blocks a stage was to run on, as captured in bypass and in
+    measurement passthrough; the reference after the timeline and the dither), `chain_out.wav`, `chain_blocks.csv` (a row a
     block) and `chain_config.json`; `process --warm-up` with that config reruns them into `chain_out.wav` exactly, and
     other settings can process the same blocks. It isn't the raw device take: the mic and the loopback as delivered,
     before the engine's FIFOs, with their stamps, are still to record.

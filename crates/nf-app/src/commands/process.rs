@@ -9,7 +9,8 @@
 //! (`nf_engine::warm_up_chain`). `--warm-up` does the same, so a chain recording from `quality --save`
 //! (`chain_mic.wav`, `chain_ref.wav`, with `chain_config.json` as `--config`) reruns into exactly
 //! `chain_out.wav`. The input isn't dithered here: the recording's blocks are as the chain got them, with the engine's
-//! dither wherever it added it (the reference always; the mic while a stage ran, not in bypass or measurement passthrough).
+//! dither wherever it added it (the reference always; the mic on each block a stage was to run on, `Chain::runs_a_stage`,
+//! not in bypass or measurement passthrough).
 
 use std::path::Path;
 use std::sync::Arc;
