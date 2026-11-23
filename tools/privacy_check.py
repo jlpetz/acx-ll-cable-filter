@@ -8,8 +8,8 @@ Usage:
     python -I tools/privacy_check.py --range A..B            the commits in a range
     python -I tools/privacy_check.py --all [REV ...]         every commit and file in the history (default: all refs)
 
-Each commit's author and committer email, its message and the lines its diff adds are checked; --all checks every file
-version in full. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
+Each commit's author and committer email, its message and every file version it adds or changes are checked, each read
+whole by its encoding; --all checks every file version in the history. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
 
 The deny list, `.git/info/privacy-deny`, holds private strings (one per line, case-insensitive; `#` starts a comment): the
 owner's email and domain, host and account names. It stays in .git/, so it is never committed or pushed: this script, which
@@ -101,15 +101,25 @@ class Checker:
                                           "set user.email to your GitHub no-reply address"))
         self.text(f"commit {commit[:10]} message", raw.split("\n\n", 1)[1] if "\n\n" in raw else "")
 
-    def commit_diff(self, commit):
+    def commit_diff(self, commit, seen_blobs):
+        """A commit's identities and message, and every file version it adds or changes, read whole and by its encoding
+        (UTF-16 with a BOM, as the driver's INF is, or UTF-8): a diff's lines would show UTF-16 as bytes."""
         self.identity(commit)
-        out = git("show", "--format=", "--unified=0", "--no-color", "--no-ext-diff", "--text", commit)
-        path = "?"
-        for l in out.splitlines():
-            if l.startswith("+++ "):
-                path = l[6:] if l.startswith("+++ b/") else l[4:]
-            elif l.startswith("+") and not l.startswith("+++"):
-                self.line(f"{commit[:10]} {path}", l[1:])
+        parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
+        bases = parents or [None]
+        for base in bases:
+            args = ["diff-tree", "-r", "-z", "--no-commit-id", "--no-renames"]
+            args += [base, commit] if base else ["--root", commit]
+            fields = git(*args).split("\0")
+            # -z: ":<old mode> <new mode> <old sha> <new sha> <status>" then the path, each NUL-terminated.
+            for meta, path in zip(fields[0::2], fields[1::2]):
+                parts = meta.split()
+                if len(parts) < 5 or parts[4] == "D" or parts[1] == "160000":
+                    continue
+                sha = parts[3]
+                if sha not in seen_blobs:
+                    seen_blobs.add(sha)
+                    self.blob(sha, f"{commit[:10]} {path}")
 
     def blob(self, sha, path):
         data = git("cat-file", "-p", sha, binary=True)
@@ -144,7 +154,9 @@ def main(argv):
         return 2
     c = Checker()
     mode = argv[1]
+    seen_blobs = set()
     if mode == "--pre-push":
+        remote = argv[2] if len(argv) > 2 else ""
         for line in sys.stdin.read().splitlines():
             parts = line.split()
             if len(parts) != 4:
@@ -153,15 +165,17 @@ def main(argv):
             if local_sha == ZERO:
                 continue  # a deletion pushes nothing
             if remote_sha == ZERO:
-                # A new branch: what no remote branch has yet.
-                new = git("rev-list", "--reverse", local_sha, "--not", "--remotes").split()
+                # A new branch: what the destination doesn't have yet, by its own remote-tracking branches (none when pushing
+                # to a URL, or to a remote never fetched: then every commit is checked). Another remote's commits count as
+                # new here: a private remote's history isn't checked for this one.
+                new = git("rev-list", "--reverse", local_sha, "--not", f"--remotes={remote}/*").split()
             else:
                 new = commits_in(f"{remote_sha}..{local_sha}")
             for commit in new:
-                c.commit_diff(commit)
+                c.commit_diff(commit, seen_blobs)
     elif mode == "--range" and len(argv) == 3:
         for commit in commits_in(argv[2]):
-            c.commit_diff(commit)
+            c.commit_diff(commit, seen_blobs)
     elif mode == "--all":
         revs = argv[2:] or ["--all"]
         seen = set()
