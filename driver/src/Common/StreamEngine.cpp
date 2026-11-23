@@ -1640,12 +1640,14 @@ CRenderStreamEngine::LoopbackRenderPass(
     //
     // The lead (how early this stream's packets reach the ring), from a pass that copied. The pass at Run before the client has
     // released a packet copies nothing: its packet as the lead moved every capture stream running a packet back, and then on
-    // again, skipping the start of this stream's audio, or now held it there (LoopbackCapturePass keeps a longer lead while
-    // the ring holds audio a shorter one would skip). The first pass that copies says how this stream's packets are copied.
+    // again, skipping the start of this stream's audio. The first pass that copies says how this stream's packets are copied,
+    // and stamps the run it set the lead in (RenderLeadRun: the anchor block above counted the run in RenderRestarts as it
+    // started), so a capture stream keeps a longer lead only through a fall within one run (LoopbackCapturePass).
     //
     if (copied)
     {
         ring->RenderLeadFrames = lookAhead ? 0 : m_LbPacketFrames;
+        ring->RenderLeadRun = ring->RenderRestarts;
         ring->RenderActive = TRUE;
     }
 
@@ -1694,6 +1696,7 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_EnableWaveCapture(0),
     m_LbLagFrames(0),
     m_LbAnchorLead(0),
+    m_LbAnchorRun(0),
     m_LbReadBase(0),
     m_AppFormatOk(FALSE),
     m_AppEnd(0),
@@ -1910,11 +1913,15 @@ CCaptureStreamEngine::LoopbackCapturePass(
     // early: LoopbackRenderPass) and when another render stream claims the ring, which starts a new run there. So a longer
     // lead moves the read back only onto a new run: silence before its start, and after it the new owner's audio, which this
     // stream hasn't had (the ring held the last owner's there, or nothing), so no frame of the ring comes out twice. A shorter
-    // one would move the read on and skip the difference, the start of the owner's audio: while the ring holds audio there,
-    // the read stays where it is instead, and the stream keeps the longer lead (and that much more latency) until the ring
-    // holds none it would skip (the render stream stopped) or it next runs (ours, 2026-11-23, after Astra's review; the
-    // owner's to confirm against a skip that keeps the lag shortest). A lead left from a render stream that has stopped
-    // costs nothing then: there is no audio to skip.
+    // one moves the read on and skips the difference. Within the run that set the lead this stream reads behind, that is the
+    // start of the owner's audio: while the ring holds audio there, the read stays where it is instead, and the stream keeps
+    // the longer lead (and that much more latency) until the ring holds none it would skip (the render stream stopped) or it
+    // next runs (ours, 2026-11-23, after Astra's review; the owner's to confirm against a skip that keeps the lag shortest). A
+    // lead set in another run (RenderLeadRun: a new owner, or the owner's restart) is taken at once: kept across runs, the
+    // last run's longer lead held a new owner's whole run a packet behind whenever its audio began before the shorter lead's
+    // read, as an overlapping render stream's does when it claims the ring (Astra's review of 5de56b9). A fall there skips at
+    // most the difference: silence before the new run's start, or the new run's first frames before the shorter lead's read
+    // (ours, 2026-11-23; the owner's to confirm).
     //
 
     // The audio the ring still holds of the current render run.
@@ -1927,7 +1934,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
 
     anchor = LoopbackAnchor();
     lead = ring->RenderLeadFrames;
-    if (m_LbAnchorValid && lead < m_LbAnchorLead)
+    if (m_LbAnchorValid && lead < m_LbAnchorLead && ring->RenderLeadRun == m_LbAnchorRun)
     {
         // This pass's read at the lead kept, and at the shorter one: the frames between them would be skipped.
         ULONGLONG   keptStart = anchor - m_LbLagFrames - m_LbAnchorLead + (ULONGLONG)Packet * m_LbPacketFrames;
@@ -1946,6 +1953,9 @@ CCaptureStreamEngine::LoopbackCapturePass(
         m_LbAnchorValid = TRUE;
         ring->CaptureAnchors++;
     }
+
+    // The run of the lead read behind: kept, the lead is from the same run (above), so this is the ring's lead's run either way.
+    m_LbAnchorRun = ring->RenderLeadRun;
 
     readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
     readEnd = readStart + m_LbPacketFrames;

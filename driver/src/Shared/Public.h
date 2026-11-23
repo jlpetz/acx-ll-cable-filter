@@ -83,8 +83,9 @@ typedef struct _LOOPBACK_RING {
     LOOPBACK_FORMAT RenderFormat;           // the last owner's format (kept after it stops, so its tail can still be read)
     BOOLEAN         RenderActive;           // the owner is running and has written in this run
     ULONG           RenderLeadFrames;       // 0: packets copied as released (a period early); else a packet: copied as they complete.
-                                            // Set by a pass that copied; a capture stream keeps a longer one while a shorter one
-                                            // would skip audio the ring holds (LoopbackCapturePass)
+                                            // Set by a pass that copied; a capture stream keeps a longer one set in the same run
+                                            // while a shorter one would skip audio the ring holds (LoopbackCapturePass)
+    ULONG           RenderLeadRun;          // the run that set it: RenderRestarts' count then (each run counts itself as it starts)
     ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
     ULONGLONG       WritePos;
 
@@ -104,7 +105,7 @@ typedef struct _LOOPBACK_RING {
     ULONGLONG       UnderrunFrames;
     ULONG           OverrunPackets;         // capture packets zeroed at the start because the ring had already overwritten them
     ULONG           CaptureAnchors;         // capture read position (re)anchored: Run, glitch adjustment, render lead change
-    ULONG           RenderRestarts;         // render runs started (claim, or a time line jump too long to zero)
+    ULONG           RenderRestarts;         // render runs started (claim, or a time line jump too long to zero), so it numbers them
     ULONG           RenderGapFills;         // render time line moved by a short gap (resume, glitch adjustment), zeroed
     ULONG           RenderLatePackets;      // render packets copied as they completed: the client released them too late
     ULONG           RenderLostPackets;      // render packets gone from the buffer before they were copied (zeroed; not expected)

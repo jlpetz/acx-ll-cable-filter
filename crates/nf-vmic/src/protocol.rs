@@ -2,7 +2,7 @@
 //! the header's offsets at compile time. Change both together. Bump [`VERSION`] on a change to a layout or to a rule the app must
 //! follow (ATTACH, the ring's header and the ring's rules for the app's side); [`Stats`] carries its size, checked with the
 //! version ([`Device::stats`](crate::Device::stats)), and the driver's handling of its other capture streams can change without
-//! one (ours, 2026-11-23). The header's comment has the rules.
+//! one (ours, 2026-11-23: the owner's to confirm). The header's comment has the rules.
 
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};

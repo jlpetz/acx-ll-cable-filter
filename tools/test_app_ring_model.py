@@ -2,8 +2,9 @@
 AppRingOtherPass, AppRingPlayCopy, AppRingHistoryWrite; TODO 19), checking the ring's rules for three capture streams
 through a reader handoff: no stream gets a ring frame twice, a stream that plays on loses none, and the one that takes the
 slot loses exactly its counted skip (HandoffSkippedFrames). Frames are numbered by the ring's position, time in frames on
-the QPC time line; the app always has frames ready (no underruns), and each pass's timer is late by up to 817 us, the live
-maximum. Left out: the copy's 32,768-frame length and its 32-gap record, glitch adjustments, a Pause and Run of one stream.
+the QPC time line; the app always has frames ready (no underruns), and each pass's timer is late by up to 817 us, the
+maximum in the A1 session's live runs (the later session's wasn't read). Left out: the copy's 32,768-frame length and its
+32-gap record, glitch adjustments, a Pause and Run of one stream.
 
 It also shows the cause of the uncounted gaps in the live three-stream runs (2026-11-23): a reader that gave the slot up only
 after its timer stopped left the copy short for as long as the stop took, and a stream playing on lost what the next
@@ -15,7 +16,7 @@ import unittest
 
 LAG = 49  # LOOPBACK_LAG_HNS (1 ms) in frames, plus one
 MAX_GAP = 4800  # LOOPBACK_MAX_GAP_HNS (100 ms): a longer jump starts a new run of the copy
-LATE_MAX = 39  # 817 us, the live runs' timer lateness maximum
+LATE_MAX = 39  # 817 us, the timer lateness maximum in the A1 session's live runs
 
 
 class Stream:

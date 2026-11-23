@@ -23,14 +23,15 @@ non-paged ring on the device, under a spin lock; both streams on one QPC time li
 the two ends never drift and need no fill control. The render pass copies the next packet once the client has released it
 (SetRenderPacket), else the one completing; the capture pass reads one packet 1 ms and a frame behind, plus the render side's
 lead (a packet where packets are copied as they complete, else none). The lead changes only as a render stream starts copying
-or another claims the ring, which starts a new run there, so no frame comes out twice. When it falls, a capture stream keeps
-the longer lead while the shorter one would skip audio the ring holds, rather than skip it (ours, 2026-11-23; the owner's to
-confirm), until that audio ends or it next runs.
+or another claims the ring, which starts a new run there, so no frame comes out twice. When it falls within a run, a capture
+stream keeps the longer lead while the shorter one would skip audio the ring holds, rather than skip it, until that audio
+ends or it next runs; a lead set in a new run (another owner, or the owner's restart) is taken at once, skipping at most the
+difference, so a kept lead never outlasts its run's audio (both ours, 2026-11-23; the owner's to confirm).
 Both endpoints offer 48 kHz stereo with float32 first and signed 24-in-32 PCM second. On the Server 2025 spike Windows
-stored float32 on both endpoints and the filter opened exclusive float output. Float32 alone left both interfaces disabled. The loopback copies
-raw bytes between matching formats only, so a stream is refused at creation (STATUS_NOT_SUPPORTED, counted in
-`RefusedOpens`) while the other endpoint has a stream open in a different format, and its client can retry with that
-format. Each circuit's open formats are recorded in the ring under its lock, so the check and the record are one step.
+stored float32 on both endpoints and the filter opened exclusive float output. Float32 alone left both interfaces disabled.
+The loopback copies raw bytes between matching formats only, so a stream is refused at creation (STATUS_NOT_SUPPORTED,
+counted in `RefusedOpens`) while the other endpoint has a stream open in a different format, and its client can retry with
+that format. Each circuit's open formats are recorded in the ring under its lock, so the check and the record are one step.
 The capture side's zero-fill (`MismatchPackets`) stays as the fallback, e.g. for a closed render run's tail read in
 another format. The [format validation checklist](../doc/todo/19-spike-2026-11-20.md#format-validation) covers the
 integer fallback and Windows 11. The sample's tone, WAV reader and SaveData are no longer called.
@@ -81,11 +82,11 @@ Every capture stream running in 48 kHz float32 stereo hears the ring. The first 
 others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, in the image's .data) on the same QPC
 time line, the reader's packet plus 1 ms behind (`SecondaryFramesCopied`; `SecondaryUnderrunFrames` counts the silence
 they get where no reader delivered, a jump in the reader's time line included). No stream gets a frame twice. At a handoff
-(the reader stops and another stream takes its place) the taker skips its lag once (`ReaderHandoffs`,
+(the reader stops and another stream takes the reader slot) the taker skips its lag once (`ReaderHandoffs`,
 `HandoffSkippedFrames`); the others play on with no skip, getting counted silence where the new reader's packet is longer;
-where it is shorter, they keep the longer lag until they next run (ours, the owner's to confirm). A reader gives its place up
-as its Pause starts, while its timer still runs: given up after the timer stopped, it left the copy short for as long as the
-stop took, and the streams playing on lost 55 to 111 frames at live handoffs (2026-11-23).
+where it is shorter, they keep the longer lag until they next run (ours, the owner's to confirm). A reader gives the reader
+slot up as its Pause starts, while its timer still runs: given up after the timer stopped, it left the copy short for as long
+as the stop took, and the streams playing on lost 55 to 111 frames at live handoffs (2026-11-23).
 More than one can run: the microphones of two of the driver's devices share the one ring, and a RAW and a DEFAULT client
 make two device streams on one (spike check 4's live runs).
 

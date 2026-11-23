@@ -2407,7 +2407,8 @@ fn run_render(opened: Opened, seconds: u64, signal: Option<u64>) -> Result<OpenR
         render.packets,
         render.frames,
         render.what(),
-        signal.map(|first| format!(" (frames {first} to {})", first + render.frames.max(1) - 1)).unwrap_or_default(),
+        // The range only where frames were written: none (a stream that stopped at once) has no last frame.
+        signal.filter(|_| render.frames > 0).map(|first| format!(" (frames {first} to {})", first + render.frames - 1)).unwrap_or_default(),
         render.longest_wait.as_secs_f64() * 1000.0
     );
     Ok(OpenRun { elapsed, events, error })

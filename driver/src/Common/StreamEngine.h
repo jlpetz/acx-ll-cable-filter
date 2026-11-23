@@ -579,6 +579,7 @@ protected:
     // noise-filter (TODO 19): the capture half of the loopback pair.
     ULONG           m_LbLagFrames;      // LOOPBACK_LAG_HNS in frames, rounded up, plus one
     ULONG           m_LbAnchorLead;     // the render lead it reads behind: LOOPBACK_RING.RenderLeadFrames, or a longer one it keeps
+    ULONG           m_LbAnchorRun;      // the run that set that lead (LOOPBACK_RING.RenderLeadRun): it keeps a lead in that run only
     ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
     // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
