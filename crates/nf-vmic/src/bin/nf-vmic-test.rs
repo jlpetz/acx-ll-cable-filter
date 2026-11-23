@@ -101,7 +101,9 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       most). --mode: the processing mode the stream asks for (default: RAW where the endpoint offers it, else DEFAULT).
       --period-frames: open through IAudioClient3's InitializeSharedAudioStream at that engine period, in frames (a
       small-period helper, or a second client in another mode); the period granted is printed. Unmute the endpoint. The
-      first capture stream to run reads the ring; the driver gives the others its audio as secondary streams.
+      first capture stream to run reads the ring; the driver gives the others its audio as secondary streams. When the
+      reader stops, another takes the slot with one counted skip (a gap that must match the driver's count); the rest play
+      on with neither gap nor repeat, getting silence the driver counts where the new reader's packet is longer.
   nf-vmic-test stats
       Print the driver's statistics.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
@@ -1064,7 +1066,10 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     // most one each, and only if they lost exactly the frames it counted as skipped. The counts are for every stream and the
     // driver can't say which stream took the slot (a client's engine period needn't be its device stream's packet: a DEFAULT
     // client told 3.33 ms ran 480-frame packets), so the exact match is what ties a gap to a handoff: a bystander's own
-    // discontinuity, or a gap for any other reason, would have to equal the taker's skip to the frame.
+    // discontinuity, or a gap for any other reason, would have to equal the taker's skip to the frame. A stream that plays the
+    // driver's copy on through a handoff skips nothing (nf_vmic.h): where the new reader's packet is longer it gets the
+    // difference as silence, counted in SecondaryUnderrunFrames, so its recording has no gap, and any repeat fails it. With
+    // three streams, record one handoff at a time: another stream's take in the window adds its skip to the count.
     let handoffs = after.reader_handoffs.saturating_sub(before.reader_handoffs);
     let skipped = after.handoff_skipped_frames.saturating_sub(before.handoff_skipped_frames);
     let gaps_ok = r.gaps == 0 || (r.gaps <= handoffs && r.gap_frames == skipped);
@@ -3453,6 +3458,34 @@ mod tests {
         assert_eq!(failed(&verify_checks(&b, &a, &edges, &StreamSeen::default())), ["all the silence"], "the reader's 128 only");
         let own = StreamSeen { packet: 480, ..Default::default() };
         assert_eq!(failed(&verify_checks(&b, &a, &edges, &own)), Vec::<&str>::new());
+    }
+
+    /// Three capture streams and one handoff (Astra's review, 2026-11-23): a 160-frame reader stops, a 480-frame stream takes the
+    /// slot and a 240-frame one plays on as another stream. The taker loses its counted skip (its lag at most: 209 frames); the
+    /// one that plays on gets the difference in the readers' packets as silence, counted, with no gap and no repeat.
+    #[test]
+    fn verify_judges_each_stream_of_a_three_stream_handoff() {
+        let before = Stats { reader_packet_frames: 160, ..reading(counters(3, 1_000_000, 0)) };
+        let after = Stats {
+            reader_packet_frames: 480,
+            reader_handoffs: 1,
+            handoff_skipped_frames: 209,
+            secondary_underrun_frames: 320,
+            ..reading(counters(3, 1_000_000 + FRAMES, 0))
+        };
+        let taker = CheckReport { gaps: 1, gap_frames: 209, ..clean_recording() };
+        assert_eq!(verify_failures(&before, &after, &taker), Vec::<&str>::new(), "the taker");
+        let on = CheckReport { signal_frames: FRAMES - 320, zeros_inside: 320, zero_runs_inside: 1, ..clean_recording() };
+        let seen = StreamSeen { packet: 240, ..Default::default() };
+        assert_eq!(failed(&verify_checks(&before, &after, &on, &seen)), Vec::<&str>::new(), "the stream that plays on");
+        // The driver before the fix: the stream that played on had the 320 frames again, and lost what the new reader's first
+        // packet left out of the copy (151 frames, say), with nothing counted for either.
+        let old = CheckReport { repeats: 1, repeat_frames: 320, gaps: 1, gap_frames: 151, ..clean_recording() };
+        let old_after = Stats { secondary_underrun_frames: 0, ..after };
+        assert_eq!(failed(&verify_checks(&before, &old_after, &old, &seen)), ["bit-exact and in order"]);
+        // Its gap alone fails too: it matches no counted skip.
+        let gap_only = CheckReport { gaps: 1, gap_frames: 151, ..clean_recording() };
+        assert_eq!(failed(&verify_checks(&before, &old_after, &gap_only, &seen)), ["bit-exact and in order"]);
     }
 
     #[test]

@@ -390,14 +390,17 @@ pub struct Stats {
     pub reserved0: u32,
     pub ring: RingStats,
     pub loopback: LoopbackStats,
-    /// Frames of the ring's audio delivered to capture streams other than the reader.
+    /// Frames of the ring's audio delivered from the driver's copy: to capture streams other than the reader, and to a new
+    /// reader for the time the copy already held.
     pub secondary_frames_copied: u64,
-    /// Frames such a stream zero-filled because the ring's audio for its position wasn't there.
+    /// Frames zero-filled in their place: the ring's audio for the position wasn't there, or the stream had had it already (its
+    /// place in the copy moved back, at a handoff to a reader with a longer packet: it never plays a frame twice).
     pub secondary_underrun_frames: u64,
     /// Times a capture stream that was playing the driver's copy took the reader slot another stream had held (a handoff).
     pub reader_handoffs: u64,
-    /// The copy's frames such a stream never delivered: what the copy held past its place (a handoff's one-time skip; the last
-    /// reader's underrun silence there included).
+    /// The copy's frames such a stream never delivered: between its place in the copy and its first packet as the reader (a
+    /// handoff's one-time skip, its lag at most; the last reader's underrun silence there included). The other streams skip
+    /// nothing at a handoff.
     pub handoff_skipped_frames: u64,
     /// Indexed by [`KIND_RENDER`] and [`KIND_CAPTURE`].
     pub stream: [StreamStats; KINDS],

@@ -583,8 +583,10 @@ protected:
 
     // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
     BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied
-    ULONGLONG       m_AppOtherEnd;      // where this stream's latest pass as another stream ended, on the copy's time line
-    BOOLEAN         m_AppOtherValid;    // m_AppOtherEnd is from this run: a handoff to this stream counts what it skips
+    ULONGLONG       m_AppEnd;           // its place on the copy's time line: the end of what it has had (AppRingPlayCopy)
+    ULONGLONG       m_AppEndAttach;     // the attachment m_AppEnd is from (NF_VMIC_RING_STATS.Attaches; 0: none yet)
+    ULONG           m_AppOtherLead;     // the longest reader packet it has played the copy behind this run (AppRingOtherPass)
+    BOOLEAN         m_AppOtherValid;    // its latest pass this run played the copy: a handoff to this stream counts what it skips
 
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
     __declspec(noinline)
@@ -607,13 +609,30 @@ protected:
         _In_                            ULONG   PacketSize
         );
 
-    // The pass of a stream that isn't the reader: the reader's copy, a fixed lag behind. App ring lock held (AppRingCapturePass).
+    // The pass of a stream that isn't the reader: the reader's copy, a lag behind. App ring lock held (AppRingCapturePass).
     __drv_requiresIRQL(DISPATCH_LEVEL)
     VOID
     AppRingOtherPass(
         _In_                            ULONG   Packet,
         _Out_writes_bytes_(PacketSize)  PBYTE   PacketBuffer,
         _In_                            ULONG   PacketSize
+        );
+
+    // Frames frames (8 bytes each) of the reader's copy for this stream, never one it has had (m_AppEnd). App ring lock held,
+    // ring published.
+    __drv_requiresIRQL(DISPATCH_LEVEL)
+    VOID
+    AppRingPlayCopy(
+        _In_                                ULONGLONG   From,
+        _In_                                ULONG       Frames,
+        _Out_writes_bytes_(Frames * 8)      PBYTE       Dest
+        );
+
+    // This stream's place moves to End, if that is later (or End starts it, in a new attachment). App ring lock held.
+    __drv_requiresIRQL(DISPATCH_LEVEL)
+    VOID
+    AppRingPlaceReached(
+        _In_                                ULONGLONG   End
         );
 
     // noinline: called from PAGE code (Pause, ReleaseHardware, the destructor) and takes the app ring's spin lock. Inlined

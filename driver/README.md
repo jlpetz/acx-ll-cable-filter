@@ -76,10 +76,11 @@ session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for th
 Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
 others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, in the image's .data) on the same QPC
 time line, the reader's packet plus 1 ms behind (`SecondaryFramesCopied`; `SecondaryUnderrunFrames` counts the silence
-they get where no reader delivered, a jump in the reader's time line included). More than one can run if two of the
-driver's devices are installed (their microphones share the one ring), or should the capture pin list a mode besides RAW
-(the audio engine can open a device stream per mode); with one device and RAW only, a second stream isn't known to
-occur, so this is defensive until a live test makes one.
+they get where no reader delivered, a jump in the reader's time line included). No stream gets a frame twice. At a handoff
+(the reader stops and another stream takes its place) the taker skips its lag once (`ReaderHandoffs`,
+`HandoffSkippedFrames`); the others play on with no skip, getting counted silence where the new reader's packet is longer.
+More than one can run: the microphones of two of the driver's devices share the one ring, and a RAW and a DEFAULT client
+make two device streams on one (spike check 4's live runs).
 
 The ring is raw float32, so a conflict with another format shows at open time, both ways: while a ring is attached, a
 capture stream in another format is refused at creation (STATUS_NOT_SUPPORTED, `RefusedCaptureOpens`), and an ATTACH
