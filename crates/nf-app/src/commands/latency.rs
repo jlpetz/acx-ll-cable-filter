@@ -188,15 +188,45 @@ pub fn format_cable_report(r: &CableLatencyReport) -> String {
     s
 }
 
-/// The report, as the window shows it.
+/// The report, as the window shows it. The sweeps the engine's own events disturbed (TODO 13: a mic glitch or stall, an output
+/// correction, or the output queue still away from its level after one) are named, and the undisturbed ones' median and spread
+/// go beside the median of all.
 pub fn format_report(r: &LatencyReport) -> String {
     let ms = |v: f64| format!("{} ms", fixed(v, 2));
+    let list = |v: &[f64]| v.iter().map(|v| fixed(*v, 2)).collect::<Vec<_>>().join(", ");
     let mut s = String::new();
     let _ = write!(s, "Latency: {} of {} repetitions valid", r.valid, r.repetitions);
     if r.valid > 0 {
         let _ = write!(s, " (lowest confidence {} dB)", fixed(f64::from(r.confidence_db_min), 1));
-        let each: Vec<String> = r.app_ms.iter().map(|v| fixed(*v, 2)).collect();
-        let _ = write!(s, "\n  app + output cable  {} median, spread {} [{}]", ms(r.app_ms_median), ms(r.app_ms_spread), each.join(", "));
+        let _ = write!(s, "\n  app + output cable  {} median, spread {} [{}]", ms(r.app_ms_median), ms(r.app_ms_spread), list(&r.app_ms));
+        let disturbed: Vec<_> = r.disturbed().collect();
+        if !r.disturbances.is_empty() && disturbed.is_empty() {
+            let _ = write!(s, "\n  disturbed sweeps    none: no mic glitch or stall, output correction or recovering queue in any");
+        } else if !disturbed.is_empty() {
+            match r.clean_ms_median {
+                Some(m) => {
+                    let clean: Vec<f64> = r.undisturbed().collect();
+                    let (n, of) = (clean.len(), r.app_ms.len());
+                    let _ = write!(
+                        s,
+                        "\n  undisturbed sweeps  {} median, spread {} [{}], {n} of {of}",
+                        ms(m),
+                        ms(r.clean_ms_spread),
+                        list(&clean)
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        s,
+                        "\n  undisturbed sweeps  none: every sweep was disturbed (below), so no clean figure; run the test again"
+                    );
+                }
+            }
+            for (i, (app, d)) in disturbed.iter().enumerate() {
+                let label = if i == 0 { "disturbed sweeps" } else { "" };
+                let _ = write!(s, "\n  {label:<20}sweep {} ({}): {}", d.repetition, ms(*app), d.text());
+            }
+        }
     }
     if let Some(v) = r.input_path_ms_median {
         let _ = write!(s, "\n  input path          {} median (probe play-out to the app's input)", ms(v));
@@ -210,9 +240,17 @@ pub fn format_report(r: &LatencyReport) -> String {
     if let Some(b) = &r.budget {
         let _ = write!(s, "\n  latency budget      {}, means over the test", budget_text(b));
     }
+    // The mic's and the output's events over the test: a spread between the sweeps that these don't explain is the devices' own
+    // (TODO 9).
+    let mut events = Vec::new();
+    if let Some(n) = r.mic_glitches {
+        events.push(nf_engine::mic_glitch_text(n));
+    }
     if let Some(e) = &r.output {
-        // A spread between the sweeps that these don't explain is the devices' own (TODO 9).
-        let _ = write!(s, "\n  output events       {} over the test", e.text());
+        events.push(format!("output: {}", e.text()));
+    }
+    if !events.is_empty() {
+        let _ = write!(s, "\n  events              {} over the test", events.join("; "));
     }
     let _ = write!(s, "\n  chain offset        {}", ms(f64::from(r.chain_ms)));
     if !r.conditions.is_empty() {
@@ -226,6 +264,8 @@ pub fn format_report(r: &LatencyReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nf_engine::SweepDisturbance;
+
     use super::*;
 
     #[test]
@@ -241,6 +281,10 @@ mod tests {
             readout_ms_median: Some(12.0),
             budget: Some(nf_engine::LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
             output: Some(nf_engine::OutputEvents { slips: 3, slip_net: 1, ..Default::default() }),
+            mic_glitches: Some(0),
+            disturbances: (1..5).map(|repetition| SweepDisturbance { repetition, ..Default::default() }).collect(),
+            clean_ms_median: Some(12.33),
+            clean_ms_spread: 0.1,
             chain_ms: 10.0,
             confidence_db_min: 31.26,
             conditions: "mic 10 ms".into(),
@@ -250,17 +294,77 @@ mod tests {
             format_report(&r),
             "Latency: 4 of 5 repetitions valid (lowest confidence 31.3 dB)\n  \
              app + output cable  12.33 ms median, spread 0.10 ms [12.30, 12.35, 12.40, 12.31]\n  \
+             disturbed sweeps    none: no mic glitch or stall, output correction or recovering queue in any\n  \
              input path          3.20 ms median (probe play-out to the app's input)\n  \
              live readout        12.00 ms median\n  \
              latency budget      mic delivery 10.5 + wait 0.0 + output queue 22.0 + render side 5.0 = readout 37.5 ms; the chain's \
              10.0 ms on top: 47.5 ms, means over the test\n  \
-             output events       no underruns, zeros, drops or re-anchors; 3 slips (net +1 samples) over the test\n  \
+             events              no mic glitches; output: no underruns, zeros, drops or re-anchors; 3 slips (net +1 samples) over \
+             the test\n  \
              chain offset        10.00 ms\n  \
              conditions: mic 10 ms\n  \
              warning: one repetition was weak"
         );
         let none = LatencyReport { repetitions: 5, app_ms_median: f64::NAN, confidence_db_min: f32::NAN, ..Default::default() };
         assert_eq!(format_report(&none), "Latency: 0 of 5 repetitions valid\n  chain offset        0.00 ms");
+    }
+
+    /// A late wake's run (TODO 13's spread-defaults-4 of 2026-11-23, but with the queue back by sweep 4): sweep 1 had the
+    /// events, sweeps 2 and 3 the queue still over its level. They're named, with why, and the undisturbed two's figure goes
+    /// beside the median of all; with every sweep disturbed (as that run's were) there's no clean figure, and the report says so.
+    #[test]
+    fn a_report_names_its_disturbed_sweeps() {
+        let output = nf_engine::OutputEvents { underruns: 1, silence_frames: 160, late_answers: 1, ..Default::default() };
+        let queue = |repetition, queue_off_ms| SweepDisturbance { repetition, queue_off_ms, ..Default::default() };
+        let mut r = LatencyReport {
+            repetitions: 5,
+            valid: 5,
+            app_ms: vec![46.47, 43.47, 40.47, 37.91, 36.21],
+            app_ms_median: 40.47,
+            app_ms_spread: 10.26,
+            output: Some(nf_engine::OutputEvents { slips: 410, slip_net: -398, ..output }),
+            mic_glitches: Some(1),
+            disturbances: vec![
+                SweepDisturbance { mic_glitches: 1, output, queue_off_ms: 11.83, ..queue(1, 0.0) },
+                queue(2, 9.1),
+                queue(3, 6.1),
+                queue(4, 0.0),
+                queue(5, 0.0),
+            ],
+            clean_ms_median: Some(37.06),
+            clean_ms_spread: 1.7,
+            chain_ms: 10.0,
+            confidence_db_min: 40.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_report(&r),
+            "Latency: 5 of 5 repetitions valid (lowest confidence 40.0 dB)\n  \
+             app + output cable  40.47 ms median, spread 10.26 ms [46.47, 43.47, 40.47, 37.91, 36.21]\n  \
+             undisturbed sweeps  37.06 ms median, spread 1.70 ms [37.91, 36.21], 2 of 5\n  \
+             disturbed sweeps    sweep 1 (46.47 ms): 1 mic glitch; output: 1 underrun (3.3 ms of silence played, a late answer); \
+             the output queue up to 11.8 ms over its level before the event, as the drift loop trims it back\n  \
+             \x20                   sweep 2 (43.47 ms): the output queue up to 9.1 ms over its level before the event, as the drift \
+             loop trims it back\n  \
+             \x20                   sweep 3 (40.47 ms): the output queue up to 6.1 ms over its level before the event, as the drift \
+             loop trims it back\n  \
+             events              1 mic glitch; output: 1 underrun (3.3 ms of silence played, a late answer); 410 slips (net -398 \
+             samples) over the test\n  \
+             chain offset        10.00 ms"
+        );
+        for d in &mut r.disturbances[3..] {
+            d.output.reanchors = 1;
+        }
+        r.clean_ms_median = None;
+        let text = format_report(&r);
+        assert!(
+            text.contains(
+                "\n  undisturbed sweeps  none: every sweep was disturbed (below), so no clean figure; run the test again\n  \
+                 disturbed sweeps    sweep 1 (46.47 ms)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\n                      sweep 5 (36.21 ms): output: 1 re-anchor\n"), "{text}");
     }
 
     #[test]

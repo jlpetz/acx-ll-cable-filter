@@ -686,8 +686,10 @@ Preconditions: the engine is running. `probe_device` and `capture_device` exist,
 1. **Setup:**
    - Set `controls.passthrough = true` (unless `through_model`).
    - Ask the audio thread, through an atomic flag plus a pre-allocated rtrb ring of
-     (QPC-stamped mic blocks), to tap its mic input. Each item is the block's first-sample QPC and
-     480 samples. Capacity covers the whole test: repetitions × (sweep + 2 gaps) + 1 s.
+     (QPC-stamped mic blocks), to tap its mic input. Each item is the block's first-sample QPC,
+     its 480 samples (before the dither), and what the output and the thread did at the block (its
+     `OutputFacts` and `ThreadFacts`, as the chain recorder has them), pushed once the block's output
+     is written. Capacity covers the whole test: repetitions × (sweep + 2 gaps) + 1 s.
 2. **Test thread** (MMCSS "Pro Audio" while running):
    - opens a render stream on `probe_device` and a capture stream on `capture_device`;
    - builds `exp_sweep(48000, 100, 16000, 1.0, 0.01, 0.25)` and
@@ -708,7 +710,16 @@ Preconditions: the engine is running. `probe_device` and `capture_device` exist,
      ±50 ms of the median.
    - Fill `LatencyReport`. Its `conditions` lists the engine periods, RAW, autoconvert and the
      device names.
-   - Add a warning when `valid < repetitions`, or when the spread is > 2 ms.
+   - Check each kept repetition against the tap's blocks' facts (`disturbed.rs`, TODO 13): it's
+     disturbed when a mic glitch or stall, an output underrun, deficit, coarse drop, re-anchor or
+     target move came within 100 ms of its samples at the app's input, or when the output queue
+     (the fill less its target, as a 100 ms mean) was still more than 1 ms from its level before
+     such an event (the median over the 0.5 s before it) while the drift loop trimmed it back.
+     `disturbances` says what, per repetition; `clean_ms_median` and `clean_ms_spread` are the
+     undisturbed ones' (none when every one was disturbed). `mic_glitches` beside `output` counts
+     the mic's glitches over the test.
+   - Add a warning when `valid < repetitions`, or when the spread is > 2 ms (with the undisturbed
+     ones' spread beside it when some were disturbed).
 4. **Restore** the passthrough and tap flags (also on cancel or error).
 
 Mode differences: Acoustic means the probe plays on the speakers. Warn if AEC is on (it's bypassed

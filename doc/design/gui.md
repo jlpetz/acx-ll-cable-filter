@@ -64,8 +64,10 @@ minimise for now; the tray comes later (TODO #15, #16).
    - NumberBox Repetitions (1..20, default 5).
    - Button "Run test": disabled unless the engine is running. While running it reads "Cancel",
      with a ProgressBar.
-   - The result: app (input tap → cable out) median ± spread; input path; end to end; chain;
-     confidence; warnings; conditions. A "Copy" button is optional (skip if Reactor has no
+   - The result: app (input tap → cable out) median ± spread; with sweeps the engine's own events
+     disturbed, the undisturbed ones' median ± spread and a line for each disturbed one, saying
+     why (TODO 13); input path; end to end; chain; the mic's and the output's events; confidence;
+     warnings; conditions. A "Copy" button is optional (skip if Reactor has no
      clipboard).
    - **Help text, virtual mode:** "Set Microphone to CABLE-A Output. Play the probe on CABLE-A
      Input. Capture CABLE Output (the cable set as Output above). Needs two virtual cables

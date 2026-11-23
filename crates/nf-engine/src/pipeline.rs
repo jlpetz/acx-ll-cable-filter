@@ -27,6 +27,7 @@ use rtrb::Producer;
 
 use crate::api::{ChainBlock, OutputFacts, ThreadFacts};
 use crate::budget::{self, BudgetStats, WakeLog};
+use crate::disturbed::TapFacts;
 use crate::echo_guard::EchoGuard;
 use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
@@ -218,11 +219,13 @@ impl BlockProcessor for Chain {
 }
 
 /// One tapped mic block for the latency test: the QPC time of its first sample (hns; NaN when
-/// unknown) and the raw samples.
+/// unknown), the raw samples, and what the output and the thread did at the block (its `last_output` and `last_thread`), which
+/// tell the test's disturbed sweeps (disturbed.rs). Pushed once the block's output is written.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TapItem {
     pub qpc_hns: f64,
     pub samples: Block,
+    pub facts: TapFacts,
 }
 
 /// What a block's latency readout and its budget need (budget.rs): its first sample's capture time (hns, by the mic's
@@ -699,12 +702,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // Every block, so the log keeps only the wakes still in the FIFO.
         let wake_hns = self.mic_wakes.wake_of(head);
         self.mic.pop_into(&mut self.mic_blk[..]);
-        if let Some(tap) = self.tap.as_mut() {
-            let item = TapItem { qpc_hns: t_capture.unwrap_or(f64::NAN), samples: *self.mic_blk };
-            if tap.push(item).is_err() {
-                self.counters.tap_overflows += 1;
-            }
-        }
+        // The tap's copy of the block as it came (before the dither), pushed with the block's facts once its output is written.
+        let tapped = self.tap.as_ref().map(|_| TapItem {
+            qpc_hns: t_capture.unwrap_or(f64::NAN),
+            samples: *self.mic_blk,
+            facts: TapFacts::default(),
+        });
         if proc.dither_mic() {
             self.dither.apply(&mut self.mic_blk[..], DITHER);
         }
@@ -722,6 +725,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         let t1 = ticks.ticks();
         let us = ticks.to_us(t1.wrapping_sub(t0));
         self.thread_facts(us);
+        self.push_tap(tapped);
         self.record(proc, head, t_capture, mic_moved);
         pushed?;
         if !readout {
@@ -827,6 +831,17 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         };
         (self.wake_gap_max_hns, self.wakes, self.out_wakes, self.stalls) = (0.0, 0, 0, 0);
         (self.glitches_at_block, self.misses_at_block) = (glitches, misses);
+    }
+
+    /// While the latency test taps the mic, pushes this block's item with what its output and the thread did (whether or not the
+    /// write failed, as the recorders' blocks). A full ring loses the block, counted.
+    fn push_tap(&mut self, item: Option<TapItem>) {
+        if let (Some(tap), Some(mut item)) = (self.tap.as_mut(), item) {
+            item.facts = TapFacts { output: self.last_output, thread: self.last_thread };
+            if tap.push(item).is_err() {
+                self.counters.tap_overflows += 1;
+            }
+        }
     }
 
     /// While the chain recorder or the flight recorder is armed, pushes this block to each: the mic and reference blocks as
@@ -2628,6 +2643,32 @@ mod tests {
         p.drain_mic(&mut mic, 0.0).unwrap();
         p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
         assert!(rx.pop().unwrap().qpc_hns.is_nan());
+    }
+
+    /// Each tap item carries its own block's facts as the block left them, its output written: the latency test tells its
+    /// disturbed sweeps by them (disturbed.rs). A quiet block, then one with a mic glitch and the device found dry.
+    #[test]
+    fn the_tap_carries_each_blocks_facts() {
+        let mut p = pipe(false);
+        let mut sink = FakeSink::new(4800);
+        let tel = Telemetry::new();
+        let (tx, mut rx) = rtrb::RingBuffer::<TapItem>::new(4);
+        p.tap = Some(tx);
+        let mut mic = FakeCapture::default();
+        started(&mut p, &mut sink, &mut mic, &tel);
+        let quiet = rx.pop().unwrap().facts;
+        assert_eq!(quiet.output.target as usize, p.out_target());
+        assert!(!quiet.output.underrun && quiet.output.zeros == 0 && quiet.thread.mic_glitches == 0, "{quiet:?}");
+        // 100 ms since the last wake: the device has played everything; and the mic's next packet is 240 frames on.
+        sink.advance(4800.0, 1_000_000.0);
+        mic.push(480 + 240, None, vec![0.5; 480]);
+        p.drain_mic(&mut mic, 0.0).unwrap();
+        p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+        let hit = rx.pop().unwrap().facts;
+        assert_eq!(hit.thread.mic_glitches, 1);
+        assert!(hit.output.underrun && hit.output.zeros > 0, "{hit:?}");
+        assert_eq!((hit.output.index, hit.output.fill, hit.output.zeros), (p.last_output.index, p.last_output.fill, p.last_output.zeros));
+        assert_eq!(hit.thread.wakes, p.last_thread.wakes);
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! play-and-record loop ([`play_train`]), the arrival timing ([`Train::arrivals`]), the matching and the statistics.
 //!
 //! The tap ring is handed to the audio thread lock-free (a one-slot rtrb ring of producers) and
-//! handed back the same way, so the audio thread never frees it (handover.rs).
+//! handed back the same way, so the audio thread never frees it (handover.rs). Each tapped block carries what the output and
+//! the thread did at it, which tells the sweeps the engine's own events disturbed (disturbed.rs): the report names them and
+//! gives the undisturbed ones' median beside the median of all.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -32,6 +34,7 @@ use crate::api::{
 use crate::audio::{AudioShared, RENDER_BUFFER_HNS};
 use crate::control::{Inner, claim_test, lock};
 use crate::devices::resolve;
+use crate::disturbed::{self, SweepAt, TapFacts};
 use crate::errors::{StreamRole, describe_com_failure, describe_hr, describe_start_failure};
 use crate::handover::{self, End, Port};
 use crate::pipeline::{RenderSink, TapItem, play_time_hns};
@@ -273,7 +276,11 @@ impl Train {
         find_sweep_arrivals(&rec.samples, &self.sweep, self.starts.len(), self.sweep.signal.len())
             .iter()
             .filter_map(|a| {
-                interpolate_stamps(&rec.stamps, a.position, fs).map(|t_hns| TimedArrival { t_hns, confidence_db: a.confidence_db })
+                interpolate_stamps(&rec.stamps, a.position, fs).map(|t_hns| TimedArrival {
+                    t_hns,
+                    position: a.position,
+                    confidence_db: a.confidence_db,
+                })
             })
             .collect()
     }
@@ -362,12 +369,14 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     // thread never takes a page fault on it.
     let capacity = (train.total + SAMPLE_RATE as usize) / BLOCK + 1;
     let (mut tap_tx, mut tap_rx) = RingBuffer::<TapItem>::new(capacity);
-    let blank = TapItem { qpc_hns: 0.0, samples: [0.0; BLOCK] };
+    let blank = TapItem { qpc_hns: 0.0, samples: [0.0; BLOCK], facts: TapFacts::default() };
     while tap_tx.push(blank).is_ok() {}
     while tap_rx.pop().is_ok() {}
     let run = send_tap(inner, tap_tx)?;
     restore.tap_sent = true;
     let mut tap = Recording { samples: Vec::with_capacity(capacity * BLOCK), stamps: Vec::with_capacity(capacity) };
+    // Each tapped block's facts, block `i` the tap's samples from `i * BLOCK`: which sweeps the engine's own events disturbed.
+    let mut facts: Vec<TapFacts> = Vec::with_capacity(capacity);
 
     // The readout's budget over the test, and the output's events: their totals now and after the sweeps (published each
     // second).
@@ -380,14 +389,16 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
         if inner.telemetry.state() != EngineState::Running || !still_same_run {
             return Err(failed("The filter stopped or restarted during the test; run it again."));
         }
-        drain_tap(&mut tap_rx, &mut tap);
+        drain_tap(&mut tap_rx, &mut tap, &mut facts);
         shared.running(0.9 * fraction as f32, "Measuring");
         Ok(())
     })?;
-    drain_tap(&mut tap_rx, &mut tap);
+    drain_tap(&mut tap_rx, &mut tap, &mut facts);
     let after = inner.telemetry.snapshot();
     let budget = after.budget_totals.means_since(&before.budget_totals);
     let output = OutputEvents::between(&before, &after);
+    // The run can't have restarted meanwhile (checked at every wake above), so the counts only grew.
+    let mic_glitches = after.capture_glitches.saturating_sub(before.capture_glitches);
     // The analysis is seconds of CPU for a long test (FFTs of 10 M points and more): at MMCSS
     // "Pro Audio" priority (or the TIME_CRITICAL fallback) it would starve other apps' audio and
     // the UI. Back to normal priority first; nothing below needs it, nor COM's real-time state.
@@ -399,7 +410,8 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     shared.running(0.92, "Analysing");
     let tap_t = train.arrivals(&tap);
     let out_t = train.arrivals(&take.out);
-    let mut report = build_report(req.repetitions, &take.probe_t, &tap_t, &out_t, train.period_hns());
+    let blocks = Blocks { facts: &facts, sweep_len: train.sweep.signal.len() };
+    let mut report = build_report(req.repetitions, &take.probe_t, &tap_t, &out_t, train.period_hns(), blocks);
     if report.valid < req.repetitions {
         // Which side lost the sweeps, and how loud each recording was: tells a silent or muted device
         // from a garbled one.
@@ -410,6 +422,7 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.readout_ms_median = tel.latency_valid.then_some(tel.latency_ms_median);
     report.budget = budget;
     report.output = Some(output);
+    report.mic_glitches = Some(mic_glitches);
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
     let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive, fixed_ms: st.targets.output_ms };
@@ -485,20 +498,31 @@ fn peak_text(x: &[f32]) -> String {
     if p > 0.0 { format!("{:.1} dBFS", 20.0 * p.log10()) } else { "silent".to_owned() }
 }
 
-fn drain_tap(rx: &mut Consumer<TapItem>, rec: &mut Recording) {
+/// The tap's blocks so far into the recording, and each block's facts beside it (block `i`'s at `facts[i]`).
+fn drain_tap(rx: &mut Consumer<TapItem>, rec: &mut Recording, facts: &mut Vec<TapFacts>) {
     while let Ok(item) = rx.pop() {
         if item.qpc_hns.is_finite() {
             rec.stamps.push((rec.samples.len() as u64, item.qpc_hns));
         }
         rec.samples.extend_from_slice(&item.samples);
+        facts.push(item.facts);
     }
 }
 
-/// An arrival mapped to QPC time.
+/// An arrival mapped to QPC time, and where it is in its recording (samples).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TimedArrival {
     pub(crate) t_hns: f64,
+    pub(crate) position: f64,
     pub(crate) confidence_db: f32,
+}
+
+/// The tap's blocks' facts (block `i` the tap's samples from `i * BLOCK`) and a sweep's length in samples: what tells the
+/// disturbed sweeps (disturbed.rs). No facts: not told.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Blocks<'a> {
+    pub(crate) facts: &'a [TapFacts],
+    pub(crate) sweep_len: usize,
 }
 
 /// The median (the mean of the middle two for an even count); `None` when empty.
@@ -517,11 +541,14 @@ pub(crate) fn median(v: &[f64]) -> Option<f64> {
 /// Repetition `i`'s tap arrival is the first within [probe start − 5 ms, + half a period) of its
 /// probe start (or the `i`th arrival when the probe clock gave no start time); its output arrival
 /// is the first within [tap − 5 ms, + half a period) of that. Both need `confidence_db ≥ 15`; then
-/// repetitions more than 50 ms from the median app latency are dropped.
+/// repetitions more than 50 ms from the median app latency are dropped. With the tap's `blocks`, each one kept is checked for
+/// the engine's own events (disturbed.rs), and the undisturbed ones' median and spread go beside the median of all.
 pub(crate) fn build_report(
-    repetitions: u32, probe: &[Option<f64>], tap: &[TimedArrival], out: &[TimedArrival], period_hns: f64,
+    repetitions: u32, probe: &[Option<f64>], tap: &[TimedArrival], out: &[TimedArrival], period_hns: f64, blocks: Blocks<'_>,
 ) -> LatencyReport {
     struct Rep {
+        repetition: u32,
+        tap_position: f64,
         app: f64,
         input: Option<f64>,
         e2e: Option<f64>,
@@ -544,6 +571,8 @@ pub(crate) fn build_report(
             continue;
         }
         cands.push(Rep {
+            repetition: i as u32 + 1,
+            tap_position: ta.position,
             app: ms(oa.t_hns - ta.t_hns),
             input: tp.map(|tp| ms(ta.t_hns - tp)),
             e2e: tp.map(|tp| ms(oa.t_hns - tp)),
@@ -555,6 +584,15 @@ pub(crate) fn build_report(
     let app_ms: Vec<f64> = kept.iter().map(|r| r.app).collect();
     let inputs: Vec<f64> = kept.iter().filter_map(|r| r.input).collect();
     let e2e: Vec<f64> = kept.iter().filter_map(|r| r.e2e).collect();
+    let disturbances = if blocks.facts.is_empty() {
+        Vec::new()
+    } else {
+        let at: Vec<SweepAt> = kept.iter().map(|r| SweepAt { repetition: r.repetition, position: r.tap_position }).collect();
+        disturbed::disturbances(blocks.facts, &at, blocks.sweep_len)
+    };
+    // The repetitions nothing disturbed (`LatencyReport::undisturbed`).
+    let clean: Vec<f64> = app_ms.iter().zip(&disturbances).filter(|(_, d)| !d.any()).map(|(&a, _)| a).collect();
+    let clean_spread = spread(&clean);
     let spread = spread(&app_ms);
     let valid = kept.len() as u32;
     let mut warnings = Vec::new();
@@ -566,7 +604,16 @@ pub(crate) fn build_report(
         warnings.push(format!("Only {valid} of {repetitions} sweeps were found clearly in both recordings; the result is less certain."));
     }
     if spread > SPREAD_WARN_MS {
-        warnings.push(format!("The app latency varied by {spread:.1} ms between sweeps; repeat the test with less running on the PC."));
+        // With disturbed sweeps, how much of it the undisturbed ones share.
+        let among_clean = match clean.len() {
+            n if n == app_ms.len() || disturbances.is_empty() => String::new(),
+            0 => " (every sweep disturbed)".to_owned(),
+            1 => " (one sweep undisturbed)".to_owned(),
+            n => format!(" ({clean_spread:.1} ms between the {n} undisturbed)"),
+        };
+        warnings.push(format!(
+            "The app latency varied by {spread:.1} ms between sweeps{among_clean}; repeat the test with less running on the PC."
+        ));
     }
     LatencyReport {
         repetitions,
@@ -579,6 +626,10 @@ pub(crate) fn build_report(
         readout_ms_median: None,
         budget: None,
         output: None,
+        mic_glitches: None,
+        clean_ms_median: median(&clean).filter(|_| !disturbances.is_empty()),
+        clean_ms_spread: clean_spread,
+        disturbances,
         chain_ms: 0.0,
         confidence_db_min: kept.iter().map(|r| r.confidence).fold(f32::NAN, f32::min),
         conditions: String::new(),
@@ -735,8 +786,9 @@ fn describe_stream(label: &str, s: &StreamInfo) -> String {
 mod tests {
     use super::*;
 
+    /// An arrival at `t_ms`, in a recording that began at QPC 0 (48 samples a ms).
     fn arr(t_ms: f64, conf: f32) -> TimedArrival {
-        TimedArrival { t_hns: t_ms * 1e4, confidence_db: conf }
+        TimedArrival { t_hns: t_ms * 1e4, position: t_ms * 48.0, confidence_db: conf }
     }
 
     const PERIOD_HNS: f64 = 2.0 * HNS_PER_S;
@@ -756,7 +808,7 @@ mod tests {
         let tap: Vec<_> = (0..3).map(|i| arr(1012.0 + 2000.0 * i as f64, 40.0)).collect();
         let app = [31.0, 31.5, 30.5];
         let out: Vec<_> = (0..3).map(|i| arr(1012.0 + 2000.0 * i as f64 + app[i], 30.0 + i as f32)).collect();
-        let r = build_report(3, &probe, &tap, &out, PERIOD_HNS);
+        let r = build_report(3, &probe, &tap, &out, PERIOD_HNS, Blocks::default());
         assert_eq!((r.repetitions, r.valid), (3, 3));
         for (a, b) in r.app_ms.iter().zip(app) {
             assert!((a - b).abs() < 1e-9);
@@ -767,6 +819,67 @@ mod tests {
         assert!((r.end_to_end_ms_median.unwrap() - 43.0).abs() < 1e-9);
         assert_eq!(r.confidence_db_min, 30.0);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // Without the tap's blocks' facts the sweeps aren't told apart: no undisturbed figure.
+        assert!(r.disturbances.is_empty() && r.clean_ms_median.is_none());
+    }
+
+    /// `n` blocks of the tap with the output at its 736-frame target, nothing happening.
+    fn quiet_blocks(n: usize) -> Vec<TapFacts> {
+        let output = crate::api::OutputFacts { fill: 736.0, target: 736, ..Default::default() };
+        vec![TapFacts { output, ..TapFacts::default() }; n]
+    }
+
+    /// With the tap's blocks' facts, each kept repetition is checked (disturbed.rs) in its own place in the tap's samples: a
+    /// late wake in sweep 2 (a mic glitch, a late answer, the queue 10 ms over for 2.8 s after it) disturbs it and sweep 3; the
+    /// undisturbed median and spread are the other three's, and the spread's warning says how much they share.
+    #[test]
+    fn disturbed_sweeps_are_told_apart() {
+        let probe: Vec<Option<f64>> = (0..5).map(|i| Some((1000.0 + 2000.0 * i as f64) * 1e4)).collect();
+        // Tap arrivals 10 ms after each probe start: sweep i's first sample at block 100 + 200 i (and a bit).
+        let tap: Vec<_> = (0..5).map(|i| arr(1010.0 + 2000.0 * i as f64, 40.0)).collect();
+        let app = [31.0, 39.5, 38.0, 31.5, 30.5];
+        let out: Vec<_> = (0..5).map(|i| arr(1010.0 + 2000.0 * i as f64 + app[i], 30.0)).collect();
+        let mut facts = quiet_blocks(1_200);
+        facts[320].thread.mic_glitches = 1;
+        facts[321].output.underrun = true;
+        facts[321].output.late = true;
+        facts[321].output.silence = 160;
+        for f in &mut facts[322..600] {
+            f.output.fill += 480.0;
+        }
+        let blocks = Blocks { facts: &facts, sweep_len: 48_000 };
+        let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, blocks);
+        assert_eq!(r.valid, 5);
+        let reps: Vec<u32> = r.disturbances.iter().map(|d| d.repetition).collect();
+        assert_eq!(reps, [1, 2, 3, 4, 5]);
+        let disturbed: Vec<(f64, u32)> = r.disturbed().map(|(a, d)| (a, d.repetition)).collect();
+        assert_eq!(disturbed, [(39.5, 2), (38.0, 3)]);
+        assert_eq!(r.disturbances[1].mic_glitches, 1);
+        assert_eq!(r.disturbances[1].output.late_answers, 1);
+        assert!((r.disturbances[2].queue_off_ms - 10.0).abs() < 1e-3, "{:?}", r.disturbances[2]);
+        assert!((r.app_ms_median - 31.5).abs() < 1e-9);
+        assert!((r.clean_ms_median.unwrap() - 31.0).abs() < 1e-9);
+        assert!((r.clean_ms_spread - 1.0).abs() < 1e-9);
+        assert!(
+            r.warnings.iter().any(|w| w.starts_with("The app latency varied by 9.0 ms between sweeps (1.0 ms between the 3 undisturbed);")),
+            "{:?}",
+            r.warnings
+        );
+
+        // Every sweep disturbed: no undisturbed figure, and the warning says so.
+        let mut facts = quiet_blocks(1_200);
+        for f in facts.iter_mut().step_by(100) {
+            f.thread.mic_glitches = 1;
+        }
+        let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, Blocks { facts: &facts, sweep_len: 48_000 });
+        assert_eq!(r.disturbed().count(), 5);
+        assert_eq!(r.clean_ms_median, None);
+        assert!(r.warnings.iter().any(|w| w.contains("between sweeps (every sweep disturbed);")), "{:?}", r.warnings);
+        // None disturbed: the undisturbed figure is all of them, and the warning as before.
+        let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, Blocks { facts: &quiet_blocks(1_200), sweep_len: 48_000 });
+        assert_eq!((r.disturbed().count(), r.disturbances.len()), (0, 5));
+        assert_eq!(r.clean_ms_median, Some(r.app_ms_median));
+        assert!(r.warnings.iter().any(|w| w.starts_with("The app latency varied by 9.0 ms between sweeps;")), "{:?}", r.warnings);
     }
 
     #[test]
@@ -776,7 +889,7 @@ mod tests {
         // Repetition 3's output arrival is a reflection 120 ms late.
         let app = [20.0, 20.0, 21.0, 140.0, 22.5];
         let out: Vec<_> = (0..5).map(|i| arr(2000.0 * i as f64 + 10.0 + app[i], 25.0)).collect();
-        let r = build_report(5, &probe, &tap, &out, PERIOD_HNS);
+        let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, Blocks::default());
         assert_eq!(r.valid, 3, "rep 1 is weak, rep 3 an outlier");
         assert_eq!(r.app_ms, vec![20.0, 21.0, 22.5]);
         assert!((r.app_ms_spread - 2.5).abs() < 1e-9);
@@ -790,7 +903,7 @@ mod tests {
         // The tap missed sweep 0; the output missed sweep 2.
         let tap = vec![arr(2010.0, 30.0), arr(4010.0, 30.0)];
         let out = vec![arr(30.0, 30.0), arr(2035.0, 30.0)];
-        let r = build_report(3, &probe, &tap, &out, PERIOD_HNS);
+        let r = build_report(3, &probe, &tap, &out, PERIOD_HNS, Blocks::default());
         assert_eq!(r.valid, 1);
         assert_eq!(r.app_ms, vec![25.0]);
         assert!((r.input_path_ms_median.unwrap() - 10.0).abs() < 1e-9);
@@ -801,7 +914,7 @@ mod tests {
         let probe = vec![None, None];
         let tap = vec![arr(10.0, 30.0), arr(2010.0, 30.0)];
         let out = vec![arr(40.0, 30.0), arr(2041.0, 30.0)];
-        let r = build_report(2, &probe, &tap, &out, PERIOD_HNS);
+        let r = build_report(2, &probe, &tap, &out, PERIOD_HNS, Blocks::default());
         assert_eq!(r.valid, 2);
         assert!((r.app_ms_median - 30.5).abs() < 1e-9);
         assert_eq!(r.input_path_ms_median, None);
@@ -817,7 +930,7 @@ mod tests {
 
     #[test]
     fn nothing_found() {
-        let r = build_report(5, &[None; 5], &[], &[], PERIOD_HNS);
+        let r = build_report(5, &[None; 5], &[], &[], PERIOD_HNS, Blocks::default());
         assert_eq!(r.valid, 0);
         assert!(r.app_ms_median.is_nan() && r.confidence_db_min.is_nan());
         assert_eq!(r.warnings.len(), 1);

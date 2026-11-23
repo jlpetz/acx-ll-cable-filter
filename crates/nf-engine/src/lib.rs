@@ -16,6 +16,7 @@
 //! - `audio`: the audio thread itself.
 //! - `control`: start/stop/apply/status, the device listener, user-worded errors (`errors`).
 //! - `latency_test`: the sweep tests (through the engine, and through a cable alone) and their analysis.
+//! - `disturbed`: which of the engine test's sweeps the engine's own events disturbed, from the tap's blocks' facts.
 //! - `recorder`: the chain recorder, what the chain was fed live and what it gave (`Engine::record_chain`).
 //! - `flight`: the flight recorder, the last seconds of the blocks' facts kept and written out when something goes wrong
 //!   (`Engine::arm_flight_recorder`).
@@ -33,6 +34,7 @@ mod control;
 mod convert;
 mod csv;
 mod devices;
+mod disturbed;
 mod echo_guard;
 mod effect;
 mod errors;

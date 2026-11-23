@@ -235,6 +235,17 @@ impl OutputEvents {
     /// samples)". The silence an exclusive device played and the zeros lengthen the output path and the drops shorten it, until
     /// the drift loop slips it back; a move of the path these don't show is the devices' own.
     pub fn text(&self) -> String {
+        let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let slips = match self.slips {
+            0 => "no slips".to_owned(),
+            n => format!("{} (net {:+} samples)", plural(n, "slip", "slips"), self.slip_net),
+        };
+        format!("{}; {slips}", self.corrections_text())
+    }
+
+    /// [`Self::text`] without the slips: "no underruns, zeros, drops or re-anchors", or the ones there were (the latency test's
+    /// disturbed sweeps name theirs so).
+    pub fn corrections_text(&self) -> String {
         let ms = |frames: u64| format!("{:.1}", frames as f64 * 1000.0 / f64::from(crate::SAMPLE_RATE));
         let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut parts = Vec::new();
@@ -259,12 +270,7 @@ impl OutputEvents {
         if self.reanchors > 0 {
             parts.push(plural(self.reanchors, "re-anchor", "re-anchors"));
         }
-        let corrections = if parts.is_empty() { "no underruns, zeros, drops or re-anchors".to_owned() } else { parts.join(", ") };
-        let slips = match self.slips {
-            0 => "no slips".to_owned(),
-            n => format!("{} (net {:+} samples)", plural(n, "slip", "slips"), self.slip_net),
-        };
-        format!("{corrections}; {slips}")
+        if parts.is_empty() { "no underruns, zeros, drops or re-anchors".to_owned() } else { parts.join(", ") }
     }
 }
 
@@ -868,6 +874,9 @@ mod tests {
         );
         let two = OutputEvents { underruns: 2, ..Default::default() };
         assert_eq!(two.text(), "2 underruns; no slips");
+        // The corrections alone, as a disturbed sweep names them.
+        assert_eq!(late.corrections_text(), "1 underrun (2.0 ms of silence played, a late answer)");
+        assert_eq!(none.corrections_text(), "no underruns, zeros, drops or re-anchors");
     }
 
     /// Taking the clip latch clears it, so the next reading shows only a new clip.

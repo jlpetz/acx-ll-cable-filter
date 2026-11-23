@@ -326,9 +326,10 @@ fn ms(value: Option<f64>) -> String {
     }
 }
 
-/// The latency test's result (gui.md section 6), one line each.
+/// The latency test's result (gui.md section 6), one line each. The sweeps the engine's own events disturbed are named, one
+/// line each, and the undisturbed ones' median and spread go beside the median of all (TODO 13).
 pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
-    let mut lines = Vec::with_capacity(8 + r.warnings.len());
+    let mut lines = Vec::with_capacity(10 + r.warnings.len() + r.disturbances.len());
     if r.valid == 0 {
         lines.push(format!("No valid repetitions (0 of {}): no arrival was found with enough confidence.", r.repetitions));
     } else {
@@ -339,6 +340,24 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
             r.valid,
             r.repetitions
         ));
+        let disturbed: Vec<_> = r.disturbed().collect();
+        if !disturbed.is_empty() {
+            lines.push(match r.clean_ms_median {
+                Some(m) => format!(
+                    "Undisturbed sweeps: median {} ms, spread {} ms ({} of {})",
+                    fixed(m, 1),
+                    fixed(r.clean_ms_spread, 1),
+                    r.app_ms.len() - disturbed.len(),
+                    r.app_ms.len()
+                ),
+                None => "Undisturbed sweeps: none, every sweep was disturbed (below): run the test again".to_owned(),
+            });
+            lines.extend(
+                disturbed.iter().map(|(app, d)| format!("Disturbed: sweep {} ({} ms): {}", d.repetition, fixed(*app, 1), d.text())),
+            );
+        } else if !r.disturbances.is_empty() {
+            lines.push("Disturbed sweeps: none".to_owned());
+        }
     }
     lines.push(format!("Input path: {}", ms(r.input_path_ms_median)));
     lines.push(format!("End to end: {}", ms(r.end_to_end_ms_median)));
@@ -349,9 +368,12 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     if let Some(b) = &r.budget {
         lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
     }
-    if let Some(e) = &r.output {
-        // What the output side did meanwhile (TODO 9): a spread these don't explain is the devices' own.
-        lines.push(format!("Output during the test: {}", e.text()));
+    // What the mic and the output did meanwhile (TODO 9): a spread these don't explain is the devices' own.
+    match (r.mic_glitches, &r.output) {
+        (Some(n), Some(e)) => lines.push(format!("During the test: {}; output: {}", nf_engine::mic_glitch_text(n), e.text())),
+        (None, Some(e)) => lines.push(format!("Output during the test: {}", e.text())),
+        (Some(n), None) => lines.push(format!("During the test: {}", nf_engine::mic_glitch_text(n))),
+        (None, None) => {}
     }
     if r.valid > 0 {
         lines.push(format!("Confidence: {} dB (lowest)", fixed(r.confidence_db_min, 1)));
@@ -625,7 +647,9 @@ mod tests {
 
     #[test]
     fn the_report_lines() {
-        let r = LatencyReport {
+        let corrections = nf_engine::OutputEvents { underruns: 1, deficits: 1, zero_frames: 480, ..Default::default() };
+        let sweep = |repetition| nf_engine::SweepDisturbance { repetition, ..Default::default() };
+        let mut r = LatencyReport {
             repetitions: 5,
             valid: 4,
             app_ms: vec![12.0, 12.4, 12.8, 12.2],
@@ -643,6 +667,10 @@ mod tests {
                 slip_net: -2,
                 ..Default::default()
             }),
+            mic_glitches: Some(2),
+            disturbances: vec![sweep(1), nf_engine::SweepDisturbance { output: corrections, ..sweep(2) }, sweep(4), sweep(5)],
+            clean_ms_median: Some(12.2),
+            clean_ms_spread: 0.8,
             chain_ms: 10.0,
             confidence_db_min: 18.04,
             conditions: "mic 10 ms, RAW".to_owned(),
@@ -650,16 +678,30 @@ mod tests {
         };
         assert_eq!(report(&r), [
             "App (input tap → cable out): median 12.3 ms, spread 0.8 ms (4 of 5 valid)",
+            "Undisturbed sweeps: median 12.2 ms, spread 0.8 ms (3 of 4)",
+            "Disturbed: sweep 2 (12.4 ms): output: 1 underrun, 1 deficit (10.0 ms of zeros)",
             "Input path: 3.2 ms",
             "End to end: —",
             "Chain: 10.0 ms",
             "Live readout during the test: 12.1 ms",
             "Its budget (means over the test): mic 10.5 + wait 0.0 + output queue 22.0 + render 5.0 ms, chain 10.0 ms on top",
-            "Output during the test: 1 underrun, 1 deficit (10.0 ms of zeros); 4 slips (net -2 samples)",
+            "During the test: 2 mic glitches; output: 1 underrun, 1 deficit (10.0 ms of zeros); 4 slips (net -2 samples)",
             "Confidence: 18.0 dB (lowest)",
             "Warning: One repetition was too quiet",
             "Conditions: mic 10 ms, RAW",
         ]);
+        // Every sweep disturbed: no clean figure, and the window says so; none disturbed: one line says that.
+        for d in &mut r.disturbances {
+            d.mic_glitches = 1;
+        }
+        r.clean_ms_median = None;
+        let lines = report(&r);
+        assert_eq!(lines[1], "Undisturbed sweeps: none, every sweep was disturbed (below): run the test again");
+        assert_eq!(lines[2], "Disturbed: sweep 1 (12.0 ms): 1 mic glitch");
+        assert_eq!(lines[3], "Disturbed: sweep 2 (12.4 ms): 1 mic glitch; output: 1 underrun, 1 deficit (10.0 ms of zeros)");
+        r.disturbances = vec![sweep(1); 4];
+        r.clean_ms_median = Some(12.3);
+        assert_eq!(report(&r)[1], "Disturbed sweeps: none");
         let none = LatencyReport { repetitions: 5, ..LatencyReport::default() };
         let lines = report(&none);
         assert!(lines[0].starts_with("No valid repetitions (0 of 5)"));
