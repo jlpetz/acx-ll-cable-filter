@@ -141,6 +141,9 @@ pub struct LatencyArgs {
     /// `--settle`: wait for the adaptive output target to come down before the sweeps (up to `run::ADAPTIVE_WAIT_S`). Without
     /// it the test runs at once, at the target's fixed start.
     pub settle: bool,
+    /// `--save-blocks FILE`: the chain recorder, armed before the engine starts, writes every block's facts from the first
+    /// (`chain_blocks.csv`'s columns) to FILE: the readout's inputs beside the sweeps' result (TODO 13).
+    pub save_blocks: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -583,6 +586,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     let mut engine = EngineArgs::default();
     let (mut probe, mut capture, mut mode, mut reps, mut through_model, mut cable_only, mut settle) =
         (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false, false, false);
+    let mut save_blocks = None;
     // The first option given that only the test through the filter uses
     let mut filter_option: Option<&str> = None;
     while let Some(arg) = p.next() {
@@ -610,6 +614,10 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
                     filter_option.get_or_insert(flag);
                 }
                 "--cable-only" => cable_only = switch(flag, inline)?,
+                "--save-blocks" => {
+                    save_blocks = Some(std::path::PathBuf::from(text(flag, p.value(flag, inline)?)?));
+                    filter_option.get_or_insert(flag);
+                }
                 "--settle" => {
                     settle = switch(flag, inline)?;
                     filter_option.get_or_insert(flag);
@@ -637,7 +645,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
             "'latency' needs --capture DEV: the recording device that carries the filter's output"
         })
     })?;
-    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only, settle })
+    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only, settle, save_blocks })
 }
 
 fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
@@ -949,8 +957,9 @@ Usage:
                                  clean). Either way it ends with a summary (dropouts, latency, drift,
                                  and the flight recorder's dumps)
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
-                       [--through-model] [--settle] [OPTIONS]
-                                 Measure the latency with sweeps and print the report
+                       [--through-model] [--settle] [--save-blocks FILE] [OPTIONS]
+                                 Measure the latency with sweeps and print the report;
+                                 --save-blocks writes every block's facts from the start (CSV)
   noise-filter latency --cable-only --probe DEV --capture DEV [--reps N]
                                  The same sweeps through one cable alone, without the filter
   noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
@@ -1298,8 +1307,19 @@ mod tests {
         assert_eq!(err(&["run", "--settle"]), "'run' has no option '--settle'");
         assert_eq!(err(&["quality", "--probe", "a", "--capture", "b", "--settle=1"]), "--settle takes no value");
         let help = help_text();
-        assert!(help.contains("[--through-model] [--settle] [OPTIONS]") && help.contains("[--settle] [OPTIONS]"));
+        assert!(help.contains("[--through-model] [--settle] [--save-blocks FILE] [OPTIONS]") && help.contains("[--settle] [OPTIONS]"));
         assert!(help.contains(&format!("({ADAPTIVE_WAIT_S} s at most)")) && help.contains("measure at once"));
+    }
+
+    /// `latency --save-blocks FILE` (TODO 13): the engine test's block facts from the first block; not with --cable-only.
+    #[test]
+    fn save_blocks_takes_a_file_for_the_engine_test_only() {
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--save-blocks", "blocks.csv"]) else { panic!() };
+        assert_eq!(l.save_blocks, Some(std::path::PathBuf::from("blocks.csv")));
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert_eq!(l.save_blocks, None);
+        let e = err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--save-blocks", "x.csv"]);
+        assert_eq!(e.rsplit(": ").next(), Some("drop --save-blocks"));
     }
 
     #[test]

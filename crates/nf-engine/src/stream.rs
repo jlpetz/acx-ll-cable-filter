@@ -20,6 +20,7 @@ use wasapi::{
 use windows::Win32::Foundation::{HANDLE, PROPERTYKEY};
 use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToBoolean};
+use windows::Win32::System::Threading::SetEvent;
 use windows::core::GUID;
 
 use crate::api::StreamInfo;
@@ -301,6 +302,17 @@ impl CaptureStream {
             Some(e) => e.wait_for_event(ms).is_ok(),
             None => false,
         }
+    }
+
+    /// [`Self::wait`], then the event set again when it fired, so the next wait returns at once: for a start that waits for
+    /// the first packet before the audio thread's loop reads it (audio.rs, `start_streams`).
+    pub(crate) fn wait_keeping_event(&self, ms: u32) -> bool {
+        let fired = self.wait(ms);
+        if fired && let Some(e) = &self.event {
+            // SAFETY: the stream's own event handle, which lives as long as the stream, and so for the call.
+            let _ = unsafe { SetEvent(e.as_handle()) };
+        }
+        fired
     }
 
     /// The stream's event, for a wait on it and the output's together; `None` for a polled stream. Valid while it lives.

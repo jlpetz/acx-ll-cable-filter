@@ -635,9 +635,20 @@ pub(crate) fn warm_up(chain: &mut Chain) {
     }
 }
 
-/// Keep-alive first (so the loopback has data), then loopback, output and mic last. The reference
-/// streams are optional, as they are mid-run (wasapi/B): if they won't start, they're dropped with
-/// a warning and the filter runs without them.
+/// How long a shared output's start waits for the mic's first packet (ms): a few of its periods. A mic that sends nothing by
+/// then doesn't hold the start up any longer; the run's stall watch takes it from there.
+const FIRST_PACKET_WAIT_MS: u32 = 100;
+
+/// Keep-alive first (so the loopback has data), then loopback, then the output and the mic. The reference streams are
+/// optional, as they are mid-run (wasapi/B): if they won't start, they're dropped with a warning and the filter runs without
+/// them.
+///
+/// A shared output starts once the mic has its first packet (TODO 13, 2026-11-23). Started before the mic, its prefill
+/// drained while the mic's first packet was on its way (14-16 ms on the dev box's cables), and the engine, reading a period
+/// ahead, ran it dry: it played up to a period of silence the pipeline never wrote, so every later frame played that much
+/// after the frames written said, and the readout read low by it for the whole run (7.7-8.1 ms in 7 runs of 8; the run whose
+/// first packet came 5 ms in read right). The sound's own latency didn't move: the queue's target holds it. An exclusive
+/// output counts its own silence (exclusive.rs) and wants its first event answered within a period: it starts as before.
 fn start_streams(s: &mut Session, warnings: &mut Vec<Warning>) -> Result<(), StartFailure> {
     if let Err((role, hr)) = start_reference(s.ka.as_mut(), s.lb.as_ref()) {
         if let Some(ka) = s.ka.take() {
@@ -648,8 +659,15 @@ fn start_streams(s: &mut Session, warnings: &mut Vec<Warning>) -> Result<(), Sta
         }
         warnings.push(Warning::ReferenceUnavailable(StartFailure::Open { role, hr }));
     }
-    s.out.start().map_err(|hr| StartFailure::Open { role: StreamRole::Output, hr })?;
-    s.mic.start().map_err(|hr| StartFailure::Open { role: StreamRole::Mic, hr })?;
+    if s.out.is_exclusive() {
+        s.out.start().map_err(|hr| StartFailure::Open { role: StreamRole::Output, hr })?;
+        s.mic.start().map_err(|hr| StartFailure::Open { role: StreamRole::Mic, hr })?;
+    } else {
+        s.mic.start().map_err(|hr| StartFailure::Open { role: StreamRole::Mic, hr })?;
+        // The event stays set: the loop's first wait reads that packet at once.
+        let _ = s.mic.wait_keeping_event(FIRST_PACKET_WAIT_MS);
+        s.out.start().map_err(|hr| StartFailure::Open { role: StreamRole::Output, hr })?;
+    }
     Ok(())
 }
 

@@ -29,12 +29,35 @@ pub fn latency(args: &LatencyArgs) -> Result<(), Failure> {
     let cfg = config::engine_config(&args.engine, || Ok(devices.clone()))?;
     let probe = resolve_device(&devices, &args.probe, Flow::Render, "--probe").map_err(Failure::error)?;
     let capture = resolve_device(&devices, &args.capture, Flow::Capture, "--capture").map_err(Failure::error)?;
-    let engine = super::run::start(&cfg)?;
+    let engine = nf_engine::Engine::new();
+    // Armed before the start, the chain recorder holds every block from the first: the readout's inputs at start-up.
+    let recorder = match &args.save_blocks {
+        Some(_) => {
+            let limit = BLOCKS_LIMIT_S + if args.settle { 320.0 } else { 0.0 } + 3.0 * f64::from(args.repetitions);
+            Some(engine.record_chain(limit).map_err(|e| Failure::error(format!("Couldn't arm the chain recorder: {e}")))?)
+        }
+        None => None,
+    };
+    super::run::start_engine(&engine, &cfg)?;
     let result = measure(&engine, &cfg, args, probe, capture);
+    let chain = recorder.map(nf_engine::ChainRecorder::stop);
     engine.stop();
     console::finished();
+    if let (Some(path), Some(chain)) = (&args.save_blocks, &chain) {
+        std::fs::write(path, nf_engine::chain_blocks_csv(&chain.blocks))
+            .map_err(|e| Failure::error(format!("Couldn't write {}: {e}", path.display())))?;
+        say!(
+            "Wrote {} blocks' facts to {}{}.",
+            chain.blocks.len(),
+            path.display(),
+            if chain.truncated { " (cut at its limit)" } else { "" }
+        );
+    }
     result
 }
+
+/// `--save-blocks`: the recording's length past the sweeps' own (the start's settling and the analysis).
+const BLOCKS_LIMIT_S: f64 = 60.0;
 
 fn measure(
     engine: &nf_engine::Engine, cfg: &nf_engine::EngineConfig, args: &LatencyArgs, probe: String, capture: String,

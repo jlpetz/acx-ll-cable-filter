@@ -754,14 +754,8 @@ pub fn changes(kind: &str, old: &[String], new: &[String]) -> Vec<String> {
     added.chain(cleared).collect()
 }
 
-/// Starts an engine with `cfg` (Ctrl+C armed first) and prints what it opened.
-pub fn start(cfg: &EngineConfig) -> Result<nf_engine::Engine, Failure> {
-    let engine = nf_engine::Engine::new();
-    start_engine(&engine, cfg)?;
-    Ok(engine)
-}
-
-/// [`start`] on an engine of the caller's (one with the chain recorder armed, say).
+/// Starts `engine` with `cfg` (Ctrl+C armed first) and prints what it opened: the caller makes the engine, so it can arm the
+/// chain recorder first.
 pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig) -> Result<(), Failure> {
     console::handle_ctrl_c();
     say!("{}", describe_config(cfg));
