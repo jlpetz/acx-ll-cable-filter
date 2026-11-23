@@ -1,7 +1,7 @@
 # Build output, at the root and wherever a crate was built on its own
 target/
-.claude/settings.local.json
-.claude/*.lock
+# Claude Code's local state: its settings, locks and agents' worktrees
+.claude/
 # No audio in the repo, ever (the owner, 2026-11-01): test audio is fetched into a local cache, see
 # doc/todo/14-test-audio-catalogue-2026-11-01.md
 *.wav
