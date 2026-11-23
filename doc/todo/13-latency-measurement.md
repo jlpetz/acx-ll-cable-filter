@@ -182,14 +182,23 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
   65-67 ms throughout. So the shared output's readout carries a per-run offset, early by up to about a period: not the
   cable, not the chain (exclusive output leaves about 2 ms). So the 2026-11-01 gap was this offset plus VB-CABLE's own
   run-to-run wander (its cable alone read 60-62 ms then, 50.7 now), which turned its sign.
-- Our guess, not checked: the shared stream's device position against the frames the pipeline wrote (`index` =
-  `written_total` + pending) starts by a varying amount: silence the engine played before the prefill reached it, or the
-  phase of the engine's 10 ms period at the start. The exclusive path takes its inserted silence off the clock
-  (exclusive.rs); the shared path can't see it.
-- Exclusive output is the default (2026-11-02), so the readout users see is within about 2 ms there; the shared fallback
-  can read up to a period low.
-- Next: log the shared output's first clock readings beside `written_total` across starts, to find where the offset comes
-  from; then the 2 ms left with exclusive output (its own cable-alone figure, which `--cable-only` can't open yet).
+- **Found (2026-11-23, `latency --save-blocks FILE`: every block's facts from the first, the chain recorder armed before
+  the start; `nf-scratch/latency/trials.sh`).** The engine started the shared output before the mic. Its 22 ms prefill
+  drained while the mic's first packet was on its way, and when that came 14-16 ms in, the output was already dry (its
+  padding 0 at the first block): the engine, reading a period ahead, had played silence the pipeline never wrote. The
+  device's clock counts that silence and the pipeline's frame count doesn't, so every later frame played that much after
+  `play_time_hns` said, for the whole run. The proof, 8 runs: the readout's gap against the sweeps plus the steady frames
+  the device held taken but unplayed (index - pending - padding - clock position) came to the same 706 +/- 40 frames in
+  every run, 7 with a gap of 7.7-8.1 ms (369-389 frames) and the one whose first packet came 5 ms in (padding 96, never
+  dry) with 0.10 ms. The clock's origin (QPC less position over the rate) held within 0.5 ms from the first block to the
+  thousandth: no jump later on. The sound's latency didn't move with it (the sweeps 65.7-68.7 ms, the clean run's 67.1):
+  the queue's target holds it.
+- **Fixed (0d319f1):** a shared output starts once the mic has its first packet (audio.rs, `start_streams`; a wait of 100
+  ms at most, the mic's event set again for the loop). 8 runs after it: the gap -0.36 to +0.47 ms, the output never dry at
+  the first block (padding 96 or 576). An exclusive output starts as before: it counts its own silence.
+- Left: the sweeps themselves now spread 60.1-66.4 ms from run to run (65.7-68.7 before); the readout's budget, now right,
+  can say which part moves (the cables' bursty mic delivery, the engine's phase). And the 2 ms with exclusive output, set
+  against the shared cable-alone figure (`--cable-only` can't open an exclusive probe yet).
 
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the
