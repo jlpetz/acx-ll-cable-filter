@@ -9,10 +9,11 @@ Usage:
     python -I tools/privacy_check.py --all [REV ...]         every commit and file in the history (default: all refs)
 
 Each commit's author and committer (email and name), its message, and every file version it adds or changes and its path
-are checked, each read whole by its encoding; an annotated tag pushed, its name, tagger and message too; and a push's ref
-names, the remote's and the local one (a deletion's only when the remote hasn't the ref). --all checks every commit,
-annotated tag, file version and ref name (with REVs, the names of the refs they name) and every path of every commit's
-tree. Exit 0: clean; 1: findings (listed); 2: a usage or git error.
+are checked, each read whole by its encoding; an annotated tag pushed, its name, tagger and message too; a tree or file a
+pushed ref names directly (a tag of one), every path and file under it; and a push's ref names, the remote's and the local
+one (a deletion's only when the remote hasn't the ref). --all checks every commit, annotated tag, file version and ref name
+(with REVs, the names of the refs they name) and every path of every commit's tree and of every tree a ref names. Exit 0:
+clean; 1: findings (listed); 2: a usage or git error.
 
 The deny list, `.git/info/privacy-deny`, holds private strings (one per line, case-insensitive; `#` starts a comment): the
 owner's email and domain, host and account names. It stays in .git/, so it is never committed or pushed: this script, which
@@ -132,6 +133,22 @@ class Checker:
             self.seen_paths.add(path)
             self.line(f"{where} path", path)
 
+    def tree(self, sha, seen_blobs=None):
+        """A tree a ref names directly (a tag of a tree, in no commit's history): the path of every file and folder under it,
+        and with seen_blobs each file's contents (--all reads them in its object pass)."""
+        where = f"tree {sha[:10]}"
+        # -z: "<mode> <type> <id>", a tab and the path, each NUL-terminated; -t lists the folders too, and --full-tree keeps a
+        # run from a subfolder from listing only that folder.
+        for entry in git("ls-tree", "-r", "-t", "-z", "--full-tree", sha).split("\0"):
+            meta, _, path = entry.partition("\t")
+            if not path:
+                continue
+            self.path(where, path)
+            _, kind, obj = meta.split()
+            if kind == "blob" and seen_blobs is not None and obj not in seen_blobs:
+                seen_blobs.add(obj)
+                self.blob(obj, f"{where} {path}")
+
     def commit_diff(self, commit, seen_blobs):
         """A commit's identities and message, and every file version it adds or changes, read whole and by its encoding
         (UTF-16 with a BOM, as the driver's INF is, or UTF-8): a diff's lines would show UTF-16 as bytes."""
@@ -174,7 +191,8 @@ class Checker:
             print(f"  {where}: {name}: {hit!r}\n      {line.strip()[:160]}")
         if len(self.findings) > 200:
             print(f"  ... and {len(self.findings) - 200} more")
-        print("Fix the commits (amend, or rebase and edit), or list a false positive in tools/privacy-allow.txt.")
+        print("Fix the commits (amend, or rebase and edit) or the refs (rename, or retag), or list a false positive in "
+              "tools/privacy-allow.txt.")
         return 1
 
 
@@ -184,10 +202,11 @@ def commits_in(rev_range):
 
 def history_paths(revs):
     """(commit, path) for each file a commit of REVs adds or changes against its first parent (a root commit: all its files),
-    newest first: so every path of every commit's tree, a merge's too (a path a commit shares with its first parent is the
-    parent's, back to the commit that brought it)."""
+    oldest first, parents before children: so every path of every commit's tree, a merge's too (a path a commit shares with its
+    first parent is the parent's, back to the commit that brought it), each first under the commit that added it, the one a
+    rewrite starts from (as a push names it)."""
     fields = git("log", "--format=%H", "--raw", "-z", "--no-renames", "--no-relative", "--root", "--diff-merges=first-parent",
-                 "--no-show-signature", "--no-color", *revs).split("\0")
+                 "--reverse", "--topo-order", "--no-show-signature", "--no-color", *revs).split("\0")
     # -z: each commit's id, then per file ":<old mode> <new mode> <old sha> <new sha> <status>" and its path, each NUL-terminated
     # (a commit's first after a newline). A file's metadata starts with ":", an id never.
     commit, i = "", 0
@@ -229,10 +248,19 @@ def main(argv):
             if local_ref != remote_ref:
                 c.line("local ref name", local_ref)
             # An annotated tag (or a tag of one): its own text, then what it points at.
-            while git("cat-file", "-t", local_sha).strip() == "tag":
+            kind = git("cat-file", "-t", local_sha).strip()
+            while kind == "tag":
                 local_sha = c.tag(local_sha)
-            if git("cat-file", "-t", local_sha).strip() != "commit":
-                continue  # a tag of a tree or blob: rare, and no history to walk
+                kind = git("cat-file", "-t", local_sha).strip()
+            # A tag of a tree or file (rare): no history to walk, but it publishes every path and file under it.
+            if kind == "tree":
+                c.tree(local_sha, seen_blobs)
+                continue
+            if kind == "blob":
+                if local_sha not in seen_blobs:
+                    seen_blobs.add(local_sha)
+                    c.blob(local_sha, f"blob {local_sha[:10]}")
+                continue
             if remote_sha == ZERO:
                 # A new branch: what the destination doesn't have yet, by its own remote-tracking branches (none when pushing
                 # to a URL, or to a remote never fetched: then every commit is checked). Another remote's commits count as
@@ -258,9 +286,17 @@ def main(argv):
         # whose contents another path also holds (or a folder whose tree another also is) never appears there by its own path.
         for commit, path in history_paths(revs):
             c.path(commit[:10], path)
+        # And every path of a tree a REV names directly (a tag of a tree, in no commit's), by ls-tree, for the same reason. The
+        # REVs' objects (--all: every ref's, as rev-parse lists them; not a negative's), each peeled through its tags.
+        tips = [t for t in git("rev-parse", "--revs-only", *revs).splitlines() if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", t)]
+        for line in git("cat-file", "--batch-check", stdin="".join(f"{t}^{{}}\n" for t in tips).encode()).splitlines():
+            sha, kind = (line.split() + [""])[:2]
+            if kind == "tree":
+                c.tree(sha)
         # Then each object once (rev-list --objects lists none twice): a commit's identities and message, an annotated tag's
-        # text, a file's contents. A tree's or file's path is checked already, unless it's in a tree a ref names directly
-        # (a tag of a tree), in no commit's; a tag's "path" is its ref's name, checked above.
+        # text, a file's contents. A tree's or file's path is checked above, except the folder's part of one under a folder a
+        # REV names (HEAD:dir: rev-list names its files dir/a.txt, ls-tree a.txt), so the path rev-list gives is checked again
+        # (only the first it meets, as above: a rare REV); a tag's "path" is its ref's name, checked above.
         for line in git("rev-list", "--objects", *revs).splitlines():
             sha, _, path = line.partition(" ")
             kind = git("cat-file", "-t", sha).strip()

@@ -1,6 +1,7 @@
 """Tests for tools/privacy_check.py on a throwaway repository: what a push or --all must refuse (Astra's recheck,
 2026-11-23: a file's path, a commit's display name, an annotated tag's tagger and message; Astra's review, 2026-11-24: a
-branch's or lightweight tag's name, and a path whose contents another path also holds), and a clean one passing.
+branch's or lightweight tag's name, a path whose contents another path also holds, and a tree or file a tag names, its paths
+and contents), and a clean one passing.
 
 The private-looking strings are built at run time, so this file never holds one (the check reads it too).
 
@@ -22,8 +23,8 @@ DENIED = "zq" + "secretname"
 ZERO = "0" * 40
 
 
-def git(repo, *args, env=None):
-    r = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, env=env)
+def git(repo, *args, env=None, stdin=None):
+    r = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, env=env, input=stdin)
     if r.returncode != 0:
         raise AssertionError(f"git {' '.join(args)}: {r.stderr}")
     return r.stdout.strip()
@@ -65,14 +66,28 @@ class PrivacyCheck(unittest.TestCase):
     def test_clean_history_passes(self):
         self.assertEqual(self.check("--all"), (0, "privacy check: clean\n"))
 
+    def tree(self, entries):
+        """A tree object from (name, text) pairs, a text a file and a list a folder; no commit holds it. mktree -z: a text
+        stdin on Windows writes a newline as CR LF, and mktree would keep the CR in the name."""
+        lines = []
+        for name, value in entries:
+            if isinstance(value, list):
+                lines.append(f"040000 tree {self.tree(value)}\t{name}\0")
+            else:
+                lines.append(f"100644 blob {git(self.repo, 'hash-object', '-w', '--stdin', stdin=value)}\t{name}\0")
+        return git(self.repo, "mktree", "-z", stdin="".join(lines))
+
     def test_a_path_is_checked(self):
         sha = self.commit(f"logs/{HOST}.txt", "nothing here\n", "a log")
-        code, out = self.push(sha)
+        changed = self.commit(f"logs/{HOST}.txt", "something else\n", "the log changed")
+        code, out = self.push(changed)
         self.assertEqual(code, 1)
         self.assertIn(f"{sha[:10]} path: internal or cloud host name", out)
+        # --all names the commit that added the path, as a push does (where a rewrite starts), not the newest to change it.
         code, out = self.check("--all")
         self.assertEqual(code, 1)
         self.assertIn(f"{sha[:10]} path: internal or cloud host name", out)
+        self.assertNotIn(changed[:10], out)
 
     def test_a_path_whose_contents_another_holds_is_checked(self):
         # rev-list --objects names each object once, by the first path it meets ("a.txt", "docs"): never by these two.
@@ -127,6 +142,39 @@ class PrivacyCheck(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ref name: internal or cloud host name", out)
         self.assertEqual(self.check("--all", "--tags")[0], 1)
+
+    def test_a_tagged_tree_is_checked(self):
+        # Two trees no commit holds, sharing a file: rev-list --objects names it once, as plain.txt (a-tree's, met first).
+        plain = self.tree([("plain.txt", "same\n")])
+        private = self.tree([("docs", [(f"{HOST}.txt", "same\n")])])
+        git(self.repo, "tag", "a-tree", plain)
+        git(self.repo, "tag", "b-tree", private)
+        code, out = self.check("--all")
+        self.assertEqual(code, 1)
+        self.assertIn(f"tree {private[:10]} path: internal or cloud host name", out)
+        self.assertEqual(out.count("internal or cloud host name"), 1)
+        self.assertEqual(self.check("--all", "a-tree")[0], 0)
+        self.assertEqual(self.check("--all", "b-tree")[0], 1)
+        git(self.repo, "tag", "-a", "c-tree", "-m", "a tree", private)  # an annotated tag of it, peeled
+        self.assertEqual(self.check("--all", "a-tree", "c-tree")[0], 1)
+
+    def test_a_pushed_tag_of_a_tree_or_file_is_checked(self):
+        # A tag of a tree publishes its paths and files, a lightweight tag's or an annotated one's; a tag of a file, its contents.
+        tree = self.tree([("logs", [(f"{HOST}.txt", f"mail {EMAIL}\n")])])
+        for tag in (tree, None):
+            if tag is None:
+                git(self.repo, "tag", "-a", "t", "-m", "a tree", tree)
+                tag = git(self.repo, "rev-parse", "refs/tags/t")
+                self.assertNotEqual(tag, tree)
+            code, out = self.push(tag, ref="refs/tags/t")
+            self.assertEqual(code, 1)
+            self.assertIn(f"tree {tree[:10]} path: internal or cloud host name", out)
+            self.assertIn(f"tree {tree[:10]} logs/{HOST}.txt:1: email address", out)
+        blob = git(self.repo, "hash-object", "-w", "--stdin", stdin=f"built on {HOST}\n")
+        code, out = self.push(blob, ref="refs/tags/f")
+        self.assertEqual(code, 1)
+        self.assertIn(f"blob {blob[:10]}:1: internal or cloud host name", out)
+        self.assertEqual(self.push(self.tree([("docs", [("a.txt", "a\n")])]), ref="refs/tags/a"), (0, "privacy check: clean\n"))
 
     def test_a_display_name_is_checked(self):
         sha = self.commit("a.txt", "a\n", "a change", name=f"Someone {DENIED}")
