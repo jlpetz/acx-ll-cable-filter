@@ -241,8 +241,23 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
   a packet high (about 10 ms at 480 frames: Astra's 20.14 ms readout against 9.91 measured); its output period shows 0
   because the route sets none; and its fill target is exactly one reader packet, with no block, margin or adaptive term
   and nothing raising it after an underrun. Proposed (ours, for the owner): fix both here, as the latency report's.
-- Next: the direct route's readout and target (above); why the thread was held (above); then the exclusive figure against
-  an exclusive cable-only probe.
+- **The direct route, fixed (93fc2f6, 7c14a11; the owner, 2026-11-24: ours, on our review of 09e5520; a workflow,
+  reviewed).** The readout's headline is the sample time (the recorder's stamp, what the sweep measures), with the delivery
+  time (the driver's pass handing the packet over) beside it; the reader's period is printed (it read 0.00 ms); no fixed
+  offset anywhere. The fill target stays one reader packet while it runs clean, gains bounded headroom when the driver
+  reports a real underrun and loses it again after clean running (three failed lowerings keep it; ours). Live under
+  Verifier (p66, `nf-scratch/latency/direct-1124-170354`, VB-CABLE A as the mic, 3 runs a period): the sweep against the
+  readout plus the chain's 10 ms, 23.5-24.5 against 23.9-25.0 ms at a 10 ms reader, 18.2-18.4 against 18.5-18.9 at 2.67 ms
+  (128 frames), 18.1-18.7 against about 19.4 at 3.33 ms (160): within 0.7 ms everywhere, where it read a packet high
+  before (Astra's 20.14 ms readout against 9.91). The delivery figure moves with the phase, within a packet. Two runs'
+  re-anchors were named as disturbed sweeps. Left (ours): the sample time comes from the last pass's QPC, taken after its
+  deadline, so it reads the pass lateness late (0.15-0.3 ms); exact needs the pass's deadline in the ring header (a
+  version bump by the owner's rule).
+- **A lead on the late wake (2026-11-24, from the STATS stall's trace):** under Driver Verifier any of our driver's spin
+  locks taken from PASSIVE_LEVEL can stall its caller for milliseconds (Force IRQL checking's memory trim; TODO 19's spike
+  file). The 12.7-15.8 ms holds were on runs with the exclusive output on our driver: if that wake made such a call into
+  AudioCodec.sys, they are a dev-box artefact. To check (ours): a kernel trace across a latency run.
+- Next: that check; then the exclusive figure against an exclusive cable-only probe.
 
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the

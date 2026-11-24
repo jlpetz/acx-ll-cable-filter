@@ -186,3 +186,9 @@ Windows PowerShell without its `Cert:` drive.
 
 Release x64 favours speed: both projects set `FavorSizeOrSpeed` to `Speed`, so cl.exe gets `/Ox /Ot` (the WDK's default
 was `/Ox /Os`). The .sys grew from 54,272 to 57,856 bytes (2026-11-20).
+
+Under Driver Verifier (the dev box keeps `/standard` on), any of the driver's spin locks taken from PASSIVE_LEVEL can stall
+its caller for milliseconds: Force IRQL checking first trims all pageable system memory on such a raise, up to about 100 ms
+of it a second (a kernel trace, 2026-11-24, doc/todo/19-spike-2026-11-20.md). That's STATS, ATTACH, detach, stream open
+and close, Run and Pause; the per-packet path runs in the timer DPC and isn't affected. So a tool reading STATS keeps it off
+its capture thread (nf-vmic-test verify does), and handoff or stream-start timings taken under Verifier run long.
