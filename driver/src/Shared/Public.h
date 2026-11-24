@@ -148,6 +148,8 @@ typedef struct _CODEC_DEVICE_CONTEXT {
     WDF_TRI_STATE   ExcludeD3Cold;
     LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
     NF_CABLE        Cable;                  // noise-filter (TODO 19, the per-cable design): this device's cable (Cable.h)
+    BOOLEAN         StartCounted;           // noise-filter (TODO 19, the boot crash breaker, Device.cpp): this binding's start
+                                            // is counted in the hardware key and not cleared yet. PASSIVE_LEVEL only.
 } CODEC_DEVICE_CONTEXT, * PCODEC_DEVICE_CONTEXT;
 
 //
@@ -164,6 +166,7 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE     Codec_EvtDevicePrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE     Codec_EvtDeviceReleaseHardware;
 EVT_WDF_DEVICE_D0_ENTRY             Codec_EvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT              Codec_EvtDeviceD0Exit;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT Codec_EvtDeviceSelfManagedIoInit;     // noise-filter (TODO 19, the boot crash breaker)
 EVT_WDF_DEVICE_CONTEXT_CLEANUP      Codec_EvtDeviceContextCleanup;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CODEC_DEVICE_CONTEXT, GetCodecDeviceContext)

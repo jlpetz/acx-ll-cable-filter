@@ -182,6 +182,16 @@ typedef struct _NF_APP_RING {
 #define NF_CABLE_INSTANCE_ID_CHARS      200u        // MAX_DEVICE_ID_LEN (cfgmgr32.h), its NUL included
 #define NF_CABLE_NAME_CHARS             64u         // \DosDevices\AcxLlCable_<id> is 59 characters
 
+//
+// The boot crash breaker (Device.cpp; ours, for the owner's go, removable): a device's start attempts that haven't completed, a
+// REG_DWORD in its hardware key (Device Parameters; absent is 0), which the setup tool deletes when it installs a cable; and
+// the status AddDevice refuses a device with once two starts in a row never completed (DEVPKEY_Device_ProblemStatus beside
+// code 31: a customer-defined NTSTATUS, facility 0xAC).
+//
+#define NF_CABLE_START_ATTEMPTS_VALUE   L"NfStartAttempts"
+#define NF_CABLE_START_ATTEMPTS_LIMIT   2u
+#define NF_STATUS_START_BREAKER         ((NTSTATUS)0xE0AC0001L)
+
 // The microphones a device makes (Device.cpp, NfReadMicrophones; the INF's NfMicrophones): Microphone0 and Microphone1.
 #define NF_MIC_LOW_LATENCY              0x1
 #define NF_MIC_CALL                     0x2

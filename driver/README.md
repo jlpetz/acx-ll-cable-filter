@@ -67,6 +67,15 @@ other's, and its counters start at zero with each binding (AddDevice). Only the 
 friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
 circuit's component ID is the identity XOR the sample's constant.
 
+**The boot crash breaker** (ours, for the owner's go; `Device.cpp` says what it can't catch). With Driver Verifier on at
+boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
+attempts in its hardware key (`NfStartAttempts` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters`,
+flushed before it goes on); a completed start (EvtDeviceSelfManagedIoInit) or a binding that ends without a crash clears it.
+A device whose last two starts never completed is refused: code 31, with 0xE0AC0001 as its problem status, and a debug
+message saying how to clear it. The setup tool deletes the count when it installs a cable; by hand, delete the value and
+disable and enable the device. It needs the count on disk first, so it can't catch a crash in DriverEntry, or (to confirm) a
+start at boot before the Session Manager makes the SYSTEM hive writable.
+
 ### Independent Cable B
 
 Either cable works with the filter app closed. Send audio to its **Speakers** endpoint and select the **Microphone** on

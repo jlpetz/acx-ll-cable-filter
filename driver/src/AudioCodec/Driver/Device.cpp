@@ -422,6 +422,193 @@ NfAssignFriendlyName(
     }
 }
 
+//
+// noise-filter (TODO 19): the boot crash breaker (ours, for the owner's go; removable with this block, its calls in
+// Codec_EvtBusDeviceAdd and Codec_EvtDeviceContextCleanup, Codec_EvtDeviceSelfManagedIoInit and CODEC_DEVICE_CONTEXT's
+// StartCounted). Driver Verifier stays on at boot on the dev box, so a deterministic bugcheck in a cable's start would come
+// back at every boot. AddDevice counts the device's start attempts in its hardware key (NfStartAttempts, Cable.h), flushed
+// before it goes on, and the count is cleared once the start has completed (EvtDeviceSelfManagedIoInit, the last of the
+// start's callbacks) or the binding has ended without a crash (a failed AddDevice or start, a removal: a clean failure doesn't
+// loop the box). A device whose last two starts never completed, so that neither cleared the count, is refused at AddDevice
+// with NF_STATUS_START_BREAKER (Device Manager: code 31, the status in DEVPKEY_Device_ProblemStatus) and a debug message
+// saying why and how to clear it. The setup tool deletes the count when it installs a cable. Everything here is
+// PASSIVE_LEVEL (the registry calls, wdfregistry.h and wdm.h).
+//
+// What it can't catch:
+// - a crash before the count is on disk: in DriverEntry, in AddDevice before the write (the instance ID's query and parse,
+//   the key's open), and (to confirm on the box) a start at boot that runs before the Session Manager has made the SYSTEM hive
+//   writable: registry writes before then stay in memory, so a crash there loses the count. After a normal boot, a cable's
+//   hardware key's last write time (this count's clear) against smss.exe's start time shows which;
+// - a crash after the start completed: in a stream (Audiosrv's first opens after boot among them), an IOCTL, a removal;
+// - a crash in the framework's or ACX's start work after our last start callback, or in the clear itself;
+// - a crash in another cable's start counts in that cable's key, and in any other cable's whose start was in flight then.
+// A hang in start counts too (no callback clears it): two hung boots refuse the device as two crashes would.
+//
+DECLARE_CONST_UNICODE_STRING(g_NfStartAttemptsValue, NF_CABLE_START_ATTEMPTS_VALUE);
+
+// Count into the key (0: the value removed), flushed so it is on disk before the caller goes on.
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfBreakerStore(
+    _In_ WDFKEY Key,
+    _In_ ULONG  Count
+)
+{
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Count == 0)
+    {
+        status = WdfRegistryRemoveValue(Key, &g_NfStartAttemptsValue);
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND)
+        {
+            // Nothing counted: nothing to write.
+            return STATUS_SUCCESS;
+        }
+    }
+    else
+    {
+        status = WdfRegistryAssignULong(Key, &g_NfStartAttemptsValue, Count);
+    }
+    if (NT_SUCCESS(status))
+    {
+        status = ZwFlushKey(WdfRegistryWdmGetHandle(Key));
+    }
+    return status;
+}
+
+//
+// AddDevice's part, before anything is made: refuses the device at the limit, else counts this attempt. *Key: the hardware
+// key, open, once the attempt is counted (the caller clears it with NfBreakerClose if AddDevice fails before the framework
+// device exists, as no cleanup callback can then); NULL if the key can't be opened, and the device goes on without the breaker
+// (it guards against a crash loop and shouldn't stop a cable by itself).
+//
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfBreakerEnter(
+    _In_    PWDFDEVICE_INIT DeviceInit,
+    _In_    PCWSTR          InstanceId,
+    _Out_   WDFKEY*         Key
+)
+{
+    WDFKEY      key = NULL;
+    ULONG       attempts = 0;
+    NTSTATUS    status;
+
+    PAGED_CODE();
+
+    *Key = NULL;
+
+    status = WdfFdoInitOpenRegistryKey(DeviceInit, PLUGPLAY_REGKEY_DEVICE, KEY_QUERY_VALUE | KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES,
+                                       &key);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: %ws starts without the crash breaker (its hardware key: 0x%08X)\n",
+                   InstanceId, status);
+        return STATUS_SUCCESS;
+    }
+
+    // Absent, or not a DWORD: none counted.
+    if (!NT_SUCCESS(WdfRegistryQueryULong(key, &g_NfStartAttemptsValue, &attempts)))
+    {
+        attempts = 0;
+    }
+    if (attempts >= NF_CABLE_START_ATTEMPTS_LIMIT)
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL,
+                   // Under DbgPrint's 512 bytes with both instance IDs at their longest (about 80 characters).
+                   "AudioCodec: %ws refused by the crash breaker (0x%08X): its last %lu starts never completed (a crash in start?). "
+                   "To clear: the setup tool's add or update, or delete NfStartAttempts under "
+                   "HKLM\\SYSTEM\\CurrentControlSet\\Enum\\%ws\\Device Parameters; then disable and enable it.\n",
+                   InstanceId, NF_STATUS_START_BREAKER, attempts, InstanceId);
+        WdfRegistryClose(key);
+        return NF_STATUS_START_BREAKER;
+    }
+
+    status = NfBreakerStore(key, attempts + 1);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
+                   "AudioCodec: %ws: its start count may not be on disk (0x%08X): the crash breaker may not see this start\n",
+                   InstanceId, status);
+    }
+
+    // Counted (or tried): cleared once the start completes or the binding ends cleanly.
+    *Key = key;
+    return STATUS_SUCCESS;
+}
+
+// Closes AddDevice's key, clearing the count first if Clear (AddDevice failed before the framework device existed).
+PAGED_CODE_SEG
+static
+VOID
+NfBreakerClose(
+    _In_opt_    WDFKEY  Key,
+    _In_        BOOLEAN Clear
+)
+{
+    PAGED_CODE();
+
+    if (Key != NULL)
+    {
+        if (Clear)
+        {
+            (void)NfBreakerStore(Key, 0);
+        }
+        WdfRegistryClose(Key);
+    }
+}
+
+// Clears the device's count, once: its start completed, or its binding ended without a crash. PASSIVE_LEVEL.
+PAGED_CODE_SEG
+static
+VOID
+NfBreakerClear(
+    _In_ WDFDEVICE              Device,
+    _In_ PCODEC_DEVICE_CONTEXT  DevCtx
+)
+{
+    WDFKEY      key;
+    NTSTATUS    status;
+
+    PAGED_CODE();
+
+    if (!DevCtx->StartCounted)
+    {
+        return;
+    }
+    DevCtx->StartCounted = FALSE;
+
+    status = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &key);
+    if (NT_SUCCESS(status))
+    {
+        status = NfBreakerStore(key, 0);
+        WdfRegistryClose(key);
+    }
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: cable %ws's start count not cleared (0x%08X)\n",
+                   DevCtx->Cable.Label, status);
+    }
+}
+
+PAGED_CODE_SEG
+NTSTATUS
+Codec_EvtDeviceSelfManagedIoInit(
+    _In_ WDFDEVICE Device
+)
+{
+    PAGED_CODE();
+
+    // noise-filter (TODO 19, the boot crash breaker): the start has completed. Called once, after the first D0 entry.
+    NfBreakerClear(Device, GetCodecDeviceContext(Device));
+
+    return STATUS_SUCCESS;
+}
+
 PAGED_CODE_SEG
 NTSTATUS
 Codec_EvtBusDeviceAdd(
@@ -463,6 +650,8 @@ Return Value:
     ULONG                               instanceNumber = 0;
     PNF_CABLE                           cable;
     LARGE_INTEGER                       now;
+    WDFKEY                              breakerKey = NULL;
+    BOOLEAN                             startCounted = FALSE;
 
     PAGED_CODE();
 
@@ -488,12 +677,27 @@ Return Value:
         return status;
     }
 
+    // noise-filter (TODO 19, the boot crash breaker, above): refused after two starts in a row that never completed, else
+    // this attempt counted and on disk before anything is made.
+    status = NfBreakerEnter(DeviceInit, instanceId, &breakerKey);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+    startCounted = (breakerKey != NULL) ? TRUE : FALSE;
+
     //
     // The driver calls this DDI in its AddDevice callback before creating the PnP device.
     // ACX uses this call to add default/standard settings for the device to be created.
     //
     ACX_DEVICEINIT_CONFIG_INIT(&devInitCfg);
-    RETURN_IF_FAILED(AcxDeviceInitInitialize(DeviceInit, &devInitCfg));
+    status = AcxDeviceInitInitialize(DeviceInit, &devInitCfg);
+    if (!NT_SUCCESS(status))
+    {
+        // noise-filter (TODO 19, the boot crash breaker): a clean failure, with no framework device to clear the count later.
+        NfBreakerClose(breakerKey, TRUE);
+        RETURN_IF_FAILED(status);
+    }
 
     //
     // Initialize the pnpPowerCallbacks structure.  Callback events for PNP
@@ -507,12 +711,18 @@ Return Value:
     pnpPowerCallbacks.EvtDeviceReleaseHardware = Codec_EvtDeviceReleaseHardware;
     pnpPowerCallbacks.EvtDeviceD0Entry = Codec_EvtDeviceD0Entry;
     pnpPowerCallbacks.EvtDeviceD0Exit = Codec_EvtDeviceD0Exit;
+    // noise-filter (TODO 19, the boot crash breaker): the start has completed.
+    pnpPowerCallbacks.EvtDeviceSelfManagedIoInit = Codec_EvtDeviceSelfManagedIoInit;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, CODEC_DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = Codec_EvtDeviceContextCleanup;
 
-    RETURN_NTSTATUS_IF_FAILED(WdfDeviceCreate(&DeviceInit, &attributes, &device));
+    // noise-filter (TODO 19, the boot crash breaker): from here the device's own callbacks clear the count (StartCounted);
+    // before, a failure clears it now.
+    status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
+    NfBreakerClose(breakerKey, NT_SUCCESS(status) ? FALSE : TRUE);
+    RETURN_NTSTATUS_IF_FAILED(status);
 
     //
     // Init Codec's device context.
@@ -524,6 +734,7 @@ Return Value:
     devCtx->Capture = nullptr;
     devCtx->Capture2 = nullptr;
     devCtx->ExcludeD3Cold = WdfFalse;
+    devCtx->StartCounted = startCounted;
 
     //
     // noise-filter (TODO 19, the per-cable design, sections 4 and 5): the cable, first, so the context cleanup (which runs if
@@ -963,4 +1174,8 @@ Return Value:
     // runs and its handle is stale: under Driver Verifier the lookup faulted on device removal (bugcheck 0x7E in
     // Wdf01000!FxIFR, from WdfObjectGetTypedContext, 2026-11-22). Nothing is lost without it.
     //
+
+    // noise-filter (TODO 19, the boot crash breaker): the binding ended without a crash (a failed AddDevice or start, or a
+    // removal before the start completed): its count goes. PASSIVE_LEVEL (a device's cleanup callback).
+    NfBreakerClear(device, devCtx);
 }
