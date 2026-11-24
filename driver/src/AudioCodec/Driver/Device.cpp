@@ -318,9 +318,124 @@ NfParseCableInstanceId(
     return STATUS_SUCCESS;
 }
 
+// TRUE if Chars characters of Text are Upper's (upper case), without case.
+PAGED_CODE_SEG
+static
+BOOLEAN
+NfMatchUpper(
+    _In_reads_(Chars)   PCWSTR  Text,
+    _In_reads_(Chars)   PCWSTR  Upper,
+    _In_                size_t  Chars
+)
+{
+    size_t i;
+
+    PAGED_CODE();
+
+    for (i = 0; i < Chars; i++)
+    {
+        if (NfUpcase(Text[i]) != Upper[i])
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 //
-// The device's instance ID, NUL-terminated in Buffer, and its length in characters. PASSIVE_LEVEL (wdffdo.h), before
-// WdfDeviceCreate.
+// The instance ID from the name of the device's hardware key (PLUGPLAY_REGKEY_DEVICE):
+// \REGISTRY\MACHINE\SYSTEM\<control set>\Enum\<instance ID>\Device Parameters. NfQueryInstanceId's fallback, for a kernel whose
+// property store doesn't answer DEVPKEY_Device_InstanceId (unconfirmed until S0a: nothing yet shows it does). The name has that
+// form or STATUS_DEVICE_CONFIGURATION_ERROR; every read is bounded by what ZwQueryKey returned. PASSIVE_LEVEL (wdffdo.h,
+// ZwQueryKey), before WdfDeviceCreate.
+//
+// KeyNameInformation's answer: ntddk.h's KEY_NAME_INFORMATION, which this file doesn't see (wdm.h, included first, defines
+// _NTDDK_, so ntddk.h's body is skipped).
+typedef struct _NF_KEY_NAME_INFORMATION {
+    ULONG   NameLength;                     // bytes
+    WCHAR   Name[1];
+} NF_KEY_NAME_INFORMATION, *PNF_KEY_NAME_INFORMATION;
+
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfInstanceIdFromHardwareKey(
+    _In_                                        PWDFDEVICE_INIT DeviceInit,
+    _Out_writes_(NF_CABLE_INSTANCE_ID_CHARS)    PWCHAR          Buffer,
+    _Out_                                       size_t*         Chars
+)
+{
+    static const WCHAR          enumPart[] = L"\\ENUM\\";
+    static const WCHAR          leaf[] = L"\\DEVICE PARAMETERS";
+    const size_t                enumChars = ARRAYSIZE(enumPart) - 1;
+    const size_t                leafChars = ARRAYSIZE(leaf) - 1;
+    // The control set's path is about 40 characters, the instance ID at most 199: room to spare.
+    const ULONG                 infoBytes = FIELD_OFFSET(NF_KEY_NAME_INFORMATION, Name) + 512 * sizeof(WCHAR);
+    PNF_KEY_NAME_INFORMATION    info;
+    WDFKEY                      key = NULL;
+    ULONG                       returned = 0;
+    size_t                      nameChars;
+    size_t                      end;
+    size_t                      start = 0;
+    BOOLEAN                     found = FALSE;
+    size_t                      i;
+    NTSTATUS                    status;
+
+    PAGED_CODE();
+
+    *Chars = 0;
+    RtlZeroMemory(Buffer, NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR));
+
+    info = (PNF_KEY_NAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, infoBytes, DeviceDriverTag);
+    if (info == nullptr)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = WdfFdoInitOpenRegistryKey(DeviceInit, PLUGPLAY_REGKEY_DEVICE, KEY_READ, WDF_NO_OBJECT_ATTRIBUTES, &key);
+    if (NT_SUCCESS(status))
+    {
+        status = ZwQueryKey(WdfRegistryWdmGetHandle(key), KeyNameInformation, info, infoBytes, &returned);
+        WdfRegistryClose(key);
+    }
+    if (NT_SUCCESS(status))
+    {
+        status = STATUS_DEVICE_CONFIGURATION_ERROR;
+        nameChars = info->NameLength / sizeof(WCHAR);
+        if (nameChars > (infoBytes - FIELD_OFFSET(NF_KEY_NAME_INFORMATION, Name)) / sizeof(WCHAR))
+        {
+            nameChars = 0;
+        }
+
+        // The name ends in \Device Parameters (without case), and the instance ID is what lies between it and the first \Enum\.
+        if (nameChars > leafChars && NfMatchUpper(&info->Name[nameChars - leafChars], leaf, leafChars))
+        {
+            end = nameChars - leafChars;
+            for (i = 0; i + enumChars <= end; i++)
+            {
+                if (NfMatchUpper(&info->Name[i], enumPart, enumChars))
+                {
+                    start = i + enumChars;
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (found && start < end && end - start < NF_CABLE_INSTANCE_ID_CHARS &&
+                NT_SUCCESS(RtlStringCchCopyNW(Buffer, NF_CABLE_INSTANCE_ID_CHARS, &info->Name[start], end - start)))
+            {
+                status = RtlStringCchLengthW(Buffer, NF_CABLE_INSTANCE_ID_CHARS, Chars);
+            }
+        }
+    }
+
+    ExFreePoolWithTag(info, DeviceDriverTag);
+    return status;
+}
+
+//
+// The device's instance ID, NUL-terminated in Buffer, and its length in characters: DEVPKEY_Device_InstanceId, or, if the
+// property store doesn't answer it, the hardware key's name (NfInstanceIdFromHardwareKey; the debug message says so, and S0a
+// should look for it). PASSIVE_LEVEL (wdffdo.h), before WdfDeviceCreate.
 //
 PAGED_CODE_SEG
 static
@@ -344,19 +459,24 @@ NfQueryInstanceId(
     WDF_DEVICE_PROPERTY_DATA_INIT(&property, &DEVPKEY_Device_InstanceId);
     property.Lcid = LOCALE_NEUTRAL;
     status = WdfFdoInitQueryPropertyEx(DeviceInit, &property, NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR), Buffer, &bytes, &type);
-    if (!NT_SUCCESS(status))
+    if (status == STATUS_BUFFER_TOO_SMALL)
     {
-        // STATUS_BUFFER_TOO_SMALL: longer than MAX_DEVICE_ID_LEN, so not ours either.
-        return (status == STATUS_BUFFER_TOO_SMALL) ? STATUS_DEVICE_CONFIGURATION_ERROR : status;
-    }
-    if (type != DEVPROP_TYPE_STRING || bytes < 2 * sizeof(WCHAR) || bytes > NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR))
-    {
+        // Longer than MAX_DEVICE_ID_LEN, so not ours either.
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
+    if (NT_SUCCESS(status) && type == DEVPROP_TYPE_STRING && bytes >= 2 * sizeof(WCHAR) &&
+        bytes <= NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR))
+    {
+        // Whatever the property held, the string ends inside the buffer.
+        Buffer[NF_CABLE_INSTANCE_ID_CHARS - 1] = L'\0';
+        return RtlStringCchLengthW(Buffer, NF_CABLE_INSTANCE_ID_CHARS, Chars);
+    }
 
-    // Whatever the property held, the string ends inside the buffer.
-    Buffer[NF_CABLE_INSTANCE_ID_CHARS - 1] = L'\0';
-    return RtlStringCchLengthW(Buffer, NF_CABLE_INSTANCE_ID_CHARS, Chars);
+    // Not answered as a string: the hardware key's name. An error-level message, so it shows without a debug filter.
+    DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL,
+               "AudioCodec: DEVPKEY_Device_InstanceId not answered (0x%08X, type 0x%X, %lu bytes): the instance ID from the "
+               "hardware key's name\n", status, type, bytes);
+    return NfInstanceIdFromHardwareKey(DeviceInit, Buffer, Chars);
 }
 
 // A circuit's component ID for this cable: the identity XOR the circuit's constant (DriverSettings.h), so each cable's are its own.
@@ -722,7 +842,8 @@ Return Value:
     // anything is made. Every device of ours is a cable, and every cable has one: a node without one (not made by the setup
     // tool) is refused with an error status (STATUS_DEVICE_CONFIGURATION_ERROR: Device Manager shows code 31, CM_PROB_FAILED_ADD,
     // with the status in DEVPKEY_Device_ProblemStatus), so discovery, the control device's name and the setup never meet an
-    // unnamed cable. A query that fails returns its own status, for the same property to tell.
+    // unnamed cable. A query that fails (the property, then the hardware key's name: NfQueryInstanceId) returns its own status,
+    // for the same property to tell.
     //
     status = NfQueryInstanceId(DeviceInit, instanceId, &instanceChars);
     if (!NT_SUCCESS(status))

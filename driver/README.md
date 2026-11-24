@@ -80,29 +80,30 @@ is the one a crash in start leaves in a session (an install, an update, an enabl
 its second attempt in memory only and crash again. So it stops the loop that follows a crash first seen in a session; it
 can't catch a crash that only happens at boot, nor one in DriverEntry, before the count is written.
 
-### Independent Cable B
+### Using the cables
 
-Either cable works with the filter app closed. Send audio to its **Speakers** endpoint and select the **Microphone** on
-the same adapter in the receiving application. For the primary pair the adapter is **AudioCodec Device**. Both of its
-microphones receive the same signal. The optional **Noise Filter Cable B** adapter has a separate playback and recording
-pair, loopback memory and format negotiation.
+Every cable works with the filter app closed. Send audio to a cable's **Speakers** endpoint and select a microphone of the
+same cable in the receiving application: what's played into "Speakers (ACX-LL-Cable A)" comes out of both "Microphone
+(ACX-LL-Cable A)" and "Call Microphone (ACX-LL-Cable A)" (those its variant makes). Each cable has its own playback and
+recording pair, loopback memory, format negotiation, app ring and control device, and any cable can be fed directly: a
+direct feed takes over that cable's microphones while attached, and the others carry what is played into them.
 
-On the development checkout, install the current primary driver first. In an elevated PowerShell window run
-`driver\scripts\Cable-B.ps1 add` to create B. The script uses the primary device's installed INF, retains its microphone
-variant and restores any pre-existing default roles that Windows moved to B. `Cable-B.ps1 list` shows B and its endpoints.
-`Cable-B.ps1 remove` removes only B. Running `add` again on a healthy pair keeps its endpoint IDs.
-
-To process the signal on A, choose **Direct driver ring** or its WASAPI Speakers endpoint in the filter app. For B, choose
-**WASAPI** and **Speakers (Noise Filter Cable B)**. A direct feed takes over A's microphones while attached. B continues
-carrying whatever is played into B. The app currently runs one filter chain per engine instance.
+**Pending S1 and N0 (the per-cable design's step 1, with this driver).** The setup tool that makes cables in the new form
+(`Cable.ps1 add <label>`, `list`, `remove`, behind `Install-Driver.ps1`) is S1's. Until it lands, the scripts here still use
+the old hardware IDs (`ROOT\AudioCodec`, `ROOT\NoiseFilterCableB`) and devcon, whose `ROOT\MEDIA\NNNN` nodes this driver
+refuses (code 31): don't install a build of this driver with them, and `Cable-B.ps1` doesn't work with its INF. nf-vmic, its
+tools and the app's **Direct driver ring** open `\\.\NoiseFilterVmic`, which this driver no longer makes, until N0 gives
+them the cable's own path (`--path \\.\AcxLlCable_<id>`). The box's installed package (the old one: "AudioCodec Device" and
+"Noise Filter Cable B") stays until the owner's go for S0a, which moves both.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
-on each Speakers endpoint (`--device "Speakers (AudioCodec Device)"` and `--device "Speakers (Noise Filter Cable B)"`),
-with `--start 100000` on A and `--start 4000000` on B. While both renderers play, run
-`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (AudioCodec Device)"` and the equivalent on
-`Microphone (Noise Filter Cable B)` concurrently. Each capture's decoded marker range should remain inside its own
-renderer’s range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440`
-in place of A's renderer to verify an attached A ring coexists with B.
+on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with
+`--start 100000` on A and `--start 4000000` on B. While both renderers play, run
+`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (ACX-LL-Cable A)"` and the equivalent on
+`Microphone (ACX-LL-Cable B)` concurrently. Each capture's decoded marker range should remain inside its own renderer's
+range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440` (with N0's
+`--path` to A's control device) in place of A's renderer to verify an attached A ring coexists with B, and the same on B
+with A attached.
 
 **Latency: two figures, measured at different points** (the Server 2025 VM, 2026-11-20 to 23;
 doc/todo/19-spike-2026-11-20.md):
@@ -196,7 +197,9 @@ the larger, local-time versions and outrank later builds of the same date until 
    evening's builds before it). A package with an older DriverVer doesn't replace a newer one: `Uninstall-Driver.ps1`
    first. Packages built before 2026-11-23's change carry the local time of day as the version, so one from earlier the
    same UTC day can outrank a newer build.
-3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
+3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it). Not for a
+   build of this driver until S1 replaces it ("Using the cables", above): this INF has no `ROOT\AudioCodec`, and the driver
+   refuses a node devcon makes.
 4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
 5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts
    them back (`noise-filter devices` lists the ids). `scripts\Get-EndpointFormat.ps1` shows the device format Windows
