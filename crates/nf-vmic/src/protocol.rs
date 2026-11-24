@@ -567,6 +567,11 @@ pub struct Stats {
     pub skip_log: EventSlots<SKIP_LOG_ENTRIES>,
     /// The silence streams got with nothing lost, a run an entry.
     pub underrun_log: EventSlots<UNDERRUN_LOG_ENTRIES>,
+    /// Times a capture stream playing the driver's copy found its own time line moved later (a late timer's glitch adjustment),
+    /// each an [`EVENT_SECONDARY_JUMP`] entry in the skip log, and the copy's frames they passed over (the entries' frames,
+    /// added up): the device's, as the logs are (valid with [`STATS_LOOPBACK`]; the owner, 2026-11-24).
+    pub secondary_jumps: u64,
+    pub secondary_jump_frames: u64,
 }
 
 impl Stats {
@@ -651,7 +656,10 @@ const _: () = {
     assert!(offset_of!(Stats, event_bytes) == 696);
     assert!(offset_of!(Stats, skip_log) == 704);
     assert!(offset_of!(Stats, underrun_log) == 704 + 64 * SKIP_LOG_ENTRIES);
-    assert!(size_of::<Stats>() == 6_848);
+    assert!(offset_of!(Stats, underrun_log) == 4_800);
+    assert!(offset_of!(Stats, secondary_jumps) == 6_848);
+    assert!(offset_of!(Stats, secondary_jump_frames) == 6_856);
+    assert!(size_of::<Stats>() == 6_864);
     assert!(offset_of!(Stats, capture_trace) == 576);
     assert!(offset_of!(Stats, secondary_skips) == 640);
     assert!(offset_of!(Stats, secondary_skipped_frames) == 648);
@@ -793,11 +801,22 @@ mod tests {
         assert_eq!(offset_of!(Stats, skip_events_logged), 672);
         assert_eq!(offset_of!(Stats, skip_log) % 64, 0);
         assert_eq!(offset_of!(Stats, skip_log) + SKIP_LOG_ENTRIES * size_of::<Event>(), offset_of!(Stats, underrun_log));
-        assert_eq!(offset_of!(Stats, underrun_log) + UNDERRUN_LOG_ENTRIES * size_of::<Event>(), size_of::<Stats>());
-        assert_eq!((size_of::<Stats>(), size_of::<Event>(), VERSION), (6_848, 64, 1));
+        assert_eq!(offset_of!(Stats, underrun_log) + UNDERRUN_LOG_ENTRIES * size_of::<Event>(), offset_of!(Stats, secondary_jumps));
+        assert_eq!((size_of::<Event>(), VERSION), (64, 1));
         // A copy of the default is all zero: no slot holds an entry, both logs empty.
         let s = Stats::default();
         assert!(s.skip_events().entries.is_empty() && s.underrun_events().entries.is_empty());
+    }
+
+    /// The time-line jump counters of 2026-11-24 (the owner: two totals per device, so the log's cross-check covers jumps) are
+    /// appended after the logs: every earlier offset stands, and the size grows by their 16 bytes, with no version bump
+    /// (diagnostic fields: the owner's rule of 2026-11-23).
+    #[test]
+    fn the_jump_counters_are_appended() {
+        assert_eq!(offset_of!(Stats, underrun_log) + UNDERRUN_LOG_ENTRIES * size_of::<Event>(), 6_848);
+        assert_eq!((offset_of!(Stats, secondary_jumps), offset_of!(Stats, secondary_jump_frames)), (6_848, 6_856));
+        assert_eq!(offset_of!(Stats, secondary_jump_frames) + 8, size_of::<Stats>());
+        assert_eq!((size_of::<Stats>(), VERSION), (6_864, 1));
     }
 
     /// A log read from its slots: the latest it keeps, oldest first; a slot not holding the number its place says is

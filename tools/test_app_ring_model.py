@@ -17,7 +17,9 @@ driver-wide counter holds both skips and neither gap matches it alone (Astra's f
 counted 686), but each matches its own entry. verify's rule (nf-vmic-test: a gap's ring span is a chain of one stream's
 entries, end to end, any stream's, since verify doesn't know its own) is ties() here, and its verdict judge(): a gap passes
 only where its chains hold the two skips the owner allowed (a taker's, 2026-11-20; to a shorter lag, 2026-11-23); a late read
-or a jump is the driver's record of a loss, and fails.
+or a jump is the driver's record of a loss, and fails. Where several streams' chains tie a gap, the gap takes their verdict
+where they agree, and is INCONCLUSIVE only where they don't (the owner, 2026-11-24). Each jump is counted where it is logged
+(the device's SecondaryJumps and SecondaryJumpFrames, the owner, 2026-11-24), and the log's jumps add up to the counters.
 
 It also shows the cause of the uncounted gaps in the live three-stream runs (2026-11-23): a reader that gave the slot up only
 after its timer stopped left the copy short for as long as the stop took, and a stream playing on lost what the next
@@ -61,6 +63,7 @@ class Ring:
         self.valid, self.hist_from, self.hist_end, self.lead = False, 0, 0, 0
         self.copy, self.gaps = {}, []  # time-line frame -> ring position; the recorded gaps [from, end)
         self.log, self.claims = [], []  # the skip log; the spans the reader hasn't written yet: [lo, hi, entry]
+        self.jumps, self.jump_frames = 0, 0  # SecondaryJumps, SecondaryJumpFrames: counted where each jump is logged
 
     def gap_frames(self, lo, hi):
         return sum(max(0, min(hi, e) - max(lo, f)) for f, e in self.gaps)
@@ -147,7 +150,10 @@ def other_pass(ring, s, frame, jump, pausing_keeps):
     if s.other_valid:
         at_old = start + lead - s.lead  # this pass's read at its latest pass's lag
         if min(at_old, start) > s.end:  # its own time line jumped: what lies between never reaches it
-            ring.log_skip("jump", s, ring.held_frames(s.end, min(at_old, start)), s.end, min(at_old, start))
+            frames = ring.held_frames(s.end, min(at_old, start))
+            # Counted where it is logged, the frames as the entry has them (the owner, 2026-11-24: two totals per device).
+            ring.jumps, ring.jump_frames = ring.jumps + 1, ring.jump_frames + frames
+            ring.log_skip("jump", s, frames, s.end, min(at_old, start))
         if shorter:
             lo = max(at_old, s.end)
             if start > lo:
@@ -259,11 +265,19 @@ def tie(lo, hi, entries):
 ALLOWED = ("handoff", "secondary")  # the skips the owner allowed: a taker's (2026-11-20), to a shorter lag (2026-11-23)
 
 
+def candidates(lo, hi, entries):
+    """Every chain that ties [lo, hi) (ties()), each with its verdict: "ok" where it holds only allowed skips, else "fail"."""
+    return [(chain, "ok" if all(e.kind in ALLOWED for e in chain) else "fail") for chain in ties(lo, hi, entries)]
+
+
 def judge(lo, hi, entries):
-    """verify's verdict on a gap (nf-vmic-test's tie_gaps): "ok" where every chain that ties it holds only allowed skips,
-    "fail" where every one holds a loss (a late read, a jump) or none ties it, "inconclusive" where chains of different
-    streams tie it and are judged differently (the log can't say whose the gap was)."""
-    verdicts = {"ok" if all(e.kind in ALLOWED for e in chain) else "fail" for chain in ties(lo, hi, entries)}
+    """verify's verdict on a gap (nf-vmic-test's tie_gaps and judge_ties; the owner, 2026-11-24: INCONCLUSIVE only when the
+    ambiguity changes the verdict): the candidates' verdict where they agree, however many streams' they are ("ok" where
+    every chain that ties it holds only allowed skips, "fail" where every one holds a loss, a late read or a jump), "fail"
+    where none ties it, and "inconclusive" only where chains tie it and are judged differently (the log can't say whose the
+    gap was, and that decides it). A stream's own entries for a gap are settled by the end of a run (it got a code after
+    them, so the copy's end has passed them), so verify's rule for entries still being filled in isn't modelled here."""
+    verdicts = {verdict for _chain, verdict in candidates(lo, hi, entries)}
     if not verdicts:
         return "fail"
     return verdicts.pop() if len(verdicts) == 1 else "inconclusive"
@@ -302,8 +316,9 @@ class AppRingModel(unittest.TestCase):
         """Every gap is a chain of the stream's own entries, exactly, and verify's rule (which doesn't know the stream) ties it
         to them, among any others for exactly those frames; every entry with ring frames lies in one of its stream's gaps, or
         past the last frame it delivered; an entry is left pending only where its span runs past the copy's end when the run
-        ends (a stream's last read, with no reader pass after it); and the entries' frames are the counts. Returns the
-        entries by kind, and verify's verdict on each gap (judge()) by verdict."""
+        ends (a stream's last read, with no reader pass after it); and the entries' frames are the counts, the jumps' the
+        device's jump counters (verify's cross-check). Returns the entries by kind, and verify's verdict on each gap (judge())
+        by verdict."""
         kinds, verdicts = {}, {}
         seen = set()
         for s, _faults, _first, _case, streams in results:
@@ -311,6 +326,8 @@ class AppRingModel(unittest.TestCase):
             if id(ring) not in seen:
                 seen.add(id(ring))
                 self.assertTrue(all(e.span[1] > ring.hist_end for e in ring.log if e.pending), "the reader wrote past each claim")
+                jumps = [e for e in ring.log if e.kind == "jump"]
+                self.assertEqual((len(jumps), sum(e.frames for e in jumps)), (ring.jumps, ring.jump_frames), "the jump counters")
                 for e in ring.log:
                     kinds.setdefault(e.kind, []).append(e)
             own = [e for e in ring.log if e.stream == s.name]
@@ -367,9 +384,13 @@ class AppRingModel(unittest.TestCase):
         kinds, verdicts = self.check_log(results)
         self.assertEqual(sorted(kinds), ["handoff", "secondary"], "no late read or jump in these runs")
         self.assertEqual(sorted(verdicts), ["ok"], "verify passes every stream's gaps")
-        # verify doesn't know its stream: now and then two streams' skips are of the same frames, and both are named.
+        # verify doesn't know its stream: now and then two streams' skips are of the same frames, and both are named (2 of
+        # the 828 gaps with this seed). Those are two candidates with the same verdict, each an allowed skip, so the gap
+        # passes: identical skips, not candidates judged differently (verify's INCONCLUSIVE), of which these runs have none.
         shared = [v for v in verdicts["ok"] if len(ties(v[1], v[2], v[0].ring.log)) > 1]
         self.assertLess(len(shared), len(verdicts["ok"]) // 20, "a gap tied to more than one stream's entry is rare")
+        self.assertTrue(shared, "but there are some")
+        self.assertTrue(all({v for _c, v in candidates(lo, hi, s.ring.log)} == {"ok"} for s, lo, hi, _chain in shared))
         two = 0
         for streams in {id(r[4]): r[4] for r in results}.values():
             skips = [e for e in streams[0].ring.log if e.kind == "secondary" and e.ring]
@@ -397,6 +418,12 @@ class AppRingModel(unittest.TestCase):
         failed = verdicts.get("fail", [])
         self.assertGreater(len(failed), 50)
         self.assertTrue(all(any(e.kind == "late" for e in chain) for _s, _lo, _hi, chain in failed))
+        # Gaps more than one stream's entries tie are rare here too (2 of 423 with this seed), and none has candidates judged
+        # differently: no gap is INCONCLUSIVE (the owner, 2026-11-24: only where the ambiguity changes the verdict).
+        everything = sum(verdicts.values(), [])
+        shared = [v for v in everything if len({c[0].stream for c in ties(v[1], v[2], v[0].ring.log)}) > 1]
+        self.assertLess(len(shared), len(everything) // 20)
+        self.assertNotIn("inconclusive", verdicts)
 
     def test_a_jump_in_a_streams_own_time_line_is_logged(self):
         # A glitch adjustment in a stream playing on (its timer 4 ms late once): its time line moves later and it skips that
@@ -472,10 +499,15 @@ class AppRingModel(unittest.TestCase):
         self.assertIsNone(tie(101, 110, [a, b, c]))
         # verify's verdict: the skip alone passes, with its late read it fails, no tie fails.
         self.assertEqual([judge(100, 110, [a, b, c]), judge(100, 115, [a, b, c]), judge(101, 110, [a, b, c])], ["ok", "fail", "fail"])
-        # Two streams' entries for the same frames, judged differently: verify can't say whose the gap was.
+        # Two streams' entries for the same frames, judged differently: verify can't say whose the gap was, and that decides it.
         d = Entry(4, "late", "s2", 10, (0, 10), (100, 110))
         self.assertEqual(len(ties(100, 110, [a, d])), 2)
         self.assertEqual(judge(100, 110, [a, d]), "inconclusive")
+        # Judged alike, the candidates give their verdict (the owner, 2026-11-24): two allowed skips pass, two losses fail.
+        e = Entry(5, "secondary", "s2", 10, (0, 10), (100, 110))
+        f = Entry(6, "jump", "s3", 10, (0, 10), (100, 110))
+        self.assertEqual([judge(100, 110, [a, e]), judge(100, 110, [d, f])], ["ok", "fail"])
+        self.assertEqual([v for _c, v in candidates(100, 110, [a, e, d])], ["ok", "ok", "fail"])
 
 
 if __name__ == "__main__":

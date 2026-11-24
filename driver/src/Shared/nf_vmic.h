@@ -168,11 +168,11 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
-NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
+NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
-       0     4  Magic, 4 Version, 8 StatsBytes (6848), 12 Flags (NF_VMIC_STATS_*)
+       0     4  Magic, 4 Version, 8 StatsBytes (6864), 12 Flags (NF_VMIC_STATS_*)
       16     8  QpcFrequency             KeQueryPerformanceCounter's frequency
       24     8  QpcNow                   the QPC when the snapshot was taken (read last: every count and entry in it is earlier)
       32     4  AttachedPid              the attached app's process id (0: none)
@@ -209,6 +209,10 @@ NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; time
      700     4  Reserved1
      704  4096  SkipLog                  NF_VMIC_EVENT[64]: event n in slot (n - 1) % 64 (the logs, below)
     4800  2048  UnderrunLog              NF_VMIC_EVENT[32]: event n in slot (n - 1) % 32
+    6848     8  SecondaryJumps           times a capture stream playing the copy found its own time line moved later (a
+                                         late timer's glitch adjustment), each a SECONDARY_JUMP entry in the skip log (the
+                                         device's, as the logs are: valid with NF_VMIC_STATS_LOOPBACK)
+    6856     8  SecondaryJumpFrames      the copy's frames those jumps passed over (their entries' Frames, added up)
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
@@ -294,14 +298,16 @@ NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; time
         SecondarySkippedFrames' part). Span and ring span: what it passed over.
       - SECONDARY_JUMP: a stream playing the copy whose own time line moved later (a late timer's glitch adjustment): what the
         copy holds between its place and its new read never reaches it. Frames: the copy's frames there, as a skip counts
-        them. Not counted elsewhere (its GlitchPasses are).
+        them. Counted in SecondaryJumps and SecondaryJumpFrames (one entry each; the device's, as the log is: the owner,
+        2026-11-24); its glitch adjustment in Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses too.
       - LATE_READ: a stream playing the copy read past the copy's end (the reader late, or none yet): silence, SpanFrames of
         it (Frames), and the audio the reader then writes there never reaches it. One entry for a stream's contiguous reads
         past the end, extended while they last; its ring span is the audio the reader writes there, filled in by those
         writes (NF_VMIC_EVENTF_PENDING until the copy's end has passed the span). Frames: SecondaryUnderrunFrames' part.
         A SECONDARY_SKIP or SECONDARY_JUMP whose span ran past the copy's end is filled in the same way. SECONDARY_JUMP and
         LATE_READ are the driver's record of a loss, not one of the two skips the owner allowed (a taker's, 2026-11-20; to a
-        shorter lag, 2026-11-23): nf-vmic-test verify ties a gap to them and fails it.
+        shorter lag, 2026-11-23): nf-vmic-test verify ties a gap to them and fails it (a demonstrated loss), and lists one
+        no gap of its recording ties as diagnostic only (the owner, 2026-11-24).
       - RESYNC: the reader found WriteFrame invalid (Resyncs): ReadFrame moved from RingFrom to RingTo, and the frames
         between never reach any stream (NF_VMIC_EVENTF_BACKWARD: WriteFrame was behind). Frames: the move, if forward.
       - LIVE_DISCARD: a live attachment's first pass after every reader stopped discarded RingFrom to RingTo. Frames: those.
@@ -545,6 +551,8 @@ typedef struct _NF_VMIC_STATS {
     UINT32                  Reserved1;                  // 700
     NF_VMIC_EVENT           SkipLog[NF_VMIC_SKIP_LOG_ENTRIES];          //  704
     NF_VMIC_EVENT           UnderrunLog[NF_VMIC_UNDERRUN_LOG_ENTRIES];  // 4800
+    UINT64                  SecondaryJumps;             // 6848
+    UINT64                  SecondaryJumpFrames;        // 6856
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
 C_ASSERT(sizeof(NF_VMIC_ATTACH_IN) == 16);
@@ -590,7 +598,9 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SkipLogEntries) == 688);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, EventBytes) == 696);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SkipLog) == 704);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, UnderrunLog) == 4800);
-C_ASSERT(sizeof(NF_VMIC_STATS) == 6848);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryJumps) == 6848);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryJumpFrames) == 6856);
+C_ASSERT(sizeof(NF_VMIC_STATS) == 6864);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
 C_ASSERT(NF_VMIC_IOCTL_STATS == 0x00226004);
 

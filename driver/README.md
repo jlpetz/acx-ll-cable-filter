@@ -125,9 +125,12 @@ writes there never reach it: the entry's ring frames are filled in by those writ
 loopback's lead skip. The underrun log (32) holds the silence streams got with nothing lost, one entry a run (of one
 attachment). So `nf-vmic-test verify` ties each gap in a recording to an entry for exactly the ring frames its codes name,
 with any number of recorders (where driver-wide counters can't say whose a skip was); the entry may be any stream's, since
-verify doesn't know its own, and where two streams' entries name the same frames it lists both. A gap passes only as one of
-the two skips the owner allowed (a taker's, 2026-11-20; to a shorter lag, 2026-11-23): one tied to a late read, a jump or a
-resync is the driver's record of a loss, and fails. verify also checks the log against the counters.
+verify doesn't know its own, and where several streams' entries name the same frames it lists every one, and the gap takes
+their verdict where they agree (INCONCLUSIVE only where they don't: the owner, 2026-11-24). A gap passes only as one of the
+two skips the owner allowed (a taker's, 2026-11-20; to a shorter lag, 2026-11-23): one tied to a late read, a jump or a
+resync is the driver's record of a loss, and fails; a late read or jump no gap of the recording names is listed, diagnostic
+only (the owner, 2026-11-24). verify also checks the log against the counters, the jumps against the device's own two
+(`SecondaryJumps`, `SecondaryJumpFrames`, appended to STATS).
 
 The ring is raw float32, so a conflict with another format shows at open time, both ways: while a ring is attached, a
 capture stream in another format is refused at creation (STATUS_NOT_SUPPORTED, `RefusedCaptureOpens`), and an ATTACH

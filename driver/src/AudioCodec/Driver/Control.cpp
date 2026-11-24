@@ -593,6 +593,9 @@ NfVmic_Stats(
         out->Loopback.RefusedOpens = loopback->RefusedOpens;
         out->LoopbackLeadSkips = loopback->LeadSkips;
         out->LoopbackLeadSkippedFrames = loopback->LeadSkippedFrames;
+        // The device's count of the app ring's time-line jumps, written under the app ring's lock (held here) as their entries are.
+        out->SecondaryJumps = loopback->SecondaryJumps;
+        out->SecondaryJumpFrames = loopback->SecondaryJumpFrames;
         //
         // The device's event logs, inside both locks: every writer of them holds one or the other (the app ring's events the
         // app ring's, the loopback's its own), so the logs are copied at the instant the counters are, and agree with them.

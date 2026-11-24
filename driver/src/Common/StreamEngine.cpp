@@ -2796,12 +2796,21 @@ CCaptureStreamEngine::AppRingOtherPass(
 
         //
         // A jump in its own time line (a late timer's glitch adjustment): its read at the old lag starts past its place, and
-        // what the copy holds between never reaches it. Not counted elsewhere (its GlitchPasses are): logged, so its gap has
-        // an entry too.
+        // what the copy holds between never reaches it. Logged, so its gap has an entry too, and counted in the device whose
+        // skip log takes the entry (NF_APP_RING.Loopback, the app feed's: SecondaryJumps, SecondaryJumpFrames, the owner,
+        // 2026-11-24), the frames as the entry has them (the copy's, at most its length: the entry's 32 bits hold them), so
+        // the log's jumps over a window add up to the counters' rise.
         //
         if (jumpEnd > m_AppEnd)
         {
-            (void)AppRingLogSkip(NF_VMIC_EVENT_SECONDARY_JUMP, AppRingSkipFrames(ring, m_AppEnd, jumpEnd), m_AppEnd, jumpEnd, TRUE);
+            ULONGLONG jumped = AppRingSkipFrames(ring, m_AppEnd, jumpEnd);
+
+            if (ring->Loopback != NULL)
+            {
+                ring->Loopback->SecondaryJumps++;
+                ring->Loopback->SecondaryJumpFrames += jumped;
+            }
+            (void)AppRingLogSkip(NF_VMIC_EVENT_SECONDARY_JUMP, jumped, m_AppEnd, jumpEnd, TRUE);
         }
 
         //

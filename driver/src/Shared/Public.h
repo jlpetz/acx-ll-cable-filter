@@ -128,6 +128,14 @@ typedef struct _LOOPBACK_RING {
     ULONG           LeadSkips;              // capture reads moved on at once by a fall in the render lead: a one-time skip
     ULONGLONG       LeadSkippedFrames;      // the ring's audio such skips passed over (the difference in leads at most)
 
+    // The app ring's jumps in a capture stream's own time line (NF_VMIC_EVENT_SECONDARY_JUMP) this device's skip log holds, and
+    // the copy's frames they passed over (each entry's Frames), counted where each is logged (StreamEngine.cpp,
+    // AppRingOtherPass): the app feed device's only (NF_APP_RING.Loopback is this ring), under the app ring's lock, not Lock.
+    // STATS copies them inside both, with the log (the owner, 2026-11-24: two totals per device, so the log's cross-check
+    // covers jumps too).
+    ULONGLONG       SecondaryJumps;
+    ULONGLONG       SecondaryJumpFrames;
+
     // This device's event logs (NF_EVENT_LOG: their own locks, not Lock): its loopback's, and for the app feed's device the
     // app ring's (NF_APP_RING.Loopback is this ring). STATS copies the app feed device's.
     NF_EVENT_LOG    SkipLog;
