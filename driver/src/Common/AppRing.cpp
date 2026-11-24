@@ -25,6 +25,7 @@ NF_APP_RING             g_NfAppRing;
 DECLSPEC_CACHEALIGN UCHAR g_NfAppHistory[NF_APP_HISTORY_BYTES];
 NF_VMIC_STREAM_STATS    g_NfStreamStats[NF_VMIC_KINDS];
 NF_VMIC_CAPTURE_TRACE   g_NfCaptureTrace;
+volatile LONG           g_NfStreamSerial;
 
 static
 PNF_VMIC_STREAM_STATS
@@ -195,4 +196,419 @@ NfVmicCopyCaptureTrace(
     {
         dest[i] = (UINT64)ReadNoFence64(&source[i]);
     }
+}
+
+// The smaller and the larger of two 64-bit values (Private.h's MIN and MAX aren't included here).
+static
+FORCEINLINE
+ULONGLONG
+NfMin64(
+    _In_ ULONGLONG A,
+    _In_ ULONGLONG B
+)
+{
+    return (A < B) ? A : B;
+}
+
+static
+FORCEINLINE
+ULONGLONG
+NfMax64(
+    _In_ ULONGLONG A,
+    _In_ ULONGLONG B
+)
+{
+    return (A > B) ? A : B;
+}
+
+//
+// The event logs (AppRing.h). Each call holds the log's lock for one entry (STATS: for the whole log's copy); event n is in slot
+// (n - 1) % Entries. The lock is the last in every lock order, so a caller may hold the app ring's and a loopback's.
+//
+
+// The slot holding event Sequence, or NULL if a later event has taken it (or there is no such event). Log lock held.
+static
+PNF_VMIC_EVENT
+NfVmicLogSlot(
+    _In_ PNF_EVENT_LOG  Log,
+    _In_ ULONGLONG      Sequence
+)
+{
+    PNF_VMIC_EVENT slot;
+
+    if (Sequence == 0 || Sequence > Log->Logged)
+    {
+        return NULL;
+    }
+    slot = &Log->Slots[(Sequence - 1) % Log->Entries];
+    return (slot->Sequence == Sequence) ? slot : NULL;
+}
+
+// Each entry point below returns at once for a NULL log, or one not yet set up (no slots).
+
+_Use_decl_annotations_
+ULONGLONG
+NfVmicLogEvent(
+    PNF_EVENT_LOG           Log,
+    const NF_VMIC_EVENT*    Event
+)
+{
+    KIRQL           oldIrql;
+    ULONGLONG       sequence;
+    PNF_VMIC_EVENT  slot;
+
+    if (Log == NULL || Log->Slots == NULL || Log->Entries == 0)
+    {
+        return 0;
+    }
+
+    KeAcquireSpinLock(&Log->Lock, &oldIrql);
+    sequence = ++Log->Logged;
+    slot = &Log->Slots[(sequence - 1) % Log->Entries];
+    *slot = *Event;
+    slot->Sequence = sequence;
+    // Inside the lock, so the times run in the log's order.
+    slot->Qpc = (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+    KeReleaseSpinLock(&Log->Lock, oldIrql);
+
+    return sequence;
+}
+
+_Use_decl_annotations_
+BOOLEAN
+NfVmicLogExtend(
+    PNF_EVENT_LOG   Log,
+    ULONGLONG       Sequence,
+    ULONG           Frames,
+    ULONGLONG       SpanEnd,
+    USHORT          Flags
+)
+{
+    KIRQL           oldIrql;
+    PNF_VMIC_EVENT  slot;
+    BOOLEAN         found;
+
+    if (Log == NULL || Log->Slots == NULL || Log->Entries == 0)
+    {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&Log->Lock, &oldIrql);
+    slot = NfVmicLogSlot(Log, Sequence);
+    found = (slot != NULL) ? TRUE : FALSE;
+    if (found)
+    {
+        slot->Frames = (UINT32)NfMin64((ULONGLONG)slot->Frames + Frames, MAXULONG);
+        if (SpanEnd > slot->SpanFrom)
+        {
+            slot->SpanFrames = (UINT32)NfMin64(SpanEnd - slot->SpanFrom, MAXULONG);
+        }
+        slot->Flags |= Flags;
+    }
+    KeReleaseSpinLock(&Log->Lock, oldIrql);
+
+    return found;
+}
+
+_Use_decl_annotations_
+BOOLEAN
+NfVmicLogRingSpan(
+    PNF_EVENT_LOG   Log,
+    ULONGLONG       Sequence,
+    ULONGLONG       RingFrom,
+    ULONGLONG       RingTo
+)
+{
+    KIRQL           oldIrql;
+    PNF_VMIC_EVENT  slot;
+    BOOLEAN         found;
+
+    if (Log == NULL || Log->Slots == NULL || Log->Entries == 0)
+    {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&Log->Lock, &oldIrql);
+    slot = NfVmicLogSlot(Log, Sequence);
+    found = (slot != NULL) ? TRUE : FALSE;
+    if (found)
+    {
+        if ((slot->Flags & NF_VMIC_EVENTF_RING) == 0)
+        {
+            slot->RingFrom = RingFrom;
+            slot->RingTo = RingTo;
+            slot->Flags |= NF_VMIC_EVENTF_RING;
+        }
+        else if (RingTo > slot->RingTo)
+        {
+            slot->RingTo = RingTo;
+        }
+    }
+    KeReleaseSpinLock(&Log->Lock, oldIrql);
+
+    return found;
+}
+
+_Use_decl_annotations_
+BOOLEAN
+NfVmicLogFlags(
+    PNF_EVENT_LOG   Log,
+    ULONGLONG       Sequence,
+    USHORT          Set,
+    USHORT          Clear
+)
+{
+    KIRQL           oldIrql;
+    PNF_VMIC_EVENT  slot;
+    BOOLEAN         found;
+
+    if (Log == NULL || Log->Slots == NULL || Log->Entries == 0)
+    {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&Log->Lock, &oldIrql);
+    slot = NfVmicLogSlot(Log, Sequence);
+    found = (slot != NULL) ? TRUE : FALSE;
+    if (found)
+    {
+        slot->Flags = (UINT16)((slot->Flags | Set) & ~Clear);
+    }
+    KeReleaseSpinLock(&Log->Lock, oldIrql);
+
+    return found;
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicCopyEventLog(
+    PNF_EVENT_LOG   Log,
+    PNF_VMIC_EVENT  Out,
+    ULONG           Entries,
+    PUINT64         Logged
+)
+{
+    KIRQL oldIrql;
+
+    if (Log == NULL || Log->Slots == NULL || Log->Entries != Entries)
+    {
+        RtlZeroMemory(Out, (SIZE_T)Entries * sizeof(NF_VMIC_EVENT));
+        *Logged = 0;
+        return;
+    }
+
+    // Whole entries, and the count with them: no writer is inside the lock.
+    KeAcquireSpinLock(&Log->Lock, &oldIrql);
+    RtlCopyMemory(Out, Log->Slots, (SIZE_T)Entries * sizeof(NF_VMIC_EVENT));
+    *Logged = (UINT64)Log->Logged;
+    KeReleaseSpinLock(&Log->Lock, oldIrql);
+}
+
+//
+// The skip log's records of the app ring's copy (AppRing.h). App ring lock held throughout; the entries are in the app feed
+// device's skip log (NF_APP_RING.Loopback), as every app ring event is.
+//
+static
+PNF_EVENT_LOG
+NfVmicAppRingSkipLog(
+    _In_ PNF_APP_RING Ring
+)
+{
+    return (Ring->Loopback != NULL) ? &Ring->Loopback->SkipLog : NULL;
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicAppRingAudioWritten(
+    PNF_APP_RING    Ring,
+    ULONGLONG       From,
+    ULONGLONG       To,
+    ULONGLONG       RingFrame
+)
+{
+    PNF_EVENT_LOG   log = NfVmicAppRingSkipLog(Ring);
+    BOOLEAN         grown = FALSE;
+    ULONG           i;
+
+    if (To <= From)
+    {
+        return;
+    }
+
+    // The map: the latest record grows where this follows on from it in both the time line and the ring.
+    if (Ring->SegmentNext != 0)
+    {
+        PNF_APP_SEGMENT last = &Ring->Segments[(Ring->SegmentNext - 1) % NF_APP_SEGMENTS];
+
+        if (last->To == From && last->Ring + (last->To - last->From) == RingFrame)
+        {
+            last->To = To;
+            grown = TRUE;
+        }
+    }
+    if (!grown)
+    {
+        PNF_APP_SEGMENT next = &Ring->Segments[Ring->SegmentNext % NF_APP_SEGMENTS];
+
+        if (Ring->SegmentNext >= NF_APP_SEGMENTS && next->To > Ring->SegmentsLostTo)
+        {
+            Ring->SegmentsLostTo = next->To;
+        }
+        next->From = From;
+        next->To = To;
+        next->Ring = RingFrame;
+        Ring->SegmentNext++;
+    }
+
+    // The claims it fills: their entries' ring spans take in the ring's frames written there.
+    for (i = 0; i < NF_APP_CLAIMS; i++)
+    {
+        PNF_APP_CLAIM   claim = &Ring->Claims[i];
+        ULONGLONG       lo = NfMax64(From, claim->Lo);
+        ULONGLONG       hi = NfMin64(To, claim->Hi);
+
+        if (claim->Sequence != 0 && hi > lo)
+        {
+            (void)NfVmicLogRingSpan(log, claim->Sequence, RingFrame + (lo - From), RingFrame + (hi - From));
+        }
+    }
+}
+
+_Use_decl_annotations_
+BOOLEAN
+NfVmicAppRingSpan(
+    PNF_APP_RING    Ring,
+    ULONGLONG       Lo,
+    ULONGLONG       Hi,
+    PULONGLONG      RingFrom,
+    PULONGLONG      RingTo,
+    PBOOLEAN        Whole
+)
+{
+    ULONG       count = (ULONG)NfMin64(Ring->SegmentNext, NF_APP_SEGMENTS);
+    BOOLEAN     any = FALSE;
+    ULONG       i;
+
+    *RingFrom = 0;
+    *RingTo = 0;
+    *Whole = (Lo >= Ring->SegmentsLostTo) ? TRUE : FALSE;
+
+    // The ring's frames follow the time line's within the copy (the reader delivers them in order), so the span runs from the
+    // lowest the records map there to the highest.
+    for (i = 0; i < count; i++)
+    {
+        PNF_APP_SEGMENT segment = &Ring->Segments[i];
+        ULONGLONG       lo = NfMax64(Lo, segment->From);
+        ULONGLONG       hi = NfMin64(Hi, segment->To);
+
+        if (hi > lo)
+        {
+            ULONGLONG ringLo = segment->Ring + (lo - segment->From);
+            ULONGLONG ringHi = segment->Ring + (hi - segment->From);
+
+            if (!any || ringLo < *RingFrom)
+            {
+                *RingFrom = ringLo;
+            }
+            if (!any || ringHi > *RingTo)
+            {
+                *RingTo = ringHi;
+            }
+            any = TRUE;
+        }
+    }
+
+    return any;
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicAppRingClaim(
+    PNF_APP_RING    Ring,
+    ULONGLONG       Lo,
+    ULONGLONG       Hi,
+    ULONGLONG       Sequence
+)
+{
+    PNF_EVENT_LOG   log = NfVmicAppRingSkipLog(Ring);
+    ULONG           i;
+
+    if (Sequence == 0 || Hi <= Lo)
+    {
+        return;
+    }
+
+    for (i = 0; i < NF_APP_CLAIMS; i++)
+    {
+        PNF_APP_CLAIM claim = &Ring->Claims[i];
+
+        if (claim->Sequence == 0)
+        {
+            claim->Lo = Lo;
+            claim->Hi = Hi;
+            claim->Sequence = Sequence;
+            (void)NfVmicLogFlags(log, Sequence, NF_VMIC_EVENTF_PENDING, 0);
+            return;
+        }
+    }
+
+    (void)NfVmicLogFlags(log, Sequence, NF_VMIC_EVENTF_UNTRACKED, 0);
+}
+
+_Use_decl_annotations_
+BOOLEAN
+NfVmicAppRingClaimExtend(
+    PNF_APP_RING    Ring,
+    ULONGLONG       Sequence,
+    ULONGLONG       Hi,
+    ULONGLONG       NewHi
+)
+{
+    ULONG i;
+
+    for (i = 0; i < NF_APP_CLAIMS; i++)
+    {
+        PNF_APP_CLAIM claim = &Ring->Claims[i];
+
+        if (Sequence != 0 && claim->Sequence == Sequence && claim->Hi == Hi)
+        {
+            claim->Hi = NewHi;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicAppRingSettleClaims(
+    PNF_APP_RING    Ring,
+    BOOLEAN         All
+)
+{
+    PNF_EVENT_LOG   log = NfVmicAppRingSkipLog(Ring);
+    ULONG           i;
+
+    for (i = 0; i < NF_APP_CLAIMS; i++)
+    {
+        PNF_APP_CLAIM claim = &Ring->Claims[i];
+
+        if (claim->Sequence != 0 && (All || (Ring->HistoryValid && claim->Hi <= Ring->HistoryEnd)))
+        {
+            (void)NfVmicLogFlags(log, claim->Sequence, 0, NF_VMIC_EVENTF_PENDING);
+            claim->Sequence = 0;
+        }
+    }
+}
+
+_Use_decl_annotations_
+VOID
+NfVmicAppRingMapReset(
+    PNF_APP_RING Ring
+)
+{
+    Ring->SegmentNext = 0;
+    Ring->SegmentsLostTo = 0;
+    RtlZeroMemory(Ring->Segments, sizeof(Ring->Segments));
 }

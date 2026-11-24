@@ -36,6 +36,9 @@ extern "C" {
 #include <wdf.h>
 #include <acx.h>
 
+// noise-filter (TODO 19): the protocol's types, for the event logs below (NF_VMIC_EVENT). Guarded: AppRing.h includes it too.
+#include "nf_vmic.h"
+
 #define PAGED_CODE_SEG __declspec(code_seg("PAGE"))
 #define INIT_CODE_SEG __declspec(code_seg("INIT"))
 
@@ -73,6 +76,18 @@ typedef struct _LOOPBACK_OPEN {
     ULONG           Count;                  // 0: the slot is free
     LOOPBACK_FORMAT Format;                 // Valid unused (it needs the packet size, known only at Run)
 } LOOPBACK_OPEN, *PLOOPBACK_OPEN;
+
+//
+// noise-filter (TODO 19): one of a device's event logs (nf_vmic.h, "The event logs"): event n (Sequence n, from 1) in slot
+// (n - 1) % Entries of Slots. Its own spin lock, the last in every lock order (AppRing.h): taken inside the app ring's and the
+// loopback's, and nothing is taken inside it. Init in Codec_EvtBusDeviceAdd; Slots are its LOOPBACK_RING's, which never moves.
+//
+typedef struct _NF_EVENT_LOG {
+    KSPIN_LOCK      Lock;
+    ULONG           Entries;
+    ULONGLONG       Logged;                 // events logged: the newest's Sequence
+    PNF_VMIC_EVENT  Slots;
+} NF_EVENT_LOG, *PNF_EVENT_LOG;
 
 typedef struct _LOOPBACK_RING {
     BOOLEAN         AppFeed;                // immutable after AddDevice: only primary cable A participates in the named control feed
@@ -112,6 +127,13 @@ typedef struct _LOOPBACK_RING {
     ULONG           RenderNotOwner;         // passes of a second render stream (not looped back)
     ULONG           LeadSkips;              // capture reads moved on at once by a fall in the render lead: a one-time skip
     ULONGLONG       LeadSkippedFrames;      // the ring's audio such skips passed over (the difference in leads at most)
+
+    // This device's event logs (NF_EVENT_LOG: their own locks, not Lock): its loopback's, and for the app feed's device the
+    // app ring's (NF_APP_RING.Loopback is this ring). STATS copies the app feed device's.
+    NF_EVENT_LOG    SkipLog;
+    NF_EVENT_LOG    UnderrunLog;
+    NF_VMIC_EVENT   SkipSlots[NF_VMIC_SKIP_LOG_ENTRIES];
+    NF_VMIC_EVENT   UnderrunSlots[NF_VMIC_UNDERRUN_LOG_ENTRIES];
 } LOOPBACK_RING, *PLOOPBACK_RING;
 
 //

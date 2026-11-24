@@ -26,6 +26,21 @@ pub const RIGHT_MULTIPLIER: u32 = 0x0037_79B1;
 pub const RIGHT_OFFSET: u32 = 0x0015_5555;
 /// How many corrupt frames [`CheckReport::first_corrupt`] keeps.
 pub const CORRUPT_EXAMPLES: usize = 8;
+/// How many gaps [`CheckReport::gap_list`] keeps (a recording with more is far past any the driver's skip log can explain: it
+/// keeps 64 events).
+pub const GAP_RECORDS: usize = 256;
+
+/// One forward jump in the codes: the code that was due, the code that came (the frames between never arrived), where in the
+/// recording it came, and the silence between the two codes (an underrun next to the gap, or a late read's silence in place of
+/// the frames it lost).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gap {
+    /// The frame index in the recording of the code that came.
+    pub index: u64,
+    pub due: u32,
+    pub got: u32,
+    pub silence: u64,
+}
 
 /// The code frame `n` carries.
 pub fn code(n: u64) -> u32 {
@@ -86,6 +101,8 @@ pub struct CheckReport {
     /// Forward jumps (frames lost), and the frames they skipped.
     pub gaps: u64,
     pub gap_frames: u64,
+    /// The first [`GAP_RECORDS`] gaps, in order.
+    pub gap_list: Vec<Gap>,
     /// Backward jumps (frames delivered again), and how far back.
     pub repeats: u64,
     pub repeat_frames: u64,
@@ -150,6 +167,7 @@ impl SequenceChecker {
             return;
         };
         // The silence since the last signal frame lies inside the signal.
+        let silence = r.zeros_after_signal;
         r.zeros_inside += r.zeros_after_signal;
         r.zero_runs_inside += self.pending_runs;
         r.zeros_after_signal = 0;
@@ -164,6 +182,9 @@ impl SequenceChecker {
                 if u64::from(ahead) < CODE_MODULUS / 2 {
                     r.gaps += 1;
                     r.gap_frames += u64::from(ahead);
+                    if r.gap_list.len() < GAP_RECORDS {
+                        r.gap_list.push(Gap { index, due: d, got: k, silence });
+                    }
                 } else {
                     r.repeats += 1;
                     r.repeat_frames += u64::from(d.wrapping_sub(k) & CODE_MASK);
@@ -326,6 +347,23 @@ mod tests {
         let r = c.report();
         assert_eq!((r.gaps, r.gap_frames), (1, 5));
         assert_eq!((r.repeats, r.repeat_frames), (1, 3));
+        // The gap's codes either side and its place: frames 20 to 24 never came, code 25 at index 10.
+        assert_eq!(r.gap_list, [Gap { index: 10, due: 20, got: 25, silence: 0 }]);
+    }
+
+    /// A gap with silence before the code that came (a late read: silence in place of the frames it lost), one at the codes'
+    /// wrap, and the list's cap.
+    #[test]
+    fn each_gap_is_listed_with_its_silence() {
+        let silence = |n| std::iter::repeat_n([0.0; 2], n);
+        let end = CODE_MODULUS;
+        let c = check((0..10).map(frame).chain(silence(4)).chain((14..20).map(frame)).chain((40..43).map(frame)));
+        let r = c.report();
+        assert_eq!(r.gap_list, [Gap { index: 14, due: 10, got: 14, silence: 4 }, Gap { index: 20, due: 20, got: 40, silence: 0 }]);
+        let wrap = check((end - 3..end).chain(2..4).map(frame));
+        assert_eq!(wrap.report().gap_list, [Gap { index: 3, due: 0, got: 2, silence: 0 }]);
+        let many = check((0..2 * GAP_RECORDS as u64 + 2).map(|n| frame(2 * n)));
+        assert_eq!((many.report().gaps, many.report().gap_list.len()), (2 * GAP_RECORDS as u64 + 1, GAP_RECORDS));
     }
 
     #[test]

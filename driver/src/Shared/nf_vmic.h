@@ -168,7 +168,7 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
-NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
+NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
@@ -201,6 +201,14 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
                                          NF_VMIC_STATS_LOOPBACK, as Loopback is: the first-registered device's)
      664     8  LoopbackLeadSkippedFrames
                                          the loopback ring's audio those skips passed over (the difference in leads at most)
+     672     8  SkipEventsLogged         events the skip log has taken since its device was added (the newest's Sequence; 0: none)
+     680     8  UnderrunEventsLogged     the same for the underrun log
+     688     4  SkipLogEntries           NF_VMIC_SKIP_LOG_ENTRIES (64): SkipLog's slots
+     692     4  UnderrunLogEntries       NF_VMIC_UNDERRUN_LOG_ENTRIES (32)
+     696     4  EventBytes               sizeof(NF_VMIC_EVENT) (64)
+     700     4  Reserved1
+     704  4096  SkipLog                  NF_VMIC_EVENT[64]: event n in slot (n - 1) % 64 (the logs, below)
+    4800  2048  UnderrunLog              NF_VMIC_EVENT[32]: event n in slot (n - 1) % 32
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
@@ -226,11 +234,11 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
     packet's lag (a handoff to a reader with a shorter packet: the owner, 2026-11-23), and SecondarySkippedFrames the copy's
     frames it so passed over, counted as HandoffSkippedFrames is: from the copy's valid start to its end, less its recorded
     gaps. So a recording that played on through a handoff to a shorter packet has a gap of exactly those frames, as long
-    as the copy held the span (below: frames it didn't yet hold are lost uncounted, as for any read past its end), and one
-    that took the slot a
-    gap of HandoffSkippedFrames (the last reader's underrun silence in either span counts but is no gap). The copy holds the
-    whole span unless the new reader's timer is later than the skipping stream's by more than the 1 ms, which leaves that
-    stream's read short too (SecondaryUnderrunFrames).
+    as the copy held the span (below: frames it didn't yet hold are lost uncounted, as for any read past its end, though the
+    skip log has them), and one that took the slot a gap of HandoffSkippedFrames (the last reader's underrun silence in
+    either span counts but is no gap). The copy holds the whole span unless the new reader's timer is later than the
+    skipping stream's by more than the 1 ms, which leaves that stream's read short too (SecondaryUnderrunFrames). Every such
+    gap, with any number of streams, is in the skip log with the ring's frames it lost (the event logs, below).
 
     The loopback's capture side (spike check 7) takes a change in the render lead at once (the owner, 2026-11-23, for a new
     render run's lead; within a run, following the owner's app-ring decision of 2026-11-23). A fall moves the read on by the
@@ -253,6 +261,57 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
     packet and QPCCompletion. PositionQueries and CurrentPacketQueries count EvtAcxStreamGetPresentationPosition and
     EvtAcxStreamGetCurrentPacket calls. All capture streams', the latest of any of them; QPCs in ticks; each field is written
     whole, the set not as one.
+
+    The event logs (TODO 19, the owner, 2026-11-24: telemetry to find bugs by, and to prove the design): every device keeps
+    two rings of NF_VMIC_EVENT, its own, and STATS copies those of the device whose loopback Loopback is (the app feed's).
+    The skip log holds every event in which a capture stream never got some of the audio it was due, one entry an event:
+    HANDOFF_SKIP, SECONDARY_SKIP, SECONDARY_JUMP, LATE_READ, RESYNC, LIVE_DISCARD and LOOPBACK_LEAD_SKIP. The underrun log
+    holds the silence a stream got with nothing lost (READER_UNDERRUN, SECONDARY_UNDERRUN, LOOPBACK_UNDERRUN), one entry a
+    run of a stream's passes that each had some, logged at the run's first pass and extended in place while it lasts, so
+    silence can't flood it, and kept apart so that it can't push skips out of theirs. Each log numbers its events from 1
+    (Sequence) and keeps the latest NF_VMIC_*_LOG_ENTRIES: event n in slot (n - 1) % entries; *EventsLogged is the newest's
+    number, so the window between two snapshots holds every event in it unless its count rose by more than the slots. STATS
+    copies the logs under their own lock, nested in the app ring's and the loopback's (which every writer of the app feed
+    device's logs holds), at the same instant as the counters: every entry is whole, and the counters agree with the log
+    (the skips' entries in a window add up to their counters' rise). An unused slot is all zero; a reader takes an entry
+    whose Sequence isn't its slot's (n - 1) % entries, or is above the total or the slots' count below it, as unreadable
+    (not expected).
+
+    NF_VMIC_EVENT (64 bytes). Sequence, the QPC of the pass that logged it (a run's first), Kind, Flags, the capture stream
+    (Stream: a serial from 1 each stream is given when it is created, since the driver loaded), its packet (PacketFrames, in
+    its format's frames), Frames (by kind, below), the attachment (Attach: NF_VMIC_RING_STATS.Attaches when it was logged,
+    its low 32 bits; 0 for the loopback's), the span it concerns on the stream engine's QPC time line (SpanFrom and
+    SpanFrames: frame n is n / the rate's seconds of QPC time, as the app ring's copy and the loopback ring place their
+    audio), and with NF_VMIC_EVENTF_RING the ring's frames it concerns, [RingFrom, RingTo): the app ring's positions, which
+    the app numbered (nf-vmic-test's signal puts its code for frame n at position n), or the loopback ring's frames (its time
+    line's). Where a span held silence among the audio (the reader's underruns), its ring frames are only the audio's.
+      - HANDOFF_SKIP: a stream that played the copy took the reader slot (ReaderHandoffs, one entry each). Span: its place in
+        the copy to its first packet as the reader; Frames: what HandoffSkippedFrames counted; the ring span: the audio the
+        copy held there, which never reaches it. What the copy didn't hold there becomes a gap in it at the same pass.
+      - SECONDARY_SKIP: a stream playing on moved to a shorter reader packet's lag (SecondarySkips, one entry each; Frames:
+        SecondarySkippedFrames' part). Span and ring span: what it passed over.
+      - SECONDARY_JUMP: a stream playing the copy whose own time line moved later (a late timer's glitch adjustment): what the
+        copy holds between its place and its new read never reaches it. Frames: the copy's frames there, as a skip counts
+        them. Not counted elsewhere (its GlitchPasses are).
+      - LATE_READ: a stream playing the copy read past the copy's end (the reader late, or none yet): silence, SpanFrames of
+        it (Frames), and the audio the reader then writes there never reaches it. One entry for a stream's contiguous reads
+        past the end, extended while they last; its ring span is the audio the reader writes there, filled in by those
+        writes (NF_VMIC_EVENTF_PENDING until the copy's end has passed the span). Frames: SecondaryUnderrunFrames' part.
+        A SECONDARY_SKIP or SECONDARY_JUMP whose span ran past the copy's end is filled in the same way.
+      - RESYNC: the reader found WriteFrame invalid (Resyncs): ReadFrame moved from RingFrom to RingTo, and the frames
+        between never reach any stream (NF_VMIC_EVENTF_BACKWARD: WriteFrame was behind). Frames: the move, if forward.
+      - LIVE_DISCARD: a live attachment's first pass after every reader stopped discarded RingFrom to RingTo. Frames: those.
+      - LOOPBACK_LEAD_SKIP: a loopback capture read moved on to a shorter render lead (LoopbackLeadSkips; Frames: the
+        LoopbackLeadSkippedFrames part; the ring span the render audio it passed over, the loopback ring's frames).
+      - READER_UNDERRUN: the reader's underrun run (UnderrunFrames' part in Frames): RingFrom is where the ring ran dry at
+        its start, RingTo where the latest silence of the run began.
+      - SECONDARY_UNDERRUN: a stream playing the copy got silence other than a late read's: NF_VMIC_EVENTF_BEHIND (frames it
+        had had: its place moved back), _GAP (the copy's silence for a gap in the reader's time line), _OLD (before the
+        copy's valid start). Frames: SecondaryUnderrunFrames' part.
+      - LOOPBACK_UNDERRUN: a loopback capture stream's underrun run (Loopback.UnderrunFrames' part).
+    NF_VMIC_EVENTF_READER: the stream held the reader slot at that pass; _PAUSING: it had given the slot up (its Pause had
+    begun); _UNTRACKED: the ring span may be short, the driver's records of the copy (64 runs of its audio) or of the spans
+    it is filling in (16) having run out.
 
 --*/
 
@@ -309,6 +368,31 @@ NF_VMIC_STATS (672 bytes; all counters cumulative since the driver loaded; times
 
 #define NF_VMIC_LATENESS_BUCKETS        8u
 #define NF_VMIC_LATENESS_BOUNDS_HNS     { 500, 1000, 2500, 5000, 10000, 20000, 50000 }
+
+// The event logs (NF_VMIC_STATS.SkipLog, UnderrunLog): their slots, and NF_VMIC_EVENT.Kind.
+#define NF_VMIC_SKIP_LOG_ENTRIES            64u
+#define NF_VMIC_UNDERRUN_LOG_ENTRIES        32u
+#define NF_VMIC_EVENT_HANDOFF_SKIP          1u      // the skip log's
+#define NF_VMIC_EVENT_SECONDARY_SKIP        2u
+#define NF_VMIC_EVENT_SECONDARY_JUMP        3u
+#define NF_VMIC_EVENT_LATE_READ             4u
+#define NF_VMIC_EVENT_RESYNC                5u
+#define NF_VMIC_EVENT_LIVE_DISCARD          6u
+#define NF_VMIC_EVENT_LOOPBACK_LEAD_SKIP    7u
+#define NF_VMIC_EVENT_READER_UNDERRUN       8u      // the underrun log's
+#define NF_VMIC_EVENT_SECONDARY_UNDERRUN    9u
+#define NF_VMIC_EVENT_LOOPBACK_UNDERRUN     10u
+
+// NF_VMIC_EVENT.Flags bits.
+#define NF_VMIC_EVENTF_READER           0x0001u     // the stream held the reader slot at that pass
+#define NF_VMIC_EVENTF_RING             0x0002u     // RingFrom and RingTo hold the ring's frames
+#define NF_VMIC_EVENTF_PENDING          0x0004u     // part of the span is past the copy's end: the reader's writes there still add to it
+#define NF_VMIC_EVENTF_UNTRACKED        0x0008u     // the ring span may be short: the driver's records of the copy ran out
+#define NF_VMIC_EVENTF_BACKWARD         0x0010u     // RESYNC, LIVE_DISCARD: to a WriteFrame behind ReadFrame (RingTo < RingFrom)
+#define NF_VMIC_EVENTF_PAUSING          0x0020u     // the stream had given the reader slot up (its Pause had begun)
+#define NF_VMIC_EVENTF_BEHIND           0x0100u     // SECONDARY_UNDERRUN: silence for frames it had had (its place moved back)
+#define NF_VMIC_EVENTF_GAP              0x0200u     // SECONDARY_UNDERRUN: the copy's silence for a gap in the reader's time line
+#define NF_VMIC_EVENTF_OLD              0x0400u     // SECONDARY_UNDERRUN: before the copy's valid start
 
 // Magic and Version are the first 8 bytes of this and of the ring's header in every version. ATTACH checks the input's before any
 // size, and the header's before its other fields.
@@ -409,6 +493,21 @@ typedef struct _NF_VMIC_CAPTURE_TRACE {
     UINT64  CurrentPacketQueries;       //  56
 } NF_VMIC_CAPTURE_TRACE, *PNF_VMIC_CAPTURE_TRACE;
 
+typedef struct _NF_VMIC_EVENT {
+    UINT64  Sequence;                   //   0: its number in its log, from 1; 0: an unused slot
+    UINT64  Qpc;                        //   8: KeQueryPerformanceCounter at the pass that logged it
+    UINT16  Kind;                       //  16: NF_VMIC_EVENT_*
+    UINT16  Flags;                      //  18: NF_VMIC_EVENTF_*
+    UINT32  Stream;                     //  20: the capture stream's serial (from 1, in creation order since the driver loaded)
+    UINT32  PacketFrames;               //  24: its packet, in its format's frames
+    UINT32  Frames;                     //  28: by kind (the notes above)
+    UINT32  Attach;                     //  32: NF_VMIC_RING_STATS.Attaches when logged (its low 32 bits); 0: the loopback's
+    UINT32  SpanFrames;                 //  36
+    UINT64  SpanFrom;                   //  40: [SpanFrom, SpanFrom + SpanFrames), frames on the QPC time line
+    UINT64  RingFrom;                   //  48: [RingFrom, RingTo), the ring's frames, with NF_VMIC_EVENTF_RING
+    UINT64  RingTo;                     //  56
+} NF_VMIC_EVENT, *PNF_VMIC_EVENT;
+
 typedef struct _NF_VMIC_STATS {
     UINT32                  Magic;                      //   0
     UINT32                  Version;                    //   4
@@ -434,6 +533,14 @@ typedef struct _NF_VMIC_STATS {
     UINT64                  SecondarySkippedFrames;     // 648
     UINT64                  LoopbackLeadSkips;          // 656
     UINT64                  LoopbackLeadSkippedFrames;  // 664
+    UINT64                  SkipEventsLogged;           // 672
+    UINT64                  UnderrunEventsLogged;       // 680
+    UINT32                  SkipLogEntries;             // 688
+    UINT32                  UnderrunLogEntries;         // 692
+    UINT32                  EventBytes;                 // 696
+    UINT32                  Reserved1;                  // 700
+    NF_VMIC_EVENT           SkipLog[NF_VMIC_SKIP_LOG_ENTRIES];          //  704
+    NF_VMIC_EVENT           UnderrunLog[NF_VMIC_UNDERRUN_LOG_ENTRIES];  // 4800
 } NF_VMIC_STATS, *PNF_VMIC_STATS;
 
 C_ASSERT(sizeof(NF_VMIC_ATTACH_IN) == 16);
@@ -468,7 +575,18 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondarySkips) == 640);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondarySkippedFrames) == 648);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, LoopbackLeadSkips) == 656);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, LoopbackLeadSkippedFrames) == 664);
-C_ASSERT(sizeof(NF_VMIC_STATS) == 672);
+C_ASSERT(sizeof(NF_VMIC_EVENT) == 64);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_EVENT, Kind) == 16);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_EVENT, Attach) == 32);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_EVENT, SpanFrom) == 40);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_EVENT, RingTo) == 56);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SkipEventsLogged) == 672);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, UnderrunEventsLogged) == 680);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SkipLogEntries) == 688);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, EventBytes) == 696);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SkipLog) == 704);
+C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, UnderrunLog) == 4800);
+C_ASSERT(sizeof(NF_VMIC_STATS) == 6848);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
 C_ASSERT(NF_VMIC_IOCTL_STATS == 0x00226004);
 

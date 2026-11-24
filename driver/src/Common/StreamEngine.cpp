@@ -85,6 +85,9 @@ CStreamEngine::CStreamEngine(
     m_StatsKind = NF_VMIC_KIND_RENDER;
     m_ArmedHns = 0;
 
+    // noise-filter (TODO 19): its serial in the event logs, from 1, in creation order across every device.
+    m_Serial = (ULONG)InterlockedIncrement(&g_NfStreamSerial);
+
     {
         ACXCIRCUIT circuit = AcxStreamGetCircuit(Stream);
 
@@ -1737,7 +1740,12 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_AppOtherLead(0),
     m_AppOtherValid(FALSE),
     m_AppLiveAttach(0),
-    m_AppNoSlot(FALSE)
+    m_AppNoSlot(FALSE),
+    m_EvUnderrun(0),
+    m_EvSilence(0),
+    m_EvLate(0),
+    m_EvLateEnd(0),
+    m_EvLbUnderrun(0)
 {
     PAGED_CODE();
 
@@ -1891,6 +1899,13 @@ CCaptureStreamEngine::Run()
 
         // It may hold the reader slot again (AppRingReaderStop barred it). No pass reads this while the timer is stopped.
         m_AppNoSlot = FALSE;
+
+        // A new time line: its runs in the event logs end (the next pass with silence starts one).
+        m_EvUnderrun = 0;
+        m_EvSilence = 0;
+        m_EvLate = 0;
+        m_EvLateEnd = 0;
+        m_EvLbUnderrun = 0;
     }
 
     return CStreamEngine::Run();
@@ -1978,12 +1993,29 @@ CCaptureStreamEngine::LoopbackCapturePass(
         ULONGLONG   newStart = oldStart + (m_LbAnchorLead - lead);
         ULONGLONG   skipLo = MAX(oldStart, validLo);
         ULONGLONG   skipHi = MIN(newStart, validHi);
+        NF_VMIC_EVENT event;
 
         ring->LeadSkips++;
         if (skipHi > skipLo)
         {
             ring->LeadSkippedFrames += skipHi - skipLo;
         }
+
+        // The skip log (nf_vmic.h): the span between the two reads, and the render audio the ring held there.
+        RtlZeroMemory(&event, sizeof(event));
+        event.Kind = NF_VMIC_EVENT_LOOPBACK_LEAD_SKIP;
+        event.Stream = m_Serial;
+        event.PacketFrames = m_LbPacketFrames;
+        event.Frames = (skipHi > skipLo) ? (UINT32)MIN(skipHi - skipLo, (ULONGLONG)MAXULONG) : 0;
+        event.SpanFrom = oldStart;
+        event.SpanFrames = (UINT32)MIN(newStart - oldStart, (ULONGLONG)MAXULONG);
+        if (skipHi > skipLo)
+        {
+            event.Flags = NF_VMIC_EVENTF_RING;
+            event.RingFrom = skipLo;
+            event.RingTo = skipHi;
+        }
+        (void)NfVmicLogEvent(&ring->SkipLog, &event);
     }
     if (!m_LbAnchorValid || anchor != m_LbAnchor || lead != m_LbAnchorLead)
     {
@@ -2019,17 +2051,36 @@ CCaptureStreamEngine::LoopbackCapturePass(
         RtlZeroMemory(PacketBuffer + (SIZE_T)(copyHi - readStart) * blockAlign, (SIZE_T)(readEnd - copyHi) * blockAlign);
     }
 
-    if (readEnd > validHi)
+    if (readEnd > validHi && ring->RenderActive)
     {
-        if (ring->RenderActive)
+        ULONGLONG under = readEnd - MAX(readStart, validHi);
+
+        ring->UnderrunPackets++;
+        ring->UnderrunFrames += under;
+
+        // The underrun log: one entry a run of underrunning passes, extended while it lasts.
+        if (m_EvLbUnderrun == 0 ||
+            !NfVmicLogExtend(&ring->UnderrunLog, m_EvLbUnderrun, (ULONG)MIN(under, (ULONGLONG)MAXULONG), readEnd, 0))
         {
-            ring->UnderrunPackets++;
-            ring->UnderrunFrames += readEnd - MAX(readStart, validHi);
+            NF_VMIC_EVENT event;
+
+            RtlZeroMemory(&event, sizeof(event));
+            event.Kind = NF_VMIC_EVENT_LOOPBACK_UNDERRUN;
+            event.Stream = m_Serial;
+            event.PacketFrames = m_LbPacketFrames;
+            event.Frames = (UINT32)MIN(under, (ULONGLONG)MAXULONG);
+            event.SpanFrom = readEnd - under;
+            event.SpanFrames = event.Frames;
+            m_EvLbUnderrun = NfVmicLogEvent(&ring->UnderrunLog, &event);
         }
-        else
+    }
+    else
+    {
+        if (readEnd > validHi)
         {
             ring->IdlePackets++;
         }
+        m_EvLbUnderrun = 0;
     }
     if (readStart < validLo && validLo > ring->ValidFrom)
     {
@@ -2103,12 +2154,16 @@ CCaptureStreamEngine::Pause()
 // (AppRingCapturePass takes what the copy already holds for its packet from the copy); should a part start before it, only what
 // the copy doesn't hold yet is written.
 //
+// The skip log's records (AppRing.h): the audio written is mapped to the ring's frames (Source's first is RingFrame; unused for
+// silence), and joins the ring spans of the claims it fills; the claims the copy's end then passes are settled.
+//
 static
 VOID
 AppRingHistoryWrite(
     _In_                                                PNF_APP_RING    Ring,
     _In_                                                ULONGLONG       Frame,
     _In_reads_bytes_opt_(Frames * NF_VMIC_FRAME_BYTES)  const BYTE*     Source,
+    _In_                                                ULONGLONG       RingFrame,
     _In_                                                ULONG           Frames
 )
 {
@@ -2123,6 +2178,7 @@ AppRingHistoryWrite(
         Ring->HistoryValid = TRUE;
         Ring->HistoryGapNext = 0;
         RtlZeroMemory(Ring->HistoryGaps, sizeof(Ring->HistoryGaps));
+        NfVmicAppRingMapReset(Ring);
     }
     if (Frame > Ring->HistoryEnd)
     {
@@ -2146,8 +2202,14 @@ AppRingHistoryWrite(
         }
         LoopbackRingWrite(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, from,
                           (Source != NULL) ? Source + (SIZE_T)(from - Frame) * NF_VMIC_FRAME_BYTES : NULL, end - from);
+        if (Source != NULL)
+        {
+            NfVmicAppRingAudioWritten(Ring, from, end, RingFrame + (from - Frame));
+        }
         Ring->HistoryEnd = end;
     }
+
+    NfVmicAppRingSettleClaims(Ring, FALSE);
 }
 
 // The start of what the copy holds: its current run's start, or NF_APP_HISTORY_FRAMES before its end. HistoryValid, ring lock held.
@@ -2188,6 +2250,29 @@ AppRingGapFrames(
     }
 
     return frames;
+}
+
+//
+// The copy's frames in [Lo, Hi) as a skip counts them (HandoffSkippedFrames, SecondarySkippedFrames): from its valid start at the
+// earliest (nothing before a new run or past the copy's length was audio a stream would have had) to its end at the latest,
+// less its recorded gaps (silence no reader delivered); the last reader's underrun silence there counts, as the copy holds it.
+// Ring lock held.
+//
+static
+ULONGLONG
+AppRingSkipFrames(
+    _In_ PNF_APP_RING   Ring,
+    _In_ ULONGLONG      Lo,
+    _In_ ULONGLONG      Hi
+)
+{
+    if (!Ring->HistoryValid)
+    {
+        return 0;
+    }
+    Lo = MAX(Lo, AppRingHistoryValidFrom(Ring));
+    Hi = MIN(Hi, Ring->HistoryEnd);
+    return (Hi > Lo) ? Hi - Lo - AppRingGapFrames(Ring, Lo, Hi) : 0;
 }
 
 //
@@ -2268,6 +2353,96 @@ AppRingStoreCounters(
     NfVmicStore64(&header->LastPassQpc, Qpc);
 }
 
+//
+// The app ring's event logs (nf_vmic.h, "The event logs"): the app feed device's (NF_APP_RING.Loopback, the device every stream
+// that reads the app ring belongs to), which STATS copies. NULL with no such device (then nothing is logged). Ring lock held.
+//
+static
+PNF_EVENT_LOG
+AppRingSkipLog(
+    _In_ PNF_APP_RING Ring
+)
+{
+    return (Ring->Loopback != NULL) ? &Ring->Loopback->SkipLog : NULL;
+}
+
+static
+PNF_EVENT_LOG
+AppRingUnderrunLog(
+    _In_ PNF_APP_RING Ring
+)
+{
+    return (Ring->Loopback != NULL) ? &Ring->Loopback->UnderrunLog : NULL;
+}
+
+_Use_decl_annotations_
+VOID
+CCaptureStreamEngine::AppRingEventInit(
+    PNF_VMIC_EVENT  Event,
+    USHORT          Kind,
+    ULONGLONG       Frames,
+    ULONGLONG       SpanFrom,
+    ULONGLONG       SpanTo
+)
+{
+    PNF_APP_RING ring = &g_NfAppRing;
+
+    RtlZeroMemory(Event, sizeof(*Event));
+    Event->Kind = Kind;
+    Event->Flags = (USHORT)(((ring->Reader == this) ? NF_VMIC_EVENTF_READER : 0) | (m_AppNoSlot ? NF_VMIC_EVENTF_PAUSING : 0));
+    Event->Stream = m_Serial;
+    Event->PacketFrames = m_LbPacketFrames;
+    Event->Frames = (UINT32)MIN(Frames, (ULONGLONG)MAXULONG);
+    Event->Attach = (UINT32)ring->Stats.Attaches;
+    Event->SpanFrom = SpanFrom;
+    Event->SpanFrames = (SpanTo > SpanFrom) ? (UINT32)MIN(SpanTo - SpanFrom, (ULONGLONG)MAXULONG) : 0;
+}
+
+_Use_decl_annotations_
+ULONGLONG
+CCaptureStreamEngine::AppRingLogSkip(
+    USHORT      Kind,
+    ULONGLONG   Frames,
+    ULONGLONG   Lo,
+    ULONGLONG   Hi,
+    BOOLEAN     Claim
+)
+{
+    PNF_APP_RING    ring = &g_NfAppRing;
+    NF_VMIC_EVENT   event;
+    ULONGLONG       sequence;
+
+    AppRingEventInit(&event, Kind, Frames, Lo, Hi);
+
+    // The ring's frames the copy holds as audio in the span: what the stream never gets of it.
+    if (ring->HistoryValid)
+    {
+        ULONGLONG   lo = MAX(Lo, AppRingHistoryValidFrom(ring));
+        ULONGLONG   hi = MIN(Hi, ring->HistoryEnd);
+        BOOLEAN     whole = TRUE;
+
+        if (hi > lo && NfVmicAppRingSpan(ring, lo, hi, &event.RingFrom, &event.RingTo, &whole))
+        {
+            event.Flags |= NF_VMIC_EVENTF_RING;
+        }
+        if (!whole)
+        {
+            event.Flags |= NF_VMIC_EVENTF_UNTRACKED;
+        }
+    }
+    sequence = NfVmicLogEvent(AppRingSkipLog(ring), &event);
+
+    // What the copy doesn't hold yet (past its end, or no copy yet): the reader's writes there fill the ring span in.
+    if (Claim)
+    {
+        ULONGLONG claimLo = ring->HistoryValid ? MAX(Lo, ring->HistoryEnd) : Lo;
+
+        NfVmicAppRingClaim(ring, claimLo, Hi, sequence);
+    }
+
+    return sequence;
+}
+
 _Use_decl_annotations_
 BOOLEAN
 CCaptureStreamEngine::AppRingCapturePass(
@@ -2312,7 +2487,21 @@ CCaptureStreamEngine::AppRingCapturePass(
         {
             // No recorder could consume the old queue. A new recording must never replay an earlier mic session.
             // New streams joining or taking over from a running secondary leave both the queue and the history alone.
-            ring->ReadFrame = NfVmicLoadAcquire64(&ring->Header->WriteFrame);
+            ULONGLONG discardTo = NfVmicLoadAcquire64(&ring->Header->WriteFrame);
+
+            if (discardTo != ring->ReadFrame)
+            {
+                // The skip log: the ring's frames discarded (untrusted: WriteFrame is the app's).
+                NF_VMIC_EVENT event;
+
+                AppRingEventInit(&event, NF_VMIC_EVENT_LIVE_DISCARD, (discardTo > ring->ReadFrame) ? discardTo - ring->ReadFrame : 0,
+                                 0, 0);
+                event.Flags |= NF_VMIC_EVENTF_RING | ((discardTo < ring->ReadFrame) ? NF_VMIC_EVENTF_BACKWARD : 0);
+                event.RingFrom = ring->ReadFrame;
+                event.RingTo = discardTo;
+                (void)NfVmicLogEvent(AppRingSkipLog(ring), &event);
+            }
+            ring->ReadFrame = discardTo;
             ring->HistoryValid = FALSE;
         }
     }
@@ -2336,17 +2525,16 @@ CCaptureStreamEngine::AppRingCapturePass(
             // reader's underrun silence in that span counts too: the copy holds it as delivered. m_AppOtherValid says this run's
             // passes found the ring's format (AppRingOtherPass), so m_LbPacketFrames is this stream's packet.
             //
-            ring->ReaderHandoffs++;
-            if (ring->HistoryValid)
-            {
-                ULONGLONG   start = MAX(m_AppEnd, AppRingHistoryValidFrom(ring));
-                ULONGLONG   end = MIN(LoopbackAnchor() + (ULONGLONG)Packet * m_LbPacketFrames, ring->HistoryEnd);
+            // Each handoff is in the skip log too, with the ring's frames the copy held as audio there. What the copy doesn't
+            // hold up to this packet becomes a gap in it at this pass (no audio there, nothing to claim).
+            //
+            ULONGLONG   start = m_AppEnd;
+            ULONGLONG   end = LoopbackAnchor() + (ULONGLONG)Packet * m_LbPacketFrames;
+            ULONGLONG   skipped = AppRingSkipFrames(ring, start, end);
 
-                if (end > start)
-                {
-                    ring->HandoffSkippedFrames += end - start - AppRingGapFrames(ring, start, end);
-                }
-            }
+            ring->ReaderHandoffs++;
+            ring->HandoffSkippedFrames += skipped;
+            (void)AppRingLogSkip(NF_VMIC_EVENT_HANDOFF_SKIP, skipped, start, end, FALSE);
         }
         m_AppOtherValid = FALSE;
     }
@@ -2411,6 +2599,15 @@ CCaptureStreamEngine::AppRingCapturePass(
     fill = writeFrame - readFrame;
     if (fill > capacity)
     {
+        // The skip log: the ring's frames the re-sync passed over (none if WriteFrame went back), the packet's place.
+        NF_VMIC_EVENT event;
+
+        AppRingEventInit(&event, NF_VMIC_EVENT_RESYNC, (writeFrame > readFrame) ? writeFrame - readFrame : 0, at, at);
+        event.Flags |= NF_VMIC_EVENTF_RING | ((writeFrame < readFrame) ? NF_VMIC_EVENTF_BACKWARD : 0);
+        event.RingFrom = readFrame;
+        event.RingTo = writeFrame;
+        (void)NfVmicLogEvent(AppRingSkipLog(ring), &event);
+
         readFrame = writeFrame;
         fill = 0;
         ring->Stats.Resyncs++;
@@ -2428,23 +2625,46 @@ CCaptureStreamEngine::AppRingCapturePass(
         index = (ULONG)(readFrame & (capacity - 1));
         first = MIN(copyFrames, capacity - index);
         RtlCopyMemory(dest, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, (SIZE_T)first * NF_VMIC_FRAME_BYTES);
-        AppRingHistoryWrite(ring, at, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, first);
+        AppRingHistoryWrite(ring, at, ring->Data + (SIZE_T)index * NF_VMIC_FRAME_BYTES, readFrame, first);
         if (copyFrames > first)
         {
             RtlCopyMemory(dest + (SIZE_T)first * NF_VMIC_FRAME_BYTES,
                           ring->Data,
                           (SIZE_T)(copyFrames - first) * NF_VMIC_FRAME_BYTES);
-            AppRingHistoryWrite(ring, at + first, ring->Data, copyFrames - first);
+            AppRingHistoryWrite(ring, at + first, ring->Data, readFrame + first, copyFrames - first);
         }
     }
     if (copyFrames < want)
     {
         // An underrun: what the app hasn't written yet is silence. read_frame stops at write_frame: nothing is skipped.
-        RtlZeroMemory(dest + (SIZE_T)copyFrames * NF_VMIC_FRAME_BYTES, (SIZE_T)(want - copyFrames) * NF_VMIC_FRAME_BYTES);
-        AppRingHistoryWrite(ring, at + copyFrames, NULL, want - copyFrames);
+        ULONG under = want - copyFrames;
+
+        RtlZeroMemory(dest + (SIZE_T)copyFrames * NF_VMIC_FRAME_BYTES, (SIZE_T)under * NF_VMIC_FRAME_BYTES);
+        AppRingHistoryWrite(ring, at + copyFrames, NULL, 0, under);
         ring->Stats.UnderrunPackets++;
-        ring->Stats.UnderrunFrames += want - copyFrames;
-        ring->AttachUnderrunFrames += want - copyFrames;
+        ring->Stats.UnderrunFrames += under;
+        ring->AttachUnderrunFrames += under;
+
+        // The underrun log: one entry a run of underrunning passes, extended while it lasts; its ring span from where the ring
+        // ran dry at the run's start to where its latest silence began.
+        if (m_EvUnderrun != 0 && NfVmicLogExtend(AppRingUnderrunLog(ring), m_EvUnderrun, under, at + want, 0))
+        {
+            (void)NfVmicLogRingSpan(AppRingUnderrunLog(ring), m_EvUnderrun, 0, readFrame + copyFrames);
+        }
+        else
+        {
+            NF_VMIC_EVENT event;
+
+            AppRingEventInit(&event, NF_VMIC_EVENT_READER_UNDERRUN, under, at + copyFrames, at + want);
+            event.Flags |= NF_VMIC_EVENTF_RING;
+            event.RingFrom = readFrame + copyFrames;
+            event.RingTo = readFrame + copyFrames;
+            m_EvUnderrun = NfVmicLogEvent(AppRingUnderrunLog(ring), &event);
+        }
+    }
+    else
+    {
+        m_EvUnderrun = 0;
     }
     ring->HistoryLeadFrames = packetFrames;
 
@@ -2529,29 +2749,45 @@ CCaptureStreamEngine::AppRingOtherPass(
     // m_LbLagFrames: LOOPBACK_LAG_HNS and a frame (Run; m_AppFormatOk implies m_LbFormat.Valid, which sets it).
     from = LoopbackAnchor() - m_LbLagFrames - lead + (ULONGLONG)Packet * m_LbPacketFrames;
 
+    // Not the reader at this pass: its underrun run as the reader, if any, has ended.
+    m_EvUnderrun = 0;
+
     //
-    // A shorter reader packet than its latest pass played behind: this pass's read at the old lag would have started the
-    // difference earlier. What lies between its place (or that read, if later: a jump in its time line is not this skip)
-    // and this read is skipped. m_AppOtherValid: its latest pass was this run's and played the copy; the attachment check,
-    // that its place is in this copy (an ATTACH between two passes starts the copy and its lead again).
+    // m_AppOtherValid: its latest pass was this run's and played the copy; the attachment check, that its place is in this copy
+    // (an ATTACH between two passes starts the copy and its lead again). Its place (m_AppEnd) is then where that pass's read
+    // ended, and this pass's read at the same lag (atOld) starts there unless its own time line moved.
     //
-    if (m_AppOtherValid && lead < m_AppOtherLead && m_AppEndAttach == ring->Stats.Attaches)
+    if (m_AppOtherValid && m_AppEndAttach == ring->Stats.Attaches)
     {
-        ULONGLONG   start = MAX(from - (m_AppOtherLead - lead), m_AppEnd);
+        ULONGLONG   atOld = from + lead - m_AppOtherLead;
+        ULONGLONG   jumpEnd = MIN(atOld, from);
 
-        if (from > start)
+        //
+        // A jump in its own time line (a late timer's glitch adjustment): its read at the old lag starts past its place, and
+        // what the copy holds between never reaches it. Not counted elsewhere (its GlitchPasses are): logged, so its gap has
+        // an entry too.
+        //
+        if (jumpEnd > m_AppEnd)
         {
-            ULONGLONG   end = from;
+            (void)AppRingLogSkip(NF_VMIC_EVENT_SECONDARY_JUMP, AppRingSkipFrames(ring, m_AppEnd, jumpEnd), m_AppEnd, jumpEnd, TRUE);
+        }
 
-            ring->SecondarySkips++;
-            if (ring->HistoryValid)
+        //
+        // A shorter reader packet than its latest pass played behind: this pass's read at the old lag would have started the
+        // difference earlier. What lies between its place (or that read, if later: the jump above is not this skip) and this
+        // read is skipped, counted and logged.
+        //
+        if (lead < m_AppOtherLead)
+        {
+            ULONGLONG start = MAX(atOld, m_AppEnd);
+
+            if (from > start)
             {
-                start = MAX(start, AppRingHistoryValidFrom(ring));
-                end = MIN(end, ring->HistoryEnd);
-                if (end > start)
-                {
-                    ring->SecondarySkippedFrames += end - start - AppRingGapFrames(ring, start, end);
-                }
+                ULONGLONG skipped = AppRingSkipFrames(ring, start, from);
+
+                ring->SecondarySkips++;
+                ring->SecondarySkippedFrames += skipped;
+                (void)AppRingLogSkip(NF_VMIC_EVENT_SECONDARY_SKIP, skipped, start, from, TRUE);
             }
         }
     }
@@ -2569,6 +2805,11 @@ CCaptureStreamEngine::AppRingOtherPass(
 // in this attachment) is silence, as is what the copy doesn't hold (AppRingHistoryRead). Counted: the ring's audio in
 // SecondaryFramesCopied, the silence in SecondaryUnderrunFrames. Its place then reaches From + Frames.
 //
+// Logged (nf_vmic.h, "The event logs"): what it asks for past the copy's end (or with no copy yet) is a late read in the skip
+// log, the audio the reader then writes there never reaching it; one entry for its contiguous reads past the end, extended,
+// whose ring span those writes fill in. Its other silence (frames it had had, the copy's gaps, before its valid start) is an
+// underrun run in the underrun log.
+//
 _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::AppRingPlayCopy(
@@ -2581,6 +2822,9 @@ CCaptureStreamEngine::AppRingPlayCopy(
     ULONGLONG       end = From + Frames;
     ULONGLONG       from = From;
     ULONGLONG       audio;
+    ULONGLONG       ahead;
+    ULONGLONG       late;
+    ULONGLONG       silence;
 
     if (m_AppEndAttach == ring->Stats.Attaches && m_AppEnd > From)
     {
@@ -2591,6 +2835,56 @@ CCaptureStreamEngine::AppRingPlayCopy(
     audio = AppRingHistoryRead(ring, from, (ULONG)(end - from), Dest + (SIZE_T)(from - From) * NF_VMIC_FRAME_BYTES);
     ring->SecondaryFramesCopied += audio;
     ring->SecondaryUnderrunFrames += Frames - audio;
+
+    // Past the copy's end: [ahead, end), none of it audio (AppRingHistoryRead reads the copy only to its end).
+    ahead = ring->HistoryValid ? MAX(from, ring->HistoryEnd) : from;
+    late = (end > ahead) ? end - ahead : 0;
+    silence = Frames - audio - late;
+
+    if (late == 0)
+    {
+        m_EvLate = 0;
+    }
+    else if (m_EvLate != 0 && m_EvLateEnd == ahead && NfVmicAppRingClaimExtend(ring, m_EvLate, ahead, end))
+    {
+        (void)NfVmicLogExtend(AppRingSkipLog(ring), m_EvLate, (ULONG)late, end, 0);
+        m_EvLateEnd = end;
+    }
+    else
+    {
+        m_EvLate = AppRingLogSkip(NF_VMIC_EVENT_LATE_READ, late, ahead, end, TRUE);
+        m_EvLateEnd = end;
+    }
+
+    if (silence == 0)
+    {
+        m_EvSilence = 0;
+    }
+    else
+    {
+        USHORT flags = 0;
+
+        if (from > From)
+        {
+            flags |= NF_VMIC_EVENTF_BEHIND;
+        }
+        if (ring->HistoryValid && AppRingHistoryValidFrom(ring) > from && end > from)
+        {
+            flags |= NF_VMIC_EVENTF_OLD;
+        }
+        if (silence > (from - From) + ((flags & NF_VMIC_EVENTF_OLD) ? MIN(AppRingHistoryValidFrom(ring), end) - from : 0))
+        {
+            flags |= NF_VMIC_EVENTF_GAP;
+        }
+        if (m_EvSilence == 0 || !NfVmicLogExtend(AppRingUnderrunLog(ring), m_EvSilence, (ULONG)silence, end, flags))
+        {
+            NF_VMIC_EVENT event;
+
+            AppRingEventInit(&event, NF_VMIC_EVENT_SECONDARY_UNDERRUN, silence, From, end);
+            event.Flags |= flags;
+            m_EvSilence = NfVmicLogEvent(AppRingUnderrunLog(ring), &event);
+        }
+    }
 
     AppRingPlaceReached(end);
 }

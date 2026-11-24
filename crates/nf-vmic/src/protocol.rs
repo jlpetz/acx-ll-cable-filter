@@ -92,6 +92,42 @@ pub const LATENESS_BOUNDS_HNS: [u64; LATENESS_BUCKETS - 1] = [500, 1_000, 2_500,
 pub const LATENESS_LABELS: [&str; LATENESS_BUCKETS] =
     ["0-50 us", "50-100 us", "100-250 us", "250-500 us", "0.5-1 ms", "1-2 ms", "2-5 ms", "5 ms and over"];
 
+/// The event logs' slots (`NF_VMIC_SKIP_LOG_ENTRIES`, `NF_VMIC_UNDERRUN_LOG_ENTRIES`): [`Stats::skip_log`] and
+/// [`Stats::underrun_log`].
+pub const SKIP_LOG_ENTRIES: usize = 64;
+pub const UNDERRUN_LOG_ENTRIES: usize = 32;
+
+/// [`Event::kind`]: the skip log's kinds (a stream never got some of the audio it was due), then the underrun log's (silence
+/// with nothing lost). nf_vmic.h's "The event logs" has what each one's fields hold.
+pub const EVENT_HANDOFF_SKIP: u16 = 1;
+pub const EVENT_SECONDARY_SKIP: u16 = 2;
+pub const EVENT_SECONDARY_JUMP: u16 = 3;
+pub const EVENT_LATE_READ: u16 = 4;
+pub const EVENT_RESYNC: u16 = 5;
+pub const EVENT_LIVE_DISCARD: u16 = 6;
+pub const EVENT_LOOPBACK_LEAD_SKIP: u16 = 7;
+pub const EVENT_READER_UNDERRUN: u16 = 8;
+pub const EVENT_SECONDARY_UNDERRUN: u16 = 9;
+pub const EVENT_LOOPBACK_UNDERRUN: u16 = 10;
+
+/// [`Event::flags`] bits. The stream held the reader slot at that pass.
+pub const EVENTF_READER: u16 = 0x0001;
+/// [`Event::ring_from`] and [`Event::ring_to`] hold the ring's frames.
+pub const EVENTF_RING: u16 = 0x0002;
+/// Part of the span was past the copy's end: the reader's writes there still add to the ring span.
+pub const EVENTF_PENDING: u16 = 0x0004;
+/// The ring span may be short: the driver's records of the copy ran out.
+pub const EVENTF_UNTRACKED: u16 = 0x0008;
+/// A resync or live discard to a `write_frame` behind `read_frame` (`ring_to` < `ring_from`).
+pub const EVENTF_BACKWARD: u16 = 0x0010;
+/// The stream had given the reader slot up (its Pause had begun).
+pub const EVENTF_PAUSING: u16 = 0x0020;
+/// A secondary underrun's silence: frames it had had (its place moved back), the copy's gap in the reader's time line, or
+/// before the copy's valid start.
+pub const EVENTF_BEHIND: u16 = 0x0100;
+pub const EVENTF_GAP: u16 = 0x0200;
+pub const EVENTF_OLD: u16 = 0x0400;
+
 /// The ring's length for `capacity_frames` (`NF_VMIC_RING_BYTES`): the ATTACH output buffer's length, exactly. The buffer must
 /// also start on a page boundary, as [`RingMemory`](crate::RingMemory)'s `VirtualAlloc` region does.
 pub const fn ring_bytes(capacity_frames: u32) -> usize {
@@ -375,6 +411,97 @@ pub struct CaptureTrace {
     pub current_packet_queries: u64,
 }
 
+/// `NF_VMIC_EVENT`: one entry of an event log (nf_vmic.h, "The event logs").
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Event {
+    /// Its number in its log, from 1; 0: an unused slot.
+    pub sequence: u64,
+    /// The driver's QPC at the pass that logged it (a run's first pass).
+    pub qpc: u64,
+    /// `EVENT_*`.
+    pub kind: u16,
+    /// `EVENTF_*`.
+    pub flags: u16,
+    /// The capture stream's serial: from 1, in creation order since the driver loaded.
+    pub stream: u32,
+    /// Its packet, in its format's frames.
+    pub packet_frames: u32,
+    /// By kind: the frames its counter counted, or the silence it got.
+    pub frames: u32,
+    /// The attachment ([`RingStats::attaches`] when logged, its low 32 bits); 0: the loopback's.
+    pub attach: u32,
+    /// `[span_from, span_from + span_frames)`: frames on the driver's QPC time line.
+    pub span_frames: u32,
+    pub span_from: u64,
+    /// `[ring_from, ring_to)`: the ring's frames, with [`EVENTF_RING`] (the app ring's positions, or the loopback ring's
+    /// frames).
+    pub ring_from: u64,
+    pub ring_to: u64,
+}
+
+impl Event {
+    /// Its ring span, where it has one.
+    pub fn ring(&self) -> Option<(u64, u64)> {
+        (self.flags & EVENTF_RING != 0).then_some((self.ring_from, self.ring_to))
+    }
+
+    /// Its kind's name, as the tool prints it.
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            EVENT_HANDOFF_SKIP => "handoff skip",
+            EVENT_SECONDARY_SKIP => "skip to a shorter lag",
+            EVENT_SECONDARY_JUMP => "time-line jump",
+            EVENT_LATE_READ => "late read",
+            EVENT_RESYNC => "resync",
+            EVENT_LIVE_DISCARD => "live discard",
+            EVENT_LOOPBACK_LEAD_SKIP => "loopback lead skip",
+            EVENT_READER_UNDERRUN => "reader underrun",
+            EVENT_SECONDARY_UNDERRUN => "secondary underrun",
+            EVENT_LOOPBACK_UNDERRUN => "loopback underrun",
+            _ => "unknown",
+        }
+    }
+}
+
+/// One event log's slots, as STATS copies them: event n in slot (n - 1) % N.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventSlots<const N: usize>(pub [Event; N]);
+
+impl<const N: usize> Default for EventSlots<N> {
+    fn default() -> Self {
+        Self([Event::default(); N])
+    }
+}
+
+/// An event log read from its slots: its entries oldest first, and how many of the latest it should hold weren't readable
+/// (a slot whose sequence isn't one of them, or isn't where it says: not expected, since STATS copies under the log's lock).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventLog {
+    pub entries: Vec<Event>,
+    /// The log's count when copied: the newest's sequence.
+    pub logged: u64,
+    pub unreadable: u64,
+}
+
+impl EventLog {
+    /// The log's entries from `slots`, with `logged` its count: each of the latest `slots.len()` events in its own slot.
+    pub fn read(slots: &[Event], logged: u64) -> Self {
+        let n = slots.len() as u64;
+        let oldest = logged.saturating_sub(n) + 1;
+        let mut entries: Vec<Event> = (oldest..=logged)
+            .filter_map(|seq| {
+                let e = slots[((seq - 1) % n) as usize];
+                (e.sequence == seq).then_some(e)
+            })
+            .collect();
+        entries.sort_by_key(|e| e.sequence);
+        let held = logged - (oldest - 1);
+        Self { unreadable: held - entries.len() as u64, entries, logged }
+    }
+}
+
 /// `NF_VMIC_STATS`: STATS's output.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -426,6 +553,31 @@ pub struct Stats {
     pub loopback_lead_skips: u64,
     /// The render audio the loopback ring held between those reads at the two leads (the difference in leads at most).
     pub loopback_lead_skipped_frames: u64,
+    /// The event logs' counts (the newest's sequence each), since the app feed's device was added. Valid with
+    /// [`STATS_LOOPBACK`], as the logs are (the device's, as [`Stats::loopback`] is).
+    pub skip_events_logged: u64,
+    pub underrun_events_logged: u64,
+    /// [`SKIP_LOG_ENTRIES`], [`UNDERRUN_LOG_ENTRIES`] and the size of an [`Event`], as the driver has them.
+    pub skip_log_entries: u32,
+    pub underrun_log_entries: u32,
+    pub event_bytes: u32,
+    pub reserved1: u32,
+    /// Every event in which a capture stream never got some of the audio it was due: skips, jumps, late reads, resyncs.
+    pub skip_log: EventSlots<SKIP_LOG_ENTRIES>,
+    /// The silence streams got with nothing lost, a run an entry.
+    pub underrun_log: EventSlots<UNDERRUN_LOG_ENTRIES>,
+}
+
+impl Stats {
+    /// The skip log, oldest first.
+    pub fn skip_events(&self) -> EventLog {
+        EventLog::read(&self.skip_log.0, self.skip_events_logged)
+    }
+
+    /// The underrun log, oldest first.
+    pub fn underrun_events(&self) -> EventLog {
+        EventLog::read(&self.underrun_log.0, self.underrun_events_logged)
+    }
 }
 
 // The header's offsets (nf_vmic.h's layout tables and C_ASSERTs).
@@ -479,7 +631,26 @@ const _: () = {
 
     assert!(size_of::<CaptureTrace>() == 64);
     assert!(offset_of!(CaptureTrace, last_notify_qpc) == 40);
-    assert!(size_of::<Stats>() == 672);
+    assert!(size_of::<Event>() == 64);
+    assert!(offset_of!(Event, qpc) == 8);
+    assert!(offset_of!(Event, kind) == 16);
+    assert!(offset_of!(Event, flags) == 18);
+    assert!(offset_of!(Event, stream) == 20);
+    assert!(offset_of!(Event, packet_frames) == 24);
+    assert!(offset_of!(Event, frames) == 28);
+    assert!(offset_of!(Event, attach) == 32);
+    assert!(offset_of!(Event, span_frames) == 36);
+    assert!(offset_of!(Event, span_from) == 40);
+    assert!(offset_of!(Event, ring_from) == 48);
+    assert!(offset_of!(Event, ring_to) == 56);
+    assert!(offset_of!(Stats, skip_events_logged) == 672);
+    assert!(offset_of!(Stats, underrun_events_logged) == 680);
+    assert!(offset_of!(Stats, skip_log_entries) == 688);
+    assert!(offset_of!(Stats, underrun_log_entries) == 692);
+    assert!(offset_of!(Stats, event_bytes) == 696);
+    assert!(offset_of!(Stats, skip_log) == 704);
+    assert!(offset_of!(Stats, underrun_log) == 704 + 64 * SKIP_LOG_ENTRIES);
+    assert!(size_of::<Stats>() == 6_848);
     assert!(offset_of!(Stats, capture_trace) == 576);
     assert!(offset_of!(Stats, secondary_skips) == 640);
     assert!(offset_of!(Stats, secondary_skipped_frames) == 648);
@@ -610,7 +781,42 @@ mod tests {
         assert_eq!(offset_of!(Stats, capture_trace) + size_of::<CaptureTrace>(), offset_of!(Stats, secondary_skips));
         assert_eq!((offset_of!(Stats, secondary_skips), offset_of!(Stats, secondary_skipped_frames)), (640, 648));
         assert_eq!((offset_of!(Stats, loopback_lead_skips), offset_of!(Stats, loopback_lead_skipped_frames)), (656, 664));
-        assert_eq!(offset_of!(Stats, loopback_lead_skipped_frames) + 8, size_of::<Stats>());
-        assert_eq!((size_of::<Stats>(), VERSION), (672, 1));
+        assert_eq!(offset_of!(Stats, loopback_lead_skipped_frames) + 8, offset_of!(Stats, skip_events_logged));
+        assert_eq!(VERSION, 1);
+    }
+
+    /// The event logs of 2026-11-24 are appended in turn (diagnostic fields: no version bump, the owner's rule), the skip log
+    /// on a 64-byte line, each entry a line, the underrun log after it.
+    #[test]
+    fn the_event_logs_are_appended() {
+        assert_eq!(offset_of!(Stats, skip_events_logged), 672);
+        assert_eq!(offset_of!(Stats, skip_log) % 64, 0);
+        assert_eq!(offset_of!(Stats, skip_log) + SKIP_LOG_ENTRIES * size_of::<Event>(), offset_of!(Stats, underrun_log));
+        assert_eq!(offset_of!(Stats, underrun_log) + UNDERRUN_LOG_ENTRIES * size_of::<Event>(), size_of::<Stats>());
+        assert_eq!((size_of::<Stats>(), size_of::<Event>(), VERSION), (6_848, 64, 1));
+        // A copy of the default is all zero: no slot holds an entry, both logs empty.
+        let s = Stats::default();
+        assert!(s.skip_events().entries.is_empty() && s.underrun_events().entries.is_empty());
+    }
+
+    /// A log read from its slots: the latest it keeps, oldest first; a slot not holding the number its place says is
+    /// unreadable (the driver copies under the log's lock, so not expected); an empty log is empty.
+    #[test]
+    fn an_event_log_is_read_from_its_slots() {
+        let mut slots = [Event::default(); 4];
+        for n in 1..=6u64 {
+            slots[((n - 1) % 4) as usize] = Event { sequence: n, kind: EVENT_LATE_READ, ..Default::default() };
+        }
+        let log = EventLog::read(&slots, 6);
+        assert_eq!(log.entries.iter().map(|e| e.sequence).collect::<Vec<_>>(), [3, 4, 5, 6]);
+        assert_eq!(log.unreadable, 0);
+        slots[1].sequence = 2;
+        assert_eq!(EventLog::read(&slots, 6).unreadable, 1, "slot 1 should hold 6");
+        assert_eq!(EventLog::read(&slots[..], 0), EventLog::default());
+        let short = EventLog::read(&[Event { sequence: 1, ..Default::default() }, Event::default()], 2);
+        assert_eq!((short.entries.len(), short.unreadable), (1, 1), "event 2's slot is empty");
+        assert_eq!(Event { kind: EVENT_SECONDARY_SKIP, ..Default::default() }.kind_name(), "skip to a shorter lag");
+        assert_eq!(Event { flags: EVENTF_RING, ring_from: 3, ring_to: 9, ..Default::default() }.ring(), Some((3, 9)));
+        assert_eq!(Event { ring_from: 3, ring_to: 9, ..Default::default() }.ring(), None);
     }
 }

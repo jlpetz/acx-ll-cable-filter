@@ -212,6 +212,13 @@ Return Value:
     //
     RtlZeroMemory(&devCtx->Loopback, sizeof(devCtx->Loopback));
     KeInitializeSpinLock(&devCtx->Loopback.Lock);
+    // Its event logs (Public.h, NF_EVENT_LOG), zeroed above: empty, numbering from 1.
+    KeInitializeSpinLock(&devCtx->Loopback.SkipLog.Lock);
+    devCtx->Loopback.SkipLog.Entries = NF_VMIC_SKIP_LOG_ENTRIES;
+    devCtx->Loopback.SkipLog.Slots = devCtx->Loopback.SkipSlots;
+    KeInitializeSpinLock(&devCtx->Loopback.UnderrunLog.Lock);
+    devCtx->Loopback.UnderrunLog.Entries = NF_VMIC_UNDERRUN_LOG_ENTRIES;
+    devCtx->Loopback.UnderrunLog.Slots = devCtx->Loopback.UnderrunSlots;
     devCtx->Loopback.Buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, LOOPBACK_RING_BYTES, DeviceDriverTag);
     if (devCtx->Loopback.Buffer == nullptr)
     {

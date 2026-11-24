@@ -358,6 +358,8 @@ protected:
     // noise-filter (TODO 19, spike check 5): the timer statistics (AppRing.h).
     ULONG               m_StatsKind;        // NF_VMIC_KIND_RENDER or NF_VMIC_KIND_CAPTURE: the NF_VMIC_STREAM_STATS it counts in
     ULONGLONG           m_ArmedHns;         // the time ScheduleNextPass armed the timer for (its schedule's 100 ns units)
+    // noise-filter (TODO 19): the stream's serial in the event logs (NF_VMIC_EVENT.Stream), given at creation.
+    ULONG               m_Serial;
 
     static
     __drv_maxIRQL(DISPATCH_LEVEL)
@@ -596,6 +598,14 @@ protected:
     ULONGLONG       m_AppLiveAttach; // attachment whose LiveStreams count includes this run, or zero
     BOOLEAN         m_AppNoSlot;        // it gave the reader slot up (AppRingReaderStop) and may take it only after its next Run
 
+    // noise-filter (TODO 19): its open entries in the event logs (Sequence; 0: none), each a run extended while it lasts
+    // (nf_vmic.h, "The event logs"), cleared at Run. App ring lock held for the first three, the loopback's for the last.
+    ULONGLONG       m_EvUnderrun;       // its underrun run as the reader (READER_UNDERRUN)
+    ULONGLONG       m_EvSilence;        // its run of silence playing the copy (SECONDARY_UNDERRUN)
+    ULONGLONG       m_EvLate;           // its reads past the copy's end (LATE_READ), and the time-line frame they reach
+    ULONGLONG       m_EvLateEnd;
+    ULONGLONG       m_EvLbUnderrun;     // its loopback underrun run (LOOPBACK_UNDERRUN)
+
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.
     __declspec(noinline)
     __drv_maxIRQL(DISPATCH_LEVEL)
@@ -642,6 +652,31 @@ protected:
     VOID
     AppRingPlaceReached(
         _In_                                ULONGLONG   End
+        );
+
+    // An app ring event of this stream's (nf_vmic.h, "The event logs"): Kind, Frames, the span [SpanFrom, SpanTo) on the
+    // time line, and its stream, packet, attachment and READER and PAUSING flags. App ring lock held.
+    __drv_requiresIRQL(DISPATCH_LEVEL)
+    VOID
+    AppRingEventInit(
+        _Out_                               PNF_VMIC_EVENT  Event,
+        _In_                                USHORT          Kind,
+        _In_                                ULONGLONG       Frames,
+        _In_                                ULONGLONG       SpanFrom,
+        _In_                                ULONGLONG       SpanTo
+        );
+
+    // Logs a skip of this stream's of [Lo, Hi) on the copy's time line (Frames: its count) in the skip log, with the ring's
+    // frames the copy holds as audio there; with Claim, what the copy doesn't hold yet is claimed for the reader's writes to
+    // fill in. Returns the entry's Sequence. App ring lock held.
+    __drv_requiresIRQL(DISPATCH_LEVEL)
+    ULONGLONG
+    AppRingLogSkip(
+        _In_                                USHORT          Kind,
+        _In_                                ULONGLONG       Frames,
+        _In_                                ULONGLONG       Lo,
+        _In_                                ULONGLONG       Hi,
+        _In_                                BOOLEAN         Claim
         );
 
     // Gives the reader slot up, if this stream holds it, and bars it from the slot until its next Run (m_AppNoSlot). noinline:

@@ -96,6 +96,9 @@ NfVmic_UnpublishLocked(
         NfVmicStore32(&ring->Header->PacketFrames, 0);
     }
 
+    // No reader writes this attachment's copy again: the skip log's spans still being filled in are settled as they stand.
+    NfVmicAppRingSettleClaims(ring, TRUE);
+
     ring->Request = NULL;
     ring->File = NULL;
     ring->Header = NULL;
@@ -475,6 +478,9 @@ NfVmic_Attach(
     ring->HistoryEnd = 0;
     ring->HistoryGapNext = 0;
     RtlZeroMemory(ring->HistoryGaps, sizeof(ring->HistoryGaps));
+    // The skip log's records of the copy start again too (the last detach settled its claims).
+    NfVmicAppRingSettleClaims(ring, TRUE);
+    NfVmicAppRingMapReset(ring);
     ring->Stats.Attaches++;
 
     // The driver's line, zeroed, then ATTACHED: the app's sign, with ERROR_IO_PENDING, that the ring is live.
@@ -528,6 +534,9 @@ NfVmic_Stats(
     out->StatsBytes = sizeof(NF_VMIC_STATS);
     out->QpcFrequency = (UINT64)frequency.QuadPart;
     out->QpcNow = (UINT64)now.QuadPart;
+    out->SkipLogEntries = NF_VMIC_SKIP_LOG_ENTRIES;
+    out->UnderrunLogEntries = NF_VMIC_UNDERRUN_LOG_ENTRIES;
+    out->EventBytes = sizeof(NF_VMIC_EVENT);
 
     // The timer statistics and the capture-timestamp trace are interlocked: no lock.
     NfVmicCopyStreamStats(out->Stream);
@@ -585,6 +594,13 @@ NfVmic_Stats(
         out->Loopback.RefusedOpens = loopback->RefusedOpens;
         out->LoopbackLeadSkips = loopback->LeadSkips;
         out->LoopbackLeadSkippedFrames = loopback->LeadSkippedFrames;
+        //
+        // The device's event logs, inside both locks: every writer of them holds one or the other (the app ring's events the
+        // app ring's, the loopback's its own), so the logs are copied at the instant the counters are, and agree with them.
+        // Their own locks come last (AppRing.h's order).
+        //
+        NfVmicCopyEventLog(&loopback->SkipLog, out->SkipLog, NF_VMIC_SKIP_LOG_ENTRIES, &out->SkipEventsLogged);
+        NfVmicCopyEventLog(&loopback->UnderrunLog, out->UnderrunLog, NF_VMIC_UNDERRUN_LOG_ENTRIES, &out->UnderrunEventsLogged);
         KeReleaseSpinLockFromDpcLevel(&loopback->Lock);
         out->Flags |= NF_VMIC_STATS_LOOPBACK;
     }

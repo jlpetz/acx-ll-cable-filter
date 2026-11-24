@@ -50,6 +50,36 @@ typedef struct _NF_APP_HISTORY_GAP {
 } NF_APP_HISTORY_GAP, *PNF_APP_HISTORY_GAP;
 
 //
+// The copy's map from its time line to the ring's frames (NF_APP_RING.Segments), for the skip log's ring spans (nf_vmic.h, "The
+// event logs"): each record a run of audio the reader wrote, time-line frames [From, To) holding the ring's frames from Ring
+// on. A run grows while the reader's audio follows on in both (its packets one after another, no underrun between); an
+// underrun, a gap in its time line, a handoff or a resync starts another. The latest 64 are kept: with an underrun every other
+// pass of a 96-frame reader (two records a pass) they reach 32 ms back, and a skip's span lies within a lag and a packet of
+// the copy's end. A span reaching before what an overwritten record covered (SegmentsLostTo) is marked UNTRACKED.
+//
+#define NF_APP_SEGMENTS         64u
+
+typedef struct _NF_APP_SEGMENT {
+    ULONGLONG               From;                   // [From, To), frames on the time line; [0, 0) when unused
+    ULONGLONG               To;
+    ULONGLONG               Ring;                   // the ring's frame at From
+} NF_APP_SEGMENT, *PNF_APP_SEGMENT;
+
+//
+// A span of the time line the copy didn't hold yet when a stream passed over it (a late read, or a skip or jump past the copy's
+// end), claimed for its skip-log entry (NF_APP_RING.Claims): the audio the reader writes there joins the entry's ring span,
+// and once the copy's end passes Hi the claim is settled (the entry's PENDING cleared). 16 at once (a few a stream); a span
+// with none free is marked UNTRACKED.
+//
+#define NF_APP_CLAIMS           16u
+
+typedef struct _NF_APP_CLAIM {
+    ULONGLONG               Lo;                     // [Lo, Hi), frames on the time line
+    ULONGLONG               Hi;
+    ULONGLONG               Sequence;               // the entry's in the skip log; 0: a free claim
+} NF_APP_CLAIM, *PNF_APP_CLAIM;
+
+//
 // The one app ring. A global (non-paged .bss, zeroed by the loader) rather than either device's context: the capture streams
 // (under the PnP device) and the control device's callbacks both reach it, and it outlives both, since the image stays loaded
 // while any device object exists. Every field, and g_NfAppHistory, is guarded by Lock, a spin lock: the capture timer's DPC and
@@ -58,6 +88,8 @@ typedef struct _NF_APP_HISTORY_GAP {
 // Lock order: Lock, then a LOOPBACK_RING's Lock (Public.h); nothing takes them the other way. Two paths nest them:
 // NF_VMIC_IOCTL_STATS (Loopback's counters), and a capture stream's creation and destruction (CaptureStreamOpen and
 // CaptureStreamClose, StreamEngine.cpp), which check and record the stream's format in both under the two locks at once.
+// An event log's lock (NF_EVENT_LOG) comes last: taken inside either or both, and nothing is taken inside it. STATS copies
+// the logs inside both, so the counters it copies agree with them.
 // The loopback's records of what is open are the CaptureOpen and RenderOpen slots in each device's LOOPBACK_RING, under that
 // ring's lock. The app ring keeps its own count of capture streams open in another format (OtherFormatCaptureOpens), across
 // every device, since any device's capture stream reads the one app ring: ATTACH checks it under Lock alone.
@@ -99,6 +131,13 @@ typedef struct _NF_APP_RING {
     ULONG                   HistoryGapNext;         // the entry of HistoryGaps the next gap fills (modulo NF_APP_HISTORY_GAPS)
     NF_APP_HISTORY_GAP      HistoryGaps[NF_APP_HISTORY_GAPS];   // the current run's latest gaps, cleared with each new run
 
+    // The skip log's records of the copy (above): its map to the ring's frames, cleared with each new run and at ATTACH, and
+    // the spans being filled in, settled at detach.
+    ULONGLONG               SegmentNext;            // the record of Segments the next run of audio fills (modulo NF_APP_SEGMENTS)
+    ULONGLONG               SegmentsLostTo;         // the latest To of a record overwritten in this run (0: none)
+    NF_APP_SEGMENT          Segments[NF_APP_SEGMENTS];
+    NF_APP_CLAIM            Claims[NF_APP_CLAIMS];
+
     // Capture streams open (EvtCircuitCreateStream to the stream engine's destruction) in a format other than the ring's, on
     // every device: ATTACH is refused while this isn't 0, and no such stream is created while a ring is attached.
     ULONG                   OtherFormatCaptureOpens;
@@ -123,6 +162,124 @@ extern NF_APP_RING              g_NfAppRing;
 extern UCHAR                    g_NfAppHistory[NF_APP_HISTORY_BYTES];   // non-paged .bss; under g_NfAppRing.Lock
 extern NF_VMIC_STREAM_STATS     g_NfStreamStats[NF_VMIC_KINDS];     // interlocked access only
 extern NF_VMIC_CAPTURE_TRACE    g_NfCaptureTrace;                   // interlocked access only
+extern volatile LONG            g_NfStreamSerial;                   // the last stream serial given (NF_VMIC_EVENT.Stream); interlocked
+
+//
+// The event logs (Public.h's NF_EVENT_LOG; nf_vmic.h, "The event logs"; AppRing.cpp): each takes its own spin lock, the last in
+// every lock order, so they are callable up to DISPATCH_LEVEL from any code, other spin locks held or not. No allocation. A
+// NULL log (no device) logs nothing: the logging returns 0, the updates FALSE.
+//
+
+// Logs Event (its Sequence and Qpc set here) and returns its Sequence.
+__drv_maxIRQL(DISPATCH_LEVEL)
+ULONGLONG
+NfVmicLogEvent(
+    _Inout_opt_ PNF_EVENT_LOG       Log,
+    _In_        const NF_VMIC_EVENT* Event
+);
+
+// A run's entry, extended: Frames more (saturating), its span to SpanEnd, Flags added. FALSE: the entry is gone (overwritten).
+__drv_maxIRQL(DISPATCH_LEVEL)
+BOOLEAN
+NfVmicLogExtend(
+    _Inout_opt_ PNF_EVENT_LOG       Log,
+    _In_        ULONGLONG           Sequence,
+    _In_        ULONG               Frames,
+    _In_        ULONGLONG           SpanEnd,
+    _In_        USHORT              Flags
+);
+
+// The entry's ring span takes in [RingFrom, RingTo): set with NF_VMIC_EVENTF_RING if it had none, else extended to RingTo.
+__drv_maxIRQL(DISPATCH_LEVEL)
+BOOLEAN
+NfVmicLogRingSpan(
+    _Inout_opt_ PNF_EVENT_LOG       Log,
+    _In_        ULONGLONG           Sequence,
+    _In_        ULONGLONG           RingFrom,
+    _In_        ULONGLONG           RingTo
+);
+
+__drv_maxIRQL(DISPATCH_LEVEL)
+BOOLEAN
+NfVmicLogFlags(
+    _Inout_opt_ PNF_EVENT_LOG       Log,
+    _In_        ULONGLONG           Sequence,
+    _In_        USHORT              Set,
+    _In_        USHORT              Clear
+);
+
+// The log's slots, whole, and its count, at one instant (STATS). Entries: Out's length, the log's.
+__drv_maxIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicCopyEventLog(
+    _Inout_                     PNF_EVENT_LOG   Log,
+    _Out_writes_(Entries)       PNF_VMIC_EVENT  Out,
+    _In_                        ULONG           Entries,
+    _Out_                       PUINT64         Logged
+);
+
+//
+// The skip log's records of the app ring's copy (AppRing.h's NF_APP_SEGMENT and NF_APP_CLAIM; AppRing.cpp). App ring lock held.
+// Their entries are in NF_APP_RING.Loopback's skip log, the app feed device's, which STATS copies.
+//
+
+// The copy's audio written at time-line [From, To), from the ring's frame RingFrame: mapped, and joined to the claims it fills.
+__drv_requiresIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicAppRingAudioWritten(
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    ULONGLONG       From,
+    _In_    ULONGLONG       To,
+    _In_    ULONGLONG       RingFrame
+);
+
+// The ring's frames the copy holds as audio in time-line [Lo, Hi): FALSE if none. *Whole: FALSE where part of the span may be
+// audio whose record was overwritten (the span is then UNTRACKED).
+__drv_requiresIRQL(DISPATCH_LEVEL)
+BOOLEAN
+NfVmicAppRingSpan(
+    _In_    PNF_APP_RING    Ring,
+    _In_    ULONGLONG       Lo,
+    _In_    ULONGLONG       Hi,
+    _Out_   PULONGLONG      RingFrom,
+    _Out_   PULONGLONG      RingTo,
+    _Out_   PBOOLEAN        Whole
+);
+
+// Claims [Lo, Hi) for the skip-log entry Sequence (PENDING), or marks it UNTRACKED if no claim is free.
+__drv_requiresIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicAppRingClaim(
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    ULONGLONG       Lo,
+    _In_    ULONGLONG       Hi,
+    _In_    ULONGLONG       Sequence
+);
+
+// Sequence's claim, if it ends at Hi, ends at NewHi instead. FALSE: no such claim (settled, or never made).
+__drv_requiresIRQL(DISPATCH_LEVEL)
+BOOLEAN
+NfVmicAppRingClaimExtend(
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    ULONGLONG       Sequence,
+    _In_    ULONGLONG       Hi,
+    _In_    ULONGLONG       NewHi
+);
+
+// Settles the claims the copy's end has passed (All: every claim, as the attachment ends), clearing their entries' PENDING.
+__drv_requiresIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicAppRingSettleClaims(
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    BOOLEAN         All
+);
+
+// Clears the copy's map (a new run of the copy, or ATTACH).
+__drv_requiresIRQL(DISPATCH_LEVEL)
+VOID
+NfVmicAppRingMapReset(
+    _Inout_ PNF_APP_RING    Ring
+);
 
 //
 // Timer statistics (AppRing.cpp): interlocked, no lock, no allocation; callable up to DISPATCH_LEVEL from any code.
