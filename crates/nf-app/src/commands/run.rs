@@ -381,6 +381,7 @@ impl Tally {
             self.budget.chain_ms += b.chain_ms - base.chain_ms;
             self.budget.queue_ms += b.queue_ms - base.queue_ms;
             self.budget.render_ms += b.render_ms - base.render_ms;
+            self.budget.delivery_ms += b.delivery_ms - base.delivery_ms;
         }
         if t.state != EngineState::Running {
             self.not_running += 1;
@@ -423,6 +424,7 @@ impl Tally {
             chain_ms: part(|b| b.chain_ms),
             queue_ms: part(|b| b.queue_ms),
             render_ms: part(|b| b.render_ms),
+            delivery_ms: part(|b| b.delivery_ms),
         });
         let device = |s: Option<&StreamInfo>| s.map_or_else(|| "--".to_owned(), |s| s.device_name.clone());
         Summary {
@@ -533,10 +535,12 @@ impl Summary {
             c.output.text()
         );
         if let Some((lo, m, hi)) = self.readout_medians {
+            // The direct driver route's readout ends at the sample time; its delivery is in the budget's line.
+            let to = if self.budget.is_some_and(|b| b.direct()) { " to the sample time" } else { "" };
             let _ = write!(
                 s,
                 "
-  {:<15}readout {} ms (the seconds' medians {} to {})",
+  {:<15}readout {} ms{to} (the seconds' medians {} to {})",
                 "latency",
                 ms(m),
                 ms(lo),
@@ -562,7 +566,18 @@ impl Summary {
                 budget_text(b)
             );
         }
-        if let Some(b) = &self.budget_p95 {
+        if let Some(b) = self.budget_p95.as_ref().filter(|b| b.direct()) {
+            let _ = write!(
+                s,
+                "
+  {:<15}mic delivery {}, wait {}, ring queue {}, delivery {} ms (the median second's)",
+                "budget p95s",
+                ms(b.mic_ms),
+                ms(b.wait_ms),
+                ms(b.queue_ms),
+                ms(b.delivery_ms)
+            );
+        } else if let Some(b) = &self.budget_p95 {
             let _ = write!(
                 s,
                 "
@@ -800,7 +815,8 @@ pub fn start_engine(engine: &nf_engine::Engine, cfg: &EngineConfig, allow_driver
 pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS (the input before any processing; CLIP: it clipped \
      since the last line, near-clip: within 0.1 dB of full scale); latency median/p95 (mic capture to cable play-out), \
      then its budget's means in ms [mic delivery+wait+output queue+render side] (the chain's offset, given at the start, \
-     isn't in it), and with the adaptive output target (unless --no-adaptive-output) the output queue's target now; CPU \
+     isn't in it; with --output-backend driver-ring, to the virtual mic's sample time, the median to the driver's delivery \
+     beside it, and [mic delivery+wait+ring queue]), and with the adaptive output target (unless --no-adaptive-output) the output queue's target now; CPU \
      p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic block \
      it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not cover); \
      dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse corrections, \
@@ -826,7 +842,21 @@ pub fn status_line(t: &TelemetrySnapshot, retrying: bool, clipped: bool) -> Stri
     } else {
         ""
     };
-    let latency = if t.latency_valid {
+    let latency = if t.latency_valid && t.budget_mean.direct() {
+        // The direct driver route: to the sample time, the delivery's median beside it, and the budget's parts to the sample
+        // time (the ring is the only queue: no render side).
+        let b = &t.budget_mean;
+        let part = |v: f32| fixed(f64::from(v), 1);
+        format!(
+            "{}/{} ms, delivered {} [{}+{}+{}]",
+            fixed(f64::from(t.latency_ms_median), 1),
+            fixed(f64::from(t.latency_ms_p95), 1),
+            fixed(f64::from(t.latency_delivery_ms_median), 1),
+            part(b.mic_ms),
+            part(b.wait_ms),
+            part(b.queue_ms)
+        )
+    } else if t.latency_valid {
         // The budget's means, compact (engine.md, "The latency budget").
         let b = &t.budget_mean;
         let part = |v: f32| fixed(f64::from(v), 1);
@@ -1101,7 +1131,14 @@ mod tests {
             latency_valid: true,
             latency_ms_median: 21.26,
             latency_ms_p95: 23.0,
-            budget_mean: nf_engine::LatencyBudget { mic_ms: 10.71, wait_ms: 0.04, chain_ms: 10.0, queue_ms: 6.02, render_ms: 4.96 },
+            budget_mean: nf_engine::LatencyBudget {
+                mic_ms: 10.71,
+                wait_ms: 0.04,
+                chain_ms: 10.0,
+                queue_ms: 6.02,
+                render_ms: 4.96,
+                delivery_ms: 0.0,
+            },
             block_us_p99: 131.4,
             output_drift_ppm: 12.4,
             reference_drift_ppm: -3.2,
@@ -1183,7 +1220,14 @@ mod tests {
             latency_valid: true,
             latency_ms_median: 18.3,
             latency_ms_p95: 19.0,
-            budget_mean: nf_engine::LatencyBudget { mic_ms: 10.3, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 5.04, render_ms: 3.0 },
+            budget_mean: nf_engine::LatencyBudget {
+                mic_ms: 10.3,
+                wait_ms: 0.0,
+                chain_ms: 10.0,
+                queue_ms: 5.04,
+                render_ms: 3.0,
+                delivery_ms: 0.0,
+            },
             output_target_ms: 5.0,
             output_adaptive: true,
             output_exclusive: true,
@@ -1198,6 +1242,14 @@ mod tests {
         assert!(line.contains("[10.3+0.0+5.0+3.0]  cpu") && line.contains("drops 0/0/0  excl mic  rt"), "{line}");
         assert!(!status_line(&TelemetrySnapshot { mic_exclusive: false, ..shared }, false, false).contains("excl"));
         assert!(LEGEND.contains("--no-adaptive-output") && LEGEND.contains("'excl'"));
+        // The direct driver route: to the sample time, the delivery beside it, the parts to the sample time.
+        let direct = TelemetrySnapshot {
+            latency_delivery_ms_median: 19.6,
+            budget_mean: nf_engine::LatencyBudget { delivery_ms: 1.3, render_ms: 0.0, ..t.budget_mean },
+            ..shared
+        };
+        let line = status_line(&direct, false, false);
+        assert!(line.contains("lat 18.3/19.0 ms, delivered 19.6 [10.3+0.0+5.0]  cpu"), "{line}");
     }
 
     /// One second of a running engine: `s` seconds in (100 blocks a second), its budget's totals so far (1 + 6 + 6 + 4 ms a
@@ -1210,7 +1262,14 @@ mod tests {
             latency_valid: s > 0,
             latency_ms_median: 17.0,
             latency_ms_p95: 18.0,
-            budget_p95: nf_engine::LatencyBudget { mic_ms: 1.5, wait_ms: 6.5, chain_ms: 10.0, queue_ms: 7.0, render_ms: 4.5 },
+            budget_p95: nf_engine::LatencyBudget {
+                mic_ms: 1.5,
+                wait_ms: 6.5,
+                chain_ms: 10.0,
+                queue_ms: 7.0,
+                render_ms: 4.5,
+                delivery_ms: 0.0,
+            },
             budget_totals: BudgetTotals {
                 blocks: n,
                 mic_ms: n as f64,
@@ -1218,6 +1277,7 @@ mod tests {
                 chain_ms: 10.0 * n as f64,
                 queue_ms: 6.0 * n as f64,
                 render_ms: 4.0 * n as f64,
+                delivery_ms: 0.0,
             },
             output_slips: s,
             output_slip_net: -(s as i64),

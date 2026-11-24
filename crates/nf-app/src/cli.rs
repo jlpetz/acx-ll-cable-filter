@@ -147,6 +147,10 @@ pub struct LatencyArgs {
     /// `--save-blocks FILE`: the chain recorder, armed before the engine starts, writes every block's facts from the first
     /// (`chain_blocks.csv`'s columns) to FILE: the readout's inputs beside the sweeps' result (TODO 13).
     pub save_blocks: Option<std::path::PathBuf>,
+    /// `--capture-period-frames N`: the test's capture at IAudioClient3's N frames, shared (`Engine::start_latency_test_at`);
+    /// 0, the default, the endpoint's default period. With `--output-backend driver-ring` the capture is the recording app
+    /// that reads the ring, so N sets the reader's packet (TODO 13: the live check at 128 or 160 frames).
+    pub capture_period_frames: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -598,6 +602,7 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
     let (mut probe, mut capture, mut mode, mut reps, mut through_model, mut cable_only, mut settle) =
         (None, None, LatencyMode::VirtualLoop, DEFAULT_REPETITIONS, false, false, false);
     let mut save_blocks = None;
+    let mut capture_period_frames = 0;
     // The first option given that only the test through the filter uses
     let mut filter_option: Option<&str> = None;
     while let Some(arg) = p.next() {
@@ -629,6 +634,14 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
                     save_blocks = Some(std::path::PathBuf::from(text(flag, p.value(flag, inline)?)?));
                     filter_option.get_or_insert(flag);
                 }
+                "--capture-period-frames" => {
+                    let v = p.value(flag, inline)?;
+                    capture_period_frames = match v.trim().parse::<u32>() {
+                        Ok(n @ 16..=4_800) => n,
+                        _ => return Err(usage(format!("--capture-period-frames takes a period from 16 to 4800 frames, not '{v}'"))),
+                    };
+                    filter_option.get_or_insert(flag);
+                }
                 "--settle" => {
                     settle = switch(flag, inline)?;
                     filter_option.get_or_insert(flag);
@@ -656,7 +669,18 @@ fn parse_latency(p: &mut Parser<'_>) -> Result<LatencyArgs, UsageError> {
             "'latency' needs --capture DEV: the recording device that carries the filter's output"
         })
     })?;
-    Ok(LatencyArgs { engine, probe, capture, mode, repetitions: reps, through_model, cable_only, settle, save_blocks })
+    Ok(LatencyArgs {
+        engine,
+        probe,
+        capture,
+        mode,
+        repetitions: reps,
+        through_model,
+        cable_only,
+        settle,
+        save_blocks,
+        capture_period_frames,
+    })
 }
 
 fn parse_quality(p: &mut Parser<'_>) -> Result<QualityArgs, UsageError> {
@@ -968,11 +992,14 @@ Usage:
                                  clean). Either way it ends with a summary (dropouts, latency, drift,
                                  and the flight recorder's dumps)
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
-                       [--through-model] [--settle] [--save-blocks FILE] [OPTIONS]
+                       [--through-model] [--settle] [--save-blocks FILE]
+                       [--capture-period-frames N] [OPTIONS]
                                  Measure the latency with sweeps and print the report (the
                                  sweeps the filter's own events disturbed are named, and the
                                  rest's median given apart); --save-blocks writes every
-                                 block's facts from the start (CSV)
+                                 block's facts from the start (CSV); --capture-period-frames
+                                 records the capture at IAudioClient3's N frames (with
+                                 --output-backend driver-ring, the reader's packet)
   noise-filter latency --cable-only --probe DEV --capture DEV [--reps N]
                                  The same sweeps through one cable alone, without the filter
   noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
@@ -1334,7 +1361,7 @@ mod tests {
         assert_eq!(err(&["run", "--settle"]), "'run' has no option '--settle'");
         assert_eq!(err(&["quality", "--probe", "a", "--capture", "b", "--settle=1"]), "--settle takes no value");
         let help = help_text();
-        assert!(help.contains("[--through-model] [--settle] [--save-blocks FILE] [OPTIONS]") && help.contains("[--settle] [OPTIONS]"));
+        assert!(help.contains("[--through-model] [--settle] [--save-blocks FILE]") && help.contains("[--settle] [OPTIONS]"));
         assert!(help.contains(&format!("({ADAPTIVE_WAIT_S} s at most)")) && help.contains("measure at once"));
     }
 
@@ -1347,6 +1374,25 @@ mod tests {
         assert_eq!(l.save_blocks, None);
         let e = err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--save-blocks", "x.csv"]);
         assert_eq!(e.rsplit(": ").next(), Some("drop --save-blocks"));
+    }
+
+    /// `latency --capture-period-frames N` (TODO 13): the capture at IAudioClient3's N frames, so the direct route's reader
+    /// runs at a short packet; the default period without it; a period out of range refused; not with --cable-only.
+    #[test]
+    fn capture_period_frames_is_the_engine_tests_and_checked() {
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--capture-period-frames", "160"]) else { panic!() };
+        assert_eq!(l.capture_period_frames, 160);
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b", "--capture-period-frames=128"]) else { panic!() };
+        assert_eq!(l.capture_period_frames, 128);
+        let Ok(Command::Latency(l)) = p(&["latency", "--probe", "a", "--capture", "b"]) else { panic!() };
+        assert_eq!(l.capture_period_frames, 0);
+        for bad in ["0", "8", "4801", "fast"] {
+            let e = err(&["latency", "--probe", "a", "--capture", "b", "--capture-period-frames", bad]);
+            assert_eq!(e, format!("--capture-period-frames takes a period from 16 to 4800 frames, not '{bad}'"));
+        }
+        let e = err(&["latency", "--cable-only", "--probe", "a", "--capture", "b", "--capture-period-frames", "160"]);
+        assert_eq!(e.rsplit(": ").next(), Some("drop --capture-period-frames"));
+        assert!(help_text().contains("[--capture-period-frames N] [OPTIONS]"));
     }
 
     #[test]

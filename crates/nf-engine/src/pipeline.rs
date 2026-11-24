@@ -33,6 +33,7 @@ use crate::fifo::Fifo;
 use crate::out_target::AdaptiveTarget;
 use crate::recorder::ChainTx;
 use crate::reference::{MicTime, Reference};
+use crate::ring_headroom::RingHeadroom;
 use crate::timing::{HNS_PER_S, StampMap};
 
 /// A raw HRESULT from a failed stream call.
@@ -355,7 +356,11 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     out_target: usize,
     out_period: usize,
     out_margin: usize,
+    /// The direct driver route (`for_driver_ring`): `out_period` is the recording app's packet (the ring's reader's), the
+    /// target one packet + `headroom`'s.
     driver_ring: bool,
+    /// The direct route's headroom over one reader packet (ring_headroom.rs); `None` on the WASAPI route.
+    headroom: Option<RingHeadroom>,
     /// The output target follows the delivery (`IoConfig::adaptive_output`; out_target.rs); `None`: it's fixed.
     adaptive: Option<AdaptiveTarget>,
     pending: Box<[f32]>,
@@ -367,6 +372,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     last_out_fill: f64,
     /// Calibrates the interpolated output fill to the padding.
     fill_offset: FillOffset,
+    /// The re-anchors of the calibrations a reader's new packet replaced (the direct route): the run's count goes on from them.
+    reanchor_base: u64,
     /// The first block has set the output's starting fill (wasapi/F).
     out_started: bool,
     /// Dropping whole output blocks back towards the target (after a coarse overfill).
@@ -404,6 +411,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     // Statistics.
     pub(crate) counters: Counters,
     latency_ms: RollingStats<100>,
+    /// The direct route's readout to the delivery time, over the same blocks (the readout's own ends at the sample time).
+    delivery_ms: RollingStats<100>,
     /// The readout's budget over the same blocks (budget.rs).
     budget: BudgetStats,
     block_us: RollingStats<100>,
@@ -448,12 +457,14 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             out_period: cfg.out_period,
             out_margin: cfg.out_margin,
             driver_ring: false,
+            headroom: None,
             adaptive: None,
             pending: vec![0.0; PENDING].into_boxed_slice(),
             pending_len: 0,
             written_total: 0,
             last_out_fill: 0.0,
             fill_offset: FillOffset::new(cfg.out_period),
+            reanchor_base: 0,
             out_started: false,
             out_draining: false,
             mic_blk: Box::new([0.0; BLOCK]),
@@ -478,6 +489,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             out_meter: MeterBallistics::new(),
             counters: Counters::default(),
             latency_ms: RollingStats::new(),
+            delivery_ms: RollingStats::new(),
             budget: BudgetStats::new(),
             block_us: RollingStats::new(),
             aec_us: RollingStats::new(),
@@ -499,11 +511,20 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self
     }
 
-    /// A direct feed obtains its target and clock from the capture reader, which may open long after the engine starts.
+    /// A direct feed obtains its target and clock from the capture reader, which may open long after the engine starts: one
+    /// reader packet where it runs clean, + the headroom the driver's underruns call for (ring_headroom.rs; the owner,
+    /// 2026-11-24). The WASAPI route's margin and adaptive target don't apply.
     pub(crate) fn for_driver_ring(&mut self) {
         self.driver_ring = true;
+        self.headroom = Some(RingHeadroom::new());
         self.out_period = 0;
         self.set_out_target(0);
+    }
+
+    /// The direct route's headroom now, in frames (0 on the WASAPI route).
+    #[inline]
+    pub(crate) fn headroom(&self) -> usize {
+        self.headroom.map_or(0, |h| h.frames())
     }
 
     /// The echo-path guard (`IoConfig::echo_guard`; echo_guard.rs) watches for an echo that comes before its reference, and
@@ -929,6 +950,11 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// adaptive target back to the fixed one first, so the deficit's zeros fill to that
     /// (out_target.rs); ordinary blocks give it their lateness.
     ///
+    /// The direct driver route counts the driver's own underruns (the frames it filled with silence where the ring ran
+    /// out) and nothing else, and writes no deficit's zeros after the start: the driver's silence is where the ring ran out,
+    /// read_frame stops there and nothing is skipped, so zeros from us would only come on top. An underrun raises the
+    /// headroom instead, and clean running lowers it (ring_headroom.rs).
+    ///
     /// After a correction the loop restarts from the fill the next wake will read: the corrected
     /// fill with this wake's queued blocks written.
     fn push_output<S: RenderSink>(&mut self, sink: &mut S, times: Option<BlockTimes>) -> Result<(), Hr> {
@@ -937,21 +963,28 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.last_output = OutputFacts::default();
         // What the sink saw itself (an exclusive output's ring short at an event). Before the first block it's the output
         // running before the mic, as a shared device's dry start is.
+        // A direct feed's reader is read first: the passes that showed a new recording's packet ran before the underruns are
+        // read, so its first passes' silence (the ring empty after the live discard) counts before its starting fill, at the
+        // block that sets it, not as a real underrun.
+        let driver_packet = sink.driver_packet();
         let sink_dry = sink.take_underruns();
         // Its device events answered late (the thread held up past the device's deadline), and the silence its device
         // played meanwhile; before the first block, as its underruns, they aren't counted.
         let late = sink.take_late();
         let silence = sink.take_silence();
-        let driver_packet = sink.driver_packet();
         if let Some(packet) = driver_packet {
             if packet != self.out_period {
                 self.out_period = packet;
+                self.reanchor_base += self.fill_offset.reanchors;
                 self.fill_offset = FillOffset::new(packet);
-                self.set_out_target(packet);
-                self.out_drift.reset(packet as f32);
+                // One reader packet + the headroom the run has needed so far (a new recording app may bring the same mic).
+                let target = if packet == 0 { 0 } else { packet + self.headroom() };
+                self.set_out_target(target);
+                self.out_drift.reset(target as f32);
                 self.out_started = false;
                 if packet == 0 {
                     self.latency_ms.clear();
+                    self.delivery_ms.clear();
                     self.budget.clear();
                 }
             }
@@ -1012,10 +1045,26 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         if dry && let Some(t) = self.adaptive.as_mut().and_then(|a| a.underrun(raw, clocked)) {
             self.set_out_target(t);
         }
+        // The direct route's headroom (ring_headroom.rs): up at once by the driver's silence since the block before, down after
+        // clean running. Only blocks fed to a recording app after its starting fill count.
+        let moved = match self.headroom.as_mut() {
+            Some(h) if self.out_started => {
+                if dry {
+                    h.underrun(silence)
+                } else {
+                    h.clean_block()
+                }
+            }
+            _ => None,
+        };
+        if let Some(frames) = moved {
+            self.set_out_target(self.out_period + frames);
+        }
         let target = self.out_target as f64;
-        // At the start the target is set exactly; after it, this block counts as well.
+        // At the start the target is set exactly; after it, this block counts as well. The direct route tops up with zeros
+        // only at its start: after it, the driver's silence is the ring's record of running short.
         let (deficit, this_block) = if self.out_started {
-            (low && queued + (BLOCK as f64) < target, BLOCK)
+            (!self.driver_ring && low && queued + (BLOCK as f64) < target, BLOCK)
         } else {
             (padding + self.pending_len + backlog < self.out_target, 0)
         };
@@ -1079,8 +1128,12 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         }
         self.out_started = true;
         facts.target = u32::try_from(self.out_target).unwrap_or(u32::MAX);
+        if self.driver_ring {
+            facts.packet = u32::try_from(self.out_period).unwrap_or(u32::MAX);
+            facts.headroom = u32::try_from(self.headroom()).unwrap_or(u32::MAX);
+        }
         facts.reanchored = self.fill_offset.reanchors != reanchors;
-        self.counters.output_reanchors = self.fill_offset.reanchors;
+        self.counters.output_reanchors = self.reanchor_base + self.fill_offset.reanchors;
         // Where this block's first sample lands in the device stream (or would have, dropped).
         let index = self.written_total + self.pending_len as u64;
         facts.index = index;
@@ -1167,30 +1220,31 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     /// Pushes one latency sample, the block's predicted play-out time minus its capture time, and its budget (budget.rs): the
     /// mic's delivery to the wake that read the block's first sample, the wait from there to this write (the clock's
     /// reading), the queue `ahead` of it, and the render side, the rest.
+    ///
+    /// On the direct driver route the play-out is the sample's **sample time**: its capture time on the virtual mic's device
+    /// time line, the stamp the recording app gets, which the latency test's sweeps measure (the owner, 2026-11-24: the
+    /// headline). Its **delivery time**, the driver's pass that hands its packet over, is beside it: the delivery readout
+    /// and the budget's `delivery_ms`. The two differ by what's left of the reader's packet from the sample on, never by a
+    /// fixed amount (the period goes from 2.67 to 10 ms).
     fn readout(&mut self, clock: ClockReading, index: u64, ahead: f64, times: BlockTimes) {
-        let t_play = if self.driver_ring {
-            driver_delivery_hns(clock, index, self.out_period)
+        let t_play = play_time_hns(clock, index, SAMPLE_RATE as f64);
+        let Some(ms) = readout_ms(t_play, times.capture_hns) else { return };
+        self.latency_ms.push(ms);
+        self.last_latency_ms = Some(ms);
+        // A first sample no wake delivered can't be; it would be timed as delivered at the write (no wait).
+        let wake = times.wake_hns.unwrap_or(clock.now_hns);
+        let b = if self.driver_ring {
+            // The ring is the only output queue: from the write to the sample time, and the delivery after it.
+            let t_delivery = driver_delivery_hns(clock, index, self.out_period);
+            if let Some(d) = readout_ms(t_delivery, times.capture_hns) {
+                self.delivery_ms.push(d);
+            }
+            budget::split_ring(times.capture_hns, wake, clock.now_hns, t_play, t_delivery, times.chain)
         } else {
-            play_time_hns(clock, index, SAMPLE_RATE as f64)
+            budget::split(times.capture_hns, wake, clock.now_hns, t_play, ahead, times.chain)
         };
-        if let Some(ms) = readout_ms(t_play, times.capture_hns) {
-            self.latency_ms.push(ms);
-            self.last_latency_ms = Some(ms);
-            // A first sample no wake delivered can't be; it would be timed as delivered at the write (no wait).
-            let wake = times.wake_hns.unwrap_or(clock.now_hns);
-            let b = if self.driver_ring {
-                // The ring is the only output queue. It holds the frame until the capture pass releases it; there is no
-                // independent render stream to measure. Include the residual fraction of the capture packet in that queue time.
-                let mut b = budget::split(times.capture_hns, wake, clock.now_hns, t_play, 0.0, times.chain);
-                b.queue_ms = b.render_ms;
-                b.render_ms = 0.0;
-                b
-            } else {
-                budget::split(times.capture_hns, wake, clock.now_hns, t_play, ahead, times.chain)
-            };
-            self.budget.push(&b);
-            self.last_budget = Some(b);
-        }
+        self.budget.push(&b);
+        self.last_budget = Some(b);
     }
 
     /// Queues `m` slipped samples behind the pending ones; returns how many of the oldest pending ones it dropped to make room.
@@ -1294,6 +1348,11 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             tel.latency_ms_median.store(self.latency_ms.median());
             tel.latency_ms_p95.store(self.latency_ms.percentile(0.95));
         }
+        // The direct route's readout to the delivery time beside it (0 on the WASAPI route, which has none).
+        if !self.delivery_ms.is_empty() {
+            tel.latency_delivery_ms_median.store(self.delivery_ms.median());
+            tel.latency_delivery_ms_p95.store(self.delivery_ms.percentile(0.95));
+        }
         self.budget.publish(tel);
 
         // The adaptive output target may come down once a second (out_target.rs); the target is published either way.
@@ -1303,6 +1362,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         tel.output_target_ms.store(self.out_target as f32 * (1000.0 / SAMPLE_RATE as f32));
         if self.driver_ring {
             tel.output_period_ms.store(self.out_period as f32 * (1000.0 / SAMPLE_RATE as f32));
+            tel.output_headroom_ms.store(self.headroom() as f32 * (1000.0 / SAMPLE_RATE as f32));
         }
         tel.output_target_on_trial.store(self.adaptive.as_ref().is_some_and(AdaptiveTarget::on_trial), Relaxed);
         tel.output_drift_ppm.store(self.out_drift.ppm());
@@ -1374,14 +1434,21 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 
 /// The predicted play-out time (hns) of device-stream frame `index`, from one clock reading:
 /// `t_play = clock.qpc + (index - clock.pos) / fs`.
+///
+/// On the direct driver route it's the frame's sample time: the ring's `read_frame` (`pos`) starts the packet the next pass
+/// completes, whose stamp, its first frame's time on the stream's time line, is the deadline of the pass that read up to
+/// `pos` (StreamEngine.cpp's PacketStartQpc), and `qpc` is that pass's QPC (`last_pass_qpc`); frame `pos + j` is stamped `j`
+/// frames on. The pass's QPC is taken a little after its deadline (its timer's lateness and the ring lock: about 0.2 ms
+/// on the dev box under Verifier), so the sample time reads that much late.
 #[inline]
 pub(crate) fn play_time_hns(clock: ClockReading, index: u64, fs: f64) -> f64 {
     clock.qpc_hns + (index as f64 - clock.pos_frames) * (HNS_PER_S / fs)
 }
 
-/// The driver releases a complete packet at once. `pos_frames` is the first frame still to read at the last pass.
-/// The recorder's callback can run later; this estimate ends at the predicted capture pass.
-fn driver_delivery_hns(clock: ClockReading, index: u64, packet: usize) -> f64 {
+/// The direct driver route's delivery time (hns) of ring frame `index`: the pass that completes its packet hands it to the
+/// recording app (a whole packet at once). `pos_frames` is the first frame still to read at the last pass, which starts the
+/// packet the next pass completes, a packet after the last; the recording app's own wake comes after that.
+pub(crate) fn driver_delivery_hns(clock: ClockReading, index: u64, packet: usize) -> f64 {
     let frames = packet.max(1) as f64;
     let passes = ((index as f64 - clock.pos_frames) / frames).floor() + 1.0;
     // A late reader may already be past its predicted deadline. An unpublished frame can only be delivered from this write onward.
@@ -1826,22 +1893,67 @@ mod tests {
         assert!(!sink.written.contains(&-0.5));
     }
 
+    /// The direct route's two times of a ring frame, from one clock reading (the last pass read up to frame 432, at QPC 1e7),
+    /// at the recording apps' periods from IAudioClient3's smallest to the shared default: its sample time (the recording
+    /// app's stamp) steps a frame a frame, `j` frames on from the pass; its delivery is the pass that completes its packet,
+    /// the same for the whole packet. The delivery comes after the sample time by the rest of the packet, from a frame to a
+    /// whole packet, never a fixed amount.
     #[test]
-    fn driver_clock_releases_each_whole_packet_at_one_instant() {
+    fn driver_sample_and_delivery_times_at_each_period() {
         let c = ClockReading { pos_frames: 432.0, qpc_hns: 1e7, now_hns: 1e7 + 212.0 };
-        for index in [432, 433, 559] {
-            assert_eq!(driver_delivery_hns(c, index, 128), 1e7 + 128.0 * HNS_PER_SAMPLE);
+        for packet in [128usize, 160, 240, 480] {
+            let p = packet as u64;
+            for j in [0, 1, p - 1, p, p + 1, 2 * p + 5] {
+                let index = 432 + j;
+                let sample = play_time_hns(c, index, 48_000.0);
+                let delivery = driver_delivery_hns(c, index, packet);
+                assert!((sample - (1e7 + j as f64 * HNS_PER_SAMPLE)).abs() < 1e-6, "{packet}: {j}");
+                assert!((delivery - (1e7 + ((j / p + 1) * p) as f64 * HNS_PER_SAMPLE)).abs() < 1e-6, "{packet}: {j}");
+                let rest = (p - j % p) as f64 * HNS_PER_SAMPLE;
+                assert!((delivery - sample - rest).abs() < 1e-6, "{packet}: {j}: the rest of the packet");
+            }
         }
-        assert_eq!(driver_delivery_hns(c, 560, 128), 1e7 + 256.0 * HNS_PER_SAMPLE);
+        // A pass overdue at the reading: what it hasn't delivered can only come from now on. The sample time stays on the
+        // stamps' time line (the recording app's packet carries it whenever it's delivered).
         let late = ClockReading { now_hns: 1e7 + 200_000.0, ..c };
         assert_eq!(driver_delivery_hns(late, 432, 128), late.now_hns);
+        assert_eq!(play_time_hns(late, 432, 48_000.0), 1e7);
+    }
+
+    /// The direct route's readout (the headline) is the sample time less the capture, what the sweeps measure; the delivery
+    /// readout is the delivery time less the capture, later by the rest of the packet; the budget's parts add up to the first,
+    /// with the ring's queue from the write to the sample time and no render side, and its delivery goes on to the second.
+    /// At each period, for a frame at the start, the middle and the end of its packet.
+    #[test]
+    fn the_direct_readout_is_the_sample_time_and_the_delivery_goes_beside_it() {
+        let c = ClockReading { pos_frames: 432.0, qpc_hns: 1e7, now_hns: 1e7 + 212.0 };
+        let capture = 1e7 - 1e5;
+        for packet in [128usize, 160, 240, 480] {
+            for j in [0, packet as u64 / 2, packet as u64 - 1] {
+                let mut p = pipe(false);
+                p.for_driver_ring();
+                p.out_period = packet;
+                p.readout(c, 432 + j, 480.0, BlockTimes { capture_hns: capture, wake_hns: Some(1e7 - 5e4), chain: 480 });
+                let readout = (j as f64 * HNS_PER_SAMPLE + 1e5) * 1e-4;
+                let rest = (packet as u64 - j) as f64 / 48.0;
+                let got = f64::from(p.last_latency_ms.unwrap());
+                assert!((got - readout).abs() < 1e-4, "{packet}, {j}: {got} against {readout}");
+                let b = p.last_budget.unwrap();
+                assert!(b.direct() && b.render_ms == 0.0, "{packet}, {j}: {b:?}");
+                assert!((f64::from(b.readout_ms()) - readout).abs() < 1e-4, "{packet}, {j}: {b:?}");
+                assert!((f64::from(b.delivery_ms) - rest).abs() < 1e-4, "{packet}, {j}: {b:?}");
+                assert!((f64::from(b.queue_ms) - (j as f64 * HNS_PER_SAMPLE - 212.0) * 1e-4).abs() < 1e-4, "{packet}, {j}: {b:?}");
+                assert!((f64::from(b.mic_ms) - 5.0).abs() < 1e-4 && (f64::from(b.wait_ms) - 5.0212).abs() < 1e-4, "{b:?}");
+                assert_eq!(p.delivery_ms.len(), 1);
+                assert!((f64::from(p.delivery_ms.median()) - (readout + rest)).abs() < 1e-4, "{packet}, {j}");
+            }
+        }
+        // The WASAPI route: the play-out the output's clock predicts, no delivery.
         let mut p = pipe(false);
-        p.for_driver_ring();
-        p.out_period = 128;
-        p.readout(c, 433, 480.0, BlockTimes { capture_hns: 1e7 - 1e5, wake_hns: Some(1e7), chain: 480 });
+        p.readout(c, 433, 480.0, BlockTimes { capture_hns: capture, wake_hns: Some(1e7), chain: 480 });
         let b = p.last_budget.unwrap();
-        assert_eq!(b.render_ms, 0.0);
-        assert!((b.queue_ms - (128.0 * HNS_PER_SAMPLE - 212.0) as f32 * 1e-4).abs() < 1e-5);
+        assert!(!b.direct() && p.delivery_ms.is_empty(), "{b:?}");
+        assert!((f64::from(p.last_latency_ms.unwrap()) - (HNS_PER_SAMPLE + 1e5) * 1e-4).abs() < 1e-4);
     }
 
     /// Index-coded samples, plus one so that a zero is a filled-in sample.
@@ -3174,6 +3286,7 @@ mod tests {
     }
 
     mod budget;
+    mod driver;
     mod events;
     mod exclusive;
     mod flight;

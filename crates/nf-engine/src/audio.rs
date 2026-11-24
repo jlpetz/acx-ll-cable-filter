@@ -277,6 +277,8 @@ fn run(r: Run<'_>) {
     }
 
     let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
+    // The direct driver route keeps one reader packet where it runs clean, with headroom only after the driver's underruns
+    // (the owner, 2026-11-24; ring_headroom.rs): no margin, and no adaptive target, there.
     let margin_ms = if !direct && config.io.output_margin_ms.is_finite() { config.io.output_margin_ms.clamp(0.0, 100.0) } else { 0.0 };
     // The output's period: the shared engine's pass, or (exclusive) the device's buffer; the target follows it.
     let pcfg = PipelineConfig {

@@ -22,14 +22,14 @@ use std::time::{Duration, Instant};
 
 use nf_core::latency::analysis::find_sweep_arrivals;
 use nf_core::latency::sweep::{Sweep, exp_sweep, probe_train};
-use nf_core::telemetry::{EngineState, OutputEvents};
+use nf_core::telemetry::{EngineState, OutputEvents, TelemetrySnapshot};
 use nf_core::{BLOCK, SAMPLE_RATE};
 use rtrb::{Consumer, Producer, RingBuffer};
 use wasapi::{DeviceEnumerator, Direction};
 
 use crate::api::{
     CableLatencyReport, CableLatencyRequest, EngineError, LatencyMode, LatencyProgress, LatencyReport, LatencyTest, LatencyTestRequest,
-    StreamInfo, output_target_text,
+    StreamInfo, output_target_text, ring_target_text,
 };
 use crate::audio::{AudioShared, RENDER_BUFFER_HNS};
 use crate::control::{Inner, claim_test, lock};
@@ -117,7 +117,9 @@ fn failed(msg: impl Into<String>) -> TestError {
     TestError::Failed(msg.into())
 }
 
-pub(crate) fn start(inner: &Arc<Inner>, request: LatencyTestRequest) -> Result<LatencyTest, EngineError> {
+/// Starts the test, its capture at `capture_period_frames` (IAudioClient3, shared: `CaptureStream::open_events_at`), or at the
+/// endpoint's default period for 0.
+pub(crate) fn start(inner: &Arc<Inner>, request: LatencyTestRequest, capture_period_frames: u32) -> Result<LatencyTest, EngineError> {
     if inner.telemetry.state() != EngineState::Running {
         return Err(EngineError("Start the filter first: the latency test measures the running engine.".into()));
     }
@@ -128,7 +130,9 @@ pub(crate) fn start(inner: &Arc<Inner>, request: LatencyTestRequest) -> Result<L
     }
     let shared = Arc::new(TestShared::new());
     let (inner2, shared2) = (inner.clone(), shared.clone());
-    match std::thread::Builder::new().name("nf-latency".into()).spawn(move || run_test(inner2, request, shared2)) {
+    let spawned =
+        std::thread::Builder::new().name("nf-latency".into()).spawn(move || run_test(inner2, request, capture_period_frames, shared2));
+    match spawned {
         Ok(_) => Ok(LatencyTest { inner: shared }),
         Err(_) => {
             inner.test_running.store(false, Relaxed);
@@ -230,10 +234,10 @@ fn take_tap_back(inner: &Inner) {
     }
 }
 
-fn run_test(inner: Arc<Inner>, req: LatencyTestRequest, shared: Arc<TestShared>) {
+fn run_test(inner: Arc<Inner>, req: LatencyTestRequest, capture_period_frames: u32, shared: Arc<TestShared>) {
     let _flag = TestFlag(inner.clone());
     let mut restore = Restore::engage(&inner, !req.through_model);
-    let outcome = measure(&inner, &req, &shared, &mut restore);
+    let outcome = measure(&inner, &req, capture_period_frames, &shared, &mut restore);
     // Restore before reporting, so "done" means the engine is back to normal.
     drop(restore);
     shared.set(match outcome {
@@ -293,13 +297,16 @@ struct Take {
 }
 
 /// The probe's render stream and the capture stream.
-fn open_streams(probe_id: &str, capture_id: &str) -> Result<(RenderStream, CaptureStream), TestError> {
+fn open_streams(probe_id: &str, capture_id: &str, capture_period_frames: u32) -> Result<(RenderStream, CaptureStream), TestError> {
     let en = DeviceEnumerator::new().map_err(|e| failed(describe_hr(StreamRole::Probe, hr_of(&e))))?;
     let probe_dev = resolve(&en, Some(probe_id), Direction::Render, StreamRole::Probe).map_err(|f| failed(describe_start_failure(&f)))?;
     let cap_dev =
         resolve(&en, Some(capture_id), Direction::Capture, StreamRole::Capture).map_err(|f| failed(describe_start_failure(&f)))?;
     let probe = RenderStream::open(&probe_dev, RENDER_BUFFER_HNS).map_err(|e| failed(describe_hr(StreamRole::Probe, hr_of(&e))))?;
-    let cap = CaptureStream::open_events(&cap_dev).map_err(|e| failed(describe_hr(StreamRole::Capture, hr_of(&e))))?;
+    let cap = match capture_period_frames {
+        0 => CaptureStream::open_events(&cap_dev).map_err(|e| failed(describe_hr(StreamRole::Capture, hr_of(&e))))?,
+        frames => CaptureStream::open_events_at(&cap_dev, frames).map_err(failed)?,
+    };
     Ok((probe, cap))
 }
 
@@ -357,13 +364,15 @@ fn play_train(
     result.map(|()| Take { out: rec.rec, probe_t })
 }
 
-fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore: &mut Restore<'_>) -> Result<LatencyReport, TestError> {
+fn measure(
+    inner: &Inner, req: &LatencyTestRequest, capture_period_frames: u32, shared: &TestShared, restore: &mut Restore<'_>,
+) -> Result<LatencyReport, TestError> {
     let _com = Com::mta().map_err(|c| failed(describe_com_failure(c)))?;
     // Real-time priority only while streaming: dropped before the analysis (RT-2).
     let mmcss = Mmcss::enter(MmcssPriority::Normal);
     shared.running(0.0, "Preparing");
     let train = Train::new(req.repetitions as usize);
-    let (mut probe, mut cap) = open_streams(&req.probe_device, &req.capture_device)?;
+    let (mut probe, mut cap) = open_streams(&req.probe_device, &req.capture_device, capture_period_frames)?;
 
     // The tap ring covers the whole test: train + tail + 1 s. Touch every page now so the audio
     // thread never takes a page fault on it.
@@ -423,18 +432,37 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
         report.warnings.push(found_line(req.repetitions, tap_t.len(), &tap.samples, out_t.len(), &take.out.samples));
     }
 
-    let tel = inner.telemetry.snapshot();
+    // The readout and the targets as the sweeps ended (the last second's), not after the analysis: on the direct driver route
+    // the test's capture is the ring's reader, and once it has stopped there's no reader, so no readout and no period.
+    let tel = after;
     report.readout_ms_median = tel.latency_valid.then_some(tel.latency_ms_median);
+    let st = lock(&inner.status).clone();
+    // The direct driver route's readout ends at the sample time (what the sweeps measure); its readout to the delivery time
+    // goes beside it, with the reader's period that sets the difference (the owner, 2026-11-24). The period and the headroom
+    // are the tap's last fed block's where it has one (the snapshot's are a second's).
+    let mut ring = ring_conditions(st.driver_ring, &tel);
+    if let (Some(r), Some(last)) = (ring.as_mut(), facts.iter().rev().find(|f| f.output.packet > 0)) {
+        let ms = |frames: u32| frames as f32 * 1000.0 / SAMPLE_RATE as f32;
+        *r = (ms(last.output.packet), ms(last.output.headroom));
+    }
+    if let Some(r) = ring {
+        report.delivery_ms_median = (tel.latency_valid && tel.latency_delivery_ms_median > 0.0).then_some(tel.latency_delivery_ms_median);
+        report.reader_period_ms = (r.0 > 0.0).then_some(r.0);
+    }
     report.budget = budget;
     report.output = Some(output);
     report.mic_glitches = Some(mic_glitches);
     report.mic_stalls = Some(mic_stalls);
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
-    let st = lock(&inner.status).clone();
-    let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive, fixed_ms: st.targets.output_ms };
+    let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive, fixed_ms: st.targets.output_ms, ring };
+    // The direct route's output has the reader's period live (the stream opened with none: a recording app sets it).
+    let mut output = st.output.clone();
+    if let (Some(o), Some((period_ms, _))) = (output.as_mut(), ring) {
+        o.period_ms = period_ms;
+    }
     report.conditions = conditions(
         st.mic.as_ref(),
-        st.output.as_ref(),
+        output.as_ref(),
         &probe.info.stream_info(),
         &cap.info.stream_info(),
         req.mode,
@@ -470,7 +498,7 @@ fn measure_cable(req: &CableLatencyRequest<'_>) -> Result<CableLatencyReport, Te
     // Real-time priority only while streaming, as in the engine test (RT-2).
     let mmcss = Mmcss::enter(MmcssPriority::Normal);
     let train = Train::new(req.repetitions as usize);
-    let (mut probe, mut cap) = open_streams(&req.probe_device, &req.capture_device)?;
+    let (mut probe, mut cap) = open_streams(&req.probe_device, &req.capture_device, 0)?;
     let cancelled = || req.cancel.is_some_and(|c| c.load(Relaxed));
     let take = play_train(&mut probe, &mut cap, &train, |_| if cancelled() { Err(TestError::Cancelled) } else { Ok(()) })?;
     drop(mmcss);
@@ -630,6 +658,8 @@ pub(crate) fn build_report(
         input_path_ms_median: median(&inputs),
         end_to_end_ms_median: median(&e2e),
         readout_ms_median: None,
+        delivery_ms_median: None,
+        reader_period_ms: None,
         budget: None,
         output: None,
         mic_glitches: None,
@@ -728,12 +758,21 @@ pub(crate) fn mode_warnings(req: &LatencyTestRequest, aec_enabled: bool) -> Vec<
     w
 }
 
-/// The output's target at the end of a test, whether it adapts (`IoConfig::adaptive_output`), and the fixed one it started at.
+/// The output's target at the end of a test, whether it adapts (`IoConfig::adaptive_output`), and the fixed one it started at;
+/// on the direct driver route the reader's period and the ring's headroom instead (ms: [`ring_conditions`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct OutputTarget {
     pub(crate) ms: f32,
     pub(crate) adaptive: bool,
     pub(crate) fixed_ms: f32,
+    pub(crate) ring: Option<(f32, f32)>,
+}
+
+/// The direct driver route's live output at a snapshot: the reader's period and the ring's headroom over it (ms), which the
+/// target is (one packet + the headroom); `None` on the WASAPI route. Telemetry's, published each second: the output stream's
+/// own record has no period (it opened before any recording app set one: the 0.00 ms the report printed before 2026-11-24).
+pub(crate) fn ring_conditions(driver_ring: bool, tel: &TelemetrySnapshot) -> Option<(f32, f32)> {
+    driver_ring.then_some((tel.output_period_ms, tel.output_headroom_ms))
 }
 
 /// The record of how the test ran: engine periods, RAW, autoconvert, exclusive mode, the output's target and the devices.
@@ -755,7 +794,10 @@ pub(crate) fn conditions(
     if let Some(o) = output {
         parts.push(describe_stream("output", o));
     }
-    let target = output_target_text(target.ms, target.adaptive, target.fixed_ms);
+    let target = match target.ring {
+        Some((period_ms, headroom_ms)) => ring_target_text(period_ms, headroom_ms),
+        None => output_target_text(target.ms, target.adaptive, target.fixed_ms),
+    };
     if !target.is_empty() {
         parts.push(target);
     }
@@ -1086,7 +1128,7 @@ mod tests {
             &s("CABLE-B Output", false, false, false),
             LatencyMode::VirtualLoop,
             true,
-            OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0 },
+            OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0, ring: None },
         );
         assert_eq!(
             c,
@@ -1103,7 +1145,7 @@ mod tests {
             &s("CABLE Output", false, false, false),
             LatencyMode::VirtualLoop,
             true,
-            OutputTarget { ms: 5.0, adaptive: true, fixed_ms: 14.0 },
+            OutputTarget { ms: 5.0, adaptive: true, fixed_ms: 14.0, ring: None },
         );
         assert!(c.contains("mic: CABLE-A Output (48000 Hz, 2 ch, 3.33 ms period, exclusive 16-bit)"), "{c}");
         assert!(
@@ -1114,7 +1156,7 @@ mod tests {
             "{c}"
         );
         // At the fixed target (a run's first four minutes, or back there after an underrun): said neutrally, as a snapshot.
-        let start = OutputTarget { ms: 14.0, adaptive: true, fixed_ms: 14.0 };
+        let start = OutputTarget { ms: 14.0, adaptive: true, fixed_ms: 14.0, ring: None };
         let c = conditions(None, None, &s("A", false, false, false), &s("B", false, false, false), LatencyMode::VirtualLoop, true, start);
         assert!(
             c.contains(
@@ -1125,9 +1167,55 @@ mod tests {
         );
         // Asked for in exclusive mode and refused: shared, and why.
         let refused = StreamInfo { exclusive_refused: Some("another app is using it".into()), ..s("CABLE Input", false, false, false) };
-        let target = OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0 };
+        let target = OutputTarget { ms: 22.0, adaptive: false, fixed_ms: 22.0, ring: None };
         let c = conditions(None, Some(&refused), &refused, &refused, LatencyMode::VirtualLoop, true, target);
         assert!(c.contains("CABLE Input (48000 Hz, 2 ch, 10.00 ms period, shared: exclusive refused (another app is using it))"), "{c}");
+    }
+
+    /// The direct driver route's conditions (the owner, 2026-11-24: show the active period): the reader's period comes from
+    /// telemetry (the stream's own record has none: it opened before a recording app set one), and the target is one reader
+    /// packet, with the headroom when the driver's underruns raised it; nothing on the WASAPI route.
+    #[test]
+    fn direct_route_conditions_show_the_readers_period_and_the_headroom() {
+        let tel = TelemetrySnapshot { output_period_ms: 10.0 / 3.0, output_headroom_ms: 0.0, ..Default::default() };
+        let ring = ring_conditions(true, &tel);
+        assert_eq!(ring, Some((10.0 / 3.0, 0.0)));
+        assert_eq!(ring_conditions(false, &tel), None);
+        let opened = StreamInfo {
+            device_name: "Noise Filter virtual microphone (direct driver ring)".into(),
+            sample_rate: 48_000,
+            channels: 2,
+            period_ms: 0.0,
+            low_latency: false,
+            autoconvert: false,
+            raw: false,
+            exclusive: None,
+            exclusive_refused: None,
+        };
+        let output = StreamInfo { period_ms: ring.unwrap().0, ..opened.clone() };
+        let target = OutputTarget { ms: 3.33, adaptive: false, fixed_ms: 0.0, ring };
+        let c = conditions(None, Some(&output), &opened, &opened, LatencyMode::VirtualLoop, true, target);
+        assert!(
+            c.contains(
+                "output: Noise Filter virtual microphone (direct driver ring) (48000 Hz, 2 ch, 3.33 ms period); output target one \
+                 reader packet, 3.33 ms (the direct route's, with no headroom: it runs clean)"
+            ),
+            "{c}"
+        );
+        let raised = OutputTarget { ring: Some((10.0 / 3.0, 9.0)), ..target };
+        let c = conditions(None, Some(&output), &opened, &opened, LatencyMode::VirtualLoop, true, raised);
+        assert!(
+            c.contains(
+                "output target 12.33 ms at the end: one reader packet, 3.33 ms, + 9.00 ms of headroom (the direct route's: raised \
+                 by the driver's underruns, lowered after clean running)"
+            ),
+            "{c}"
+        );
+        // No recording app at the end: no packet, no target to name.
+        assert!(
+            !conditions(None, None, &opened, &opened, LatencyMode::VirtualLoop, true, OutputTarget { ring: Some((0.0, 0.0)), ..target })
+                .contains("output target")
+        );
     }
 
     #[test]

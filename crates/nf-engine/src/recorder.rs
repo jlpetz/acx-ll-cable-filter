@@ -98,6 +98,8 @@ impl ChainItem {
                 silence: 0,
                 clock_pos: 0.0,
                 clock_qpc_hns: 0.0,
+                packet: 0,
+                headroom: 0,
             },
             thread: ThreadFacts {
                 wake_hns: 0.0,

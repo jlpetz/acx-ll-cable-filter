@@ -1209,7 +1209,7 @@ mod tests {
             aec_delay_ms: f32::NAN,
             aec_erle_db: f32::NAN,
             settings: ChainParams::default(),
-            budget: Some(LatencyBudget { mic_ms, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 14.0, render_ms: 3.0 }),
+            budget: Some(LatencyBudget { mic_ms, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 14.0, render_ms: 3.0, delivery_ms: 0.0 }),
             output: OutputFacts {
                 target: 672,
                 clock_pos: pos,

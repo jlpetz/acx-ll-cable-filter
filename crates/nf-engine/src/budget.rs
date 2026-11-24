@@ -4,7 +4,8 @@
 //! - [`WakeLog`] remembers which wake delivered the mic FIFO's samples, so a block's first sample can be timed to the wake
 //!   that read it (mic delivery) and from there to the block's write (wait).
 //! - [`split`] makes one block's [`LatencyBudget`] from its times and the output queue ahead of it: the render side is what's
-//!   left of the readout.
+//!   left of the readout. [`split_ring`] makes the direct driver route's: the ring is its only queue, timed from the write to
+//!   the sample time, and the delivery after it.
 //! - [`BudgetStats`] keeps the last 100 blocks' parts (the readout's own window) and the run's totals, and publishes them once
 //!   a second.
 //!
@@ -85,6 +86,26 @@ pub(crate) fn split(capture: f64, wake: f64, write: f64, play: f64, queue: f64, 
         chain_ms: (f64::from(chain) * MS_PER_SAMPLE) as f32,
         queue_ms: queue_ms as f32,
         render_ms: ((play - write) * MS_PER_HNS - queue_ms) as f32,
+        delivery_ms: 0.0,
+    }
+}
+
+/// The direct driver route's budget (the owner, 2026-11-24: sample time and delivery time apart). Times are QPC hns, as
+/// [`split`]'s: `sample` is the first output sample's sample time (its capture time on the virtual mic's device time line,
+/// the recording app's stamp: the readout's end), `delivery` the driver's pass that hands its packet over. The ring is the
+/// only queue: `queue_ms` runs from the write to the sample time, with no render side after it; `delivery_ms` from the
+/// sample time to the delivery. Nothing here is a fixed amount: the delivery is whatever is left of the reader's packet
+/// (its period varies from 2.67 to 10 ms).
+#[inline]
+pub(crate) fn split_ring(capture: f64, wake: f64, write: f64, sample: f64, delivery: f64, chain: u32) -> LatencyBudget {
+    const MS_PER_HNS: f64 = 1e-4;
+    LatencyBudget {
+        mic_ms: ((wake - capture) * MS_PER_HNS) as f32,
+        wait_ms: ((write - wake) * MS_PER_HNS) as f32,
+        chain_ms: (f64::from(chain) * MS_PER_SAMPLE) as f32,
+        queue_ms: ((sample - write) * MS_PER_HNS) as f32,
+        render_ms: 0.0,
+        delivery_ms: ((delivery - sample) * MS_PER_HNS) as f32,
     }
 }
 
@@ -95,6 +116,7 @@ pub(crate) struct BudgetStats {
     chain: RollingStats<100>,
     queue: RollingStats<100>,
     render: RollingStats<100>,
+    delivery: RollingStats<100>,
     totals: BudgetTotals,
 }
 
@@ -106,6 +128,7 @@ impl BudgetStats {
             chain: RollingStats::new(),
             queue: RollingStats::new(),
             render: RollingStats::new(),
+            delivery: RollingStats::new(),
             totals: BudgetTotals::default(),
         }
     }
@@ -117,12 +140,13 @@ impl BudgetStats {
         self.chain.push(b.chain_ms);
         self.queue.push(b.queue_ms);
         self.render.push(b.render_ms);
+        self.delivery.push(b.delivery_ms);
         self.totals.add(b);
     }
 
     /// The readout went off: the window starts afresh when it comes back (the totals carry on).
     pub(crate) fn clear(&mut self) {
-        for s in [&mut self.mic, &mut self.wait, &mut self.chain, &mut self.queue, &mut self.render] {
+        for s in [&mut self.mic, &mut self.wait, &mut self.chain, &mut self.queue, &mut self.render, &mut self.delivery] {
             s.clear();
         }
     }
@@ -137,6 +161,7 @@ impl BudgetStats {
                 chain_ms: f(&self.chain),
                 queue_ms: f(&self.queue),
                 render_ms: f(&self.render),
+                delivery_ms: f(&self.delivery),
             };
             tel.budget_mean.store(&of(&|s| s.mean()));
             tel.budget_p95.store(&of(&|s| s.percentile(0.95)));
@@ -195,6 +220,25 @@ mod tests {
         assert!((b.queue_ms - 22.0).abs() < 1e-4 && (b.chain_ms - 10.0).abs() < 1e-4, "{b:?}");
         assert!((b.render_ms - 23.5).abs() < 1e-4, "{b:?}");
         assert!((b.readout_ms() - 61.7).abs() < 1e-4 && (b.total_ms() - 71.7).abs() < 1e-4, "{b:?}");
+        assert_eq!(b.delivery_ms, 0.0, "the WASAPI route has no delivery past the readout");
+    }
+
+    /// The direct driver route: the ring's queue runs from the write to the sample time and the readout ends there (no render
+    /// side), the delivery from there to the pass; the parts still add up to the readout, and the delivery goes on top.
+    #[test]
+    fn the_ring_parts_end_at_the_sample_time_and_the_delivery_follows() {
+        // Captured at 0, read 10.4 ms later, written 0.1 ms after that; sampled 1.5 ms after the write, delivered 2.2 ms after
+        // that (the rest of a 160-frame packet: 106 frames).
+        let t0 = 1e10;
+        let b = split_ring(t0, t0 + 104_000.0, t0 + 105_000.0, t0 + 120_000.0, t0 + 142_000.0, 480);
+        assert!((b.mic_ms - 10.4).abs() < 1e-4 && (b.wait_ms - 0.1).abs() < 1e-4 && (b.queue_ms - 1.5).abs() < 1e-4, "{b:?}");
+        assert!(b.render_ms == 0.0 && (b.delivery_ms - 2.2).abs() < 1e-4 && b.direct(), "{b:?}");
+        assert!((b.readout_ms() - 12.0).abs() < 1e-4 && (b.delivered_ms() - 14.2).abs() < 1e-4, "{b:?}");
+        assert!((b.total_ms() - 22.0).abs() < 1e-4, "the chain on top of the readout: {b:?}");
+        // A late reader: the sample time can be before the write (the stamps the recording app gets say so). The queue reads
+        // negative and the parts still add up.
+        let late = split_ring(t0, t0 + 104_000.0, t0 + 105_000.0, t0 + 100_000.0, t0 + 106_000.0, 480);
+        assert!((late.queue_ms + 0.5).abs() < 1e-4 && (late.readout_ms() - 10.0).abs() < 1e-4, "{late:?}");
     }
 
     /// Each second: the window's means and 95th percentiles, and the totals; an empty window leaves the last values.
@@ -204,13 +248,15 @@ mod tests {
         let mut s = BudgetStats::new();
         for k in 0..100 {
             let mic = if k % 2 == 0 { 10.0 } else { 20.0 };
-            s.push(&LatencyBudget { mic_ms: mic, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 37.0 - mic, render_ms: 5.0 });
+            let delivery_ms = if k % 4 == 0 { 3.0 } else { 1.0 };
+            s.push(&LatencyBudget { mic_ms: mic, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 37.0 - mic, render_ms: 5.0, delivery_ms });
         }
         s.publish(&tel);
         let (mean, p95, totals) = (tel.budget_mean.load(), tel.budget_p95.load(), tel.budget_totals.load());
         assert!((mean.mic_ms - 15.0).abs() < 1e-4 && (mean.queue_ms - 22.0).abs() < 1e-4, "{mean:?}");
         assert!((mean.readout_ms() - 42.1).abs() < 1e-3 && (mean.chain_ms - 10.0).abs() < 1e-4, "{mean:?}");
-        assert_eq!((p95.mic_ms, p95.queue_ms), (20.0, 27.0));
+        assert_eq!((p95.mic_ms, p95.queue_ms, p95.delivery_ms), (20.0, 27.0, 3.0));
+        assert!((mean.delivery_ms - 1.5).abs() < 1e-4, "{mean:?}");
         assert_eq!(totals.blocks, 100);
         assert!((totals.mic_ms - 1500.0).abs() < 1e-6, "{totals:?}");
         s.clear();

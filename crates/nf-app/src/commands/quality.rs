@@ -1246,7 +1246,7 @@ mod tests {
     fn the_report_shows_the_latency_budget_over_the_take() {
         let readings = EngineReadings { output_drift_ppm: 1.24, ..Default::default() };
         let failed = Err(AlignmentFailure { alignment: None, reason: "silent".into() });
-        let b = LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44 };
+        let b = LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44, delivery_ms: 0.0 };
         let report = format_report(QualityTest::Noise, &failed, &Take { budget: Some(b), ..take(&["A"], readings) });
         assert!(
             report.contains(
@@ -1644,6 +1644,7 @@ mod tests {
                 chain_ms: 10.0,
                 queue_ms: 21.25,
                 render_ms: 22.0,
+                delivery_ms: 0.0,
             }),
             output: OutputFacts {
                 index: 1056 + index * 480,
@@ -1661,6 +1662,8 @@ mod tests {
                 silence: if index == 1 { 46 } else { 0 },
                 clock_pos: if index == 0 { 96.0 } else { f64::NAN },
                 clock_qpc_hns: if index == 0 { 10_000_180_000.0 } else { f64::NAN },
+                packet: 0,
+                headroom: 0,
             },
             thread: ThreadFacts {
                 wake_hns: 1e10 + index as f64 * 1e5 + 2e5,
@@ -1722,12 +1725,12 @@ mod tests {
         assert_eq!(
             lines[1],
             "0,10000000000.0,1,0,10000200000.0,0,0,0,-96,96,14.250,14.000,14.100,-1.50,1,1,0,-12,481,12,0,96,aligned|coasted,0,,3.25,0,\
-             19.500,0.125,10.000,21.250,22.000,62.875,1056,960,0,1019.8,1056,0,0,0,0,0,0,0,0,96.0,10000180000.0,\
+             19.500,0.125,10.000,21.250,22.000,62.875,0.000,62.875,1056,960,0,1019.8,1056,0,0,0,0,0,0,0,0,96.0,10000180000.0,0,0,\
              10000200000.0,10.000,1,0,0,0,87.5,0"
         );
         assert_eq!(
             lines[2],
-            "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,0,,3.25,1,,,,,,,1536,960,0,1019.8,1056,-1,96,0,0,1,0,0,46,,,\
+            "1,10000100000.0,1,480,10000300000.0,0,960,-48,,,,,,,,,,,,,,,,0,,3.25,1,,,,,,,,,1536,960,0,1019.8,1056,-1,96,0,0,1,0,0,46,,,0,0,\
              10000300000.0,0.000,0,0,0,1,87.5,0"
         );
         let back = crate::config::load(&dir.join("chain_config.json")).unwrap();

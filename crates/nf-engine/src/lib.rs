@@ -8,6 +8,7 @@
 //! - `exclusive`: exclusive mode apart from WASAPI: its period and formats, the fall-back to shared mode, and the
 //!   event-driven output's ring.
 //! - `out_target`: the adaptive output target.
+//! - `ring_output`, `ring_headroom`: the direct driver route's output (the driver's live ring) and its fill headroom.
 //! - `pipeline`: the audio thread's per-block bookkeeping (FIFOs, slips, coarse corrections, the
 //!   latency readout, statistics) behind stream traits, so tests drive it with fakes.
 //! - `reference`: the reference's timeline, read in step with the mic so the echo path holds still.
@@ -51,6 +52,7 @@ mod pipeline;
 mod play_record;
 mod recorder;
 mod reference;
+mod ring_headroom;
 mod ring_output;
 mod sched;
 mod stream;

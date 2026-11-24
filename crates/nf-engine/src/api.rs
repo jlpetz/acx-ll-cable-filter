@@ -204,6 +204,25 @@ pub fn output_target_text(target_ms: f32, adaptive: bool, fixed_ms: f32) -> Stri
     format!("output target {target_ms:.1} ms at the end (adaptive, {how})")
 }
 
+/// The direct driver route's output target as the reports' conditions name it, from the snapshot at the test's end: the
+/// reader's packet (`TelemetrySnapshot::output_period_ms`, the recording app's period) and the headroom over it
+/// (`output_headroom_ms`): "output target one reader packet, 3.33 ms (the direct route's, with no headroom: it runs clean)",
+/// or "output target 12.33 ms at the end: one reader packet, 3.33 ms, + 9.00 ms of headroom (the direct route's: raised by
+/// the driver's underruns, lowered after clean running)". Empty while no app records (no packet).
+pub fn ring_target_text(period_ms: f32, headroom_ms: f32) -> String {
+    if period_ms.is_nan() || period_ms <= 0.0 {
+        return String::new();
+    }
+    if headroom_ms.is_nan() || headroom_ms <= 0.0 {
+        return format!("output target one reader packet, {period_ms:.2} ms (the direct route's, with no headroom: it runs clean)");
+    }
+    format!(
+        "output target {:.2} ms at the end: one reader packet, {period_ms:.2} ms, + {headroom_ms:.2} ms of headroom (the direct \
+         route's: raised by the driver's underruns, lowered after clean running)",
+        period_ms + headroom_ms
+    )
+}
+
 /// Which loop the latency test measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatencyMode {
@@ -254,8 +273,15 @@ pub struct LatencyReport {
     pub input_path_ms_median: Option<f64>,
     /// Probe play-out to the output capture: what an app reading the output cable experiences.
     pub end_to_end_ms_median: Option<f64>,
-    /// The live readout (layer 1) during the test, for comparison.
+    /// The live readout (layer 1) during the test, for comparison. On the direct driver route to the sample time (the
+    /// recording app's stamps, what the sweeps measure).
     pub readout_ms_median: Option<f32>,
+    /// The direct driver route's live readout to the delivery time (the driver's pass that hands each packet over) over the
+    /// same blocks, beside it: it's later by what's left of the reader's packet. `None` on the WASAPI route.
+    pub delivery_ms_median: Option<f32>,
+    /// The direct driver route's reader packet at the test's end, in ms (the recording app's period, which the readout's
+    /// delivery and the target follow); `None` on the WASAPI route, or with no app recording.
+    pub reader_period_ms: Option<f32>,
     /// The readout's budget during the test: each part's mean over the blocks from the sweeps' start to their end (engine.md,
     /// "The latency budget"). The readout leaves the chain's offset out; `app_ms` holds it.
     pub budget: Option<LatencyBudget>,
@@ -373,6 +399,11 @@ pub struct SweepDisturbance {
     /// echo-path guard's hold (each move a jump in the audio's delay).
     pub target_moves: u32,
     pub hold_moves: u32,
+    /// The direct driver route's moves in the window: of the headroom over one reader packet (raised after an underrun,
+    /// lowered after clean running: ring_headroom.rs), and of the reader's packet (another recording app took the ring). Each
+    /// moves the target; neither counts in `target_moves`.
+    pub headroom_moves: u32,
+    pub packet_moves: u32,
     /// The drift loop's net slips over the window (inserted less dropped: the samples the path grew by), when they came at more
     /// than 0.5 ms a second; 0 otherwise.
     pub trim_samples: i64,
@@ -406,6 +437,8 @@ impl SweepDisturbance {
             || self.output.any_correction()
             || self.target_moves > 0
             || self.hold_moves > 0
+            || self.headroom_moves > 0
+            || self.packet_moves > 0
             || self.trim_samples != 0
             || self.queue != QueueRecovery::None
     }
@@ -429,6 +462,18 @@ impl SweepDisturbance {
         }
         if self.target_moves > 0 {
             parts.push(format!("{} (adaptive)", plural(self.target_moves, "output target move", "output target moves")));
+        }
+        if self.headroom_moves > 0 {
+            parts.push(format!(
+                "{} (direct route: raised after an underrun, lowered after clean running)",
+                plural(self.headroom_moves, "move of the ring's headroom", "moves of the ring's headroom")
+            ));
+        }
+        if self.packet_moves > 0 {
+            parts.push(format!(
+                "{} (direct route: another recording app's period)",
+                plural(self.packet_moves, "change of the reader's packet", "changes of the reader's packet")
+            ));
         }
         if self.hold_moves > 0 {
             parts.push(format!("{} of the echo-path guard's hold", plural(self.hold_moves, "move", "moves")));
@@ -765,6 +810,10 @@ pub struct OutputFacts {
     /// mic's index and stamps they give the clocks' drift ([`clock_drift`]).
     pub clock_pos: f64,
     pub clock_qpc_hns: f64,
+    /// The direct driver route: the recording app's packet the block was fed to (the ring's reader's, in frames), and the
+    /// headroom over it in the target (frames: nf-engine `ring_headroom.rs`). Both 0 on the WASAPI route.
+    pub packet: u32,
+    pub headroom: u32,
 }
 
 impl Default for OutputFacts {
@@ -785,6 +834,8 @@ impl Default for OutputFacts {
             silence: 0,
             clock_pos: f64::NAN,
             clock_qpc_hns: f64::NAN,
+            packet: 0,
+            headroom: 0,
         }
     }
 }
@@ -1205,7 +1256,16 @@ impl Engine {
 
     /// Starts a latency test. The engine must be running, with the mic set to the loop's input.
     pub fn start_latency_test(&self, request: LatencyTestRequest) -> Result<LatencyTest, EngineError> {
-        crate::latency_test::start(&self.inner, request)
+        crate::latency_test::start(&self.inner, request, 0)
+    }
+
+    /// [`Self::start_latency_test`] with its capture opened at IAudioClient3's `capture_period_frames`, shared, in the
+    /// endpoint's DEFAULT mode (0: its default period, as `start_latency_test`). On the direct driver route the test's
+    /// capture is the recording app that reads the ring, so this sets the reader's packet: a short one (128 or 160 frames)
+    /// needs the capture to ask for it itself (TODO 13). The capture endpoint must take the period: the test fails, naming
+    /// the periods it takes, where it doesn't.
+    pub fn start_latency_test_at(&self, request: LatencyTestRequest, capture_period_frames: u32) -> Result<LatencyTest, EngineError> {
+        crate::latency_test::start(&self.inner, request, capture_period_frames)
     }
 
     /// Arms the chain recorder (engine.md, "The chain recorder"): every block the chain processes, its mic and reference

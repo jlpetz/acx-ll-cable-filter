@@ -1,7 +1,8 @@
 //! Which of the latency test's sweeps the engine's own events disturbed (TODO 13). The tap carries each block's output and
 //! thread facts, the output's counts since the block before and the echo-path guard's hold (pipeline.rs's `TapItem`), so the
 //! test knows, block for block in the tap's own samples, where a mic glitch or stall, an output underrun, deficit, coarse
-//! drop, re-anchor, target move or hold move came, what the drift loop slipped, and where the output queue stood against its
+//! drop, re-anchor, target move or hold move came (on the direct driver route, a move of the ring's headroom or of the
+//! reader's packet: the owner, 2026-11-24), what the drift loop slipped, and where the output queue stood against its
 //! target. A sweep is disturbed when:
 //! - **an event** came in its window: from [`MARGIN_MS`] before its first sample at the app's input to its app latency and
 //!   [`MARGIN_SLACK_MS`] after its last (at least [`MARGIN_MS`]);
@@ -134,18 +135,30 @@ pub(crate) fn disturbances(blocks: &[TapFacts], sweeps: &[SweepAt], sweep_len: u
 
 /// Each block's own events (a [`SweepDisturbance`] of one block, its repetition and queue unset): its mic glitches and stalls,
 /// its output's counts (slips included: they make no event), and a move of the target or the echo-path hold from the block
-/// before's.
+/// before's. On the direct driver route the target is one reader packet + the ring's headroom (ring_headroom.rs), so a move
+/// of it is the headroom's or the packet's (or both), named as those: no adaptive target runs there.
 fn block_events(blocks: &[TapFacts]) -> Vec<SweepDisturbance> {
     let mut prev_target = None;
     let mut prev_hold = None;
+    // The direct route's last fed block: its reader's packet and the headroom.
+    let mut prev_ring: Option<(u32, u32)> = None;
     blocks
         .iter()
         .map(|b| {
-            // A failed write leaves the block's output facts at their defaults (no target): it moves nothing.
+            // A failed write leaves the block's output facts at their defaults (no target): it moves nothing. So does a block
+            // the direct route discarded with no app recording (no target either).
             let target = b.output.target;
             let target_moved = target > 0 && prev_target.is_some_and(|p| p != target);
             if target > 0 {
                 prev_target = Some(target);
+            }
+            let ring = (target > 0 && b.output.packet > 0).then_some((b.output.packet, b.output.headroom));
+            let (packet_moved, headroom_moved) = match (prev_ring, ring) {
+                (Some((p0, h0)), Some((p1, h1))) => (p0 != p1, h0 != h1),
+                _ => (false, false),
+            };
+            if ring.is_some() {
+                prev_ring = ring;
             }
             let hold_moved = prev_hold.is_some_and(|p| p != b.hold);
             prev_hold = Some(b.hold);
@@ -153,8 +166,10 @@ fn block_events(blocks: &[TapFacts]) -> Vec<SweepDisturbance> {
                 mic_glitches: b.thread.mic_glitches,
                 mic_stalls: b.thread.stalls,
                 output: b.events,
-                target_moves: u32::from(target_moved),
+                target_moves: u32::from(target_moved && ring.is_none()),
                 hold_moves: u32::from(hold_moved),
+                headroom_moves: u32::from(headroom_moved),
+                packet_moves: u32::from(packet_moved),
                 ..SweepDisturbance::default()
             }
         })
@@ -167,6 +182,8 @@ fn add(d: &mut SweepDisturbance, e: &SweepDisturbance) {
     d.mic_stalls = d.mic_stalls.saturating_add(e.mic_stalls);
     d.target_moves = d.target_moves.saturating_add(e.target_moves);
     d.hold_moves = d.hold_moves.saturating_add(e.hold_moves);
+    d.headroom_moves = d.headroom_moves.saturating_add(e.headroom_moves);
+    d.packet_moves = d.packet_moves.saturating_add(e.packet_moves);
     d.output.add(&e.output);
 }
 
@@ -498,6 +515,59 @@ mod tests {
         assert!(!disturbances(&blocks, &[slow], 4_800)[0].any(), "150 ms after it");
     }
 
+    /// The direct driver route (TODO 13; the owner, 2026-11-24): a move of the ring's headroom is an event for the sweeps
+    /// around it, as is a new reader packet, each named as such rather than as the adaptive target's move; the queue then
+    /// recovers to its level as after any event. Blocks discarded while no app records (no target) move nothing, and a
+    /// recording app that comes back with the same packet and headroom isn't a move.
+    #[test]
+    fn the_direct_routes_headroom_and_packet_moves_disturb_their_sweeps() {
+        let ring = |packet: u32, headroom: u32, n: usize| -> Vec<TapFacts> {
+            let mut v = steady(n, packet + headroom);
+            for b in &mut v {
+                (b.output.packet, b.output.headroom) = (packet, headroom);
+            }
+            v
+        };
+        // 128-frame packets: the headroom down from 240 to 96 at block 200 (the fill 144 over the new target, trimmed back at
+        // 0.72 a block), and a 160-frame reader from block 600.
+        let mut blocks = ring(128, 240, 200);
+        let mut lowered = ring(128, 96, 400);
+        let mut over = 144.0f32;
+        for b in &mut lowered {
+            b.output.fill += over.max(0.0);
+            if over > 0.0 {
+                slip(b, -1);
+            }
+            over -= 0.72;
+        }
+        blocks.extend(lowered);
+        blocks.extend(ring(160, 96, 300));
+        let sweeps = [sweep(1, 40), sweep(2, 190), sweep(3, 450), sweep(4, 595), sweep(5, 750)];
+        let d = disturbances(&blocks, &sweeps, 4_800);
+        assert!(!d[0].any(), "{:?}", d[0]);
+        assert_eq!((d[1].headroom_moves, d[1].target_moves, d[1].packet_moves), (1, 0, 0), "{:?}", d[1]);
+        assert_eq!(d[1].queue, QueueRecovery::AfterEvent);
+        assert!(
+            d[1].text().starts_with("1 move of the ring's headroom (direct route: raised after an underrun, lowered after clean running)"),
+            "{}",
+            d[1].text()
+        );
+        assert!(!d[2].any(), "recovered: {:?}", d[2]);
+        assert_eq!((d[3].packet_moves, d[3].headroom_moves, d[3].target_moves), (1, 0, 0), "{:?}", d[3]);
+        assert_eq!(d[3].text(), "1 change of the reader's packet (direct route: another recording app's period)");
+        assert!(!d[4].any(), "{:?}", d[4]);
+        assert_eq!(d[4].events_before, 2);
+        // Idle blocks between two recordings with the same packet and headroom: nothing moved.
+        let mut idle = ring(128, 96, 100);
+        idle.extend((0..100).map(|_| TapFacts::default()));
+        idle.extend(ring(128, 96, 100));
+        assert!(
+            disturbances(&idle, &[sweep(1, 60), sweep(2, 150)], 4_800)
+                .iter()
+                .all(|d| d.headroom_moves + d.packet_moves + d.target_moves == 0)
+        );
+    }
+
     /// A failed write's block (its output facts at their defaults: no target) neither moves the target nor reads as a queue
     /// far from it, and a queue under its level after an event is named as under.
     #[test]
@@ -554,6 +624,8 @@ mod tests {
             "out_silence", "mic_glitches", "stalls", "echo_hold",
         ]
         .map(col);
+        // The direct route's packet and headroom: in CSVs from 2026-11-24 on (0 in older ones, as on the WASAPI route).
+        let ring = ["out_packet", "out_headroom"].map(|name| header.iter().position(|h| *h == name));
         let mut dropping = false;
         let blocks: Vec<TapFacts> = rows
             .skip(from)
@@ -561,6 +633,7 @@ mod tests {
                 let f: Vec<&str> = line.split(',').collect();
                 let [fill, target, slip, zeros, dropped, skipped, underrun, late, reanchored, silence, glitches, stalls, hold] =
                     cols.map(|i| f[i].parse::<f64>().unwrap_or(if f[i] == "true" { 1.0 } else { 0.0 }));
+                let [packet, headroom] = ring.map(|i| i.and_then(|i| f.get(i)?.parse::<u32>().ok()).unwrap_or(0));
                 let dropped_frames = (dropped + 480.0 * skipped) as u64;
                 let drop_starts = dropped_frames > 0 && !dropping;
                 dropping = dropped_frames > 0;
@@ -577,7 +650,14 @@ mod tests {
                     reanchors: reanchored as u64,
                 };
                 TapFacts {
-                    output: OutputFacts { fill: fill as f32, target: target as u32, slip: slip as i8, ..OutputFacts::default() },
+                    output: OutputFacts {
+                        fill: fill as f32,
+                        target: target as u32,
+                        slip: slip as i8,
+                        packet,
+                        headroom,
+                        ..OutputFacts::default()
+                    },
                     thread: ThreadFacts { mic_glitches: glitches as u32, stalls: stalls as u32, ..ThreadFacts::default() },
                     events,
                     hold: hold as u32,

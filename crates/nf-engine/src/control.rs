@@ -859,6 +859,8 @@ fn reset_telemetry(t: &Telemetry) {
     t.latency_valid.store(false, Relaxed);
     t.latency_ms_median.store(0.0);
     t.latency_ms_p95.store(0.0);
+    t.latency_delivery_ms_median.store(0.0);
+    t.latency_delivery_ms_p95.store(0.0);
     t.budget_mean.store(&s.budget_mean);
     t.budget_p95.store(&s.budget_p95);
     t.budget_totals.store(&s.budget_totals);
@@ -887,6 +889,7 @@ fn reset_telemetry(t: &Telemetry) {
     t.rt_pool_allocations_per_s.store(0, Relaxed);
     t.mic_period_ms.store(0.0);
     t.output_period_ms.store(0.0);
+    t.output_headroom_ms.store(0.0);
     clear_targets(t);
     t.clip_latched.store(clip, Relaxed);
 }

@@ -134,18 +134,39 @@ pub(crate) fn reduction_and_speech(t: &TelemetrySnapshot) -> String {
     format!("Reduction: {} dB · Speech: {}", db(t.noise_reduction_db), fixed(speech, 2))
 }
 
-/// Readout line 1a: "Pipeline: 12.3 ms (p95 14.1)", or "Pipeline: —" while it isn't valid.
+/// Readout line 1a: "Pipeline: 12.3 ms (p95 14.1)", or "Pipeline: —" while it isn't valid. The direct driver route's ends at
+/// the sample time (what the latency test's sweeps measure), with the driver's delivery beside it (the owner, 2026-11-24):
+/// "Pipeline: 12.3 ms to the sample time (p95 14.1) · 13.6 ms to delivery".
 pub(crate) fn pipeline(t: &TelemetrySnapshot) -> String {
-    if t.latency_valid && t.latency_ms_median.is_finite() {
-        format!("Pipeline: {} ms (p95 {})", fixed(t.latency_ms_median, 1), fixed(t.latency_ms_p95, 1))
-    } else {
-        format!("Pipeline: {DASH}")
+    if !(t.latency_valid && t.latency_ms_median.is_finite()) {
+        return format!("Pipeline: {DASH}");
     }
+    if t.latency_delivery_ms_median > 0.0 {
+        return format!(
+            "Pipeline: {} ms to the sample time (p95 {}) · {} ms to delivery",
+            fixed(t.latency_ms_median, 1),
+            fixed(t.latency_ms_p95, 1),
+            fixed(t.latency_delivery_ms_median, 1)
+        );
+    }
+    format!("Pipeline: {} ms (p95 {})", fixed(t.latency_ms_median, 1), fixed(t.latency_ms_p95, 1))
 }
 
 /// A latency budget's parts (engine.md, "The latency budget"): "mic 16.2 + wait 0.1 + output queue 22.0 + render 23.4 ms,
-/// chain 10.0 ms on top". The readout holds the four parts; the chain's offset isn't in it.
+/// chain 10.0 ms on top". The readout holds the four parts; the chain's offset isn't in it. The direct driver route's end at
+/// the sample time, the delivery after it: "mic 10.4 + wait 0.1 + ring queue 1.5 ms to the sample time, delivery 2.2 ms
+/// after it, chain 10.0 ms on top".
 fn budget_parts(b: &LatencyBudget) -> String {
+    if b.direct() {
+        return format!(
+            "mic {} + wait {} + ring queue {} ms to the sample time, delivery {} ms after it, chain {} ms on top",
+            fixed(b.mic_ms, 1),
+            fixed(b.wait_ms, 1),
+            fixed(b.queue_ms, 1),
+            fixed(b.delivery_ms, 1),
+            fixed(b.chain_ms, 1)
+        );
+    }
     format!(
         "mic {} + wait {} + output queue {} + render {} ms, chain {} ms on top",
         fixed(b.mic_ms, 1),
@@ -181,8 +202,14 @@ pub(crate) fn streams(t: &TelemetrySnapshot, direct: bool) -> String {
         } else {
             "waiting for a recorder".into()
         };
+        // The ring's headroom over one reader packet, while the driver's underruns hold it up (ring_headroom.rs).
+        let headroom = if t.output_period_ms > 0.0 && t.output_headroom_ms > 0.0 {
+            format!(" + {} ms headroom after underruns", fixed(t.output_headroom_ms, 1))
+        } else {
+            String::new()
+        };
         return format!(
-            "Streams: mic {}, {} ms period · output direct to driver, {reader}",
+            "Streams: mic {}, {} ms period · output direct to driver, {reader}{headroom}",
             mode(t.mic_exclusive),
             fixed(t.mic_period_ms, 1)
         );
@@ -366,8 +393,19 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     lines.push(format!("Input path: {}", ms(r.input_path_ms_median)));
     lines.push(format!("End to end: {}", ms(r.end_to_end_ms_median)));
     lines.push(format!("Chain: {} ms", fixed(r.chain_ms, 1)));
-    if let Some(readout) = r.readout_ms_median {
-        lines.push(format!("Live readout during the test: {}", ms(Some(f64::from(readout)))));
+    // The direct driver route's readout ends at the sample time, the sweeps' measure; its delivery goes beside it, and the
+    // reader's period that sets the difference (the owner, 2026-11-24).
+    match (r.readout_ms_median, r.delivery_ms_median) {
+        (Some(readout), Some(delivery)) => lines.push(format!(
+            "Live readout during the test: {} to the sample time (the sweeps' measure), {} to the driver's delivery",
+            ms(Some(f64::from(readout))),
+            ms(Some(f64::from(delivery)))
+        )),
+        (Some(readout), None) => lines.push(format!("Live readout during the test: {}", ms(Some(f64::from(readout))))),
+        _ => {}
+    }
+    if let Some(p) = r.reader_period_ms {
+        lines.push(format!("Reader period: {} (the recording app's packet)", ms(Some(f64::from(p)))));
     }
     if let Some(b) = &r.budget {
         lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
@@ -520,7 +558,14 @@ mod tests {
             latency_valid: true,
             latency_ms_median: 12.34,
             latency_ms_p95: 14.06,
-            budget_mean: LatencyBudget { mic_ms: 16.24, wait_ms: 0.08, chain_ms: 10.0, queue_ms: 22.04, render_ms: 23.44 },
+            budget_mean: LatencyBudget {
+                mic_ms: 16.24,
+                wait_ms: 0.08,
+                chain_ms: 10.0,
+                queue_ms: 22.04,
+                render_ms: 23.44,
+                delivery_ms: 0.0,
+            },
             output_drift_ppm: 12.2,
             reference_drift_ppm: -40.4,
             output_fill_ms: 15.0,
@@ -597,6 +642,26 @@ mod tests {
         assert!(clocks(&x).contains("Output fill: 15.0 ms (target 5.0, adaptive)"), "{}", clocks(&x));
         let m = TelemetrySnapshot { mic_exclusive: true, mic_period_ms: 10.0 / 3.0, ..t };
         assert!(streams(&m, false).starts_with("Streams: mic exclusive, 3.3 ms period"), "{}", streams(&m, false));
+        // The direct driver route: to the sample time with the delivery beside it, the reader's period, and the ring's headroom
+        // while the driver's underruns hold it up.
+        let d = TelemetrySnapshot {
+            latency_delivery_ms_median: 13.62,
+            output_period_ms: 10.0 / 3.0,
+            budget_mean: LatencyBudget { mic_ms: 10.4, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 1.5, render_ms: 0.0, delivery_ms: 2.2 },
+            ..t
+        };
+        assert_eq!(pipeline(&d), "Pipeline: 12.3 ms to the sample time (p95 14.1) · 13.6 ms to delivery");
+        assert_eq!(
+            budget(&d),
+            "Budget (means): mic 10.4 + wait 0.1 + ring queue 1.5 ms to the sample time, delivery 2.2 ms after it, chain 10.0 ms on top"
+        );
+        assert!(streams(&d, true).ends_with("output direct to driver, 3.3 ms recording period"), "{}", streams(&d, true));
+        let raised = TelemetrySnapshot { output_headroom_ms: 9.0, ..d };
+        assert!(
+            streams(&raised, true).ends_with("3.3 ms recording period + 9.0 ms headroom after underruns"),
+            "{}",
+            streams(&raised, true)
+        );
     }
 
     fn stream_info() -> StreamInfo {
@@ -665,7 +730,9 @@ mod tests {
             input_path_ms_median: Some(3.24),
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.1),
-            budget: Some(LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
+            delivery_ms_median: None,
+            reader_period_ms: None,
+            budget: Some(LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0, delivery_ms: 0.0 }),
             output: Some(nf_engine::OutputEvents {
                 underruns: 1,
                 deficits: 1,
@@ -713,6 +780,21 @@ mod tests {
         (r.clean_ms_median, r.clean_ms_spread) = (Some(12.3), Some(0.8));
         assert_eq!(report(&r)[1], "Disturbed sweeps: none seen");
         assert_eq!(report(&r)[2], "Input path: 3.2 ms");
+        // The direct driver route: the readout to the sample time, the delivery beside it, the reader's period.
+        let direct = LatencyReport {
+            delivery_ms_median: Some(13.4),
+            reader_period_ms: Some(10.0 / 3.0),
+            budget: Some(LatencyBudget { mic_ms: 10.4, wait_ms: 0.1, chain_ms: 10.0, queue_ms: 1.5, render_ms: 0.0, delivery_ms: 1.4 }),
+            ..r.clone()
+        };
+        let lines = report(&direct);
+        let at = lines.iter().position(|l| l.starts_with("Live readout")).unwrap();
+        assert_eq!(lines[at..at + 3], [
+            "Live readout during the test: 12.1 ms to the sample time (the sweeps' measure), 13.4 ms to the driver's delivery",
+            "Reader period: 3.3 ms (the recording app's packet)",
+            "Its budget (means over the test): mic 10.4 + wait 0.1 + ring queue 1.5 ms to the sample time, delivery 1.4 ms after it, \
+             chain 10.0 ms on top",
+        ]);
         let none = LatencyReport { repetitions: 5, ..LatencyReport::default() };
         let lines = report(&none);
         assert!(lines[0].starts_with("No valid repetitions (0 of 5)"));

@@ -259,6 +259,7 @@ fn means(rows: &[Row], from_s: f64) -> (LatencyBudget, f64) {
         chain_ms: mean(&|b| b.chain_ms),
         queue_ms: mean(&|b| b.queue_ms),
         render_ms: mean(&|b| b.render_ms),
+        delivery_ms: mean(&|b| b.delivery_ms),
     };
     (b, kept.iter().map(|r| f64::from(r.readout)).sum::<f64>() / n)
 }

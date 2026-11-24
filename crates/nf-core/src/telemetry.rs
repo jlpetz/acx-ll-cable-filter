@@ -71,6 +71,11 @@ impl MeterCell {
 /// between its capture and its play-out, in ms. The readout is `mic + wait + queue + render`, block for block. The chain's
 /// offset isn't in it: the readout times the block's first output sample, which carries the input from the chain's offset
 /// before the block's first input sample, so that sample's own way through the app is the readout plus `chain_ms`.
+///
+/// On the direct driver route the readout ends at the sample's **sample time**, its capture time on the virtual mic's device
+/// time line (the stamp the recording app gets: its packet's start plus its place in it), which is what the latency test's
+/// sweeps measure; `delivery_ms` goes on from there to its **delivery time**, the driver's pass that hands its packet over to
+/// the recording app (the owner, 2026-11-24: the two labelled apart, the sweeps' one the headline).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LatencyBudget {
     /// Mic delivery (measured): the first sample's capture time by the mic's stamps to the wake that read it. At least the
@@ -91,8 +96,14 @@ pub struct LatencyBudget {
     /// Render side (derived, the rest of the readout): from the moment the queue would have drained to the play-out the
     /// output's AudioClock predicts. Half a device period when the device takes whole periods (the queue is calibrated to the
     /// middle of the padding's steps), plus what the shared-mode engine and the device hold after taking a sample, as the
-    /// clock reports it.
+    /// clock reports it. 0 on the direct driver route: there the ring is the only queue, and `queue_ms` runs from the write
+    /// to the sample time.
     pub render_ms: f32,
+    /// The direct driver route's delivery (derived, not in the readout): from the sample time to the delivery time, when the
+    /// driver's pass hands the packet holding the sample to the recording app. A pass delivers a whole packet at once, so it's
+    /// the rest of the packet from the sample on: from a sample to one reader packet (the recording app's period, 2.67 to
+    /// 10 ms), about half a packet on average. 0 on the WASAPI route.
+    pub delivery_ms: f32,
 }
 
 impl LatencyBudget {
@@ -107,6 +118,19 @@ impl LatencyBudget {
     pub fn total_ms(&self) -> f32 {
         self.readout_ms() + self.chain_ms
     }
+
+    /// The readout to the delivery time: the direct driver route's readout + `delivery_ms` (the readout elsewhere).
+    #[inline]
+    pub fn delivered_ms(&self) -> f32 {
+        self.readout_ms() + self.delivery_ms
+    }
+
+    /// Whether this is the direct driver route's budget: it has a delivery past the sample time (a pass hands a sample over
+    /// at least a sample after its sample time, so every block's is over 0, and so is any mean of them).
+    #[inline]
+    pub fn direct(&self) -> bool {
+        self.delivery_ms > 0.0
+    }
 }
 
 /// The budget's totals over a run: the blocks that had one, and each part's sum (ms). Two snapshots give the means between
@@ -119,6 +143,7 @@ pub struct BudgetTotals {
     pub chain_ms: f64,
     pub queue_ms: f64,
     pub render_ms: f64,
+    pub delivery_ms: f64,
 }
 
 impl BudgetTotals {
@@ -130,6 +155,7 @@ impl BudgetTotals {
         self.chain_ms += f64::from(b.chain_ms);
         self.queue_ms += f64::from(b.queue_ms);
         self.render_ms += f64::from(b.render_ms);
+        self.delivery_ms += f64::from(b.delivery_ms);
     }
 
     /// Each part's mean over the blocks since `before` (an earlier snapshot's totals); `None` when no block had a budget
@@ -144,6 +170,7 @@ impl BudgetTotals {
             chain_ms: mean(self.chain_ms, base.chain_ms),
             queue_ms: mean(self.queue_ms, base.queue_ms),
             render_ms: mean(self.render_ms, base.render_ms),
+            delivery_ms: mean(self.delivery_ms, base.delivery_ms),
         })
     }
 }
@@ -311,6 +338,7 @@ pub struct BudgetCell {
     pub chain_ms: AtomicF32,
     pub queue_ms: AtomicF32,
     pub render_ms: AtomicF32,
+    pub delivery_ms: AtomicF32,
 }
 
 impl BudgetCell {
@@ -320,6 +348,7 @@ impl BudgetCell {
         self.chain_ms.store(b.chain_ms);
         self.queue_ms.store(b.queue_ms);
         self.render_ms.store(b.render_ms);
+        self.delivery_ms.store(b.delivery_ms);
     }
     pub fn load(&self) -> LatencyBudget {
         LatencyBudget {
@@ -328,6 +357,7 @@ impl BudgetCell {
             chain_ms: self.chain_ms.load(),
             queue_ms: self.queue_ms.load(),
             render_ms: self.render_ms.load(),
+            delivery_ms: self.delivery_ms.load(),
         }
     }
 }
@@ -341,6 +371,7 @@ pub struct BudgetTotalsCell {
     pub chain_ms: AtomicF64,
     pub queue_ms: AtomicF64,
     pub render_ms: AtomicF64,
+    pub delivery_ms: AtomicF64,
 }
 
 impl BudgetTotalsCell {
@@ -351,6 +382,7 @@ impl BudgetTotalsCell {
         self.chain_ms.store(t.chain_ms);
         self.queue_ms.store(t.queue_ms);
         self.render_ms.store(t.render_ms);
+        self.delivery_ms.store(t.delivery_ms);
     }
     pub fn load(&self) -> BudgetTotals {
         BudgetTotals {
@@ -360,6 +392,7 @@ impl BudgetTotalsCell {
             chain_ms: self.chain_ms.load(),
             queue_ms: self.queue_ms.load(),
             render_ms: self.render_ms.load(),
+            delivery_ms: self.delivery_ms.load(),
         }
     }
 }
@@ -383,8 +416,14 @@ pub struct Telemetry {
     pub noise_reduction_db: AtomicF32,
     pub speech_probability: AtomicF32,
     pub latency_valid: AtomicBool,
+    /// The readout over the last 100 blocks; on the direct driver route to the sample time, what the latency test's sweeps
+    /// measure ([`LatencyBudget`]).
     pub latency_ms_median: AtomicF32,
     pub latency_ms_p95: AtomicF32,
+    /// The direct driver route's readout to the delivery time over the same blocks (each block's readout + its
+    /// `delivery_ms`); 0 on the WASAPI route.
+    pub latency_delivery_ms_median: AtomicF32,
+    pub latency_delivery_ms_p95: AtomicF32,
     /// The readout's budget over the same last 100 blocks (about a second; valid with `latency_valid`): each part's mean (the
     /// means add up to the readout's mean, not its median), and each part's own 95th percentile (those don't add up).
     pub budget_mean: BudgetCell,
@@ -450,7 +489,13 @@ pub struct Telemetry {
     /// without stamps, or whose stamps scatter too widely), which can't slip at the drift (nf-engine `reference.rs`).
     pub reference_stamped: AtomicBool,
     pub mic_period_ms: AtomicF32,
+    /// The output's period; on the direct driver route the recording app's packet (the ring's reader's; 0 while none
+    /// records), published each second.
     pub output_period_ms: AtomicF32,
+    /// The direct driver route's headroom over one reader packet in the output target (nf-engine `ring_headroom.rs`): 0 where
+    /// it runs clean, raised by the driver's underruns and lowered after clean running; published each second. 0 on the
+    /// WASAPI route.
+    pub output_headroom_ms: AtomicF32,
     /// The run's mic and output streams are in WASAPI exclusive mode (asked for in `IoConfig`, the default, and granted; a
     /// refused one runs shared, with a note), set at the start and cleared at the stop.
     pub mic_exclusive: AtomicBool,
@@ -570,6 +615,8 @@ pub struct TelemetrySnapshot {
     pub latency_valid: bool,
     pub latency_ms_median: f32,
     pub latency_ms_p95: f32,
+    pub latency_delivery_ms_median: f32,
+    pub latency_delivery_ms_p95: f32,
     pub budget_mean: LatencyBudget,
     pub budget_p95: LatencyBudget,
     pub budget_totals: BudgetTotals,
@@ -607,6 +654,7 @@ pub struct TelemetrySnapshot {
     pub reference_stamped: bool,
     pub mic_period_ms: f32,
     pub output_period_ms: f32,
+    pub output_headroom_ms: f32,
     pub mic_exclusive: bool,
     pub output_exclusive: bool,
     pub output_adaptive: bool,
@@ -704,6 +752,8 @@ impl Telemetry {
             latency_valid: self.latency_valid.load(Relaxed),
             latency_ms_median: self.latency_ms_median.load(),
             latency_ms_p95: self.latency_ms_p95.load(),
+            latency_delivery_ms_median: self.latency_delivery_ms_median.load(),
+            latency_delivery_ms_p95: self.latency_delivery_ms_p95.load(),
             budget_mean: self.budget_mean.load(),
             budget_p95: self.budget_p95.load(),
             budget_totals: self.budget_totals.load(),
@@ -741,6 +791,7 @@ impl Telemetry {
             reference_stamped: self.reference_stamped.load(Relaxed),
             mic_period_ms: self.mic_period_ms.load(),
             output_period_ms: self.output_period_ms.load(),
+            output_headroom_ms: self.output_headroom_ms.load(),
             mic_exclusive: self.mic_exclusive.load(Relaxed),
             output_exclusive: self.output_exclusive.load(Relaxed),
             output_adaptive: self.output_adaptive.load(Relaxed),
@@ -769,7 +820,7 @@ mod tests {
     use super::*;
 
     fn budget(mic_ms: f32, wait_ms: f32, chain_ms: f32, queue_ms: f32, render_ms: f32) -> LatencyBudget {
-        LatencyBudget { mic_ms, wait_ms, chain_ms, queue_ms, render_ms }
+        LatencyBudget { mic_ms, wait_ms, chain_ms, queue_ms, render_ms, delivery_ms: 0.0 }
     }
 
     /// The wakes' block counts, and the misses a worker at each depth would have had at them (TODO 6).
@@ -808,6 +859,13 @@ mod tests {
         let b = budget(16.0, 0.25, 10.0, 22.0, 23.5);
         assert_eq!(b.readout_ms(), 61.75);
         assert_eq!(b.total_ms(), 71.75);
+        assert_eq!(b.delivered_ms(), 61.75, "no delivery past the readout on the WASAPI route");
+        assert!(!b.direct());
+        // The direct driver route: the readout ends at the sample time, the delivery comes after it, and neither the readout
+        // nor the whole way (to the sample time) holds it.
+        let d = LatencyBudget { delivery_ms: 1.25, ..budget(10.5, 0.1, 10.0, 1.4, 0.0) };
+        assert!(d.direct());
+        assert!((d.readout_ms() - 12.0).abs() < 1e-5 && (d.delivered_ms() - 13.25).abs() < 1e-5 && (d.total_ms() - 22.0).abs() < 1e-5);
     }
 
     /// Two snapshots' totals give each part's mean between them; a new run's (lower) totals count from its start, and no
@@ -825,12 +883,21 @@ mod tests {
         let mut restarted = BudgetTotals::default();
         restarted.add(&budget(12.0, 0.0, 0.0, 22.0, 20.0));
         assert_eq!(restarted.means_since(&t), Some(budget(12.0, 0.0, 0.0, 22.0, 20.0)), "from the new run's start");
+        // The direct route's delivery is summed and averaged with the rest.
+        let mut direct = BudgetTotals::default();
+        direct.add(&LatencyBudget { delivery_ms: 1.0, ..budget(10.0, 0.0, 10.0, 2.0, 0.0) });
+        direct.add(&LatencyBudget { delivery_ms: 2.0, ..budget(10.0, 0.0, 10.0, 3.0, 0.0) });
+        assert_eq!(
+            direct.means_since(&BudgetTotals::default()),
+            Some(LatencyBudget { delivery_ms: 1.5, ..budget(10.0, 0.0, 10.0, 2.5, 0.0) })
+        );
 
         let tel = Telemetry::new();
-        tel.budget_totals.store(&t);
-        tel.budget_mean.store(&budget(1.0, 2.0, 3.0, 4.0, 5.0));
+        tel.budget_totals.store(&direct);
+        let mean = LatencyBudget { delivery_ms: 6.0, ..budget(1.0, 2.0, 3.0, 4.0, 5.0) };
+        tel.budget_mean.store(&mean);
         let s = tel.snapshot();
-        assert_eq!((s.budget_totals, s.budget_mean), (t, budget(1.0, 2.0, 3.0, 4.0, 5.0)));
+        assert_eq!((s.budget_totals, s.budget_mean), (direct, mean));
     }
 
     /// The output's events between two snapshots, the samples they moved the path by, and a restart between the snapshots.

@@ -133,10 +133,19 @@ impl RenderSink for RingOutput {
         if packet == 0 || h.clock_sequence.load(Ordering::Relaxed) != seq {
             return Ok(None);
         }
-        // The last completed pass consumed the prefix ending just before `pos`. The next packet starts at `pos`.
+        // The last completed pass consumed the prefix ending just before `pos`. The next packet starts at `pos`, and its stamp
+        // (the recording app's sample time of frame `pos`) is that pass's deadline (StreamEngine.cpp's PacketStartQpc); `qpc`
+        // is the pass's own QPC, taken a little after it (the timer's lateness and the ring lock). The pipeline times frame
+        // `pos + j` at `qpc + j` frames (its sample time) and at the pass that completes its packet (its delivery).
+        // TODO 13's open point: the deadline itself in the header would take that lateness out (a ring header change: a
+        // protocol version bump by the owner's rule of 2026-11-23).
         Ok(Some(ClockReading { pos_frames: pos as f64, qpc_hns: self.qpc.at_hns(qpc as i64) as f64, now_hns: self.qpc.now_hns() as f64 }))
     }
 
+    /// The frames the driver filled with silence since the last call (the header's `underrun_frames`: a pass found less than
+    /// a packet in the ring, and read_frame stopped at write_frame), as one underrun, its frames for `take_silence`. The
+    /// pipeline reads the reader's packet first: a new recording's first passes find the ring empty (the live discard) and
+    /// count before its starting fill.
     fn take_underruns(&mut self) -> u64 {
         let count = self.attachment.ring().header().underrun_frames.load(Ordering::Relaxed);
         self.missing = count.saturating_sub(self.last_missing);

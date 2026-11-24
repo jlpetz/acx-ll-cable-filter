@@ -82,7 +82,9 @@ fn measure(
         repetitions: args.repetitions,
         through_model: args.through_model,
     };
-    let test = engine.start_latency_test(request).map_err(|e| Failure::error(format!("The latency test didn't start: {e}")))?;
+    let test = engine
+        .start_latency_test_at(request, args.capture_period_frames)
+        .map_err(|e| Failure::error(format!("The latency test didn't start: {e}")))?;
     say!(
         "Latency test: {} sweeps, {} loop. Ctrl+C cancels.",
         args.repetitions,
@@ -240,8 +242,30 @@ pub fn format_report(r: &LatencyReport) -> String {
     if let Some(v) = r.end_to_end_ms_median {
         let _ = write!(s, "\n  end to end          {} median (probe play-out to the output capture)", ms(v));
     }
-    if let Some(v) = r.readout_ms_median {
-        let _ = write!(s, "\n  live readout        {} median", ms(f64::from(v)));
+    // The direct driver route's readout ends at the sample time (the recording app's stamps, what the sweeps measure) and
+    // its delivery, the driver's pass that hands each packet over, goes beside it, with the reader's period between the two
+    // (the owner, 2026-11-24).
+    match (r.readout_ms_median, r.delivery_ms_median) {
+        (Some(v), Some(d)) => {
+            let _ = write!(
+                s,
+                "\n  live readout        {} median to the sample time (the sweeps' measure); {} to the delivery (the driver's pass \
+                 hands the packet over)",
+                ms(f64::from(v)),
+                ms(f64::from(d))
+            );
+        }
+        (Some(v), None) => {
+            let _ = write!(s, "\n  live readout        {} median", ms(f64::from(v)));
+        }
+        _ => {}
+    }
+    if let Some(p) = r.reader_period_ms {
+        let _ = write!(
+            s,
+            "\n  reader period       {} (the recording app's packet: the direct route's delivery comes up to one after the sample time)",
+            ms(f64::from(p))
+        );
     }
     if let Some(b) = &r.budget {
         let _ = write!(s, "\n  latency budget      {}, means over the test", budget_text(b));
@@ -285,7 +309,16 @@ mod tests {
             input_path_ms_median: Some(3.2),
             end_to_end_ms_median: None,
             readout_ms_median: Some(12.0),
-            budget: Some(nf_engine::LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0 }),
+            delivery_ms_median: None,
+            reader_period_ms: None,
+            budget: Some(nf_engine::LatencyBudget {
+                mic_ms: 10.5,
+                wait_ms: 0.0,
+                chain_ms: 10.0,
+                queue_ms: 22.0,
+                render_ms: 5.0,
+                delivery_ms: 0.0,
+            }),
             output: Some(nf_engine::OutputEvents { slips: 3, slip_net: 1, ..Default::default() }),
             mic_glitches: Some(0),
             mic_stalls: Some(0),
@@ -324,6 +357,33 @@ mod tests {
             ),
             "{}",
             format_report(&r)
+        );
+        // The direct driver route (the owner, 2026-11-24): the readout to the sample time (the sweeps' measure) with the
+        // delivery beside it, the reader's period, and the budget to the sample time with the delivery after it.
+        let direct = LatencyReport {
+            readout_ms_median: Some(11.8),
+            delivery_ms_median: Some(13.2),
+            reader_period_ms: Some(10.0 / 3.0),
+            budget: Some(nf_engine::LatencyBudget {
+                mic_ms: 10.4,
+                wait_ms: 0.1,
+                chain_ms: 10.0,
+                queue_ms: 1.3,
+                render_ms: 0.0,
+                delivery_ms: 1.4,
+            }),
+            ..r.clone()
+        };
+        assert!(
+            format_report(&direct).contains(
+                "\n  live readout        11.80 ms median to the sample time (the sweeps' measure); 13.20 ms to the delivery (the \
+                 driver's pass hands the packet over)\n  reader period       3.33 ms (the recording app's packet: the direct \
+                 route's delivery comes up to one after the sample time)\n  latency budget      mic delivery 10.4 + wait 0.1 \
+                 + ring queue 1.3 = readout 11.8 ms to the sample time, delivered 1.4 ms after it: 13.2 ms; the chain's 10.0 ms \
+                 on top: 21.8 ms, means over the test\n"
+            ),
+            "{}",
+            format_report(&direct)
         );
         let none = LatencyReport { repetitions: 5, app_ms_median: f64::NAN, confidence_db_min: f32::NAN, ..Default::default() };
         assert_eq!(format_report(&none), "Latency: 0 of 5 repetitions valid\n  chain offset        0.00 ms");

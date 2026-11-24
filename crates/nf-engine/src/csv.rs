@@ -7,13 +7,16 @@
 //! on the reference's by a slip, `consumed` other than 480, and a jump, `jumped`); AEC3's own estimates; 1 where the chain's
 //! settings changed from the block before; the latency readout's budget (`LatencyBudget`; empty without one): mic delivery,
 //! wait, the chain's offset, the output queue and the render side in ms, and the readout, which is mic delivery + wait +
-//! queue + render side (the chain's offset isn't in it); what the output side did (`OutputFacts`, TODO 9): the device-stream
+//! queue + render side (the chain's offset isn't in it; on the direct driver route it ends at the sample time), then the
+//! direct route's delivery after it and the readout to the delivery time (0 and the readout on the WASAPI route); what the
+//! output side did (`OutputFacts`, TODO 9): the device-stream
 //! index the block's first sample went to (block to block it moves by the last block's 480 and its slip, or nothing when that
 //! one was skipped, plus this block's zeros less its dropped samples), the device's padding and our pending samples when it
 //! was written, the fill the drift loop read and its target (samples), the slip (-1, 0, +1), the zeros written (a deficit),
 //! the pending samples dropped, 1 where the block itself was dropped (skipped), an underrun, a re-anchor of the fill's
 //! calibration, the silence an exclusive device played since the block before (samples), and the device's clock as the block
-//! read it (its position in our stream's frames, and the QPC time it belongs to: `clock_drift` fits the drift from those); and
+//! read it (its position in our stream's frames, and the QPC time it belongs to: `clock_drift` fits the drift from those), and
+//! on the direct driver route the recording app's packet and the ring's headroom over it (frames; 0 on the WASAPI route); and
 //! what the audio thread did (`ThreadFacts`): the wake that processed the block, the longest gap between wakes since the block
 //! before (ms; 0 for a later block of the same wake), the wakes since the block before's and those of them the exclusive
 //! output's event made (0 with a shared output), the stalls (wakes with nothing from the mic 100 ms after its last), the mic's
@@ -29,12 +32,12 @@ pub(crate) const COLUMNS: &str = concat!(
     "index,capture_qpc_hns,mic_stamped,mic_index,mic_wake_hns,mic_queued,mic_discarded,mic_skipped,",
     "ref_read_index,path,lead_reading_ms,lead_ms,target_ms,drift_ppm,ref_stamped,fresh,delivered,buffered,",
     "consumed,owed,missing,jumped,events,echo_hold,aec_delay_ms,aec_erle_db,settings_changed,",
-    "mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,",
+    "mic_delivery_ms,wait_ms,chain_ms,queue_ms,render_ms,readout_ms,delivery_ms,delivery_readout_ms,",
     "out_index,out_padding,out_pending,out_fill,out_target,out_slip,out_zeros,out_dropped,out_skipped,",
-    "out_underrun,out_late,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns,",
+    "out_underrun,out_late,out_reanchored,out_silence,out_clock_pos,out_clock_qpc_hns,out_packet,out_headroom,",
     "wake_hns,wake_gap_ms,wakes,out_wakes,stalls,mic_glitches,process_us,model_misses",
 );
-const BUDGET_COLUMNS: usize = 6;
+const BUDGET_COLUMNS: usize = 8;
 const REFERENCE_COLUMNS: usize = 15;
 
 /// `v` with `places` decimals; empty when it isn't a number.
@@ -99,7 +102,7 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
     let _ = write!(s, ",{},{},{},{}", b.echo_hold, num(f64::from(b.aec_delay_ms), 1), num(f64::from(b.aec_erle_db), 2), u8::from(changed));
     match &b.budget {
         Some(t) => {
-            for v in [t.mic_ms, t.wait_ms, t.chain_ms, t.queue_ms, t.render_ms, t.readout_ms()] {
+            for v in [t.mic_ms, t.wait_ms, t.chain_ms, t.queue_ms, t.render_ms, t.readout_ms(), t.delivery_ms, t.delivered_ms()] {
                 let _ = write!(s, ",{}", num(f64::from(v), 3));
             }
         }
@@ -108,7 +111,7 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
     let o = &b.output;
     let _ = write!(
         s,
-        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         o.index,
         o.padding,
         o.pending,
@@ -123,7 +126,9 @@ pub(crate) fn row(s: &mut String, b: &ChainBlock, last: Option<&ChainBlock>) {
         u8::from(o.reanchored),
         o.silence,
         num(o.clock_pos, 1),
-        num(o.clock_qpc_hns, 1)
+        num(o.clock_qpc_hns, 1),
+        o.packet,
+        o.headroom
     );
     let t = &b.thread;
     let wake = if t.wake_hns > 0.0 { num(t.wake_hns, 1) } else { String::new() };

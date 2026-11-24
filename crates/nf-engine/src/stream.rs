@@ -239,6 +239,38 @@ impl CaptureStream {
         Err(last)
     }
 
+    /// An event-driven capture at IAudioClient3's `period_frames`, in shared mode and the endpoint's DEFAULT processing mode:
+    /// the latency test's `--capture-period-frames` (TODO 13). On the direct driver route the test's capture is the recording
+    /// app whose packet the ring's reader runs at, and a client gets short driver packets only by asking for them itself (one
+    /// beside a small-period helper keeps a driver stream of its own at 10 ms: TODO 19's spike, 2026-11-20 and 22). Refused,
+    /// with the periods the endpoint takes, where it doesn't take this one; and where its engine doesn't run at 48 kHz
+    /// (IAudioClient3 can't convert).
+    pub(crate) fn open_events_at(device: &Device, period_frames: u32) -> Result<Self, String> {
+        let name = device.get_friendlyname().unwrap_or_default();
+        let hr = |e: WasapiError| crate::errors::describe_hr(crate::errors::StreamRole::Capture, hr_of(&e));
+        let mix = device.get_iaudioclient().and_then(|c| c.get_mixformat()).map_err(hr)?;
+        if stream_format(&mix).1 {
+            return Err(format!(
+                "{name} doesn't run at 48 kHz, so it can't take an IAudioClient3 period: set its format to 48000 Hz, or drop \
+                 --capture-period-frames"
+            ));
+        }
+        let mut client = new_client(device, false).map_err(hr)?;
+        let p = client.get_shared_mode_engine_period(&mix).map_err(hr)?;
+        let takes = p.fundamental > 0 && period_frames.is_multiple_of(p.fundamental) && (p.min..=p.max).contains(&period_frames);
+        if !takes {
+            return Err(format!(
+                "{name} takes shared-mode periods from {} to {} frames in steps of {} (its default {}), not {period_frames}",
+                p.min, p.max, p.fundamental, p.default
+            ));
+        }
+        client.initialize_shared_audio_stream(&mix, TimingMode::Events, period_frames).map_err(hr)?;
+        // Another client may hold the engine at a different period: report what applies.
+        let actual = client.get_current_shared_mode_engine_period().map(|(_, f)| f).unwrap_or(period_frames);
+        let info = info_for(&name, &mix, actual as usize, true, false, false);
+        Self::finish(client, &mix, true, info).map_err(hr)
+    }
+
     /// An event-driven capture of any capture endpoint at the default period (the latency test).
     pub(crate) fn open_events(device: &Device) -> Result<Self, WasapiError> {
         let name = device.get_friendlyname().unwrap_or_default();

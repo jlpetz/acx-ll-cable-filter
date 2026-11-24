@@ -63,8 +63,13 @@ Argument parsing is hand-rolled (no clap) to keep the binary small.
 Select the driver ring in the window's output controls, then choose the Noise Filter microphone in the recording app.
 The CLI equivalent is `noise-filter-cli run --mic "USB microphone" --output-backend driver-ring`. This needs the updated
 ACX driver. The filter can start before a recorder opens the microphone. It drops audio captured while the microphone
-has no reader and uses the active reader's packet size when feeding it. Existing settings keep their selected WASAPI
-output. Choose **WASAPI** or pass `--output-backend wasapi --output "CABLE Input"` to use that route.
+has no reader and uses the active reader's packet size when feeding it: the fill it keeps is one reader packet, with
+headroom on top only while the driver reports underruns (the owner, 2026-11-24; engine.md, "The direct route's target"),
+so the output margin (`IoConfig::output_margin_ms`) and the adaptive output target don't apply. The readout ends at the
+sample time, what the latency test's sweeps measure, with the driver's delivery beside it ("Pipeline: 12.3 ms to the
+sample time (p95 14.1) · 13.6 ms to delivery"); `latency --capture-period-frames N` records the test's capture at
+IAudioClient3's N frames, the reader's packet. Existing settings keep their selected WASAPI output. Choose **WASAPI** or
+pass `--output-backend wasapi --output "CABLE Input"` to use that route.
 
 Direct access from an unelevated app uses the driver's access button in the window or `--allow-driver` for a CLI invocation.
 Approval starts a separate helper which owns the driver's handle. The GUI and effects continue at their existing privileges.
