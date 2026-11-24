@@ -52,9 +52,10 @@ Two microphones (TODO 19, the owner's option A): "Microphone" keeps IAudioClient
 packet-size constraints) for apps that ask for them, and "Call Microphone" (a second capture circuit, `Microphone1`) has a
 5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
 reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
-Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|low-latency`; the driver reads
-`NfMicrophones` from the device's hardware key): `ROOT\AcxLlCable` both, `ROOT\AcxLlCableCall` the call microphone,
-`ROOT\AcxLlCableLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
+Three hardware IDs pick the microphones (`Cable.ps1 variant <label> both|call|low-latency`, and `Install-Driver.ps1
+-Variant` for A; the driver reads `NfMicrophones` from the device's hardware key): `ROOT\AcxLlCable` both,
+`ROOT\AcxLlCableCall` the call microphone, `ROOT\AcxLlCableLowLatency` the low-latency one. Switching re-creates that
+cable's device, which needs admin.
 
 **Cables (TODO 19, the per-cable design, `doc/todo/19-per-cable-design.md`).** Every cable (A, B, C...) is a device node of
 the one package, with one of the three hardware IDs (shared by every cable) and an instance ID the setup tool fixes,
@@ -88,13 +89,40 @@ same cable in the receiving application: what's played into "Speakers (ACX-LL-Ca
 recording pair, loopback memory, format negotiation, app ring and control device, and any cable can be fed directly: a
 direct feed takes over that cable's microphones while attached, and the others carry what is played into them.
 
-**Pending S1 and N0 (the per-cable design's step 1, with this driver).** The setup tool that makes cables in the new form
-(`Cable.ps1 add <label>`, `list`, `remove`, behind `Install-Driver.ps1`) is S1's. Until it lands, the scripts here still use
-the old hardware IDs (`ROOT\AudioCodec`, `ROOT\NoiseFilterCableB`) and devcon, whose `ROOT\MEDIA\NNNN` nodes this driver
-refuses (code 31): don't install a build of this driver with them, and `Cable-B.ps1` doesn't work with its INF. nf-vmic, its
-tools and the app's **Direct driver ring** open `\\.\NoiseFilterVmic`, which this driver no longer makes, until N0 gives
-them the cable's own path (`--path \\.\AcxLlCable_<id>`). The box's installed package (the old one: "AudioCodec Device" and
-"Noise Filter Cable B") stays until the owner's go for S0a, which moves both.
+**Making, removing and moving cables (S1).** Only the setup tool, `acx-ll-cable` (a bin in `crates\nf-vmic`), makes a
+cable's device node; the scripts run it, and fail if it isn't built (`-Build` builds it: `cargo build --release -p nf-vmic
+--bin acx-ll-cable`). In an elevated PowerShell window (`list` takes any user):
+- `scripts\Cable.ps1 list`: the present cables with their devices, endpoints and control devices, the remembered absent ones,
+  the old driver's devices and setup errors.
+- `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>]`: makes a cable on the package the others run.
+  Present and working: no change. Present but not working: repaired in place. Removed earlier: back with its identity and
+  instance ID, so (we expect, to confirm on the box) its endpoints. `-Adopt` re-creates a device made outside the tool as
+  the cable.
+- `Cable.ps1 remove <label> [-Forget]`: removes that cable's device only; its identity stays in the setup's store
+  (`HKLM\SOFTWARE\ACX-LL-Cable\Cables`) unless `-Forget`.
+- `Cable.ps1 variant <label> both|call|low-latency`: re-creates that cable's device with the next instance number (new
+  endpoints, which Windows makes with the variant's default period); no other cable is touched.
+
+  `add` and `variant` put back the default roles Windows moved to a new endpoint.
+
+`scripts\Install-Driver.ps1` adds the package to the driver store, then:
+- the old driver's devices present (`ROOT\AudioCodec*` as A, `ROOT\NoiseFilterCableB` as B): the migration, once
+  (`acx-ll-cable migrate`). Nothing changes unless the package makes A and B; then A and B are recorded in the store, every
+  device of ours is disabled until the old image unloads, the old devices are removed, and A (its variant, or `-Variant`)
+  and B (`-CableBMics`, default both) are made on the new package. A run that stops part way is finished by running it again.
+- cables present: `acx-ll-cable update <package folder>`, every cable moved to the package together. Every cable stops for a
+  few seconds: one image serves them all. If a cable refuses the disable, or the old image is still loaded 10 s after every
+  cable was disabled (an app has a cable's control device open), every cable is enabled again, nothing is installed, and it
+  says to close the apps using the cables. `-Variant` then switches A.
+- none: `acx-ll-cable add A --mics <Variant>`.
+
+`scripts\Uninstall-Driver.ps1` removes every device of ours (`acx-ll-cable remove --all --forget`, the old driver's too) and
+deletes the packages; `-KeepIdentities` keeps the store, so cables added again keep their identities. A cable's id is a
+random GUID unique to the machine: scrub it from logs pasted into docs.
+
+**Pending N0.** nf-vmic, its tools and the app's **Direct driver ring** open `\\.\NoiseFilterVmic`, which this driver no
+longer makes, until N0 gives them the cable's own path (`--path \\.\AcxLlCable_<id>`). The box's installed package (the old
+one: "AudioCodec Device" and "Noise Filter Cable B") stays until the owner's go for S0a, which migrates both.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
 on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with
@@ -197,10 +225,9 @@ the larger, local-time versions and outrank later builds of the same date until 
    evening's builds before it). A package with an older DriverVer doesn't replace a newer one: `Uninstall-Driver.ps1`
    first. Packages built before 2026-11-23's change carry the local time of day as the version, so one from earlier the
    same UTC day can outrank a newer build.
-3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it). Not for a
-   build of this driver until S1 replaces it ("Using the cables", above): this INF has no `ROOT\AudioCodec`, and the driver
-   refuses a node devcon makes.
-4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
+3. `scripts\Install-Driver.ps1 [-BuildTool]`: the migration from the old driver's devices, the update of every cable, or
+   cable A, through the setup tool ("Using the cables", above). More cables: `scripts\Cable.ps1 add <label>`.
+4. `scripts\Get-DriverStatus.ps1` (the tool's `list`), `scripts\Uninstall-Driver.ps1 [-KeepIdentities]`.
 5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts
    them back (`noise-filter devices` lists the ids). `scripts\Get-EndpointFormat.ps1` shows the device format Windows
    stored for each endpoint.

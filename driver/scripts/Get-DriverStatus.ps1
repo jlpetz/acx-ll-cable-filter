@@ -1,6 +1,10 @@
 <#
 .SYNOPSIS
-    Where the test-signing set-up and the driver stand: test signing, the certificate, the device, its endpoints.
+    Where the test-signing set-up and the driver stand: test signing, the certificate, the cables, their endpoints.
+
+.DESCRIPTION
+    The cables come from the setup tool's list (acx-ll-cable list: any number of cables, the old driver's devices, the
+    remembered absent ones and setup errors). Without the tool built, a short list from Get-PnpDevice stands in.
 
 .EXAMPLE
     .\Get-DriverStatus.ps1
@@ -18,15 +22,17 @@ if ($cert) {
     Write-Note 'none (Setup-TestSigning.ps1 makes it)'
 }
 
-Write-Step "Device (variants: $(($HardwareIds.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '))"
-$devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $d = $_; @($HardwareIds.Values | Where-Object { $d.HardwareID -contains $_ }).Count -gt 0 })
-if ($devices.Count -eq 0) { Write-Note 'not installed' }
-foreach ($d in $devices) {
-    $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
-    $variant = ($HardwareIds.GetEnumerator() | Where-Object { $d.HardwareID -contains $_.Value } | Select-Object -First 1).Key
-    Write-Host "   $($d.InstanceId): $($d.Status)$(if ($problem) { ", problem code $problem" }) (variant: $variant)"
-    $children = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Where-Object {
-            (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data -eq $d.InstanceId -or
-            $_.FriendlyName -match [regex]::Escape($PackageName) })
-    foreach ($c in $children) { Write-Host "     endpoint: $($c.FriendlyName) ($($c.Status))" }
+Write-Step "Cables (variants: $(($HardwareIds.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '))"
+$tool = $null
+try { $tool = Get-CableTool } catch { Write-Note "$($_.Exception.Message) A short list instead:" }
+if ($tool) {
+    $null = Invoke-CableTool $tool @('list')
+} else {
+    $ids = @($HardwareIds.Values) + $LegacyHardwareIds
+    $devices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $d = $_; @($ids | Where-Object { $d.HardwareID -contains $_ }).Count -gt 0 })
+    if ($devices.Count -eq 0) { Write-Note 'none present' }
+    foreach ($d in $devices) {
+        $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
+        Write-Host "   $($d.InstanceId): $($d.Status)$(if ($problem) { ", problem code $problem" }) ($($d.HardwareID -join ', '))"
+    }
 }
