@@ -203,18 +203,39 @@ impl OutputEvents {
         if after.blocks < before.blocks {
             return a;
         }
+        a.since(&b)
+    }
+
+    /// The events since `earlier`, a reading of the same counts: each less its earlier value (none below 0). On the audio thread
+    /// too (a block's own, for the latency test's tap): no allocation.
+    #[inline]
+    pub fn since(&self, earlier: &Self) -> Self {
         Self {
-            underruns: a.underruns.saturating_sub(b.underruns),
-            silence_frames: a.silence_frames.saturating_sub(b.silence_frames),
-            late_answers: a.late_answers.saturating_sub(b.late_answers),
-            deficits: a.deficits.saturating_sub(b.deficits),
-            zero_frames: a.zero_frames.saturating_sub(b.zero_frames),
-            coarse_drops: a.coarse_drops.saturating_sub(b.coarse_drops),
-            dropped_frames: a.dropped_frames.saturating_sub(b.dropped_frames),
-            slips: a.slips.saturating_sub(b.slips),
-            slip_net: a.slip_net.wrapping_sub(b.slip_net),
-            reanchors: a.reanchors.saturating_sub(b.reanchors),
+            underruns: self.underruns.saturating_sub(earlier.underruns),
+            silence_frames: self.silence_frames.saturating_sub(earlier.silence_frames),
+            late_answers: self.late_answers.saturating_sub(earlier.late_answers),
+            deficits: self.deficits.saturating_sub(earlier.deficits),
+            zero_frames: self.zero_frames.saturating_sub(earlier.zero_frames),
+            coarse_drops: self.coarse_drops.saturating_sub(earlier.coarse_drops),
+            dropped_frames: self.dropped_frames.saturating_sub(earlier.dropped_frames),
+            slips: self.slips.saturating_sub(earlier.slips),
+            slip_net: self.slip_net.wrapping_sub(earlier.slip_net),
+            reanchors: self.reanchors.saturating_sub(earlier.reanchors),
         }
+    }
+
+    /// Adds another span's events to these (spans one after another: the latency test's blocks summed over a sweep or the test).
+    pub fn add(&mut self, other: &Self) {
+        self.underruns = self.underruns.saturating_add(other.underruns);
+        self.silence_frames = self.silence_frames.saturating_add(other.silence_frames);
+        self.late_answers = self.late_answers.saturating_add(other.late_answers);
+        self.deficits = self.deficits.saturating_add(other.deficits);
+        self.zero_frames = self.zero_frames.saturating_add(other.zero_frames);
+        self.coarse_drops = self.coarse_drops.saturating_add(other.coarse_drops);
+        self.dropped_frames = self.dropped_frames.saturating_add(other.dropped_frames);
+        self.slips = self.slips.saturating_add(other.slips);
+        self.slip_net = self.slip_net.wrapping_add(other.slip_net);
+        self.reanchors = self.reanchors.saturating_add(other.reanchors);
     }
 
     /// Samples the engine's own corrections and an exclusive device's silence added to the output path (zeros, silence and
@@ -226,9 +247,17 @@ impl OutputEvents {
             .wrapping_add(self.slip_net)
     }
 
-    /// Anything but slips: an underrun, silence, zeros, a drop or a re-anchor.
+    /// Anything but slips: an underrun, silence, zeros, a drop or a re-anchor (or the samples of one: a span's later blocks of
+    /// a drain drop samples, its first counted the drop).
     pub fn any_correction(&self) -> bool {
-        self.underruns > 0 || self.silence_frames > 0 || self.deficits > 0 || self.coarse_drops > 0 || self.reanchors > 0
+        self.underruns > 0
+            || self.silence_frames > 0
+            || self.late_answers > 0
+            || self.deficits > 0
+            || self.zero_frames > 0
+            || self.coarse_drops > 0
+            || self.dropped_frames > 0
+            || self.reanchors > 0
     }
     /// In one phrase: "no underruns, zeros, drops or re-anchors; 37 slips (net -5 samples)", or the ones there were: "1 underrun
     /// (2.0 ms of silence played), 1 deficit (12.0 ms of zeros), 1 coarse drop (10.0 ms dropped), 1 re-anchor; 37 slips (net -5
@@ -844,6 +873,11 @@ mod tests {
         // A restart between them: the counts since it.
         let restarted = TelemetrySnapshot { blocks: 50, output_slips: 2, ..TelemetrySnapshot::default() };
         assert_eq!(OutputEvents::between(&after, &restarted).slips, 2);
+        // Spans one after another add up to the whole: the span before and this one make the run's so far.
+        let mut sum = OutputEvents::of(&before);
+        sum.add(&e);
+        assert_eq!(sum, OutputEvents::of(&after));
+        assert_eq!(OutputEvents::of(&after).since(&OutputEvents::of(&before)), e);
     }
 
     #[test]

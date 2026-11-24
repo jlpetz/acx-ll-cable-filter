@@ -378,8 +378,8 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     // Each tapped block's facts, block `i` the tap's samples from `i * BLOCK`: which sweeps the engine's own events disturbed.
     let mut facts: Vec<TapFacts> = Vec::with_capacity(capacity);
 
-    // The readout's budget over the test, and the output's events: their totals now and after the sweeps (published each
-    // second).
+    // The readout's budget over the test (and the events, without the tap's blocks): their totals now and after the sweeps
+    // (published each second).
     let before = inner.telemetry.snapshot();
     let take = play_train(&mut probe, &mut cap, &train, |fraction| {
         if shared.cancelled() {
@@ -396,9 +396,14 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     drain_tap(&mut tap_rx, &mut tap, &mut facts);
     let after = inner.telemetry.snapshot();
     let budget = after.budget_totals.means_since(&before.budget_totals);
-    let output = OutputEvents::between(&before, &after);
-    // The run can't have restarted meanwhile (checked at every wake above), so the counts only grew.
-    let mic_glitches = after.capture_glitches.saturating_sub(before.capture_glitches);
+    // The events over the test: the tapped blocks' own counts, as the per-sweep lines add them; without any blocks, the
+    // telemetry's between its snapshots (the run can't have restarted meanwhile: checked at every wake above).
+    let (output, mic_glitches, mic_stalls) = if facts.is_empty() {
+        let since = |a: u64, b: u64| a.saturating_sub(b);
+        (OutputEvents::between(&before, &after), since(after.capture_glitches, before.capture_glitches), since(after.stalls, before.stalls))
+    } else {
+        disturbed::totals(&facts)
+    };
     // The analysis is seconds of CPU for a long test (FFTs of 10 M points and more): at MMCSS
     // "Pro Audio" priority (or the TIME_CRITICAL fallback) it would starve other apps' audio and
     // the UI. Back to normal priority first; nothing below needs it, nor COM's real-time state.
@@ -423,6 +428,7 @@ fn measure(inner: &Inner, req: &LatencyTestRequest, shared: &TestShared, restore
     report.budget = budget;
     report.output = Some(output);
     report.mic_glitches = Some(mic_glitches);
+    report.mic_stalls = Some(mic_stalls);
     report.chain_ms = run.chain_latency.load(Relaxed) as f32 * 1000.0 / SAMPLE_RATE as f32;
     let st = lock(&inner.status).clone();
     let target = OutputTarget { ms: tel.output_target_ms, adaptive: tel.output_adaptive, fixed_ms: st.targets.output_ms };
@@ -587,7 +593,7 @@ pub(crate) fn build_report(
     let disturbances = if blocks.facts.is_empty() {
         Vec::new()
     } else {
-        let at: Vec<SweepAt> = kept.iter().map(|r| SweepAt { repetition: r.repetition, position: r.tap_position }).collect();
+        let at: Vec<SweepAt> = kept.iter().map(|r| SweepAt { repetition: r.repetition, position: r.tap_position, app_ms: r.app }).collect();
         disturbed::disturbances(blocks.facts, &at, blocks.sweep_len)
     };
     // The repetitions nothing disturbed (`LatencyReport::undisturbed`).
@@ -627,8 +633,9 @@ pub(crate) fn build_report(
         budget: None,
         output: None,
         mic_glitches: None,
+        mic_stalls: None,
         clean_ms_median: median(&clean).filter(|_| !disturbances.is_empty()),
-        clean_ms_spread: clean_spread,
+        clean_ms_spread: (!clean.is_empty() && !disturbances.is_empty()).then_some(clean_spread),
         disturbances,
         chain_ms: 0.0,
         confidence_db_min: kept.iter().map(|r| r.confidence).fold(f32::NAN, f32::min),
@@ -820,7 +827,7 @@ mod tests {
         assert_eq!(r.confidence_db_min, 30.0);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         // Without the tap's blocks' facts the sweeps aren't told apart: no undisturbed figure.
-        assert!(r.disturbances.is_empty() && r.clean_ms_median.is_none());
+        assert!(r.disturbances.is_empty() && r.clean_ms_median.is_none() && r.clean_ms_spread.is_none());
     }
 
     /// `n` blocks of the tap with the output at its 736-frame target, nothing happening.
@@ -831,7 +838,8 @@ mod tests {
 
     /// With the tap's blocks' facts, each kept repetition is checked (disturbed.rs) in its own place in the tap's samples: a
     /// late wake in sweep 2 (a mic glitch, a late answer, the queue 10 ms over for 2.8 s after it) disturbs it and sweep 3; the
-    /// undisturbed median and spread are the other three's, and the spread's warning says how much they share.
+    /// undisturbed median and spread are the other three's, the spread's warning says how much they share, and the report
+    /// that they're on either side of the event.
     #[test]
     fn disturbed_sweeps_are_told_apart() {
         let probe: Vec<Option<f64>> = (0..5).map(|i| Some((1000.0 + 2000.0 * i as f64) * 1e4)).collect();
@@ -844,6 +852,7 @@ mod tests {
         facts[321].output.underrun = true;
         facts[321].output.late = true;
         facts[321].output.silence = 160;
+        facts[321].events = OutputEvents { underruns: 1, late_answers: 1, silence_frames: 160, ..OutputEvents::default() };
         for f in &mut facts[322..600] {
             f.output.fill += 480.0;
         }
@@ -859,7 +868,12 @@ mod tests {
         assert!((r.disturbances[2].queue_off_ms - 10.0).abs() < 1e-3, "{:?}", r.disturbances[2]);
         assert!((r.app_ms_median - 31.5).abs() < 1e-9);
         assert!((r.clean_ms_median.unwrap() - 31.0).abs() < 1e-9);
-        assert!((r.clean_ms_spread - 1.0).abs() < 1e-9);
+        assert!((r.clean_ms_spread.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(r.undisturbed_stretches(), [vec![1], vec![4, 5]]);
+        assert_eq!(
+            r.stretches_text().as_deref(),
+            Some("in 2 stretches between the engine's events (sweeps 1 | 4, 5): the output path may differ from one to the next")
+        );
         assert!(
             r.warnings.iter().any(|w| w.starts_with("The app latency varied by 9.0 ms between sweeps (1.0 ms between the 3 undisturbed);")),
             "{:?}",
@@ -873,12 +887,13 @@ mod tests {
         }
         let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, Blocks { facts: &facts, sweep_len: 48_000 });
         assert_eq!(r.disturbed().count(), 5);
-        assert_eq!(r.clean_ms_median, None);
+        assert_eq!((r.clean_ms_median, r.clean_ms_spread, r.stretches_text()), (None, None, None));
         assert!(r.warnings.iter().any(|w| w.contains("between sweeps (every sweep disturbed);")), "{:?}", r.warnings);
         // None disturbed: the undisturbed figure is all of them, and the warning as before.
         let r = build_report(5, &probe, &tap, &out, PERIOD_HNS, Blocks { facts: &quiet_blocks(1_200), sweep_len: 48_000 });
         assert_eq!((r.disturbed().count(), r.disturbances.len()), (0, 5));
-        assert_eq!(r.clean_ms_median, Some(r.app_ms_median));
+        assert_eq!((r.clean_ms_median, r.clean_ms_spread), (Some(r.app_ms_median), Some(r.app_ms_spread)));
+        assert_eq!(r.stretches_text(), None);
         assert!(r.warnings.iter().any(|w| w.starts_with("The app latency varied by 9.0 ms between sweeps;")), "{:?}", r.warnings);
     }
 

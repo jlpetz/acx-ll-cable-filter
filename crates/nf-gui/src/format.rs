@@ -327,7 +327,8 @@ fn ms(value: Option<f64>) -> String {
 }
 
 /// The latency test's result (gui.md section 6), one line each. The sweeps the engine's own events disturbed are named, one
-/// line each, and the undisturbed ones' median and spread go beside the median of all (TODO 13).
+/// line each, and the undisturbed ones' median and spread go beside the median of all, with a line when they span one of
+/// those events (TODO 13).
 pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
     let mut lines = Vec::with_capacity(10 + r.warnings.len() + r.disturbances.len());
     if r.valid == 0 {
@@ -341,22 +342,25 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
             r.repetitions
         ));
         let disturbed: Vec<_> = r.disturbed().collect();
+        let stretches = r.stretches_text().map(|t| format!("The undisturbed sweeps are {t}"));
         if !disturbed.is_empty() {
-            lines.push(match r.clean_ms_median {
-                Some(m) => format!(
+            lines.push(match (r.clean_ms_median, r.clean_ms_spread) {
+                (Some(m), Some(spread)) => format!(
                     "Undisturbed sweeps: median {} ms, spread {} ms ({} of {})",
                     fixed(m, 1),
-                    fixed(r.clean_ms_spread, 1),
+                    fixed(spread, 1),
                     r.app_ms.len() - disturbed.len(),
                     r.app_ms.len()
                 ),
-                None => "Undisturbed sweeps: none, every sweep was disturbed (below): run the test again".to_owned(),
+                _ => "Undisturbed sweeps: none, every sweep was disturbed (below): run the test again".to_owned(),
             });
+            lines.extend(stretches);
             lines.extend(
                 disturbed.iter().map(|(app, d)| format!("Disturbed: sweep {} ({} ms): {}", d.repetition, fixed(*app, 1), d.text())),
             );
         } else if !r.disturbances.is_empty() {
-            lines.push("Disturbed sweeps: none".to_owned());
+            lines.push("Disturbed sweeps: none seen".to_owned());
+            lines.extend(stretches);
         }
     }
     lines.push(format!("Input path: {}", ms(r.input_path_ms_median)));
@@ -369,10 +373,11 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
         lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
     }
     // What the mic and the output did meanwhile (TODO 9): a spread these don't explain is the devices' own.
-    match (r.mic_glitches, &r.output) {
-        (Some(n), Some(e)) => lines.push(format!("During the test: {}; output: {}", nf_engine::mic_glitch_text(n), e.text())),
+    let mic = r.mic_glitches.map(|n| nf_engine::mic_events_text(n, r.mic_stalls.unwrap_or(0)));
+    match (mic, &r.output) {
+        (Some(m), Some(e)) => lines.push(format!("During the test: {m}; output: {}", e.text())),
         (None, Some(e)) => lines.push(format!("Output during the test: {}", e.text())),
-        (Some(n), None) => lines.push(format!("During the test: {}", nf_engine::mic_glitch_text(n))),
+        (Some(m), None) => lines.push(format!("During the test: {m}")),
         (None, None) => {}
     }
     if r.valid > 0 {
@@ -649,6 +654,8 @@ mod tests {
     fn the_report_lines() {
         let corrections = nf_engine::OutputEvents { underruns: 1, deficits: 1, zero_frames: 480, ..Default::default() };
         let sweep = |repetition| nf_engine::SweepDisturbance { repetition, ..Default::default() };
+        // Sweeps 4 and 5 after the deficit's block (sweep 2's).
+        let after = |repetition| nf_engine::SweepDisturbance { events_before: 1, ..sweep(repetition) };
         let mut r = LatencyReport {
             repetitions: 5,
             valid: 4,
@@ -668,9 +675,10 @@ mod tests {
                 ..Default::default()
             }),
             mic_glitches: Some(2),
-            disturbances: vec![sweep(1), nf_engine::SweepDisturbance { output: corrections, ..sweep(2) }, sweep(4), sweep(5)],
+            mic_stalls: Some(1),
+            disturbances: vec![sweep(1), nf_engine::SweepDisturbance { output: corrections, ..sweep(2) }, after(4), after(5)],
             clean_ms_median: Some(12.2),
-            clean_ms_spread: 0.8,
+            clean_ms_spread: Some(0.8),
             chain_ms: 10.0,
             confidence_db_min: 18.04,
             conditions: "mic 10 ms, RAW".to_owned(),
@@ -679,13 +687,15 @@ mod tests {
         assert_eq!(report(&r), [
             "App (input tap → cable out): median 12.3 ms, spread 0.8 ms (4 of 5 valid)",
             "Undisturbed sweeps: median 12.2 ms, spread 0.8 ms (3 of 4)",
+            "The undisturbed sweeps are in 2 stretches between the engine's events (sweeps 1 | 4, 5): the output path may differ \
+             from one to the next",
             "Disturbed: sweep 2 (12.4 ms): output: 1 underrun, 1 deficit (10.0 ms of zeros)",
             "Input path: 3.2 ms",
             "End to end: —",
             "Chain: 10.0 ms",
             "Live readout during the test: 12.1 ms",
             "Its budget (means over the test): mic 10.5 + wait 0.0 + output queue 22.0 + render 5.0 ms, chain 10.0 ms on top",
-            "During the test: 2 mic glitches; output: 1 underrun, 1 deficit (10.0 ms of zeros); 4 slips (net -2 samples)",
+            "During the test: 2 mic glitches, 1 mic stall; output: 1 underrun, 1 deficit (10.0 ms of zeros); 4 slips (net -2 samples)",
             "Confidence: 18.0 dB (lowest)",
             "Warning: One repetition was too quiet",
             "Conditions: mic 10 ms, RAW",
@@ -694,14 +704,15 @@ mod tests {
         for d in &mut r.disturbances {
             d.mic_glitches = 1;
         }
-        r.clean_ms_median = None;
+        (r.clean_ms_median, r.clean_ms_spread) = (None, None);
         let lines = report(&r);
         assert_eq!(lines[1], "Undisturbed sweeps: none, every sweep was disturbed (below): run the test again");
         assert_eq!(lines[2], "Disturbed: sweep 1 (12.0 ms): 1 mic glitch");
         assert_eq!(lines[3], "Disturbed: sweep 2 (12.4 ms): 1 mic glitch; output: 1 underrun, 1 deficit (10.0 ms of zeros)");
         r.disturbances = vec![sweep(1); 4];
-        r.clean_ms_median = Some(12.3);
-        assert_eq!(report(&r)[1], "Disturbed sweeps: none");
+        (r.clean_ms_median, r.clean_ms_spread) = (Some(12.3), Some(0.8));
+        assert_eq!(report(&r)[1], "Disturbed sweeps: none seen");
+        assert_eq!(report(&r)[2], "Input path: 3.2 ms");
         let none = LatencyReport { repetitions: 5, ..LatencyReport::default() };
         let lines = report(&none);
         assert!(lines[0].starts_with("No valid repetitions (0 of 5)"));

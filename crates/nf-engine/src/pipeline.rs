@@ -21,7 +21,7 @@ use nf_core::latency::stats::RollingStats;
 use nf_core::noise::InferenceStats;
 use nf_core::rt::Dither;
 use nf_core::stage::AecStats;
-use nf_core::telemetry::{LatencyBudget, Telemetry};
+use nf_core::telemetry::{LatencyBudget, OutputEvents, Telemetry};
 use nf_core::{BLOCK, Block, SAMPLE_RATE};
 use rtrb::Producer;
 
@@ -219,8 +219,9 @@ impl BlockProcessor for Chain {
 }
 
 /// One tapped mic block for the latency test: the QPC time of its first sample (hns; NaN when
-/// unknown), the raw samples, and what the output and the thread did at the block (its `last_output` and `last_thread`), which
-/// tell the test's disturbed sweeps (disturbed.rs). Pushed once the block's output is written.
+/// unknown), the raw samples, and what the output and the thread did at the block (its `last_output` and `last_thread`, the
+/// output's counts since the block before, the echo-path hold), which tell the test's disturbed sweeps (disturbed.rs). Pushed
+/// once the block's output is written.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TapItem {
     pub qpc_hns: f64,
@@ -235,6 +236,23 @@ struct BlockTimes {
     capture_hns: f64,
     wake_hns: Option<f64>,
     chain: u32,
+}
+
+/// The output's counts as telemetry's [`OutputEvents`] has them (`publish_second` stores the same counters).
+#[inline]
+fn output_events(c: &Counters) -> OutputEvents {
+    OutputEvents {
+        underruns: c.render_underruns,
+        silence_frames: c.output_silence_frames,
+        late_answers: c.output_late_answers,
+        deficits: c.output_deficits,
+        zero_frames: c.output_zero_frames,
+        coarse_drops: c.output_drops,
+        dropped_frames: c.output_dropped_frames,
+        slips: c.output_slips,
+        slip_net: c.output_slip_net,
+        reanchors: c.output_reanchors,
+    }
 }
 
 /// Counters the pipeline keeps (published once a second).
@@ -376,6 +394,8 @@ pub(crate) struct Pipeline<D = DriftController, R = SlipResampler> {
     stalls: u32,
     glitches_at_block: u64,
     misses_at_block: u64,
+    /// The output's counts (`Counters` as `OutputEvents`) at the last block: each tapped block carries its own (`TapFacts::events`).
+    events_at_block: OutputEvents,
     /// A model pack's inference worker's counters, for its misses a block (`ThreadFacts::model_misses`).
     inference: Option<Arc<InferenceStats>>,
     /// Display ballistics for the published meters (DSP-3).
@@ -452,6 +472,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             stalls: 0,
             glitches_at_block: 0,
             misses_at_block: 0,
+            events_at_block: OutputEvents::default(),
             inference: None,
             in_meter: MeterBallistics::new(),
             out_meter: MeterBallistics::new(),
@@ -834,10 +855,16 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
     }
 
     /// While the latency test taps the mic, pushes this block's item with what its output and the thread did (whether or not the
-    /// write failed, as the recorders' blocks). A full ring loses the block, counted.
+    /// write failed, as the recorders' blocks), the output's counts since the last block (an echo-path hold's move and its
+    /// drop before this block included) and the echo-path guard's hold. A full ring loses the block, counted. The counts'
+    /// baseline moves on every block, tapped or not: ten subtractions.
     fn push_tap(&mut self, item: Option<TapItem>) {
+        let now = output_events(&self.counters);
+        let events = now.since(&self.events_at_block);
+        self.events_at_block = now;
         if let (Some(tap), Some(mut item)) = (self.tap.as_mut(), item) {
-            item.facts = TapFacts { output: self.last_output, thread: self.last_thread };
+            let hold = u32::try_from(self.hold).unwrap_or(u32::MAX);
+            item.facts = TapFacts { output: self.last_output, thread: self.last_thread, events, hold };
             if tap.push(item).is_err() {
                 self.counters.tap_overflows += 1;
             }
@@ -2669,6 +2696,49 @@ mod tests {
         assert!(hit.output.underrun && hit.output.zeros > 0, "{hit:?}");
         assert_eq!((hit.output.index, hit.output.fill, hit.output.zeros), (p.last_output.index, p.last_output.fill, p.last_output.zeros));
         assert_eq!(hit.thread.wakes, p.last_thread.wakes);
+        assert_eq!((hit.events.underruns, hit.events.deficits, hit.events.zero_frames), (1, 1, u64::from(hit.output.zeros)));
+        assert_eq!(quiet.events.underruns + quiet.events.deficits, 0, "the first block's starting fill is no deficit");
+    }
+
+    /// The tap's per-block counts are the engine's own: a coarse drop over several blocks (the cable taking nothing for 30 ms,
+    /// as `overfill_past_two_blocks_drops_back_to_within_half_a_block`) is one drop in all, as the counters have it, and the
+    /// blocks' counts add up to the counters' over the tap; each block carries the echo-path guard's hold as it was there.
+    #[test]
+    fn the_tap_counts_each_blocks_events_as_the_engine_does() {
+        let mut p = pipe(false);
+        let mut sink = FakeSink::new(4800);
+        let tel = Telemetry::new();
+        let mut mic = FakeCapture::default();
+        started(&mut p, &mut sink, &mut mic, &tel);
+        let (tx, mut rx) = rtrb::RingBuffer::<TapItem>::new(16);
+        p.tap = Some(tx);
+        let at_tap = output_events(&p.counters);
+        for b in 1..12usize {
+            if b > 3 {
+                sink.advance(480.0, 100_000.0);
+            }
+            mic.push((b * 480) as u64, None, vec![0.5; 480]);
+            p.drain_mic(&mut mic, 0.0).unwrap();
+            p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+        }
+        let items: Vec<TapFacts> = std::iter::from_fn(|| rx.pop().ok()).map(|i| i.facts).collect();
+        assert_eq!(items.len(), 11);
+        let mut sum = OutputEvents::default();
+        for f in &items {
+            sum.add(&f.events);
+        }
+        assert_eq!(sum, output_events(&p.counters).since(&at_tap));
+        assert_eq!(sum.coarse_drops, 1, "one drop over the drain's blocks: {items:?}");
+        let dropping = items.iter().filter(|f| f.output.dropped > 0 || f.output.skipped).count();
+        assert!(dropping >= 1 && sum.dropped_frames > 0, "{items:?}");
+        assert!(items.iter().all(|f| f.hold == 0));
+        // A hold of 240 samples (the guard's): its block carries it.
+        p.hold_wanted = 240;
+        sink.advance(960.0, 200_000.0);
+        mic.push(12 * 480, None, vec![0.5; 960]);
+        p.drain_mic(&mut mic, 0.0).unwrap();
+        p.process_block(&mut CopyChain, &mut sink, &mut FakeTicks(0), &tel, false).unwrap();
+        assert_eq!(rx.pop().unwrap().facts.hold, 240);
     }
 
     #[test]

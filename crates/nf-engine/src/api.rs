@@ -261,19 +261,22 @@ pub struct LatencyReport {
     pub budget: Option<LatencyBudget>,
     /// The chain's own stream offset during the test (passthrough: the enabled stages' latency).
     pub chain_ms: f32,
-    /// What the output side did from the sweeps' start to their end (its underruns, zeros, drops, slips and re-anchors): a
-    /// spread between sweeps that these don't explain is the devices' own (TODO 9). `None` until the sweeps have run.
+    /// What the output side did over the test (its underruns, zeros, drops, slips and re-anchors): the tapped blocks' own
+    /// counts added up, from the tap's first block to its last, as the per-sweep lines add theirs (`disturbances`); without
+    /// them, telemetry's between its once-a-second snapshots at the test's start and end. A spread between sweeps that these
+    /// don't explain is the devices' own (TODO 9). `None` until the sweeps have run.
     pub output: Option<OutputEvents>,
-    /// The mic's glitches over the same span (telemetry's `capture_glitches`: packets flagged discontinuous or missing by
-    /// device position, and the FIFO overflowing). `None` until the sweeps have run.
+    /// The mic's glitches (packets flagged discontinuous or missing by device position, and the FIFO overflowing) and stalls (a
+    /// wake that found nothing from the mic 100 ms after its last) over the same blocks. `None` until the sweeps have run.
     pub mic_glitches: Option<u64>,
+    pub mic_stalls: Option<u64>,
     /// Per valid repetition, as `app_ms`: what disturbed it ([`SweepDisturbance`]; nothing when `!any()`). Empty when the test
     /// had no blocks' facts to tell by.
     pub disturbances: Vec<SweepDisturbance>,
-    /// The undisturbed repetitions' median and spread (of `app_ms`); `None` when none was undisturbed, or `disturbances` is
-    /// empty. Beside the median of all, which mixes them with the disturbed ones.
+    /// The undisturbed repetitions' median and spread (of `app_ms`); both `None` when none was undisturbed, or `disturbances`
+    /// is empty. Beside the median of all, which mixes them with the disturbed ones.
     pub clean_ms_median: Option<f64>,
-    pub clean_ms_spread: f64,
+    pub clean_ms_spread: Option<f64>,
     /// Lowest arrival confidence among valid repetitions, in dB.
     pub confidence_db_min: f32,
     /// Engine periods, RAW, autoconvert and the devices used, for the record.
@@ -291,39 +294,125 @@ impl LatencyReport {
     pub fn undisturbed(&self) -> impl Iterator<Item = f64> {
         self.app_ms.iter().copied().zip(&self.disturbances).filter(|(_, d)| !d.any()).map(|(a, _)| a)
     }
+
+    /// The undisturbed repetitions in the stretches between the engine's events (`SweepDisturbance::events_before`), each
+    /// stretch's repetitions in order: one stretch when no event came between any two of them. Across an event the output path
+    /// may have moved for good (after a late answer the sweeps read 1-4 ms less against the readout: TODO 13).
+    pub fn undisturbed_stretches(&self) -> Vec<Vec<u32>> {
+        let mut stretches: Vec<(u32, Vec<u32>)> = Vec::new();
+        for d in self.disturbances.iter().filter(|d| !d.any()) {
+            match stretches.last_mut() {
+                Some((before, reps)) if *before == d.events_before => reps.push(d.repetition),
+                _ => stretches.push((d.events_before, vec![d.repetition])),
+            }
+        }
+        stretches.into_iter().map(|(_, reps)| reps).collect()
+    }
+
+    /// When the undisturbed repetitions span the engine's events: "in 2 stretches between the engine's events (sweeps 1, 2 |
+    /// 4, 5): the output path may differ from one to the next". `None` in one stretch (or none).
+    pub fn stretches_text(&self) -> Option<String> {
+        let stretches = self.undisturbed_stretches();
+        (stretches.len() > 1).then(|| {
+            let each: Vec<String> = stretches.iter().map(|s| repetitions_text(s)).collect();
+            format!(
+                "in {} stretches between the engine's events (sweeps {}): the output path may differ from one to the next",
+                stretches.len(),
+                each.join(" | ")
+            )
+        })
+    }
 }
 
-/// What disturbed one sweep of the latency test (TODO 13): the engine's own events while its samples went through, from 100 ms
-/// before its first sample reached the app's input to 100 ms after its last (an output event moves the samples queued then
-/// and after; a mic glitch's zeros land in the next blocks), and the output queue away from its level before such an event
-/// while the drift loop trims it back (with today's defaults a late wake left it 9-12 ms over, 6-9 s to trim back, and the
-/// sweeps meanwhile read high by most of it: TODO 13's 2026-11-23 runs). An adaptive target's move is such an event too.
+/// Repetitions in a few characters: "3", "1, 2", "4-7" (three or more in a row), "1, 4-7, 9".
+fn repetitions_text(reps: &[u32]) -> String {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &r in reps {
+        match runs.last_mut() {
+            Some((_, last)) if r == *last + 1 => *last = r,
+            _ => runs.push((r, r)),
+        }
+    }
+    let mut parts = Vec::new();
+    for (a, b) in runs {
+        match b - a {
+            0 => parts.push(a.to_string()),
+            1 => parts.extend([a.to_string(), b.to_string()]),
+            _ => parts.push(format!("{a}-{b}")),
+        }
+    }
+    parts.join(", ")
+}
+
+/// What disturbed one sweep of the latency test (TODO 13), from the tap's blocks' own facts (disturbed.rs):
+/// - the engine's own events in its window, from 100 ms before its first sample reached the app's input to its app latency
+///   and 25 ms after its last (100 ms at least): a mic glitch or stall, an output correction, a move of the output target or
+///   of the echo-path guard's hold (an output event moves the samples queued then and after; a mic glitch's zeros land in the
+///   next blocks);
+/// - the drift loop moving the path under it: its net slips over the window at more than 0.5 ms a second, past any crystal
+///   clock's drift (the loop's top rate is 1.5 ms a second);
+/// - the filter's own estimate of its output queue still away from its level while the drift loop trims it back, after such
+///   an event, or from the test's start when it began 2.5 ms or more from its target (something before the test moved it).
+///
+/// With today's defaults a late wake left the estimate 9-13 ms over its level and the loop trimming for 6-9 s and more; the
+/// sweeps meanwhile read up to 8 ms high (TODO 13's 2026-11-23 runs). After the event the estimate and the path no longer
+/// agreed (the sweeps read 1-4 ms less against the readout than before it), so sweeps on either side of an event may
+/// differ even once the queue is back: `events_before` tells them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SweepDisturbance {
     /// The repetition, from 1, in the train's order.
     pub repetition: u32,
-    /// Mic glitches and stalls (a wake that found nothing from the mic 100 ms after its last) in the sweep's blocks.
+    /// Mic glitches and stalls in the sweep's window.
     pub mic_glitches: u32,
     pub mic_stalls: u32,
-    /// The output's corrections in the sweep's blocks (underruns, an exclusive device's silence, late answers, deficits, coarse
-    /// drops, re-anchors); no slips: trimming the queue back is the drift loop's ordinary work.
+    /// The output's counts in the sweep's window, as the engine counted them: its corrections (underruns, an exclusive device's
+    /// silence, late answers, deficits, coarse drops, re-anchors), which disturb it, and its slips, which disturb it only as
+    /// `trim_samples`: following the clocks' drift is the drift loop's ordinary work.
     pub output: OutputEvents,
-    /// Times the output target moved in the sweep's blocks (adaptive: down a step, or back up after an underrun).
+    /// Times the output target moved in the sweep's window (adaptive: down a step, or back up after an underrun), and the
+    /// echo-path guard's hold (each move a jump in the audio's delay).
     pub target_moves: u32,
-    /// The output queue's farthest from its level before the event, in ms (over its target when positive), over the sweep's
-    /// blocks while it recovered: the fill as the drift loop reads it, less its target, over a 100 ms mean. 0 when none
-    /// was recovering.
+    pub hold_moves: u32,
+    /// The drift loop's net slips over the window (inserted less dropped: the samples the path grew by), when they came at more
+    /// than 0.5 ms a second; 0 otherwise.
+    pub trim_samples: i64,
+    /// Whether the output queue was recovering in the window, and from what.
+    pub queue: QueueRecovery,
+    /// While it recovered: the filter's own estimate of its queue (the fill the drift loop reads less its target, a 100 ms
+    /// mean) at its farthest from its level, in ms (over when positive). Not the sweep's displacement: after a late answer the
+    /// estimate and the path disagree.
     pub queue_off_ms: f32,
+    /// The tapped blocks with an event before the sweep's window: sweeps with different counts are on either side of one.
+    pub events_before: u32,
+}
+
+/// Whether a sweep's output queue was recovering, and from what ([`SweepDisturbance::queue`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueueRecovery {
+    #[default]
+    None,
+    /// From an event in the test: the level is the queue's before it.
+    AfterEvent,
+    /// From the test's start, which found the queue 2.5 ms or more from its target (an event before the test, or an
+    /// unsettled start): the level is the target.
+    FromStart,
 }
 
 impl SweepDisturbance {
-    /// Anything at all: an event, or the queue recovering from one.
+    /// Anything at all: an event, the drift loop moving the path, or the queue recovering.
     pub fn any(&self) -> bool {
-        self.mic_glitches > 0 || self.mic_stalls > 0 || self.output.any_correction() || self.target_moves > 0 || self.queue_off_ms != 0.0
+        self.mic_glitches > 0
+            || self.mic_stalls > 0
+            || self.output.any_correction()
+            || self.target_moves > 0
+            || self.hold_moves > 0
+            || self.trim_samples != 0
+            || self.queue != QueueRecovery::None
     }
 
     /// What disturbed it, in one phrase: "1 mic glitch; output: 1 underrun (3.3 ms of silence played, a late answer); the
-    /// output queue up to 11.8 ms over its level before the event, as the drift loop trims it back". Empty when nothing did.
+    /// filter's own estimate of its output queue up to 11.8 ms over its level before the event, as the drift loop trims it
+    /// back (86 samples dropped net over the sweep, 1.8 ms)". Empty when nothing did.
     pub fn text(&self) -> String {
         let plural = |n: u32, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut parts = Vec::new();
@@ -341,20 +430,48 @@ impl SweepDisturbance {
         if self.target_moves > 0 {
             parts.push(format!("{} (adaptive)", plural(self.target_moves, "output target move", "output target moves")));
         }
-        if self.queue_off_ms != 0.0 {
-            let (by, way) = (self.queue_off_ms.abs(), if self.queue_off_ms > 0.0 { "over" } else { "under" });
-            parts.push(format!("the output queue up to {by:.1} ms {way} its level before the event, as the drift loop trims it back"));
+        if self.hold_moves > 0 {
+            parts.push(format!("{} of the echo-path guard's hold", plural(self.hold_moves, "move", "moves")));
+        }
+        let trim = (self.trim_samples != 0).then(|| {
+            let way = if self.trim_samples < 0 { "dropped" } else { "inserted" };
+            let n = self.trim_samples.unsigned_abs();
+            format!("{n} samples {way} net over the sweep, {:.1} ms", n as f64 * 1000.0 / f64::from(nf_core::SAMPLE_RATE))
+        });
+        let level = match self.queue {
+            QueueRecovery::None => None,
+            QueueRecovery::AfterEvent => Some("its level before the event"),
+            QueueRecovery::FromStart => Some("its target from the test's start (something before the test moved it)"),
+        };
+        match (level, trim) {
+            (Some(level), trim) => {
+                let (by, way) = (self.queue_off_ms.abs(), if self.queue_off_ms >= 0.0 { "over" } else { "under" });
+                let base = format!(
+                    "the filter's own estimate of its output queue up to {by:.1} ms {way} {level}, as the drift loop trims it back"
+                );
+                parts.push(match trim {
+                    Some(t) => format!("{base} ({t})"),
+                    None => base,
+                });
+            }
+            (None, Some(t)) => parts.push(format!("the drift loop moving the output path under it ({t})")),
+            (None, None) => {}
         }
         parts.join("; ")
     }
 }
 
-/// The mic's glitches in a few words: "no mic glitches", "1 mic glitch", "3 mic glitches".
-pub fn mic_glitch_text(n: u64) -> String {
-    match n {
+/// The mic's events in a few words: "no mic glitches", "1 mic glitch", "3 mic glitches", "no mic glitches, 1 mic stall".
+pub fn mic_events_text(glitches: u64, stalls: u64) -> String {
+    let glitches = match glitches {
         0 => "no mic glitches".to_owned(),
         1 => "1 mic glitch".to_owned(),
         n => format!("{n} mic glitches"),
+    };
+    match stalls {
+        0 => glitches,
+        1 => format!("{glitches}, 1 mic stall"),
+        n => format!("{glitches}, {n} mic stalls"),
     }
 }
 

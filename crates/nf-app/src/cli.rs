@@ -970,9 +970,9 @@ Usage:
   noise-filter latency --probe DEV --capture DEV [--mode virtual|acoustic] [--reps N]
                        [--through-model] [--settle] [--save-blocks FILE] [OPTIONS]
                                  Measure the latency with sweeps and print the report (the
-                                 sweeps the filter's own glitches disturbed are named and
-                                 set apart); --save-blocks writes every block's facts from
-                                 the start (CSV)
+                                 sweeps the filter's own events disturbed are named, and the
+                                 rest's median given apart); --save-blocks writes every
+                                 block's facts from the start (CSV)
   noise-filter latency --cable-only --probe DEV --capture DEV [--reps N]
                                  The same sweeps through one cable alone, without the filter
   noise-filter quality --probe DEV --capture DEV [--test noise|echo] [--far DEV] [QUALITY]
