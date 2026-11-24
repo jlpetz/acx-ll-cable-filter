@@ -124,9 +124,10 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       recording must also add up to the driver's counters' rise. Where no stream holds the reader slot just after the
       recording (the last reader stopped as it ended), verify waits up to 200 ms for one to (its own stream takes it at
       its next pass).
-  nf-vmic-test stats
+  nf-vmic-test stats [--time N]
       Print the driver's statistics, and its skip and underrun logs (newest last, times before the snapshot, each entry's
-      stream by its serial).
+      stream by its serial). --time N: read STATS N times back to back instead and print how long each read took (min,
+      median, p99, max in us): a read on a capture thread costs it that much of its buffer.
   nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
       K times (default 10): start `feed` as a child, check that a capture stream reads its ring, terminate the child MIN to
       MAX milliseconds after it attached (default 300 to 2000; MIN at least 200), and check that it exited within 2 s and its
@@ -1121,7 +1122,7 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
     capture.print_volume_notes();
     let _pro_audio = ProAudio::join();
     capture.start()?;
-    let recorded = record(&device, &mut capture, Duration::from_secs(seconds));
+    let recorded = record(&mut capture, Duration::from_secs(seconds));
     capture.stop();
     let Recorded { before, after, checker, vacancy, lost_frames, discontinuities } = recorded?;
 
@@ -1666,12 +1667,12 @@ struct Recorded {
 /// as the recording ended: three.sh's A2-default, 2026-11-24, the last of three recorders), it drains the stream, unrecorded,
 /// and reads STATS again until one does, up to [`VACANCY_WAIT`]: this stream still runs and takes the slot at its next pass.
 /// The later STATS is the recording's `after` (a wider window takes in nothing the recording's frames could need).
-fn record(device: &Device, capture: &mut Capture, duration: Duration) -> Result<Recorded, String> {
+fn record(capture: &mut Capture, duration: Duration) -> Result<Recorded, String> {
     let t0 = Instant::now();
     let mut signal_seen = false;
     let before = loop {
         capture.read(|f| signal_seen |= signal::decode(f).is_some())?;
-        let s = read_stats(device)?;
+        let s = stats_while_draining(capture, |f| signal_seen |= signal::decode(f).is_some())?;
         if (signal_seen && is_reading(&s)) || t0.elapsed() >= READING_WAIT {
             break s;
         }
@@ -1687,18 +1688,33 @@ fn record(device: &Device, capture: &mut Capture, duration: Duration) -> Result<
         let what = if signal_seen { "the driver reported no capture stream reading the ring" } else { "the stream delivered no signal" };
         eprintln!("{what} within {wait} s of the stream's start: not recorded");
     }
-    let mut after = read_stats(device)?;
+    let mut after = stats_while_draining(capture, |_| {})?;
     let (lost_frames, discontinuities) = (capture.lost_frames, capture.discontinuities);
     let mut vacancy = None;
     if slot_vacant(&before, &after) {
         let t = Instant::now();
         while slot_vacant(&before, &after) && t.elapsed() < VACANCY_WAIT {
             capture.read(|_| {})?;
-            after = read_stats(device)?;
+            after = stats_while_draining(capture, |_| {})?;
         }
         vacancy = Some(t.elapsed());
     }
     Ok(Recorded { before, after, checker, vacancy, lost_frames, discontinuities })
+}
+
+/// STATS, read on a helper thread (its own handle) while this thread keeps draining the stream into `on_frame`. A STATS
+/// read can take tens of milliseconds now and then on the dev box under Driver Verifier (2026-11-24: about 1% of reads over
+/// 1 ms, up to 36 ms, with no stream running; a rejected control code on the same handle never over 0.4 ms, so it's our
+/// handler's), longer than a 128-frame shared client's buffer: read on the capture thread, it cost every recording 104 frames
+/// at its start (p65 and its rerun, 10 of 12 verifies).
+fn stats_while_draining(capture: &mut Capture, mut on_frame: impl FnMut([f32; 2])) -> Result<Stats, String> {
+    std::thread::scope(|s| {
+        let reader = s.spawn(|| open_device().and_then(|d| read_stats(&d)));
+        while !reader.is_finished() {
+            capture.read(&mut on_frame)?;
+        }
+        reader.join().map_err(|_| "the STATS thread panicked".to_string())?
+    })
 }
 
 /// `after` shows `before`'s attachment still published with no stream holding the reader slot.
@@ -2093,8 +2109,29 @@ fn endpoint_volume(device: &wasapi::Device) -> Option<Volume> {
 // ---- stats ----
 
 fn stats(args: &[String]) -> Result<Verdict, String> {
-    Opts::parse(args, &[], &[])?;
-    print_stats(&read_stats(&open_device()?)?);
+    let o = Opts::parse(args, &["--time"], &[])?;
+    let device = open_device()?;
+    let reads: usize = o.value("--time", 0)?;
+    if reads == 0 {
+        print_stats(&read_stats(&device)?);
+        return Ok(Verdict::Pass);
+    }
+    let mut us: Vec<f64> = Vec::with_capacity(reads);
+    for _ in 0..reads {
+        let t = Instant::now();
+        read_stats(&device)?;
+        us.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    us.sort_by(f64::total_cmp);
+    let at = |q: f64| us[((us.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "{reads} STATS reads of {} bytes: min {:.1} us, median {:.1}, p99 {:.1}, max {:.1}",
+        std::mem::size_of::<Stats>(),
+        at(0.0),
+        at(0.5),
+        at(0.99),
+        at(1.0)
+    );
     Ok(Verdict::Pass)
 }
 
