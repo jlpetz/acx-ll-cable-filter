@@ -19,6 +19,9 @@ Environment:
 #include <wdm.h>
 #include <windef.h>
 #include "public.h"
+// noise-filter (TODO 19, the per-cable design): DEVPKEY_Device_InstanceId and DEVPKEY_Device_FriendlyName, defined here
+// (selectany): public.h includes <initguid.h> first.
+#include <devpkey.h>
 #include <devguid.h>
 #include <ks.h>
 #include <mmsystem.h>
@@ -86,12 +89,9 @@ NTSTATUS - SUCCESS if able to configure the framework
 
 //
 // noise-filter (TODO 19, the owner's options A and D, 2026-11-23): which microphones this device makes, from its hardware key's
-// NfMicrophones (the INF sets it per hardware ID): 1 the low-latency one (Microphone0), 2 the call one (Microphone1), 3 both.
-// Absent, 0 or out of range: both.
+// NfMicrophones (the INF sets it per hardware ID): 1 the low-latency one (Microphone0), 2 the call one (Microphone1), 3 both
+// (NF_MIC_LOW_LATENCY and NF_MIC_CALL, Cable.h). Absent, 0 or out of range: both.
 //
-#define NF_MIC_LOW_LATENCY  0x1
-#define NF_MIC_CALL         0x2
-
 PAGED_CODE_SEG
 static
 ULONG
@@ -116,6 +116,310 @@ NfReadMicrophones(
 
     value &= (NF_MIC_LOW_LATENCY | NF_MIC_CALL);
     return (value != 0) ? value : (NF_MIC_LOW_LATENCY | NF_MIC_CALL);
+}
+
+//
+// noise-filter (TODO 19, the per-cable design, section 4): a cable's identity and label, carried in its instance ID, which the
+// setup tool fixes when it creates the device node: ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n> (Cable.h). Nothing the driver reads
+// here is written after the node is registered, so Plug and Play can't start a node before its identity is there.
+//
+
+PAGED_CODE_SEG
+static
+WCHAR
+NfUpcase(
+    _In_ WCHAR C
+)
+{
+    PAGED_CODE();
+
+    return (C >= L'a' && C <= L'z') ? (WCHAR)(C - L'a' + L'A') : C;
+}
+
+// A hex digit's value in *Value; FALSE if C isn't one.
+PAGED_CODE_SEG
+static
+BOOLEAN
+NfHexDigit(
+    _In_    WCHAR   C,
+    _Out_   PUCHAR  Value
+)
+{
+    PAGED_CODE();
+
+    C = NfUpcase(C);
+    if (C >= L'0' && C <= L'9')
+    {
+        *Value = (UCHAR)(C - L'0');
+        return TRUE;
+    }
+    if (C >= L'A' && C <= L'F')
+    {
+        *Value = (UCHAR)(C - L'A' + 10);
+        return TRUE;
+    }
+    *Value = 0;
+    return FALSE;
+}
+
+//
+// A GUID's 36 characters without braces, xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx in either case: RtlGUIDFromString's form less the
+// braces, checked character by character (so nothing is read past the 36).
+//
+PAGED_CODE_SEG
+static
+BOOLEAN
+NfParseGuid36(
+    _In_reads_(NF_CABLE_ID_CHARS)   PCWSTR  Text,
+    _Out_                           GUID*   Guid
+)
+{
+    UCHAR   bytes[16] = {};
+    ULONG   nibble = 0;
+    ULONG   i;
+
+    PAGED_CODE();
+
+    RtlZeroMemory(Guid, sizeof(*Guid));
+    for (i = 0; i < NF_CABLE_ID_CHARS; i++)
+    {
+        UCHAR value;
+
+        if (i == 8 || i == 13 || i == 18 || i == 23)
+        {
+            if (Text[i] != L'-')
+            {
+                return FALSE;
+            }
+            continue;
+        }
+        if (!NfHexDigit(Text[i], &value))
+        {
+            return FALSE;
+        }
+        bytes[nibble / 2] = (UCHAR)((bytes[nibble / 2] << 4) | value);
+        nibble++;
+    }
+
+    // The text's order: Data1, Data2 and Data3 most significant first, then Data4's eight bytes.
+    Guid->Data1 = ((ULONG)bytes[0] << 24) | ((ULONG)bytes[1] << 16) | ((ULONG)bytes[2] << 8) | bytes[3];
+    Guid->Data2 = (USHORT)((bytes[4] << 8) | bytes[5]);
+    Guid->Data3 = (USHORT)((bytes[6] << 8) | bytes[7]);
+    RtlCopyMemory(Guid->Data4, &bytes[8], sizeof(Guid->Data4));
+    return TRUE;
+}
+
+//
+// What follows the instance ID's last backslash: ACXLLCABLE_<label>_<id>_<n>, without case. The label one to eight of A-Z and
+// 0-9 (returned upper case), the id a GUID's 36 characters, n a decimal from 1 without leading zeros (so one cable has one
+// instance ID for each n). STATUS_DEVICE_CONFIGURATION_ERROR for anything else: a node made outside the setup tool (devcon,
+// Device Manager's Add legacy hardware: ROOT\MEDIA\NNNN) has no identity.
+//
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfParseCableInstanceId(
+    _In_reads_(Chars)                               PCWSTR  InstanceId,
+    _In_                                            size_t  Chars,
+    _Out_                                           GUID*   Id,
+    _Out_writes_(NF_CABLE_LABEL_MAX_CHARS + 1)      PWCHAR  Label,
+    _Out_                                           PULONG  InstanceNumber
+)
+{
+    static const WCHAR  prefix[] = NF_CABLE_INSTANCE_PREFIX;
+    const size_t        prefixChars = ARRAYSIZE(prefix) - 1;
+    PCWSTR              p = InstanceId;
+    size_t              rest = Chars;
+    size_t              labelChars = 0;
+    ULONGLONG           n = 0;
+    size_t              i;
+
+    PAGED_CODE();
+
+    RtlZeroMemory(Id, sizeof(*Id));
+    Label[0] = L'\0';
+    *InstanceNumber = 0;
+
+    for (i = 0; i < Chars; i++)
+    {
+        if (InstanceId[i] == L'\\')
+        {
+            p = InstanceId + i + 1;
+            rest = Chars - i - 1;
+        }
+    }
+
+    if (rest < prefixChars)
+    {
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    for (i = 0; i < prefixChars; i++)
+    {
+        if (NfUpcase(p[i]) != prefix[i])
+        {
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+    }
+    p += prefixChars;
+    rest -= prefixChars;
+
+    // The label, up to the next underscore.
+    while (labelChars < rest && p[labelChars] != L'_')
+    {
+        WCHAR c = NfUpcase(p[labelChars]);
+
+        if (labelChars == NF_CABLE_LABEL_MAX_CHARS || !((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')))
+        {
+            Label[0] = L'\0';
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        Label[labelChars++] = c;
+    }
+    Label[labelChars] = L'\0';
+    if (labelChars == 0 || labelChars == rest)
+    {
+        Label[0] = L'\0';
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    p += labelChars + 1;
+    rest -= labelChars + 1;
+
+    // The identity, then an underscore and at least one digit.
+    if (rest < NF_CABLE_ID_CHARS + 2 || p[NF_CABLE_ID_CHARS] != L'_' || !NfParseGuid36(p, Id))
+    {
+        Label[0] = L'\0';
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    p += NF_CABLE_ID_CHARS + 1;
+    rest -= NF_CABLE_ID_CHARS + 1;
+
+    // n: 1 to 4294967295, decimal, no leading zero, and nothing after it.
+    if (rest == 0 || rest > 10 || p[0] == L'0')
+    {
+        Label[0] = L'\0';
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    for (i = 0; i < rest; i++)
+    {
+        if (p[i] < L'0' || p[i] > L'9')
+        {
+            Label[0] = L'\0';
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        n = n * 10 + (ULONGLONG)(p[i] - L'0');
+    }
+    if (n == 0 || n > MAXULONG)
+    {
+        Label[0] = L'\0';
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    *InstanceNumber = (ULONG)n;
+    return STATUS_SUCCESS;
+}
+
+//
+// The device's instance ID, NUL-terminated in Buffer, and its length in characters. PASSIVE_LEVEL (wdffdo.h), before
+// WdfDeviceCreate.
+//
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfQueryInstanceId(
+    _In_                                        PWDFDEVICE_INIT DeviceInit,
+    _Out_writes_(NF_CABLE_INSTANCE_ID_CHARS)    PWCHAR          Buffer,
+    _Out_                                       size_t*         Chars
+)
+{
+    WDF_DEVICE_PROPERTY_DATA    property;
+    ULONG                       bytes = 0;
+    DEVPROPTYPE                 type = DEVPROP_TYPE_EMPTY;
+    NTSTATUS                    status;
+
+    PAGED_CODE();
+
+    *Chars = 0;
+    RtlZeroMemory(Buffer, NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR));
+
+    WDF_DEVICE_PROPERTY_DATA_INIT(&property, &DEVPKEY_Device_InstanceId);
+    property.Lcid = LOCALE_NEUTRAL;
+    status = WdfFdoInitQueryPropertyEx(DeviceInit, &property, NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR), Buffer, &bytes, &type);
+    if (!NT_SUCCESS(status))
+    {
+        // STATUS_BUFFER_TOO_SMALL: longer than MAX_DEVICE_ID_LEN, so not ours either.
+        return (status == STATUS_BUFFER_TOO_SMALL) ? STATUS_DEVICE_CONFIGURATION_ERROR : status;
+    }
+    if (type != DEVPROP_TYPE_STRING || bytes < 2 * sizeof(WCHAR) || bytes > NF_CABLE_INSTANCE_ID_CHARS * sizeof(WCHAR))
+    {
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    // Whatever the property held, the string ends inside the buffer.
+    Buffer[NF_CABLE_INSTANCE_ID_CHARS - 1] = L'\0';
+    return RtlStringCchLengthW(Buffer, NF_CABLE_INSTANCE_ID_CHARS, Chars);
+}
+
+// A circuit's component ID for this cable: the identity XOR the circuit's constant (DriverSettings.h), so each cable's are its own.
+PAGED_CODE_SEG
+static
+VOID
+NfDeriveComponentId(
+    _In_    const GUID* Identity,
+    _In_    const GUID* Constant,
+    _Out_   GUID*       Out
+)
+{
+    const UCHAR*    a = (const UCHAR*)Identity;
+    const UCHAR*    b = (const UCHAR*)Constant;
+    UCHAR*          o = (UCHAR*)Out;
+    ULONG           i;
+
+    PAGED_CODE();
+
+    for (i = 0; i < sizeof(GUID); i++)
+    {
+        o[i] = (UCHAR)(a[i] ^ b[i]);
+    }
+}
+
+//
+// The device's FriendlyName, "ACX-LL-Cable <label>", which names its endpoints' adapter part: "Microphone (ACX-LL-Cable D)"
+// (the per-cable design, section 8). Set at every binding, before the circuits' interfaces are enabled at start and the
+// endpoints are made. The setup tool sets the same name before it registers the node, a second layer: a failure here is
+// reported and costs nothing else. WdfDeviceAssignProperty: up to APC_LEVEL (wdfdevice.h).
+//
+PAGED_CODE_SEG
+static
+VOID
+NfAssignFriendlyName(
+    _In_ WDFDEVICE      Device,
+    _In_ PNF_CABLE      Cable
+)
+{
+    WDF_DEVICE_PROPERTY_DATA    property;
+    WCHAR                       name[sizeof("ACX-LL-Cable ") + NF_CABLE_LABEL_MAX_CHARS] = {};
+    size_t                      chars = 0;
+    NTSTATUS                    status;
+
+    PAGED_CODE();
+
+    status = RtlStringCchPrintfW(name, ARRAYSIZE(name), L"ACX-LL-Cable %ws", Cable->Label);
+    if (NT_SUCCESS(status))
+    {
+        status = RtlStringCchLengthW(name, ARRAYSIZE(name), &chars);
+    }
+    if (NT_SUCCESS(status))
+    {
+        WDF_DEVICE_PROPERTY_DATA_INIT(&property, &DEVPKEY_Device_FriendlyName);
+        property.Lcid = LOCALE_NEUTRAL;
+        property.Flags = PLUGPLAY_PROPERTY_PERSISTENT;
+        status = WdfDeviceAssignProperty(Device, &property, DEVPROP_TYPE_STRING, (ULONG)((chars + 1) * sizeof(WCHAR)), name);
+    }
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: cable %ws's friendly name not set (0x%08X)\n",
+                   Cable->Label, status);
+    }
 }
 
 PAGED_CODE_SEG
@@ -152,21 +456,37 @@ Return Value:
     WDFDEVICE                           device = nullptr;
     PCODEC_DEVICE_CONTEXT               devCtx;
     WDF_PNPPOWER_EVENT_CALLBACKS        pnpPowerCallbacks;
-    WCHAR                               hardwareIds[128] = {};
-    ULONG                               hardwareBytes;
-    DECLARE_CONST_UNICODE_STRING(cableBId, L"ROOT\\NoiseFilterCableB");
-    UNICODE_STRING                      firstId;
+    WCHAR                               instanceId[NF_CABLE_INSTANCE_ID_CHARS];
+    size_t                              instanceChars = 0;
+    GUID                                cableId;
+    WCHAR                               label[NF_CABLE_LABEL_MAX_CHARS + 1];
+    ULONG                               instanceNumber = 0;
+    PNF_CABLE                           cable;
+    LARGE_INTEGER                       now;
 
     PAGED_CODE();
 
-    // Our INF matches exact root hardware IDs. Routing must be known even on first boot or when the optional cable loads first.
-    RETURN_NTSTATUS_IF_FAILED(WdfFdoInitQueryProperty(DeviceInit, DevicePropertyHardwareID, sizeof(hardwareIds), hardwareIds, &hardwareBytes));
-    if (hardwareBytes < 2 * sizeof(WCHAR) || hardwareBytes > sizeof(hardwareIds) || hardwareIds[hardwareBytes / sizeof(WCHAR) - 1] != 0)
+    //
+    // noise-filter (TODO 19, the per-cable design, section 4): the cable's identity and label, from its instance ID, before
+    // anything is made. Every device of ours is a cable, and every cable has one: a node without one (not made by the setup
+    // tool) is refused with an error status (STATUS_DEVICE_CONFIGURATION_ERROR: Device Manager shows code 31, CM_PROB_FAILED_ADD,
+    // with the status in DEVPKEY_Device_ProblemStatus), so discovery, the control device's name and the setup never meet an
+    // unnamed cable. A query that fails returns its own status, for the same property to tell.
+    //
+    status = NfQueryInstanceId(DeviceInit, instanceId, &instanceChars);
+    if (!NT_SUCCESS(status))
     {
-        return STATUS_INVALID_PARAMETER;
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, "AudioCodec: no instance ID (0x%08X): the device is refused\n", status);
+        return status;
     }
-    RtlInitUnicodeString(&firstId, hardwareIds);
-    const BOOLEAN cableB = RtlEqualUnicodeString(&firstId, &cableBId, TRUE);
+    status = NfParseCableInstanceId(instanceId, instanceChars, &cableId, label, &instanceNumber);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL,
+                   "AudioCodec: %ws is not an ACX-LL-Cable instance (ROOT\\MEDIA\\ACXLLCABLE_<label>_<id>_<n>): refused (0x%08X); "
+                   "make cables with the setup tool\n", instanceId, status);
+        return status;
+    }
 
     //
     // The driver calls this DDI in its AddDevice callback before creating the PnP device.
@@ -204,14 +524,45 @@ Return Value:
     devCtx->Capture = nullptr;
     devCtx->Capture2 = nullptr;
     devCtx->ExcludeD3Cold = WdfFalse;
-    devCtx->VmicRegistered = FALSE;
+
+    //
+    // noise-filter (TODO 19, the per-cable design, sections 4 and 5): the cable, first, so the context cleanup (which runs if
+    // anything below fails) always finds its lock and its loopback ring. The framework zeroed the context: every counter and log
+    // of this binding starts at zero, and the attachment count from 1 at the first ATTACH.
+    //
+    cable = &devCtx->Cable;
+    RtlZeroMemory(&devCtx->Loopback, sizeof(devCtx->Loopback));
+    KeInitializeSpinLock(&devCtx->Loopback.Lock);
+    KeInitializeSpinLock(&cable->Ring.Lock);
+    cable->Ring.Loopback = &devCtx->Loopback;
+    cable->ControlStatus = STATUS_DEVICE_NOT_READY;
+
+    cable->Id = cableId;
+    cable->InstanceNumber = instanceNumber;
+    RETURN_NTSTATUS_IF_FAILED(RtlStringCchCopyW(cable->Label, ARRAYSIZE(cable->Label), label));
+    RETURN_NTSTATUS_IF_FAILED(RtlStringCchCopyW(cable->InstanceId, ARRAYSIZE(cable->InstanceId), instanceId));
+    RETURN_NTSTATUS_IF_FAILED(RtlStringCchPrintfW(cable->IdText, ARRAYSIZE(cable->IdText),
+                                                  L"%08lx-%04hx-%04hx-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                                                  cableId.Data1, cableId.Data2, cableId.Data3, cableId.Data4[0], cableId.Data4[1],
+                                                  cableId.Data4[2], cableId.Data4[3], cableId.Data4[4], cableId.Data4[5],
+                                                  cableId.Data4[6], cableId.Data4[7]));
+    // The control device's names (Control.cpp, nf_vmic.h): \Device\AcxLlCable_<id> and \DosDevices\AcxLlCable_<id>.
+    RETURN_NTSTATUS_IF_FAILED(RtlStringCchPrintfW(cable->DeviceName, ARRAYSIZE(cable->DeviceName), L"%ws%ws", NF_VMIC_DEVICE_PREFIX,
+                                                  cable->IdText));
+    RETURN_NTSTATUS_IF_FAILED(RtlStringCchPrintfW(cable->LinkName, ARRAYSIZE(cable->LinkName), L"%ws%ws", NF_VMIC_SYMLINK_PREFIX,
+                                                  cable->IdText));
+    // The generation: the binding's start, UTC in 100 ns units, unique per binding; readers compare it for equality only.
+    KeQuerySystemTimePrecise(&now);
+    cable->Generation = (ULONGLONG)now.QuadPart;
+    cable->BindQpc = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
+    NfDeriveComponentId(&cableId, &CODEC_RENDER_COMPONENT_GUID, &cable->RenderComponentId);
+    NfDeriveComponentId(&cableId, &CODEC_CAPTURE_COMPONENT_GUID, &cable->CaptureComponentId);
+    NfDeriveComponentId(&cableId, &CODEC_CAPTURE2_COMPONENT_GUID, &cable->Capture2ComponentId);
 
     //
     // noise-filter (TODO 19): the loopback ring, allocated once for the device's life so that no stream allocates at
     // DISPATCH_LEVEL; freed in Codec_EvtDeviceContextCleanup. ExAllocatePool2 zeroes it.
     //
-    RtlZeroMemory(&devCtx->Loopback, sizeof(devCtx->Loopback));
-    KeInitializeSpinLock(&devCtx->Loopback.Lock);
     // Its event logs (Public.h, NF_EVENT_LOG), zeroed above: empty, numbering from 1.
     KeInitializeSpinLock(&devCtx->Loopback.SkipLog.Lock);
     devCtx->Loopback.SkipLog.Entries = NF_VMIC_SKIP_LOG_ENTRIES;
@@ -225,17 +576,23 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    //
-    // noise-filter (TODO 19, spike check 4): register with the app feed: the first device makes its control device
-    // (NoiseFilterVmic), and the last one's context cleanup deletes it. A failure there costs only the app feed; it is
-    // reported and the device goes on. From here on this device's cleanup must unregister, whatever fails later.
-    //
-    if (!cableB)
+    // noise-filter (TODO 19, the per-cable design, section 5): the cable's copy of what its reader delivered, 256 KiB, as the
+    // loopback ring is (it was a static of the image's); freed in the context cleanup.
+    cable->Ring.History = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, NF_APP_HISTORY_BYTES, DeviceDriverTag);
+    if (cable->Ring.History == nullptr)
     {
-        RETURN_NTSTATUS_IF_FAILED(NfVmic_DeviceAdd(Driver, device, &devCtx->Loopback));
-        devCtx->Loopback.AppFeed = TRUE;
-        devCtx->VmicRegistered = TRUE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    // noise-filter (TODO 19, the per-cable design, section 8): the endpoints' adapter name, "ACX-LL-Cable D". Best effort.
+    NfAssignFriendlyName(device, cable);
+
+    //
+    // noise-filter (TODO 19, spike check 4; the per-cable design, section 3): the cable's own control device,
+    // \Device\AcxLlCable_<id>, which its context cleanup deletes. A failure there costs this cable's feed only (a name collision:
+    // another node carries the identity); it is reported (ControlStatus) and the cable plays on as a plain cable.
+    //
+    (void)NfVmic_CableAdd(Driver, cable);
 
     //
     // The driver calls this DDI in its AddDevice callback after creating the PnP
@@ -258,22 +615,26 @@ Return Value:
     // device context. These circuits will be added to the device when the
     // prepare hardware callback is called. 
     //
-    RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, cableB ? &CABLE_B_RENDER_COMPONENT_GUID : &CODEC_RENDER_COMPONENT_GUID,
-                                                    &renderCircuitName));
+    // noise-filter (TODO 19, the per-cable design, section 8): each circuit's component ID is the cable's own (NfDeriveComponentId).
+    RETURN_NTSTATUS_IF_FAILED(CodecR_AddStaticRender(device, &cable->RenderComponentId, &renderCircuitName));
 
-    // noise-filter (TODO 19): the microphones this hardware ID asks for (NfReadMicrophones); the call one is a second capture
-    // circuit (DriverSettings.h). The first made goes in devCtx->Capture, a second in devCtx->Capture2.
-    ULONG microphones = cableB ? NF_MIC_LOW_LATENCY : NfReadMicrophones(device);
-    if (microphones & NF_MIC_LOW_LATENCY)
+    // noise-filter (TODO 19): the microphones this hardware ID asks for (NfReadMicrophones), the same rule for every cable; the
+    // call one is a second capture circuit (DriverSettings.h). The first made goes in devCtx->Capture, a second in
+    // devCtx->Capture2.
+    cable->Microphones = NfReadMicrophones(device);
+    if (cable->Microphones & NF_MIC_LOW_LATENCY)
     {
-        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, cableB ? &CABLE_B_CAPTURE_COMPONENT_GUID : &CODEC_CAPTURE_COMPONENT_GUID,
-                                                          &MIC_CUSTOM_NAME, &captureCircuitName, L"Microphone"));
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->CaptureComponentId, &MIC_CUSTOM_NAME, &captureCircuitName,
+                                                          L"Microphone"));
     }
-    if (microphones & NF_MIC_CALL)
+    if (cable->Microphones & NF_MIC_CALL)
     {
-        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &CODEC_CAPTURE2_COMPONENT_GUID, &MIC2_CUSTOM_NAME, &capture2CircuitName,
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->Capture2ComponentId, &MIC2_CUSTOM_NAME, &capture2CircuitName,
                                                           L"Call Microphone"));
     }
+
+    DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_INFO_LEVEL, "AudioCodec: cable %ws added (instance %lu, microphones %lu, feed 0x%08X)\n",
+               cable->Label, cable->InstanceNumber, cable->Microphones, cable->ControlStatus);
 
     return status;
 }
@@ -556,15 +917,24 @@ Return Value:
     ASSERT(devCtx != nullptr);
 
     //
-    // noise-filter (TODO 19, spike check 4): first, while the loopback ring that STATS reads from is still here: stop STATS
-    // reading it and, with the last device, end any app ring and delete the control device. Learn: a driver with both kinds
-    // deletes its control device itself, at PASSIVE_LEVEL, after the framework has deleted its PnP devices, which this
-    // callback is how it learns (wdf/using-control-device-objects).
+    // noise-filter (TODO 19, spike check 4; the per-cable design, section 3): first, while the cable's ring and the loopback
+    // ring that STATS reads from are still here: end the cable's app ring and delete its control device, in the design's order
+    // (NfVmic_CableCleanup), whatever Codec_EvtBusDeviceAdd got to. PASSIVE_LEVEL (a device's cleanup callback). Then the
+    // cable's copy: no ring can be published any more, so no stream writes or reads it.
     //
-    if (devCtx->VmicRegistered)
+    NfVmic_CableCleanup(&devCtx->Cable);
+
+    if (devCtx->Cable.Ring.History != nullptr)
     {
-        NfVmic_DeviceCleanup(device);
-        devCtx->VmicRegistered = FALSE;
+        KIRQL   oldIrql;
+        PUCHAR  history;
+
+        KeAcquireSpinLock(&devCtx->Cable.Ring.Lock, &oldIrql);
+        history = devCtx->Cable.Ring.History;
+        devCtx->Cable.Ring.History = nullptr;
+        KeReleaseSpinLock(&devCtx->Cable.Ring.Lock, oldIrql);
+
+        ExFreePoolWithTag(history, DeviceDriverTag);
     }
 
     //

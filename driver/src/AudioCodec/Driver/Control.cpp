@@ -1,6 +1,7 @@
 /*++
 
-    noise-filter (TODO 19, spike checks 4 and 5). Original to noise-filter, not from Microsoft's sample: MIT OR Apache-2.0.
+    noise-filter (TODO 19, spike checks 4 and 5; the per-cable design). Original to noise-filter, not from Microsoft's sample:
+    MIT OR Apache-2.0.
 
 Module Name:
 
@@ -8,21 +9,35 @@ Module Name:
 
 Abstract:
 
-    The control device that takes an app's capture ring (NF_VMIC_IOCTL_ATTACH) and hands out the driver's statistics
-    (NF_VMIC_IOCTL_STATS). The protocol and its rules are Shared\nf_vmic.h; the capture side is
-    CCaptureStreamEngine::AppRingCapturePass (Common\StreamEngine.cpp).
+    Each cable's control device, which takes an app's capture ring for that cable (NF_VMIC_IOCTL_ATTACH) and hands out the
+    cable's statistics (NF_VMIC_IOCTL_STATS). The protocol and its rules are Shared\nf_vmic.h; the capture side is
+    CCaptureStreamEngine::AppRingCapturePass (Common\StreamEngine.cpp); the cable's state is Shared\Cable.h's, in its PnP
+    device's context.
 
-    Lifetime (Learn, wdf/using-control-device-objects, "Deleting a Control Device Object"): a driver with both a control
-    device and PnP devices must delete the control device itself, at PASSIVE_LEVEL, and only after the framework has deleted
-    the PnP devices, which it learns from their EvtCleanupCallback; until then the driver can't unload. So it is made with the
-    first PnP device (Codec_EvtBusDeviceAdd) and deleted in the last one's context cleanup (Codec_EvtDeviceContextCleanup),
-    as the KMDF toaster's sideband filter does (general/toaster/toastDrv/kmdf/filter/sideband/filter.c). The framework
-    destroys a deleted control device only once the last handle to it closes, so the driver makes and deletes the symbolic
-    link itself, and a PnP device that comes back gets a new control device under the same name while an old handle is still
-    open (NfVmic_CreateControlDevice).
+    One control device per cable (doc/todo/19-per-cable-design.md, section 3), named from the cable's identity:
+    \Device\AcxLlCable_<id>, link \DosDevices\AcxLlCable_<id>, opened from user mode as \\.\AcxLlCable_<id>, <id> the identity's
+    36 lower-case characters. Made in the cable's AddDevice (NfVmic_CableAdd) and deleted in its context cleanup
+    (NfVmic_CableCleanup): no state is shared between cables, so there is no device count and no driver-wide lock.
 
-    Nothing here is pageable: the cancel routine runs at up to DISPATCH_LEVEL, the IOCTL callback may (parallel queue, no
-    execution level set), and every function takes the ring's spin lock.
+    Lifetime. The framework destroys a deleted control device only once the last handle to it closes (WDF source:
+    FxDevice::DeleteObject defers it until FxPkgGeneral::CanDestroyControlDevice sees that device's own open-handle count reach
+    zero), while the cable it serves lives in the PnP device's context, which goes with the binding. So each control device
+    carries a rundown guard (NF_CONTROL_CONTEXT): every callback takes rundown protection before it touches the cable, and the
+    cleanup waits for the guard after purging the queue, so a callback on a lingering deleted control device (a handle's
+    cleanup) is refused and touches nothing. The ring used to be a static for exactly that reason.
+
+    Learn, Using Control Device Objects, "Deleting a Control Device Object": "the driver must not delete the control device
+    objects until after the framework has deleted the other device objects". Deleting one cable's control device while other
+    cables' PnP devices live departs from that wording. Ours (the per-cable design, section 14, risk 3): WDF deletes per object
+    (FxDevice::DeleteObject deletes the WDM device object at once and defers the framework object's destruction on that device's
+    own handle count; nothing in it is driver-wide), so the rule reads as being about unload order. The gate is S0a's removal
+    runs under Verifier; the fallback is one control device for the whole driver with a per-cable namespace.
+
+    The symbolic link is made and deleted by hand, and only by the binding that made it (NF_CABLE.LinkCreated), so a binding
+    whose name collided never deletes another binding's link: a handle still open on an old binding's control device would
+    otherwise hold the name across a disable and enable (the framework deletes a link it made only when it destroys the device).
+
+    Nothing here is pageable: the cancel routine runs at up to DISPATCH_LEVEL, and every function takes the ring's spin lock.
 
 Environment:
 
@@ -34,25 +49,15 @@ Environment:
 #include "AppRing.h"
 
 //
-// Only SYSTEM and Administrators can open this control device. For a standard user, nf-vmic's explicitly approved broker
-// owns the handle, checks the interactive session and transfers only the live ring pages to its parent. STATS stays privileged.
+// Only SYSTEM and Administrators can open a cable's control device. For a standard user, nf-vmic's explicitly approved broker
+// owns the handle, checks the interactive session and transfers only the live ring pages to its parent. STATS stays privileged
+// (the per-cable design's IU read comes with D2's redacted statistics).
 //
 DECLARE_CONST_UNICODE_STRING(g_NfVmicSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-DECLARE_CONST_UNICODE_STRING(g_NfVmicDeviceName, NF_VMIC_DEVICE_NAME);
-DECLARE_CONST_UNICODE_STRING(g_NfVmicSymlinkName, NF_VMIC_SYMLINK_NAME);
-
-//
-// The control device's life, guarded by s_CdoLock (a wait lock: WdfDeviceCreate and the rest need PASSIVE_LEVEL, which a
-// spin lock or a fast mutex wouldn't leave). s_DeviceCount is 0 or 1, excluding the independent WASAPI-only cable.
-//
-static WDFWAITLOCK  s_CdoLock;
-static ULONG        s_DeviceCount;
-static WDFDEVICE    s_ControlDevice;
-static WDFQUEUE     s_ControlQueue;
 
 //
 // Each control-device file object's context (zeroed by the framework). CleanedUp: its EvtFileCleanup has run, so no ring may be
-// published on it any more (NfVmic_Attach says why). Set and read under g_NfAppRing.Lock.
+// published on it any more (NfVmic_Attach says why). Set and read under its cable's app ring lock.
 //
 typedef struct _NF_VMIC_FILE_CONTEXT {
     BOOLEAN CleanedUp;
@@ -60,22 +65,35 @@ typedef struct _NF_VMIC_FILE_CONTEXT {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(NF_VMIC_FILE_CONTEXT, NfVmicGetFileContext);
 
+//
+// Each control device's context (non-paged, as every framework context is: Learn, Framework Object Context Space). It can
+// outlive the cable: a deleted control device lives until its last handle closes. Every callback takes Rundown's protection
+// before it reads Cable, and NfVmic_CableCleanup waits for it before the cable's memory goes; after that wait no protection is
+// granted again, so a late callback touches nothing but its own request.
+//
+typedef struct _NF_CONTROL_CONTEXT {
+    EX_RUNDOWN_REF  Rundown;
+    PNF_CABLE       Cable;
+} NF_CONTROL_CONTEXT, *PNF_CONTROL_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(NF_CONTROL_CONTEXT, NfVmicGetControlContext);
+
 static EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL   NfVmic_EvtIoDeviceControl;
 static EVT_WDF_REQUEST_CANCEL               NfVmic_EvtRequestCancel;
 static EVT_WDF_FILE_CLEANUP                 NfVmic_EvtFileCleanup;
 
-_Use_decl_annotations_
-NTSTATUS
-NfVmic_DriverInit(
-    WDFDRIVER Driver
+//
+// The control device a file object belongs to, its context: WdfFileObjectGetDevice, up to DISPATCH_LEVEL (wdffileobject.h).
+//
+static
+PNF_CONTROL_CONTEXT
+NfVmic_ControlOfFile(
+    _In_opt_ WDFFILEOBJECT File
 )
 {
-    UNREFERENCED_PARAMETER(Driver);
+    WDFDEVICE device = (File != NULL) ? WdfFileObjectGetDevice(File) : NULL;
 
-    KeInitializeSpinLock(&g_NfAppRing.Lock);
-
-    // Parented to the driver object by default; it goes with it.
-    return WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &s_CdoLock);
+    return (device != NULL) ? NfVmicGetControlContext(device) : NULL;
 }
 
 //
@@ -85,45 +103,48 @@ NfVmic_DriverInit(
 static
 VOID
 NfVmic_UnpublishLocked(
-    _In_ ULONG Reason
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    ULONG           Reason
 )
 {
-    PNF_APP_RING ring = &g_NfAppRing;
-
-    if (ring->Header != NULL)
+    if (Ring->Header != NULL)
     {
-        NfVmicStore32(&ring->Header->State, 0);
-        NfVmicStore32(&ring->Header->PacketFrames, 0);
+        NfVmicStore32(&Ring->Header->State, 0);
+        NfVmicStore32(&Ring->Header->PacketFrames, 0);
     }
 
     // No reader writes this attachment's copy again: the skip log's spans still being filled in are settled as they stand.
-    NfVmicAppRingSettleClaims(ring, TRUE);
+    NfVmicAppRingSettleClaims(Ring, TRUE);
 
-    ring->Request = NULL;
-    ring->File = NULL;
-    ring->Header = NULL;
-    ring->Data = NULL;
-    ring->CapacityFrames = 0;
-    ring->AttachPid = 0;
-    ring->Reader = NULL;
-    ring->ReaderState = 0;
-    ring->ReaderPacketFrames = 0;
+    Ring->Request = NULL;
+    Ring->File = NULL;
+    Ring->Header = NULL;
+    Ring->Data = NULL;
+    Ring->CapacityFrames = 0;
+    Ring->AttachPid = 0;
+    Ring->Reader = NULL;
+    Ring->ReaderState = 0;
+    Ring->ReaderPacketFrames = 0;
 
-    ring->Stats.Detaches++;
+    Ring->Stats.Detaches++;
     switch (Reason)
     {
-    case NF_APP_DETACH_CANCEL:  ring->Stats.DetachCancel++;     break;
-    case NF_APP_DETACH_CLEANUP: ring->Stats.DetachCleanup++;    break;
-    default:                    ring->Stats.DetachRemoval++;    break;
+    case NF_APP_DETACH_CANCEL:  Ring->Stats.DetachCancel++;     break;
+    case NF_APP_DETACH_CLEANUP: Ring->Stats.DetachCleanup++;    break;
+    default:                    Ring->Stats.DetachRemoval++;    break;
     }
 }
 
 //
 // The framework calls this when the pending ATTACH is cancelled: CancelIoEx, the issuing thread or process exiting, or the
-// queue's purge when the control device goes (NfVmic_DeleteControlDevice, with Removing set). It takes the lock before it
-// completes the request, so a detach elsewhere that still finds the request published (and calls WdfRequestUnmarkCancelable
-// under the same lock) can't race the completion. A removal completes with STATUS_DEVICE_REMOVED rather than STATUS_CANCELLED,
-// so the app can tell it from its own cancel: it must then close its handles, since an open one keeps the driver loaded.
+// queue's purge when the control device goes (NfVmic_CableCleanup, with Removing set). It takes the lock before it completes the
+// request, so a detach elsewhere that still finds the request published (and calls WdfRequestUnmarkCancelable under the same
+// lock) can't race the completion. A removal completes with STATUS_DEVICE_REMOVED rather than STATUS_CANCELLED, so the app can
+// tell it from its own cancel: it must then close its handles, since an open one keeps the driver loaded.
+//
+// Refused rundown protection (the cable is gone: after NfVmic_CableCleanup's wait, which the purge before it should keep any
+// cancel from meeting), it still completes its request, as STATUS_DEVICE_REMOVED, and touches nothing else: a cancel routine
+// that returned without completing would hang WdfIoQueuePurgeSynchronously.
 //
 _Use_decl_annotations_
 static
@@ -132,16 +153,24 @@ NfVmic_EvtRequestCancel(
     WDFREQUEST Request
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
-    KIRQL           oldIrql;
-    BOOLEAN         unpublished = FALSE;
-    BOOLEAN         removing;
+    PNF_CONTROL_CONTEXT control = NfVmic_ControlOfFile(WdfRequestGetFileObject(Request));
+    PNF_APP_RING        ring;
+    KIRQL               oldIrql;
+    BOOLEAN             unpublished = FALSE;
+    BOOLEAN             removing;
+
+    if (control == NULL || !ExAcquireRundownProtection(&control->Rundown))
+    {
+        WdfRequestComplete(Request, STATUS_DEVICE_REMOVED);
+        return;
+    }
+    ring = &control->Cable->Ring;
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
     removing = ring->Removing;
     if (ring->Request == Request)
     {
-        NfVmic_UnpublishLocked(removing ? NF_APP_DETACH_REMOVAL : NF_APP_DETACH_CANCEL);
+        NfVmic_UnpublishLocked(ring, removing ? NF_APP_DETACH_REMOVAL : NF_APP_DETACH_CANCEL);
         unpublished = TRUE;
     }
     // Else a detach elsewhere took it first: WdfRequestUnmarkCancelable returned STATUS_CANCELLED there, so completing it is ours.
@@ -156,36 +185,38 @@ NfVmic_EvtRequestCancel(
     // Completion unlocks the pages, which also releases the system mapping (Learn, MmGetSystemAddressForMdlSafe); nothing
     // can reach the ring any more.
     WdfRequestComplete(Request, removing ? STATUS_DEVICE_REMOVED : STATUS_CANCELLED);
+
+    ExReleaseRundownProtection(&control->Rundown);
 }
 
 //
 // EvtFileCleanup's work: marks File cleaned up, so no ring is published on it from now on, and ends the attachment if File's
-// request holds it (the handle closed with the ATTACH still pending).
+// request holds it (the handle closed with the ATTACH still pending). Rundown protection held by the caller.
 //
 static
 VOID
 NfVmic_DetachFile(
-    _In_ WDFFILEOBJECT File
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    WDFFILEOBJECT   File
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
     KIRQL           oldIrql;
     WDFREQUEST      request = NULL;
     NTSTATUS        status = STATUS_SUCCESS;
 
-    KeAcquireSpinLock(&ring->Lock, &oldIrql);
+    KeAcquireSpinLock(&Ring->Lock, &oldIrql);
     // In the same locked section as the detach: an ATTACH on File still on its way either was published before this (and is
     // ended below) or finds the flag and is refused.
     NfVmicGetFileContext(File)->CleanedUp = TRUE;
-    if (ring->Request != NULL && ring->File == File)
+    if (Ring->Request != NULL && Ring->File == File)
     {
-        request = ring->Request;
+        request = Ring->Request;
         // Under the lock: the cancel routine takes it before it completes the request, so the request is still ours here
         // (Learn, WdfRequestUnmarkCancelable: never call it after EvtRequestCancel has completed the request).
         status = WdfRequestUnmarkCancelable(request);
-        NfVmic_UnpublishLocked(NF_APP_DETACH_CLEANUP);
+        NfVmic_UnpublishLocked(Ring, NF_APP_DETACH_CLEANUP);
     }
-    KeReleaseSpinLock(&ring->Lock, oldIrql);
+    KeReleaseSpinLock(&Ring->Lock, oldIrql);
 
     if (request != NULL)
     {
@@ -199,6 +230,10 @@ NfVmic_DetachFile(
     }
 }
 
+//
+// Refused rundown protection (a handle closed on a control device whose cable has gone), it does nothing: the purge ended every
+// request of the cable's first, and no ring can be published again.
+//
 _Use_decl_annotations_
 static
 VOID
@@ -206,32 +241,42 @@ NfVmic_EvtFileCleanup(
     WDFFILEOBJECT FileObject
 )
 {
-    NfVmic_DetachFile(FileObject);
+    PNF_CONTROL_CONTEXT control = NfVmic_ControlOfFile(FileObject);
+
+    if (control == NULL || !ExAcquireRundownProtection(&control->Rundown))
+    {
+        return;
+    }
+
+    NfVmic_DetachFile(&control->Cable->Ring, FileObject);
+
+    ExReleaseRundownProtection(&control->Rundown);
 }
 
 static
 VOID
 NfVmic_CountReject(
-    _In_ NTSTATUS Status
+    _Inout_ PNF_APP_RING    Ring,
+    _In_    NTSTATUS        Status
 )
 {
     KIRQL oldIrql;
 
-    KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
+    KeAcquireSpinLock(&Ring->Lock, &oldIrql);
     if (Status == STATUS_DEVICE_BUSY)
     {
-        g_NfAppRing.Stats.BusyRejects++;
+        Ring->Stats.BusyRejects++;
     }
     else if (Status == STATUS_NOT_SUPPORTED)
     {
         // NfVmic_Attach's one source of it: a capture stream open in another format.
-        g_NfAppRing.Stats.FormatRejects++;
+        Ring->Stats.FormatRejects++;
     }
     else if (Status != STATUS_CANCELLED && Status != STATUS_DEVICE_REMOVED)
     {
-        g_NfAppRing.Stats.InvalidRejects++;
+        Ring->Stats.InvalidRejects++;
     }
-    KeReleaseSpinLock(&g_NfAppRing.Lock, oldIrql);
+    KeReleaseSpinLock(&Ring->Lock, oldIrql);
 }
 
 //
@@ -283,17 +328,19 @@ NfVmic_CheckHeader(
 }
 
 //
-// NF_VMIC_IOCTL_ATTACH: check, map, snapshot, publish under the lock, and leave the request pending.
+// NF_VMIC_IOCTL_ATTACH: check, map, snapshot, publish under the lock, and leave the request pending. Rundown protection held by
+// the caller (only until it returns: the pending request is the purge's to end).
 //
 static
 VOID
 NfVmic_Attach(
-    _In_ WDFREQUEST Request,
-    _In_ size_t     OutputBufferLength,
-    _In_ size_t     InputBufferLength
+    _Inout_ PNF_CABLE   Cable,
+    _In_    WDFREQUEST  Request,
+    _In_    size_t      OutputBufferLength,
+    _In_    size_t      InputBufferLength
 )
 {
-    PNF_APP_RING            ring = &g_NfAppRing;
+    PNF_APP_RING            ring = &Cable->Ring;
     NTSTATUS                status;
     PNF_VMIC_ATTACH_IN      input = NULL;
     PMDL                    mdl = NULL;
@@ -437,7 +484,7 @@ NfVmic_Attach(
     // to come: until the issuing thread exited (a handle on a completion port issues requests that belong to no thread, so
     // perhaps not even then) or the device went away, holding the app's pages locked and every other ATTACH at
     // STATUS_DEVICE_BUSY. NfVmic_DetachFile sets CleanedUp under this lock, so either it finds the request published and ends
-    // it, or this finds the flag.
+    // it, or this finds the flag. (The cancel routine reaches the cable through the file too: a published request has one.)
     //
     if (file == NULL || NfVmicGetFileContext(file)->CleanedUp)
     {
@@ -499,21 +546,23 @@ rejectLocked:
     KeReleaseSpinLock(&ring->Lock, oldIrql);
 
 reject:
-    NfVmic_CountReject(status);
+    NfVmic_CountReject(ring, status);
     WdfRequestComplete(Request, status);
 }
 
 //
-// NF_VMIC_IOCTL_STATS: a snapshot of the counters. The output buffer is the system buffer (METHOD_BUFFERED), zeroed first so
-// nothing of the kernel's leaks into it.
+// NF_VMIC_IOCTL_STATS: a snapshot of the cable's counters, in today's layout (NF_VMIC_STATS; D2 brings the per-cable layout).
+// The output buffer is the system buffer (METHOD_BUFFERED), zeroed first so nothing of the kernel's leaks into it. Every counter
+// is the binding's, from zero at its AddDevice.
 //
 static
 VOID
 NfVmic_Stats(
+    _In_ PNF_CABLE  Cable,
     _In_ WDFREQUEST Request
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &Cable->Ring;
     PNF_VMIC_STATS  out = NULL;
     NTSTATUS        status;
     LARGE_INTEGER   frequency;
@@ -537,9 +586,9 @@ NfVmic_Stats(
     out->UnderrunLogEntries = NF_VMIC_UNDERRUN_LOG_ENTRIES;
     out->EventBytes = sizeof(NF_VMIC_EVENT);
 
-    // The timer statistics and the capture-timestamp trace are interlocked: no lock.
-    NfVmicCopyStreamStats(out->Stream);
-    NfVmicCopyCaptureTrace(&out->CaptureTrace);
+    // The cable's timer statistics and capture-timestamp trace are interlocked: no lock.
+    NfVmicCopyStreamStats(Cable, out->Stream);
+    NfVmicCopyCaptureTrace(Cable, &out->CaptureTrace);
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
 
@@ -550,6 +599,9 @@ NfVmic_Stats(
     out->HandoffSkippedFrames = ring->HandoffSkippedFrames;
     out->SecondarySkips = ring->SecondarySkips;
     out->SecondarySkippedFrames = ring->SecondarySkippedFrames;
+    // The copy's jumps, written under this lock as their entries are.
+    out->SecondaryJumps = ring->SecondaryJumps;
+    out->SecondaryJumpFrames = ring->SecondaryJumpFrames;
     if (ring->Header != NULL)
     {
         out->Flags |= NF_VMIC_STATS_ATTACHED;
@@ -573,11 +625,12 @@ NfVmic_Stats(
         }
     }
 
+    // The cable's own loopback ring, in the same context: always there while the control device is (Cable.h).
     if (ring->Loopback != NULL)
     {
         PLOOPBACK_RING loopback = ring->Loopback;
 
-        // Lock order: the app ring's, then the loopback's (AppRing.h).
+        // Lock order: the app ring's, then the loopback's (Cable.h).
         KeAcquireSpinLockAtDpcLevel(&loopback->Lock);
         out->Loopback.IdlePackets = loopback->IdlePackets;
         out->Loopback.MismatchPackets = loopback->MismatchPackets;
@@ -593,13 +646,10 @@ NfVmic_Stats(
         out->Loopback.RefusedOpens = loopback->RefusedOpens;
         out->LoopbackLeadSkips = loopback->LeadSkips;
         out->LoopbackLeadSkippedFrames = loopback->LeadSkippedFrames;
-        // The device's count of the app ring's time-line jumps, written under the app ring's lock (held here) as their entries are.
-        out->SecondaryJumps = loopback->SecondaryJumps;
-        out->SecondaryJumpFrames = loopback->SecondaryJumpFrames;
         //
-        // The device's event logs, inside both locks: every writer of them holds one or the other (the app ring's events the
+        // The cable's event logs, inside both locks: every writer of them holds one or the other (the app ring's events the
         // app ring's, the loopback's its own), so the logs are copied at the instant the counters are, and agree with them.
-        // Their own locks come last (AppRing.h's order).
+        // Their own locks come last (Cable.h's order).
         //
         NfVmicCopyEventLog(&loopback->SkipLog, out->SkipLog, NF_VMIC_SKIP_LOG_ENTRIES, &out->SkipEventsLogged);
         NfVmicCopyEventLog(&loopback->UnderrunLog, out->UnderrunLog, NF_VMIC_UNDERRUN_LOG_ENTRIES, &out->UnderrunEventsLogged);
@@ -617,6 +667,11 @@ NfVmic_Stats(
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(NF_VMIC_STATS));
 }
 
+//
+// Every IOCTL reaches its cable through the queue's control device. Refused rundown protection (the cable is gone; the purged
+// queue refuses requests before this, so the order should keep any from meeting it), it completes the request with
+// STATUS_INVALID_DEVICE_STATE, as the purged queue's are.
+//
 _Use_decl_annotations_
 static
 VOID
@@ -628,42 +683,63 @@ NfVmic_EvtIoDeviceControl(
     ULONG       IoControlCode
 )
 {
-    UNREFERENCED_PARAMETER(Queue);
+    PNF_CONTROL_CONTEXT control = NfVmicGetControlContext(WdfIoQueueGetDevice(Queue));
+
+    if (control == NULL || !ExAcquireRundownProtection(&control->Rundown))
+    {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
 
     switch (IoControlCode)
     {
     case NF_VMIC_IOCTL_ATTACH:
-        NfVmic_Attach(Request, OutputBufferLength, InputBufferLength);
+        NfVmic_Attach(control->Cable, Request, OutputBufferLength, InputBufferLength);
         break;
 
     case NF_VMIC_IOCTL_STATS:
-        NfVmic_Stats(Request);
+        NfVmic_Stats(control->Cable, Request);
         break;
 
     default:
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
         break;
     }
+
+    ExReleaseRundownProtection(&control->Rundown);
 }
 
 //
-// Creates the control device. s_CdoLock held, PASSIVE_LEVEL. The steps are Learn's, "Creating a Control Device Object".
+// Creates the cable's control device, PASSIVE_LEVEL, from its AddDevice. The steps are Learn's, "Creating a Control Device
+// Object", with the rundown guard set up before the device can be opened (WdfControlFinishInitializing, last).
 //
 static
 NTSTATUS
 NfVmic_CreateControlDevice(
-    _In_ WDFDRIVER Driver
+    _In_    WDFDRIVER   Driver,
+    _Inout_ PNF_CABLE   Cable
 )
 {
     NTSTATUS                status;
     PWDFDEVICE_INIT         init;
     WDFDEVICE               device = NULL;
     WDFQUEUE                queue = NULL;
+    PNF_CONTROL_CONTEXT     control = NULL;
     WDF_FILEOBJECT_CONFIG   fileConfig;
     WDF_OBJECT_ATTRIBUTES   fileAttributes;
+    WDF_OBJECT_ATTRIBUTES   deviceAttributes;
+    WDF_OBJECT_ATTRIBUTES   queueAttributes;
     WDF_IO_QUEUE_CONFIG     queueConfig;
-    KIRQL                   oldIrql;
-    BOOLEAN                 symlink = FALSE;
+    UNICODE_STRING          deviceName;
+    UNICODE_STRING          linkName;
+
+    // No ring can be published without the cable's copy (Cable.h): no control device either.
+    if (Cable->Ring.History == NULL || Cable->DeviceName[0] == L'\0' || Cable->LinkName[0] == L'\0')
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    RtlInitUnicodeString(&deviceName, Cable->DeviceName);
+    RtlInitUnicodeString(&linkName, Cable->LinkName);
 
     init = WdfControlDeviceInitAllocate(Driver, &g_NfVmicSddl);
     if (init == NULL)
@@ -671,12 +747,12 @@ NfVmic_CreateControlDevice(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // The security descriptor covers opens of the device's namespace too (\\.\NoiseFilterVmic\anything).
+    // The security descriptor covers opens of the device's namespace too (\\.\AcxLlCable_<id>\anything).
     WdfDeviceInitSetCharacteristics(init, FILE_DEVICE_SECURE_OPEN, FALSE);
     // More than one handle: a STATS reader alongside the app that attached.
     WdfDeviceInitSetExclusive(init, FALSE);
 
-    status = WdfDeviceInitAssignName(init, &g_NfVmicDeviceName);
+    status = WdfDeviceInitAssignName(init, &deviceName);
     if (!NT_SUCCESS(status))
     {
         goto error;
@@ -688,59 +764,56 @@ NfVmic_CreateControlDevice(
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&fileAttributes, NF_VMIC_FILE_CONTEXT);
     WdfDeviceInitSetFileObjectConfig(init, &fileConfig, &fileAttributes);
 
-    // On success WdfDeviceCreate takes the init (and sets it to NULL).
-    status = WdfDeviceCreate(&init, WDF_NO_OBJECT_ATTRIBUTES, &device);
+    //
+    // On success WdfDeviceCreate takes the init (and sets it to NULL). A name another device holds fails here with
+    // STATUS_OBJECT_NAME_COLLISION: another device node carries this identity (a setup error), or (not expected) a deleted
+    // control device's name wasn't freed (IoDeleteDevice takes a named device object out of the namespace at once: spike
+    // check 4's disable and enable with a handle held got the name for the new control device).
+    //
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, NF_CONTROL_CONTEXT);
+    status = WdfDeviceCreate(&init, &deviceAttributes, &device);
     if (!NT_SUCCESS(status))
     {
         goto error;
     }
 
-    //
-    // The symbolic link by hand, not WdfDeviceCreateSymbolicLink. The framework deletes a link it made only when it destroys
-    // the device, and it destroys a deleted control device only once the last handle to it closes (WDF source:
-    // FxDevice::DeleteObject defers the destruction, and FxDevice::Destroy is the one caller of DeleteSymbolicLink). A handle
-    // still open on the old device, a STATS reader's say, would then hold the name across a disable and enable or a PnP
-    // restart: this link would fail with STATUS_OBJECT_NAME_COLLISION, and nothing would make the control device again until
-    // the PnP device was next added. So NfVmic_DeleteControlDevice deletes the link itself, with the device. The device's own
-    // name goes at once too: WdfObjectDelete calls IoDeleteDevice straight away (FxDevice::DeleteObject), which takes a named
-    // device object out of the namespace (an inference, for the live test to confirm). While s_ControlDevice is set, the link
-    // exists.
-    //
-    status = IoCreateSymbolicLink((PUNICODE_STRING)&g_NfVmicSymlinkName, (PUNICODE_STRING)&g_NfVmicDeviceName);
+    // The guard, before anything can open the device: I/O is refused until WdfControlFinishInitializing, below.
+    control = NfVmicGetControlContext(device);
+    ExInitializeRundownProtection(&control->Rundown);
+    control->Cable = Cable;
+
+    // The symbolic link by hand (the header says why). Only this binding deletes it, and only if it made it.
+    status = IoCreateSymbolicLink(&linkName, &deviceName);
     if (!NT_SUCCESS(status))
     {
         goto error;
     }
-    symlink = TRUE;
+    Cable->LinkCreated = TRUE;
 
     //
     // Parallel dispatch: the ATTACH stays pending for as long as the ring is attached, and a sequential queue would hold every
     // later request (STATS included) behind it. Not power-managed: a control device's queues can't be (Learn, the same page).
+    // Passive execution level (KMDF 1.9 and later: the framework calls the queue's callbacks only at PASSIVE_LEVEL; Learn,
+    // WDF_EXECUTION_LEVEL), which D2's snapshot mutex needs (the per-cable design, section 3). User-mode IOCTLs arrive at
+    // PASSIVE_LEVEL already. The cancel routine and the file cleanup don't depend on it: both are DISPATCH-safe.
     //
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.EvtIoDeviceControl = NfVmic_EvtIoDeviceControl;
     queueConfig.PowerManaged = WdfFalse;
-    status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
+    WDF_OBJECT_ATTRIBUTES_INIT(&queueAttributes);
+    queueAttributes.ExecutionLevel = WdfExecutionLevelPassive;
+    status = WdfIoQueueCreate(device, &queueConfig, &queueAttributes, &queue);
     if (!NT_SUCCESS(status))
     {
         goto error;
     }
 
-    //
-    // Removing (set when the last control device went) cleared before WdfControlFinishInitializing opens this one to I/O:
-    // cleared after it, an ATTACH that came in between would be refused with STATUS_DEVICE_REMOVED by a live device. Nothing of
-    // the old device can take advantage: its queue was purged under s_CdoLock, which the caller holds, and stays purged, so a
-    // handle still open on it reaches no callback but its cleanup.
-    //
-    KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
-    g_NfAppRing.Removing = FALSE;
-    KeReleaseSpinLock(&g_NfAppRing.Lock, oldIrql);
+    // Set before the device opens to I/O, so the cleanup always finds what it must delete.
+    Cable->ControlDevice = device;
+    Cable->ControlQueue = queue;
 
     // I/O is refused until this.
     WdfControlFinishInitializing(device);
-
-    s_ControlDevice = device;
-    s_ControlQueue = queue;
     return STATUS_SUCCESS;
 
 error:
@@ -748,133 +821,102 @@ error:
     {
         WdfDeviceInitFree(init);
     }
-    if (symlink)
+    if (Cable->LinkCreated)
     {
-        (void)IoDeleteSymbolicLink((PUNICODE_STRING)&g_NfVmicSymlinkName);
+        (void)IoDeleteSymbolicLink(&linkName);
+        Cable->LinkCreated = FALSE;
     }
     if (device != NULL)
     {
+        // Never opened (I/O is refused before WdfControlFinishInitializing), so nothing holds the guard; waited for anyway.
+        if (control != NULL)
+        {
+            ExWaitForRundownProtectionRelease(&control->Rundown);
+            control->Cable = NULL;
+        }
         WdfObjectDelete(device);
     }
     return status;
 }
 
-//
-// Deletes the control device. s_CdoLock held, PASSIVE_LEVEL, from the last PnP device's context cleanup.
-//
-static
-VOID
-NfVmic_DeleteControlDevice()
-{
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
-    g_NfAppRing.Removing = TRUE;
-    KeReleaseSpinLock(&g_NfAppRing.Lock, oldIrql);
-
-    // The link NfVmic_CreateControlDevice made by hand (it says why): no new handle finds the device from here, and the name is
-    // free for the next control device even while a handle to this one stays open.
-    (void)IoDeleteSymbolicLink((PUNICODE_STRING)&g_NfVmicSymlinkName);
-
-    //
-    // Cancels the pending ATTACH, if any: the purge calls the cancel routine of every request the driver owns and marked
-    // cancelable (WDF source, FxIoQueue::QueuePurge), and NfVmic_EvtRequestCancel unpublishes the ring, counts a removal and
-    // completes the request with STATUS_DEVICE_REMOVED. Returns once every request the queue delivered, STATS included, has
-    // completed; the queue stays purged, so later ones on a handle still open fail with STATUS_INVALID_DEVICE_STATE (Learn,
-    // WdfIoQueuePurgeSynchronously; FxIoQueue::QueueRequest). An ATTACH between the flag and the purge is refused by the flag,
-    // so none can be published behind the purge.
-    //
-    WdfIoQueuePurgeSynchronously(s_ControlQueue);
-
-    // IoDeleteDevice at once, the rest once the last handle closes (NfVmic_CreateControlDevice).
-    WdfObjectDelete(s_ControlDevice);
-    s_ControlDevice = NULL;
-    s_ControlQueue = NULL;
-
-    DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_INFO_LEVEL, "AudioCodec: app-feed control device deleted\n");
-}
-
 _Use_decl_annotations_
 NTSTATUS
-NfVmic_DeviceAdd(
-    WDFDRIVER       Driver,
-    WDFDEVICE       Device,
-    PLOOPBACK_RING  Loopback
+NfVmic_CableAdd(
+    WDFDRIVER   Driver,
+    PNF_CABLE   Cable
 )
 {
-    NTSTATUS    status;
-    KIRQL       oldIrql;
+    NTSTATUS status = NfVmic_CreateControlDevice(Driver, Cable);
 
-    (void)WdfWaitLockAcquire(s_CdoLock, NULL);
-
-    // The primary cable owns the one named app feed. A duplicate manually-created primary must never receive its audio.
-    if (s_DeviceCount != 0)
+    //
+    // A failure costs this cable's feed only: reported, kept for the cable's diagnostics (ControlStatus), and the cable plays on
+    // as a plain cable. Nothing retries before the device is next added. A name collision means another device node carries
+    // this cable's identity (a setup error: the setup tool and its list name the duplicate).
+    //
+    Cable->ControlStatus = status;
+    if (status == STATUS_OBJECT_NAME_COLLISION)
     {
-        WdfWaitLockRelease(s_CdoLock);
-        return STATUS_DEVICE_BUSY;
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
+                   "AudioCodec: cable %ws has no app feed (0x%08X): another device node holds %ws (a duplicate identity)\n",
+                   Cable->Label, status, Cable->DeviceName);
     }
-    s_DeviceCount++;
-
-    KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
-    if (g_NfAppRing.Loopback == NULL)
+    else if (!NT_SUCCESS(status))
     {
-        g_NfAppRing.Loopback = Loopback;
-        g_NfAppRing.LoopbackOwner = Device;
-    }
-    KeReleaseSpinLock(&g_NfAppRing.Lock, oldIrql);
-
-    if (s_ControlDevice == NULL)
-    {
-        //
-        // A failure costs the app feed only: reported, and the device goes on (as the toaster's sideband filter does). Nothing
-        // retries before the next PnP device is added. A name collision means something still holds the device's name or its
-        // link: NfVmic_DeleteControlDevice frees both, so it would be another driver's, or a deleted control device's name if
-        // IoDeleteDevice didn't free it (NfVmic_CreateControlDevice).
-        //
-        status = NfVmic_CreateControlDevice(Driver);
-        if (status == STATUS_OBJECT_NAME_COLLISION)
-        {
-            DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
-                       "AudioCodec: no app-feed control device (0x%08X): \\Device\\NoiseFilterVmic or its link is still taken\n",
-                       status);
-        }
-        else if (!NT_SUCCESS(status))
-        {
-            DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: no app-feed control device (0x%08X)\n", status);
-        }
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: cable %ws has no app feed (0x%08X)\n", Cable->Label, status);
     }
 
-    WdfWaitLockRelease(s_CdoLock);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 _Use_decl_annotations_
 VOID
-NfVmic_DeviceCleanup(
-    WDFDEVICE Device
+NfVmic_CableCleanup(
+    PNF_CABLE Cable
 )
 {
-    KIRQL oldIrql;
+    KIRQL               oldIrql;
+    UNICODE_STRING      linkName;
+    PNF_CONTROL_CONTEXT control;
 
-    (void)WdfWaitLockAcquire(s_CdoLock, NULL);
+    // 1. No new attachment, ever, for this binding: an ATTACH between this and the purge is refused with STATUS_DEVICE_REMOVED,
+    //    so none can be published behind the purge.
+    KeAcquireSpinLock(&Cable->Ring.Lock, &oldIrql);
+    Cable->Ring.Removing = TRUE;
+    KeReleaseSpinLock(&Cable->Ring.Lock, oldIrql);
 
-    // STATS stops reading this device's loopback counters before its context goes.
-    KeAcquireSpinLock(&g_NfAppRing.Lock, &oldIrql);
-    if (g_NfAppRing.LoopbackOwner == Device)
+    // 2. The link, if this binding made it: no new handle finds the device from here, and the name is free for the next binding
+    //    even while a handle to this one stays open.
+    if (Cable->LinkCreated)
     {
-        g_NfAppRing.Loopback = NULL;
-        g_NfAppRing.LoopbackOwner = NULL;
-    }
-    KeReleaseSpinLock(&g_NfAppRing.Lock, oldIrql);
-
-    if (s_DeviceCount != 0)
-    {
-        s_DeviceCount--;
-    }
-    if (s_DeviceCount == 0 && s_ControlDevice != NULL)
-    {
-        NfVmic_DeleteControlDevice();
+        RtlInitUnicodeString(&linkName, Cable->LinkName);
+        (void)IoDeleteSymbolicLink(&linkName);
+        Cable->LinkCreated = FALSE;
     }
 
-    WdfWaitLockRelease(s_CdoLock);
+    if (Cable->ControlDevice == NULL)
+    {
+        return;
+    }
+
+    //
+    // 3. Cancels the pending ATTACH, if any: the purge calls the cancel routine of every request the driver owns and marked
+    //    cancelable (WDF source, FxIoQueue::QueuePurge), and NfVmic_EvtRequestCancel unpublishes the ring, counts a removal and
+    //    completes the request with STATUS_DEVICE_REMOVED. Returns once every request the queue delivered, STATS included, has
+    //    completed; the queue stays purged, so later ones on a handle still open fail with STATUS_INVALID_DEVICE_STATE (Learn,
+    //    WdfIoQueuePurgeSynchronously; FxIoQueue::QueueRequest).
+    //
+    WdfIoQueuePurgeSynchronously(Cable->ControlQueue);
+
+    // 4. Every callback still holding the guard has finished (<= APC_LEVEL, wdm.h); none is granted it again, so a file cleanup
+    //    on the lingering deleted control device touches nothing.
+    control = NfVmicGetControlContext(Cable->ControlDevice);
+    ExWaitForRundownProtectionRelease(&control->Rundown);
+    control->Cable = NULL;
+
+    // 5. IoDeleteDevice at once, the rest once the last handle closes (the header). The caller frees the cable's buffers after.
+    WdfObjectDelete(Cable->ControlDevice);
+    Cable->ControlDevice = NULL;
+    Cable->ControlQueue = NULL;
+
+    DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_INFO_LEVEL, "AudioCodec: cable %ws's control device deleted\n", Cable->Label);
 }

@@ -7,8 +7,8 @@ there (doc/todo/19-driver-base-2026-10-28.md has the plan and the spike's checks
 **Licence.** The files under `src/` derive from the sample, which is MS-PL (`LICENSE-MS-PL.txt`): they stay MS-PL (its
 section 3(D)). The scripts are ours, under the repo's licence. `src/Common/PacketSize.{h,cpp}` are ported from
 microsoft/low-latency-audio (MIT, `LICENSE-MIT-low-latency-audio.txt`) and keep its Microsoft and Yamaha notices.
-`src/Shared/nf_vmic.h`, `src/Common/AppRing.{h,cpp}` and `src/AudioCodec/Driver/Control.cpp` are ours, not the sample's:
-MIT OR Apache-2.0, so the Rust mirror of the protocol stays under the repo's licence (the repo's licence, the owner, 2026-11-23: `LICENSE-MIT` and `LICENSE-APACHE` at the root).
+`src/Shared/nf_vmic.h`, `src/Shared/Cable.h`, `src/Common/AppRing.{h,cpp}` and `src/AudioCodec/Driver/Control.cpp` are ours,
+not the sample's: MIT OR Apache-2.0, so the Rust mirror of the protocol stays under the repo's licence (the repo's licence, the owner, 2026-11-23: `LICENSE-MIT` and `LICENSE-APACHE` at the root).
 
 **What changed from the sample** (the first commit after the import shows it): KMDF 1.35 (Windows 11 24H2 / Server 2025,
 build 26100, and up: the owner, 2026-11-20) in both projects, and the INF's OS floor 10.0...26100 to match. ACX stays 1.1,
@@ -53,8 +53,19 @@ packet-size constraints) for apps that ask for them, and "Call Microphone" (a se
 5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
 reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
 Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|low-latency`; the driver reads
-`NfMicrophones` from the device's hardware key): `ROOT\AudioCodec` both, `ROOT\AudioCodecCall` the call microphone,
-`ROOT\AudioCodecLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
+`NfMicrophones` from the device's hardware key): `ROOT\AcxLlCable` both, `ROOT\AcxLlCableCall` the call microphone,
+`ROOT\AcxLlCableLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
+
+**Cables (TODO 19, the per-cable design, `doc/todo/19-per-cable-design.md`).** Every cable (A, B, C...) is a device node of
+the one package, with one of the three hardware IDs (shared by every cable) and an instance ID the setup tool fixes,
+`ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`: the label one to eight of A-Z and 0-9, the id the cable's identity (a GUID's 36
+characters), n an instance number from 1. The driver reads the label and identity there at AddDevice and refuses a node
+without them (STATUS_DEVICE_CONFIGURATION_ERROR, code 31: devcon and Add legacy hardware make `ROOT\MEDIA\NNNN`). Each cable
+has its own app ring and copy, counters, event logs, timer statistics, capture trace and control device,
+`\\.\AcxLlCable_<id>` (the identity in lower case), all in its device's context: removing or re-adding one cable touches no
+other's, and its counters start at zero with each binding (AddDevice). Only the stream serial is driver-wide. The device's
+friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
+circuit's component ID is the identity XOR the sample's constant.
 
 ### Independent Cable B
 
@@ -93,8 +104,8 @@ one-packet fill, so it follows the client's period. The second is the loopback's
 behind the render) and compares with another cable's `--cable-only` figure (VB-CABLE's: 50-62 ms on the same VM); a client
 gets each packet about a packet plus its wake after its first frame's device time (10.4 ms at a 10 ms period).
 
-The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
-(page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
+The app feed (spike check 4): each cable's control device, `\\.\AcxLlCable_<id>`, takes an app's ring of 48 kHz float32
+stereo frames (page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
 plays it instead of the loopback, frame for frame. The request ends with ERROR_OPERATION_ABORTED (a cancel, the issuing thread
 or process exiting, or the handle closed) or ERROR_DEVICE_REMOVED (the device is going away: the app must then close every
 handle, since an open handle on the control device keeps the driver loaded). `src/Shared/nf_vmic.h` has the protocol, every
@@ -104,7 +115,7 @@ Only SYSTEM and Administrators may open it for the spike: letting unelevated use
 session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for the same reason as above.
 
 Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
-others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, in the image's .data) on the same QPC
+others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, the cable's) on the same QPC
 time line, the reader's packet plus 1 ms behind (`SecondaryFramesCopied`; `SecondaryUnderrunFrames` counts the silence
 they get where no reader delivered, a jump in the reader's time line included). No stream gets a frame twice. At a handoff
 (the reader stops and another stream takes the reader slot) the taker skips its lag once (`ReaderHandoffs`,
@@ -113,10 +124,10 @@ is shorter moving on to its lag at once and skipping the difference once, counte
 `SecondarySkippedFrames`: the owner, 2026-11-23, lower latency over a one-time skip; from a66d8ab to e801320 they kept the
 longer lag until they next ran). A reader gives the reader slot up as its Pause starts, while its timer still runs: given
 up after the timer stopped, it left the copy short for as long as the stop took, and the streams playing on lost 55 to 111
-frames at live handoffs (2026-11-23). More than one can run: the microphones of two of the driver's devices share the one
-ring, and a RAW and a DEFAULT client make two device streams on one (spike check 4's live runs).
+frames at live handoffs (2026-11-23). More than one can run: a cable's two microphones share its ring, and a RAW and a
+DEFAULT client make two device streams on one (spike check 4's live runs).
 
-Each device also keeps two event logs, which STATS copies for the app feed's device (`nf_vmic.h`, "The event logs"; the
+Each cable also keeps two event logs, which its STATS copies (`nf_vmic.h`, "The event logs"; the
 owner, 2026-11-24: telemetry to find bugs by, and to prove the design). The skip log (64 entries) holds every event in which
 a capture stream never got some of the audio it was due, each with its stream (a serial given at creation), its time, the
 span on the QPC time line and the ring's frames it concerns: a taker's handoff skip, a skip to a shorter lag, a jump in a

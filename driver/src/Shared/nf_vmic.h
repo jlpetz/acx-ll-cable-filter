@@ -17,14 +17,17 @@ Module Name:
 
 Abstract:
 
-    One named control device, \Device\NoiseFilterVmic (symbolic link \DosDevices\NoiseFilterVmic), opened from user mode as
-    \\.\NoiseFilterVmic with FILE_FLAG_OVERLAPPED, takes two IOCTLs:
+    One control device per cable (TODO 19, the per-cable design, doc/todo/19-per-cable-design.md): \Device\AcxLlCable_<id>
+    (symbolic link \DosDevices\AcxLlCable_<id>), opened from user mode as \\.\AcxLlCable_<id> with FILE_FLAG_OVERLAPPED, where
+    <id> is the cable's identity: a GUID's 36 lower-case characters, no braces (the setup tool puts it in the cable's device
+    instance ID, ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>, which the driver reads at AddDevice). \\.\NoiseFilterVmic is gone.
+    Each takes two IOCTLs, for its own cable only (its ring, its statistics):
 
     NF_VMIC_IOCTL_ATTACH (METHOD_OUT_DIRECT, read and write access). Input: an NF_VMIC_ATTACH_IN. Output: the app's ring,
         exactly NF_VMIC_RING_BYTES(capacity) long and starting on a page boundary (VirtualAlloc's memory does): an
         NF_VMIC_RING_HEADER, then the frames. The I/O manager probes and locks the pages for the request's life; the driver maps
         them no-execute and keeps the request pending, reading the ring from the capture stream's timer, until the request ends.
-        One attachment at a time.
+        One attachment at a time on each cable.
 
         Refusals complete the request without publishing the ring. KMDF pends every request it delivers to the driver, so on
         the overlapped handle each refusal below returns ERROR_IO_PENDING from DeviceIoControl, and then its status from
@@ -57,10 +60,10 @@ Abstract:
         Otherwise the ring is published: the header's State turns NF_VMIC_STATE_ATTACHED while the request stays pending (the
         app's sign that the ring is live). It ends with one of:
           - STATUS_CANCELLED (995): CancelIoEx, the thread that issued it or its process exiting, or the handle closed.
-          - STATUS_DEVICE_REMOVED (1617): the device is going away (its last PnP device removed, disabled or updated). Close
-            every handle to the control device then: the framework destroys a deleted control device only once the last handle
-            closes, and until then it keeps the driver loaded. The driver deletes the symbolic link with the device, so the name
-            is free at once, and a PnP device that comes back gets a new control device under it. A handle opened earlier
+          - STATUS_DEVICE_REMOVED (1617): the cable's device is going away (removed, disabled or updated). Close every handle
+            to the control device then: the framework destroys a deleted control device only once the last handle closes, and
+            until then it keeps the driver loaded. The driver deletes the symbolic link with the device, so the name is free at
+            once, and the cable's device that comes back gets a new control device under it. A handle opened earlier
             stays on the deleted device, where every request fails at once (DeviceIoControl returns ERROR_BAD_COMMAND, 22:
             STATUS_INVALID_DEVICE_STATE, the queue is purged): open a new one. With no control device the open fails with
             ERROR_FILE_NOT_FOUND (2).
@@ -95,7 +98,7 @@ The ring's rules:
       Run). Only the reader reads the ring and moves ReadFrame, so its passes set the pace. The driver keeps a copy of the
       packets it delivers (its underrun silence included) on the stream engine's QPC time line, and every other capture stream
       running in 48 kHz float32 stereo plays that copy a lag behind: the reader's packet plus 1 ms and a frame. More than one
-      capture stream can run at once: the microphones of two of the driver's devices share the one app ring, and the audio
+      capture stream can run at once: a cable's microphones share that cable's app ring (each cable has its own), and the audio
       engine opens a device stream per processing mode (a RAW and a DEFAULT client make two). The other streams' passes are
       counted in NF_VMIC_STATS only (NotReaderPackets, SecondaryFramesCopied, SecondaryUnderrunFrames, SecondarySkips,
       SecondarySkippedFrames).
@@ -168,7 +171,8 @@ NF_VMIC_RING_HEADER (256 bytes, four 64-byte lines; little-endian; the frames st
     Line 3 (192-255): reserved, 0.
      256        frames           app     CapacityFrames x NF_VMIC_FRAME_BYTES
 
-NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; times in 100 ns units):
+NF_VMIC_STATS (6864 bytes; one cable's, all counters cumulative since its binding began, AddDevice: a disable and enable, an
+update or a re-add starts them at zero; times in 100 ns units):
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
@@ -198,7 +202,7 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
      648     8  SecondarySkippedFrames   the copy's frames those skips passed over (the last reader's underrun silence there
                                          included; its recorded gaps not)
      656     8  LoopbackLeadSkips        times a loopback capture read moved on at once to a shorter render lead (valid with
-                                         NF_VMIC_STATS_LOOPBACK, as Loopback is: the first-registered device's)
+                                         NF_VMIC_STATS_LOOPBACK, as Loopback is: the cable's own)
      664     8  LoopbackLeadSkippedFrames
                                          the loopback ring's audio those skips passed over (the difference in leads at most)
      672     8  SkipEventsLogged         events the skip log has taken since its device was added (the newest's Sequence; 0: none)
@@ -211,7 +215,7 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
     4800  2048  UnderrunLog              NF_VMIC_EVENT[32]: event n in slot (n - 1) % 32
     6848     8  SecondaryJumps           times a capture stream playing the copy found its own time line moved later (a
                                          late timer's glitch adjustment), each a SECONDARY_JUMP entry in the skip log (the
-                                         device's, as the logs are: valid with NF_VMIC_STATS_LOOPBACK)
+                                         cable's, as the logs are)
     6856     8  SecondaryJumpFrames      the copy's frames those jumps passed over (their entries' Frames, added up): what
                                          the copy held there as each was logged, as SecondarySkippedFrames counts a skip; a
                                          span past the copy's end then is filled in only in the entry's ring frames
@@ -268,8 +272,8 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
     EvtAcxStreamGetCurrentPacket calls. All capture streams', the latest of any of them; QPCs in ticks; each field is written
     whole, the set not as one.
 
-    The event logs (TODO 19, the owner, 2026-11-24: telemetry to find bugs by, and to prove the design): every device keeps
-    two rings of NF_VMIC_EVENT, its own, and STATS copies those of the device whose loopback Loopback is (the app feed's).
+    The event logs (TODO 19, the owner, 2026-11-24: telemetry to find bugs by, and to prove the design): every cable keeps
+    two rings of NF_VMIC_EVENT, its own, and its STATS copies them.
     The skip log holds every event in which a capture stream never got some of the audio it was due, one entry an event:
     HANDOFF_SKIP, SECONDARY_SKIP, SECONDARY_JUMP, LATE_READ, RESYNC, LIVE_DISCARD and LOOPBACK_LEAD_SKIP. The underrun log
     holds the silence a stream got with nothing lost (READER_UNDERRUN, SECONDARY_UNDERRUN, LOOPBACK_UNDERRUN), one entry a
@@ -279,18 +283,18 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
     (the loopback's) at a pass the app ring served or the loopback zero-filled idle. Each log numbers its events from 1
     (Sequence) and keeps the latest NF_VMIC_*_LOG_ENTRIES: event n in slot (n - 1) % entries; *EventsLogged is the newest's
     number, so the window between two snapshots holds every event in it unless its count rose by more than the slots. STATS
-    copies the logs under their own lock, nested in the app ring's and the loopback's (which every writer of the app feed
-    device's logs holds), at the same instant as the counters: every entry is whole, and the counters agree with the log
+    copies the logs under their own lock, nested in the app ring's and the loopback's (which every writer of the cable's logs
+    holds), at the same instant as the counters: every entry is whole, and the counters agree with the log
     (the skips' entries in a window add up to their counters' rise). An unused slot is all zero; a reader takes an entry
     whose Sequence isn't its slot's (n - 1) % entries, or is above the total or the slots' count below it, as unreadable
     (not expected).
 
     NF_VMIC_EVENT (64 bytes). Sequence, the QPC of the pass that logged it (a run's first), Kind, Flags, the capture stream
-    (Stream: a serial from 1 each stream is given when it is created, since the driver loaded), its packet (PacketFrames, in
-    its format's frames), Frames (by kind, below), the attachment (Attach: NF_VMIC_RING_STATS.Attaches when it was logged,
-    its low 32 bits; 0 for the loopback's), the span it concerns on the stream engine's QPC time line (SpanFrom and
-    SpanFrames: frame n is n / the rate's seconds of QPC time, as the app ring's copy and the loopback ring place their
-    audio), and with NF_VMIC_EVENTF_RING the ring's frames it concerns, [RingFrom, RingTo): the app ring's positions, which
+    (Stream: a serial from 1 each stream is given when it is created, since the driver loaded, across every cable), its
+    packet (PacketFrames, in its format's frames), Frames (by kind, below), the attachment (Attach: NF_VMIC_RING_STATS.Attaches
+    when it was logged, its low 32 bits; 0 for the loopback's), the span it concerns on the stream engine's QPC time line
+    (SpanFrom and SpanFrames: frame n is n / the rate's seconds of QPC time, as the app ring's copy and the loopback ring place
+    their audio), and with NF_VMIC_EVENTF_RING the ring's frames it concerns, [RingFrom, RingTo): the app ring's positions, which
     the app numbered (nf-vmic-test's signal puts its code for frame n at position n), or the loopback ring's frames (its time
     line's). Where a span held silence among the audio (the reader's underruns), its ring frames are only the audio's.
       - HANDOFF_SKIP: a stream that played the copy took the reader slot (ReaderHandoffs, one entry each). Span: its place in
@@ -301,7 +305,7 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
       - SECONDARY_JUMP: a stream playing the copy whose own time line moved later (a late timer's glitch adjustment): what the
         copy holds between its place and its new read never reaches it. Frames: the copy's frames there as it was logged, as
         a skip counts them (what lay past the copy's end then is filled in only in its ring span, below, never in Frames).
-        Counted in SecondaryJumps and SecondaryJumpFrames (one entry each, its Frames; the device's, as the log is: the
+        Counted in SecondaryJumps and SecondaryJumpFrames (one entry each, its Frames; the cable's, as the log is: the
         owner, 2026-11-24); its glitch adjustment in Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses too.
       - LATE_READ: a stream playing the copy read past the copy's end (the reader late, or none yet): silence, SpanFrames of
         it (Frames), and the audio the reader then writes there never reaches it. One entry for a stream's contiguous reads
@@ -336,9 +340,10 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
 #define NF_VMIC_VERSION                 1u
 #define NF_VMIC_LIVE_VERSION            2u              // opt-in ATTACH and ring header only; ordinary ATTACH and STATS stay v1
 
-#define NF_VMIC_DEVICE_NAME             L"\\Device\\NoiseFilterVmic"
-#define NF_VMIC_SYMLINK_NAME            L"\\DosDevices\\NoiseFilterVmic"
-#define NF_VMIC_USER_PATH               L"\\\\.\\NoiseFilterVmic"
+// A cable's control device: the prefix, then the identity's 36 lower-case characters (the per-cable design, section 3).
+#define NF_VMIC_DEVICE_PREFIX           L"\\Device\\AcxLlCable_"
+#define NF_VMIC_SYMLINK_PREFIX          L"\\DosDevices\\AcxLlCable_"
+#define NF_VMIC_USER_PREFIX             L"\\\\.\\AcxLlCable_"
 
 // 0x0022E002 and 0x00226004.
 #define NF_VMIC_IOCTL_ATTACH            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
@@ -370,7 +375,7 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
 
 // NF_VMIC_STATS.Flags bits.
 #define NF_VMIC_STATS_ATTACHED          0x00000001u     // an app ring is attached (the Attached* fields are valid)
-#define NF_VMIC_STATS_LOOPBACK          0x00000002u     // the PnP device is there (Loopback is valid)
+#define NF_VMIC_STATS_LOOPBACK          0x00000002u     // the cable's loopback ring is there (Loopback is valid): always set
 #define NF_VMIC_STATS_READING           0x00000004u     // the header's NF_VMIC_STATE_READING (the reader's latest pass)
 #define NF_VMIC_STATS_FORMAT_MISMATCH   0x00000008u     // the header's NF_VMIC_STATE_FORMAT_MISMATCH (the reader's latest pass)
 
@@ -511,7 +516,8 @@ typedef struct _NF_VMIC_EVENT {
     UINT64  Qpc;                        //   8: KeQueryPerformanceCounter at the pass that logged it
     UINT16  Kind;                       //  16: NF_VMIC_EVENT_*
     UINT16  Flags;                      //  18: NF_VMIC_EVENTF_*
-    UINT32  Stream;                     //  20: the capture stream's serial (from 1, in creation order since the driver loaded)
+    UINT32  Stream;                     //  20: the capture stream's serial (from 1, in creation order since the driver loaded,
+                                        //      across every cable)
     UINT32  PacketFrames;               //  24: its packet, in its format's frames
     UINT32  Frames;                     //  28: by kind (the notes above)
     UINT32  Attach;                     //  32: NF_VMIC_RING_STATS.Attaches when logged (its low 32 bits); 0: the loopback's

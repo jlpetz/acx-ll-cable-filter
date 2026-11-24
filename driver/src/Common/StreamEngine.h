@@ -114,6 +114,14 @@ LoopbackRingOfCircuit(
     _In_    ACXCIRCUIT          Circuit
 );
 
+// noise-filter (TODO 19, the per-cable design, section 5): the cable of the device a circuit belongs to, or NULL. The same
+// context as LoopbackRingOfCircuit's: the cable's Ring.Loopback is that loopback ring.
+__drv_maxIRQL(DISPATCH_LEVEL)
+PNF_CABLE
+CableOfCircuit(
+    _In_    ACXCIRCUIT          Circuit
+);
+
 // A stream format's loopback fields (Valid left FALSE: it needs the packet size, known only at Run).
 __drv_maxIRQL(DISPATCH_LEVEL)
 VOID
@@ -148,16 +156,17 @@ LoopbackStreamClose(
 
 //
 // noise-filter (TODO 19, spike check 4): the capture circuit's creation-time checks, the loopback's and the app ring's, in one
-// step under both locks (AppRing.h has the order). Refuses (STATUS_NOT_SUPPORTED) a format other than 48 kHz float32 stereo
-// while an app ring is attached, counted in RefusedCaptureOpens; else LoopbackStreamOpen's check and record (Ring: NULL if
-// the device has none), and a stream in another format counted in OtherFormatCaptureOpens, which ATTACH refuses while it
-// isn't 0. CaptureStreamClose gives both records back. noinline for the reason above.
+// step under both locks of the stream's cable (Cable.h has the order). Refuses (STATUS_NOT_SUPPORTED) a format other than
+// 48 kHz float32 stereo while the cable's app ring is attached, counted in RefusedCaptureOpens; else LoopbackStreamOpen's check
+// and record on the cable's loopback ring (Cable->Ring.Loopback), and a stream in another format counted in
+// OtherFormatCaptureOpens, which ATTACH refuses while it isn't 0. STATUS_INVALID_DEVICE_STATE with no cable. CaptureStreamClose
+// gives both records back. noinline for the reason above.
 //
 __declspec(noinline)
 __drv_maxIRQL(DISPATCH_LEVEL)
 NTSTATUS
 CaptureStreamOpen(
-    _In_opt_    PLOOPBACK_RING          Ring,
+    _In_opt_    PNF_CABLE               Cable,
     _In_        const LOOPBACK_FORMAT * Format
 );
 
@@ -165,7 +174,7 @@ __declspec(noinline)
 __drv_maxIRQL(DISPATCH_LEVEL)
 VOID
 CaptureStreamClose(
-    _In_opt_    PLOOPBACK_RING          Ring,
+    _In_opt_    PNF_CABLE               Cable,
     _In_        const LOOPBACK_FORMAT * Format
 );
 
@@ -345,17 +354,20 @@ protected:
 
     // noise-filter (TODO 19): the device's loopback ring and this stream's place on its time line.
     PLOOPBACK_RING      m_Loopback;         // in the WDFDEVICE's context; NULL if the device has none
+    // noise-filter (TODO 19, the per-cable design): the device's cable (its app ring, timer statistics and trace), in the same
+    // context as m_Loopback (m_Cable->Ring.Loopback == m_Loopback); NULL if the device has none.
+    PNF_CABLE           m_Cable;
     LOOPBACK_FORMAT     m_LbFormat;         // this stream's format, snapshotted at Run
     ULONG               m_LbPacketFrames;   // m_PacketSize in frames
     ULONG               m_LbRingFrames;     // LOOPBACK_RING_BYTES in frames
     ULONGLONG           m_LbAnchor;         // ring frame of this stream's byte position 0 on its current time line
     BOOLEAN             m_LbAnchorValid;
     BOOLEAN             m_LbOpen;           // this stream holds an open record (LoopbackAdoptOpen)
-    PLOOPBACK_RING      m_LbOpenRing;       // the ring it is counted open in, or NULL (a capture stream on a device without one)
+    PLOOPBACK_RING      m_LbOpenRing;       // the loopback ring it is counted open in (a capture stream: its cable's)
     BOOLEAN             m_LbOpenRender;
     LOOPBACK_FORMAT     m_LbOpenFormat;
 
-    // noise-filter (TODO 19, spike check 5): the timer statistics (AppRing.h).
+    // noise-filter (TODO 19, spike check 5): the timer statistics (AppRing.h), its cable's.
     ULONG               m_StatsKind;        // NF_VMIC_KIND_RENDER or NF_VMIC_KIND_CAPTURE: the NF_VMIC_STREAM_STATS it counts in
     ULONGLONG           m_ArmedHns;         // the time ScheduleNextPass armed the timer for (its schedule's 100 ns units)
     // noise-filter (TODO 19): the stream's serial in the event logs (NF_VMIC_EVENT.Stream), given at creation.
@@ -588,7 +600,7 @@ protected:
     ULONG           m_LbAnchorLead;     // the render lead it reads behind (LOOPBACK_RING.RenderLeadFrames at its latest pass)
     ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
-    // noise-filter (TODO 19, spike check 4): the app-fed ring (AppRing.h).
+    // noise-filter (TODO 19, spike check 4): its cable's app-fed ring (Cable.h, m_Cable->Ring).
     BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied
     ULONGLONG       m_AppEnd;           // its place on the copy's time line: the end of what it has had (AppRingPlayCopy)
     ULONGLONG       m_AppEndAttach;     // the attachment m_AppEnd is from (NF_VMIC_RING_STATS.Attaches; 0: none yet)

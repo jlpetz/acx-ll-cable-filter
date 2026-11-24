@@ -169,6 +169,7 @@
     <ClInclude Include="PacketSize.h" />
     <ClInclude Include="AppRing.h" />
     <ClInclude Include="..\Shared\nf_vmic.h" />
+    <ClInclude Include="..\Shared\Cable.h" />
     <ClInclude Include="KeywordDetector.h" />
     <ClInclude Include="Private.h" />
     <ClInclude Include="Public.h" />

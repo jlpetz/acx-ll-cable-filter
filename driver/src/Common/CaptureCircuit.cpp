@@ -702,11 +702,11 @@ Return Value:
     CCaptureStreamEngine *          streamEngine = nullptr;
     CODEC_CAPTURE_CIRCUIT_CONTEXT * circuitCtx;
     CODEC_PIN_CONTEXT *             pinCtx;
-    PLOOPBACK_RING                  lbRing = nullptr;
+    PNF_CABLE                       cable = nullptr;
     bool                            lbOpen = false;
     LOOPBACK_FORMAT                 lbFormat = {};
 
-    auto streamEngineScope = scope_exit([&streamEngine, &lbRing, &lbOpen, &lbFormat]() {
+    auto streamEngineScope = scope_exit([&streamEngine, &cable, &lbOpen, &lbFormat]() {
 
         if (streamEngine)
         {
@@ -716,7 +716,7 @@ Return Value:
         // noise-filter (TODO 19): a creation that fails after CaptureStreamOpen gives the records back.
         if (lbOpen)
         {
-            CaptureStreamClose(lbRing, &lbFormat);
+            CaptureStreamClose(cable, &lbFormat);
         }
 
         });
@@ -766,14 +766,14 @@ Return Value:
     AcxStreamInitSetAcxRtStreamSupportsNotifications(StreamInit);
 
     //
-    // noise-filter (TODO 19): refuse a format other than one the render circuit has open, or, while an app ring is attached
-    // (spike check 4), any format but the ring's 48 kHz float32 stereo (CaptureStreamOpen, StreamEngine.cpp), so the client
-    // can retry with that format rather than open onto a loopback or a ring that only zero-fills. Before the stream exists, so
-    // a refusal leaves nothing to undo; the stream engine takes the records over below.
+    // noise-filter (TODO 19): refuse a format other than one the render circuit has open, or, while the cable's app ring is
+    // attached (spike check 4), any format but the ring's 48 kHz float32 stereo (CaptureStreamOpen, StreamEngine.cpp), so the
+    // client can retry with that format rather than open onto a loopback or a ring that only zero-fills. Before the stream
+    // exists, so a refusal leaves nothing to undo; the stream engine takes the records over below.
     //
-    lbRing = LoopbackRingOfCircuit(Circuit);
+    cable = CableOfCircuit(Circuit);
     LoopbackFormatOf(StreamFormat, &lbFormat);
-    RETURN_NTSTATUS_IF_FAILED(CaptureStreamOpen(lbRing, &lbFormat));
+    RETURN_NTSTATUS_IF_FAILED(CaptureStreamOpen(cable, &lbFormat));
     lbOpen = true;
 
     //
@@ -793,7 +793,8 @@ Return Value:
     streamEngine = new (POOL_FLAG_NON_PAGED, DeviceDriverTag) CCaptureStreamEngine(stream, StreamFormat);
     RETURN_NTSTATUS_IF_TRUE(streamEngine == nullptr, STATUS_INSUFFICIENT_RESOURCES);
 
-    streamEngine->LoopbackAdoptOpen(lbRing, FALSE, &lbFormat);
+    // The record is on the cable's loopback ring (CaptureStreamOpen succeeded, so the cable and its ring are there).
+    streamEngine->LoopbackAdoptOpen(cable->Ring.Loopback, FALSE, &lbFormat);
     lbOpen = false;
 
     streamCtx->StreamEngine = (PVOID)streamEngine;
