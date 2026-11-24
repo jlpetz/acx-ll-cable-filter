@@ -1,7 +1,14 @@
 //! nf-vmic-test: spike check 4's tool for the driver's app-fed capture ring (TODO 19; driver/README.md, "App feed").
 //!
+//! Every mode that opens the driver works on one cable (the per-cable design, doc/todo/19-per-cable-design.md, section 10; N0's
+//! slice): `--path \\.\AcxLlCable_<id>`, its control device, or without it the cable labelled A, else the only cable, as Plug
+//! and Play lists the cables' device nodes ([`cables::present`]). The endpoint a mode records or plays is that cable's own,
+//! found by the instance ID its KS filter names ([`sessions::pick`]), never by its name: its Microphone (Microphone0), with
+//! `--mic call` its Call Microphone (Microphone1), or for `open --render` its Speakers. `--device NAME` names an endpoint instead,
+//! which must be that cable's (open's may be any).
+//!
 //! - `feed` attaches a ring and writes the test signal, paced by the driver's `read_frame`, until Ctrl+C.
-//! - `verify` records "Microphone (AudioCodec Device)" (shared mode, float32 stereo 48 kHz, RAW where offered, or the processing
+//! - `verify` records the cable's Microphone (shared mode, float32 stereo 48 kHz, RAW where offered, or the processing
 //!   mode and IAudioClient3 period asked for) while a feed runs, and passes only with proof that the app ring fed the recording:
 //!   the driver's statistics just before and just after it (the same attachment, read throughout, its frames copied), and the
 //!   signal bit-exact on both channels and in order, with silence only where the driver counted underruns, the reader's or a
@@ -24,10 +31,11 @@
 //! - `stamps` records a capture endpoint and, after each GetBuffer, reads the driver's capture-timestamp trace from STATS, to
 //!   set the device time the client sees beside the packet times the driver gave ACX (TODO 19).
 //!
-//! The spike's control device admits SYSTEM and Administrators only: run it elevated. The owner runs it (CLAUDE.md); no test
-//! starts it. Its feed loop prints a status line a second, which formats and allocates: a test tool's liberty, with the ring's
-//! 20 ms of fill (the default target) as the margin. `latency` prints nothing while it measures, and its feed and capture
-//! threads allocate nothing per block or packet once they run: their logs are sized from `--seconds` before the start.
+//! A cable's control device admits SYSTEM and Administrators only (D1 keeps the spike's SDDL): run it elevated. The owner runs it
+//! (CLAUDE.md); no test starts it. Its feed loop prints a status line a second, which formats and allocates: a test tool's
+//! liberty, with the ring's 20 ms of fill (the default target) as the margin. `latency` prints nothing while it measures, and its
+//! feed and capture threads allocate nothing per block or packet once they run: their logs are sized from `--seconds` before the
+//! start.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::collections::BTreeSet;
@@ -43,6 +51,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
+use nf_vmic::cables::{self, CableId, EndpointKind, PresentCable};
 use nf_vmic::latency::{self, Block, Continuity, FrameCounts, Log, Receipt, Run, Summary, Weighted};
 use nf_vmic::protocol::{
     self, CaptureTrace, EVENT_HANDOFF_SKIP, EVENT_LATE_READ, EVENT_LIVE_DISCARD, EVENT_LOOPBACK_LEAD_SKIP, EVENT_RESYNC,
@@ -51,6 +60,7 @@ use nf_vmic::protocol::{
     STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_READING, STATS_ATTACHED, STATS_FORMAT_MISMATCH, STATS_LOOPBACK, STATS_READING, Stats,
     StreamStats,
 };
+use nf_vmic::sessions::{self, CableEndpoint, EndpointState, Pick};
 use nf_vmic::signal::{self, CheckReport, SequenceChecker};
 use nf_vmic::{AttachError, Attachment, Device, RingMemory, Writer, top_up};
 use wasapi::{
@@ -77,8 +87,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{BOOL, HRESULT, Owned, PCWSTR, w};
 
-/// The capture endpoint the driver's ring feeds (spike check 1's name).
-const ENDPOINT: &str = "Microphone (AudioCodec Device)";
 /// How long verify waits, once its stream runs, for the driver to report a capture stream reading the ring.
 const READING_WAIT: Duration = Duration::from_secs(2);
 /// How long verify waits after the recording, where no stream holds the reader slot (the last reader stopped as it ended), for
@@ -95,84 +103,95 @@ const GUARD_WAIT: Duration = Duration::from_secs(10);
 const USAGE: &str = "\
 nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it elevated.
 
-  nf-vmic-test feed [--seconds N] [--capacity FRAMES] [--target FRAMES] [--start N] [--quiet]
+  Every mode works on one cable (ACX-LL-Cable, the per-cable driver): --path \\\\.\\AcxLlCable_<id>, the cable's control
+  device (its identity, the GUID in its instance ID ROOT\\MEDIA\\ACXLLCABLE_<label>_<id>_<n>, as `acx-ll-cable list` shows it),
+  or without --path the cable labelled A, else the only cable. kill-test gives its feed children the same path. The endpoint a
+  mode records is that cable's own, found by the instance ID its KS filter names, not by its name: its Microphone
+  (Microphone0), or with --mic call its Call Microphone (Microphone1). --device NAME (the endpoint's name, as Sound settings
+  shows it) names one instead, which must be that cable's; open's --device may be any endpoint.
+
+  nf-vmic-test feed [--path PATH] [--seconds N] [--capacity FRAMES] [--target FRAMES] [--start N] [--quiet]
       Attach a ring and write the test signal (frame n carries the code n mod 2^23, a different float32 on each channel),
       paced by the driver's read_frame, until Ctrl+C (or for N seconds; default 0, until stopped). The capacity is a power
       of two from 1024 to 262144 frames (default 8192). The target is the fill kept, in frames (default 960, 20 ms): at least
       one capture packet (480 frames for a shared stream's 10 ms period), or every pass underruns; the feed ends with an error
       once the reader's packet shows the target is below it. --start: the first frame's number. A refusal says why:
       ERROR_NOT_SUPPORTED (50) means a capture stream is open in a format other than 48 kHz float32 stereo.
-  nf-vmic-test verify [--seconds N] [--device NAME] [--mode raw|default|communications] [--period-frames N] [--start N]
-      Start `feed` first, in another window, and leave it running. Then record the capture endpoint (default \"Microphone
-      (AudioCodec Device)\") in shared mode, float32 stereo 48 kHz, for N seconds (default 10), and check that the app ring
-      fed it: the driver's statistics just before and after (the same attachment, read throughout, its frames copied), and
-      the signal bit-exact on both channels and in order, with silence only where the driver underran (the reader, or a
-      secondary stream; one packet's slack at each end). The recording starts once the stream delivers the signal (2 s at
-      most). --mode: the processing mode the stream asks for (default: RAW where the endpoint offers it, else DEFAULT).
-      --period-frames: open through IAudioClient3's InitializeSharedAudioStream at that engine period, in frames (a
-      small-period helper, or a second client in another mode); the period granted is printed. --start: the feed's
-      --start (default 0), so the codes name the ring's frames. Unmute the endpoint. The first capture stream to run
-      reads the ring; the driver gives the others its audio as secondary streams. When the reader stops, another takes the
-      slot with one skip; the rest play on with no repeat, getting silence where the new reader's packet is longer and
-      skipping once where it is shorter. Each gap must be the driver's own record of one of those two skips: the codes
-      either side name the ring's frames it lost, and the driver's skip log (in STATS, read before and after) must hold an
-      entry for exactly those frames, or a chain of one stream's entries end to end (any stream's: verify doesn't know its
-      own), each a handoff's skip or a skip to a shorter lag. A gap with no entry, or with one for its first frame that
-      doesn't end with it, fails; so does one tied to a late read (a read past the copy's end: silence, and the frames the
-      reader then wrote there never reach it), a jump in a stream's own time line, or a resync (the feed's write position
-      invalid): the log's record of a loss, not a skip the ring's rules allow. A late read or a jump that no gap of the
-      recording names is listed, diagnostic only. Where entries of more than one stream tie a gap, each is listed (stream,
-      kind, frames, ring frames), and the gap takes their verdict where they agree. An entry still being filled in just
-      after the recording is no gap's record (a stream's own entries for a gap are settled before it reads the code after
-      it). INCONCLUSIVE only where what the log can't say would change the verdict: candidates for one gap judged
-      differently, or an untracked entry (its ring frames may be short: the driver's records ran out) that may hold a
-      gap's frames and would judge it otherwise; for a gap no chain ties, events of the recording no longer in the log (it
-      keeps 64) or unreadable, any of which may be an allowed skip for it; and the log's skips and time-line jumps over the
-      recording, which must add up to the driver's counters' rise, where events of it are no longer in the log. The
-      capture stream's own losses (frames the engine dropped, discontinuities) count up to the recording's end (those
-      before its first packet told apart): those of the drain after it (the final STATS read, the reader slot's wait) are
-      listed, as information. Where no stream holds the reader slot just after the recording (the last reader stopped as
-      it ended), verify waits up to 200 ms for one to (its own stream takes it at its next pass).
-  nf-vmic-test stats [--time N]
+  nf-vmic-test verify [--path PATH] [--seconds N] [--mic low-latency|call | --device NAME] [--mode raw|default|communications]
+                      [--period-frames N] [--start N]
+      Start `feed` first, in another window, and leave it running. Then record the cable's microphone in shared mode,
+      float32 stereo 48 kHz, for N seconds (default 10), and check that the app ring fed it: the driver's statistics just
+      before and after (the same attachment, read throughout, its frames copied), and the signal bit-exact on both channels
+      and in order, with silence only where the driver underran (the reader, or a secondary stream; one packet's slack at
+      each end). The recording starts once the stream delivers the signal (2 s at most). --mode: the processing mode the
+      stream asks for (default: RAW where the endpoint offers it, else DEFAULT). --period-frames: open through
+      IAudioClient3's InitializeSharedAudioStream at that engine period, in frames (a small-period helper, or a second
+      client in another mode); the period granted is printed. --start: the feed's --start (default 0), so the codes name the
+      ring's frames. Unmute the endpoint. The first capture stream to run reads the ring; the driver gives the others its
+      audio as secondary streams. When the reader stops, another takes the slot with one skip; the rest play on with no
+      repeat, getting silence where the new reader's packet is longer and skipping once where it is shorter. Each gap must
+      be the driver's own record of one of those two skips: the codes either side name the ring's frames it lost, and the
+      driver's skip log (in STATS, read before and after) must hold an entry for exactly those frames, or a chain of one
+      stream's entries end to end (any stream's: verify doesn't know its own), each a handoff's skip or a skip to a shorter
+      lag. A gap with no entry, or with one for its first frame that doesn't end with it, fails; so does one tied to a late
+      read (a read past the copy's end: silence, and the frames the reader then wrote there never reach it), a jump in a
+      stream's own time line, or a resync (the feed's write position invalid): the log's record of a loss, not a skip the
+      ring's rules allow. A late read or a jump that no gap of the recording names is listed, diagnostic only. Where entries
+      of more than one stream tie a gap, each is listed (stream, kind, frames, ring frames), and the gap takes their verdict
+      where they agree. An entry still being filled in just after the recording is no gap's record (a stream's own entries
+      for a gap are settled before it reads the code after it). INCONCLUSIVE only where what the log can't say would change
+      the verdict: candidates for one gap judged differently, or an untracked entry (its ring frames may be short: the
+      driver's records ran out) that may hold a gap's frames and would judge it otherwise; for a gap no chain ties, events
+      of the recording no longer in the log (it keeps 64) or unreadable, any of which may be an allowed skip for it; and the
+      log's skips and time-line jumps over the recording, which must add up to the driver's counters' rise, where events of
+      it are no longer in the log. The capture stream's own losses (frames the engine dropped, discontinuities) count up to
+      the recording's end (those before its first packet told apart): those of the drain after it (the final STATS read, the
+      reader slot's wait) are listed, as information. Where no stream holds the reader slot just after the recording (the
+      last reader stopped as it ended), verify waits up to 200 ms for one to (its own stream takes it at its next pass).
+  nf-vmic-test stats [--path PATH] [--time N]
       Print the driver's statistics, and its skip and underrun logs (newest last, times before the snapshot, each entry's
       stream by its serial). --time N: read STATS N times back to back instead and print how long each read took (min,
       median, p99, max in us): a read on a capture thread costs it that much of its buffer.
-  nf-vmic-test kill-test [--kills K] [--min-ms MIN] [--max-ms MAX] [--device NAME] [--no-capture]
+  nf-vmic-test kill-test [--path PATH] [--kills K] [--min-ms MIN] [--max-ms MAX] [--mic low-latency|call | --device NAME]
+                         [--no-capture]
       K times (default 10): start `feed` as a child, check that a capture stream reads its ring, terminate the child MIN to
       MAX milliseconds after it attached (default 300 to 2000; MIN at least 200), and check that it exited within 2 s and its
       attachment ended through the cancel path within 1 s of that. This tool's own capture stream reads the endpoint
       throughout, and its timer must still run after the last kill. --no-capture leaves the reading to another capture
       client: without one the result is INCONCLUSIVE.
-  nf-vmic-test open --device NAME [--render] (--exclusive | --shared) --format float|pcm24 [--period-frames N]
-                    [--mode raw|default|communications] [--seconds N] [--signal [--start N]]
-      Open the endpoint (capture, or render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32
-      PCM (a 32-bit container with 24 valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name (or
-      that of the call after it that failed, up to Start), then hold the stream running for N seconds (default 10; Ctrl+C
-      ends it sooner): render writes silence, or with --signal (float only) the test signal as feed writes it, from frame
-      N (--start, default 0); capture counts packets and silent packets, and for float decodes the test signal and counts
-      its codes, gaps and repeats (the loopback's check, with no app ring attached and a --signal render stream on the
-      speakers). --period-frames: exclusive, the period (default: the device's default period); shared, an IAudioClient3
-      engine period. --mode: the processing mode (default: DEFAULT). Shared mode converts nothing, so a format other than
-      the endpoint's mix format is refused. The driver's statistics before and after are printed where
-      its control device opens. Exit 0: it opened and ran. 1: the driver refused it (a capture stream while a ring is
-      attached, in a format other than 48 kHz float32 stereo: its RefusedCaptureOpens rose), the expected result in some
-      tests. 4: refused, but not shown to be by that rule: the outcome line names the call and its HRESULT, and says
-      whether the counter rules the driver's ring rule out (another client holding the device, a bad period, the engine)
-      or can't tell (no driver statistics, or a render endpoint). 3: it opened and started, then stopped running.
-  nf-vmic-test latency [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N] [--mode raw|default|communications]
-                       [--device NAME] [--exclusive]
-      In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192)
-      as feed does, and record the capture endpoint (shared, float32 stereo 48 kHz; --mode and --period-frames as for
-      verify; --exclusive: an exclusive event-driven stream, --period-frames its period, so the device times are the
-      driver's own packet stamps rather than the shared engine's). After a 1 s warm-up, for N seconds (default 10, at most 600), time every frame from the store of write_frame
-      that published it to its receipt: by the host's QPC when GetBuffer returned its packet, and by its device time
-      (GetBuffer's device QPC position, its packet's first frame's, plus its place in the packet): p50, p90, p99 and max
-      in ms for each, with the fill the feed found before each top-up, the underruns and the period granted. Stop any
-      other feed first (the ring must be this process's), and close other apps that record the endpoint: a capture stream
-      already running holds the ring's reader slot, and unless it shares this one's driver stream (shared, the same mode)
-      this one gets the ring's audio late, as a secondary (a check fails).
-  nf-vmic-test stamps [--packets N] [--resumes N] [--period-frames N] [--mode raw|default|communications] [--device NAME]
-                      [--exclusive]
+  nf-vmic-test open [--path PATH] [--render] [--mic low-latency|call | --device NAME] (--exclusive | --shared)
+                    --format float|pcm24 [--period-frames N] [--mode raw|default|communications] [--seconds N]
+                    [--signal [--start N]]
+      Open the endpoint (the cable's microphone, or its Speakers with --render; --device NAME any endpoint, capture, or
+      render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32 PCM (a 32-bit container with 24
+      valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name (or that of the call after it that
+      failed, up to Start), then hold the stream running for N seconds (default 10; Ctrl+C ends it sooner): render writes
+      silence, or with --signal (float only) the test signal as feed writes it, from frame N (--start, default 0); capture
+      counts packets and silent packets, and for float decodes the test signal and counts its codes, gaps and repeats (the
+      loopback's check, with no app ring attached and a --signal render stream on the speakers). --period-frames: exclusive,
+      the period (default: the device's default period); shared, an IAudioClient3 engine period. --mode: the processing mode
+      (default: DEFAULT). Shared mode converts nothing, so a format other than the endpoint's mix format is refused. The
+      driver's statistics before and after are printed where the cable's control device opens (--path's cable, else the
+      endpoint's own; none for another vendor's endpoint). Exit 0: it opened and ran. 1: the driver refused it (a capture
+      stream while a ring is attached, in a format other than 48 kHz float32 stereo: its RefusedCaptureOpens rose), the
+      expected result in some tests. 4: refused, but not shown to be by that rule: the outcome line names the call and its
+      HRESULT, and says whether the counter rules the driver's ring rule out (another client holding the device, a bad
+      period, the engine) or can't tell (no driver statistics, or a render endpoint). 3: it opened and started, then stopped
+      running.
+  nf-vmic-test latency [--path PATH] [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N]
+                       [--mode raw|default|communications] [--mic low-latency|call | --device NAME] [--exclusive]
+      In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192) as
+      feed does, and record the capture endpoint (shared, float32 stereo 48 kHz; --mode and --period-frames as for verify;
+      --exclusive: an exclusive event-driven stream, --period-frames its period, so the device times are the driver's own
+      packet stamps rather than the shared engine's). After a 1 s warm-up, for N seconds (default 10, at most 600), time
+      every frame from the store of write_frame that published it to its receipt: by the host's QPC when GetBuffer returned
+      its packet, and by its device time (GetBuffer's device QPC position, its packet's first frame's, plus its place in the
+      packet): p50, p90, p99 and max in ms for each, with the fill the feed found before each top-up, the underruns and the
+      period granted. Stop any other feed first (the ring must be this process's), and close other apps that record the
+      endpoint: a capture stream already running holds the ring's reader slot, and unless it shares this one's driver stream
+      (shared, the same mode) this one gets the ring's audio late, as a secondary (a check fails).
+  nf-vmic-test stamps [--path PATH] [--packets N] [--resumes N] [--period-frames N] [--mode raw|default|communications]
+                      [--mic low-latency|call | --device NAME] [--exclusive]
       Record the capture endpoint (as latency does; no ring needed) for N packets (default 200) past a 0.5 s warm-up, then
       stop and start the same client N times (--resumes, default 8), recording 4 packets after each: each Stop waits 30%
       to 170% of a packet after the last read (past 100%, the driver completes a packet the client hasn't read), each
@@ -186,7 +205,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       across each resume, by at least the frames between; FAIL otherwise, or for any other stamp off the grid (in the
       first run, or after the driver's first packet since a Start: listed with its offset); INCONCLUSIVE when a resume's
       step couldn't be compared, or the grid couldn't be found from the first run's notifications (too few packets).
-  nf-vmic-test idle-test [--device NAME]
+  nf-vmic-test idle-test [--path PATH] [--mic low-latency|call | --device NAME]
       Start an exclusive recorder twice on a live ring. Check that samples queued before each open are discarded and new
       samples reach the recorder. Requires an idle virtual capture endpoint.
 
@@ -375,19 +394,203 @@ fn verdict_of(checks: &[Check]) -> Verdict {
     }
 }
 
-fn open_device() -> Result<Device, String> {
-    let path = protocol::USER_PATH;
-    Device::open().map_err(|e| match e.raw_os_error().map(|c| c as u32) {
-        // The driver deletes the symbolic link with the control device, so this is also what an open gets while its PnP device
-        // is gone (removed, disabled or being updated): nf_vmic.h, STATUS_DEVICE_REMOVED.
-        Some(c) if c == ERROR_FILE_NOT_FOUND.0 => {
-            format!("{path} isn't there ({e}): is the driver installed and started, in a build with the app feed, and its device enabled?")
+// ---- the cable and its endpoints ----
+
+/// The cable a mode works on (TODO 19, the per-cable design, section 10; N0): its identity, and its control device's path, built
+/// from the identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Target {
+    id: CableId,
+    path: String,
+    /// Its device node, where the default was chosen from the nodes present.
+    node: Option<PresentCable>,
+}
+
+impl Target {
+    /// `--path`, or without it the default cable.
+    fn of(o: &Opts) -> Result<Self, String> {
+        Self::of_option(o.optional::<String>("--path")?.as_deref())
+    }
+
+    /// `path` (`--path`), or the default cable where there's none.
+    fn of_option(path: Option<&str>) -> Result<Self, String> {
+        match path {
+            Some(p) => Self::of_path(p),
+            None => Self::default_cable(),
         }
-        Some(c) if c == ERROR_ACCESS_DENIED.0 => {
-            format!("{path} refused access ({e}): the spike's control device admits SYSTEM and Administrators only; run elevated")
+    }
+
+    /// `--path \\.\AcxLlCable_<id>`: the identity in either case (the canonical path is opened). The old names are refused with
+    /// what replaced them.
+    fn of_path(path: &str) -> Result<Self, String> {
+        if cables::is_old_name(path) {
+            return Err(format!(
+                "--path {path}: that name went with the per-cable driver (TODO 19): each cable's control device is {}<id>, its \
+                 identity (the GUID in its instance ID), and without --path the cable labelled A is used",
+                protocol::USER_PREFIX
+            ));
         }
-        _ => format!("can't open {path}: {e}"),
-    })
+        let id = cables::parse_control_path(path).ok_or_else(|| {
+            format!(
+                "--path {path}: not a cable's control device, {}<id>, where <id> is the cable's identity (a GUID's 36 characters, no \
+                 braces: the one in its instance ID, ROOT\\MEDIA\\ACXLLCABLE_<label>_<id>_<n>)",
+                protocol::USER_PREFIX
+            )
+        })?;
+        Ok(Self::of_id(id))
+    }
+
+    /// The cable with identity `id`, its path built from it.
+    fn of_id(id: CableId) -> Self {
+        Self { path: protocol::control_path(&id), id, node: None }
+    }
+
+    /// The cable labelled A, else the only cable, among the device nodes present (interim: discovery comes with N1).
+    fn default_cable() -> Result<Self, String> {
+        let present = cables::present().map_err(|e| format!("can't list the cables: {e}"))?;
+        let chosen = cables::choose_default(&present).map_err(|e| format!("{e}: say which with --path {}<id>", protocol::USER_PREFIX))?;
+        Ok(Self { node: Some(chosen.clone()), ..Self::of_id(chosen.cable.id) })
+    }
+
+    /// "cable A (ROOT\MEDIA\..., working), \\.\AcxLlCable_<id>", or the path alone where it was given.
+    fn describe(&self) -> String {
+        match &self.node {
+            Some(node) => format!("{}, {}", node.describe(), self.path),
+            None => self.path.clone(),
+        }
+    }
+
+    /// Its control device, read and write, an error in words: where it isn't there, what Plug and Play says of the cable's
+    /// device nodes.
+    fn open(&self) -> Result<Device, String> {
+        let path = &self.path;
+        Device::open_path(path).map_err(|e| match e.raw_os_error().map(|c| c as u32) {
+            // The driver deletes the symbolic link with the control device, so this is also what an open gets while the cable's
+            // device is gone (removed, disabled or being updated): nf_vmic.h, STATUS_DEVICE_REMOVED.
+            Some(c) if c == ERROR_FILE_NOT_FOUND.0 => format!("{path} isn't there ({e}): {}", self.nodes_note()),
+            Some(c) if c == ERROR_ACCESS_DENIED.0 => {
+                format!("{path} refused access ({e}): a cable's control device admits SYSTEM and Administrators only; run elevated")
+            }
+            _ => format!("can't open {path}: {e}"),
+        })
+    }
+
+    /// What Plug and Play has of this cable's device nodes, for an open that found no control device.
+    fn nodes_note(&self) -> String {
+        let present = match cables::present() {
+            Ok(p) => p,
+            Err(e) => return format!("is its device installed, started and enabled? (the cables present can't be listed: {e})"),
+        };
+        let mine: Vec<String> = present.iter().filter(|c| c.cable.id == self.id).map(PresentCable::describe).collect();
+        if mine.is_empty() {
+            let others: Vec<String> = present.iter().map(PresentCable::describe).collect();
+            let others = if others.is_empty() { "none".to_string() } else { others.join("; ") };
+            format!("no device node present has the identity {} (the cables present: {others})", self.id)
+        } else {
+            format!(
+                "its device node is {}: a cable whose device isn't working has no control device, and a second node with its \
+                 identity has none either",
+                mine.join("; ")
+            )
+        }
+    }
+}
+
+/// An endpoint, resolved: its MMDevice id (what's opened) and its name as Windows shows it now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Endpoint {
+    id: String,
+    name: String,
+}
+
+/// `--mic low-latency|call`: which of the cable's microphones (Microphone0, the default, or Microphone1). Not with `--device`,
+/// which names one itself.
+fn mic_kind(o: &Opts) -> Result<EndpointKind, String> {
+    let mic = o.optional::<String>("--mic")?;
+    if mic.is_some() && o.optional::<String>("--device")?.is_some() {
+        return Err("--mic and --device both say which endpoint: give one".into());
+    }
+    match mic.as_deref() {
+        None | Some("low-latency") => Ok(EndpointKind::Microphone),
+        Some("call") => Ok(EndpointKind::CallMicrophone),
+        Some(other) => Err(format!("--mic {other:?}: low-latency (the Microphone) or call (the Call Microphone)")),
+    }
+}
+
+/// The capture endpoint a mode records: `--device NAME`, which must be the target cable's, or the cable's microphone that
+/// `--mic` says, by the instance ID its KS filter names.
+fn cable_capture(o: &Opts, target: &Target) -> Result<Endpoint, String> {
+    let kind = mic_kind(o)?;
+    let listed = sessions::cable_endpoints().map_err(|e| format!("can't list the cables' endpoints: {e}"))?;
+    let endpoint = match o.optional::<String>("--device")? {
+        Some(name) => named_on_cable(&listed, &name, target)?,
+        None => cable_endpoint(&listed, target, kind)?,
+    };
+    Ok(endpoint)
+}
+
+/// The target cable's active endpoint of `kind`, by its filter's instance ID ([`sessions::pick`]).
+fn cable_endpoint(listed: &[CableEndpoint], target: &Target, kind: EndpointKind) -> Result<Endpoint, String> {
+    let listing = |list: &[&CableEndpoint]| {
+        if list.is_empty() { "none".to_string() } else { list.iter().map(|e| e.describe()).collect::<Vec<_>>().join("; ") }
+    };
+    match sessions::pick(listed, &target.id, kind) {
+        Pick::Found(e) => Ok(Endpoint { id: e.id.clone(), name: e.name.clone() }),
+        Pick::NotActive(on_cable) => {
+            let hint = match kind {
+                EndpointKind::Microphone => " (a cable of the call variant has only the Call Microphone: --mic call)",
+                EndpointKind::CallMicrophone => " (a cable of the low-latency variant has only the Microphone: leave out --mic)",
+                EndpointKind::Speakers => "",
+            };
+            Err(format!(
+                "cable {} has no active {} ({}){hint}; its endpoints Windows lists: {}",
+                target.id,
+                kind.name(),
+                kind.reference(),
+                listing(&on_cable)
+            ))
+        }
+        Pick::Several(active) => Err(format!(
+            "cable {} has more than one active {} (two of its device nodes at once?): {}; name one with --device",
+            target.id,
+            kind.name(),
+            listing(&active)
+        )),
+    }
+}
+
+/// `--device NAME` for a mode that records the target cable: the active capture endpoint of ours with that name, which must
+/// be on the target cable (verify would otherwise judge one cable's recording by another's statistics). One of ours known by
+/// its name alone (its filter couldn't be read) is taken, with a note.
+fn named_on_cable(listed: &[CableEndpoint], name: &str, target: &Target) -> Result<Endpoint, String> {
+    let named: Vec<&CableEndpoint> = listed.iter().filter(|e| !e.render && e.state == EndpointState::Active && e.name == name).collect();
+    let e = match named.as_slice() {
+        [one] => *one,
+        [] => {
+            let ours: Vec<String> =
+                listed.iter().filter(|e| !e.render && e.state == EndpointState::Active).map(|e| format!("{:?}", e.name)).collect();
+            let ours = if ours.is_empty() { "none".to_string() } else { ours.join(", ") };
+            return Err(format!(
+                "--device {name:?}: no active ACX-LL-Cable microphone has that name (ours active: {ours}); this mode records the \
+                 cable's own"
+            ));
+        }
+        _ => return Err(format!("--device {name:?}: more than one active microphone of ours has that name; use --mic")),
+    };
+    match &e.cable {
+        Some(c) if c.id == target.id => {}
+        Some(c) => {
+            return Err(format!(
+                "--device {name:?} is cable {}'s ({}), not the one this mode works on ({}): its statistics wouldn't be the \
+                 recording's",
+                c.label,
+                c.id,
+                target.describe()
+            ));
+        }
+        None => eprintln!("note: {}; taken as the cable's", e.describe()),
+    }
+    Ok(Endpoint { id: e.id.clone(), name: e.name.clone() })
 }
 
 fn read_stats(device: &Device) -> Result<Stats, String> {
@@ -771,8 +974,9 @@ impl Opened {
     }
 }
 
-/// The endpoint called `name` in direction `dir` (its friendly name, as Sound settings shows it).
-fn find_endpoint(name: &str, dir: Direction) -> Result<wasapi::Device, String> {
+/// The active endpoint called `name` in direction `dir` (its friendly name, as Sound settings shows it): open's `--device`,
+/// which may be any endpoint.
+fn find_named(name: &str, dir: Direction) -> Result<wasapi::Device, String> {
     let kind = if dir == Direction::Capture { "capture" } else { "render" };
     let enumerator = DeviceEnumerator::new().map_err(werr)?;
     let devices = enumerator.get_device_collection(&dir).map_err(werr)?;
@@ -780,6 +984,12 @@ fn find_endpoint(name: &str, dir: Direction) -> Result<wasapi::Device, String> {
         let names: Vec<String> = (&devices).into_iter().filter_map(|d| d.ok()?.get_friendlyname().ok()).collect();
         format!("no {kind} endpoint {name:?}; there are: {}", names.join("; "))
     })
+}
+
+/// A resolved endpoint, by its id. COM must be initialised on this thread.
+fn find_endpoint(endpoint: &Endpoint) -> Result<wasapi::Device, String> {
+    let enumerator = DeviceEnumerator::new().map_err(werr)?;
+    enumerator.get_device(&endpoint.id).map_err(|e| format!("{:?} ({}) can't be opened: {e}", endpoint.name, endpoint.id))
 }
 
 /// A format in words: rate, channels, and the sample type with its container and valid bits.
@@ -937,7 +1147,7 @@ fn packet_above_target(target: u64, state: u32, packet_frames: u32) -> Option<u3
 }
 
 fn feed(args: &[String]) -> Result<Verdict, String> {
-    let o = Opts::parse(args, &["--seconds", "--capacity", "--target", "--start"], &["--quiet"])?;
+    let o = Opts::parse(args, &["--path", "--seconds", "--capacity", "--target", "--start"], &["--quiet"])?;
     let seconds: u64 = o.value("--seconds", 0)?;
     let capacity: u32 = o.value("--capacity", 8192)?;
     let target: u64 = o.value("--target", 960)?;
@@ -951,7 +1161,11 @@ fn feed(args: &[String]) -> Result<Verdict, String> {
         return Err(format!("--target {target}: from 1 to the capacity ({capacity}), and at least one capture packet"));
     }
 
-    let device = open_device()?;
+    let cable = Target::of(&o)?;
+    if !quiet {
+        println!("cable: {}", cable.describe());
+    }
+    let device = cable.open()?;
     let ring = RingMemory::new(capacity).map_err(|e| e.to_string())?;
     // Pre-filled to the target, so the first capture pass after ATTACH finds audio (the driver starts at frame 0).
     Writer::new(&ring).produce(target, |n| signal::frame(start.wrapping_add(n)));
@@ -1057,10 +1271,12 @@ fn print_ring_counters(h: &RingHeader) {
 /// until the first capture pass. A silent leading packet alone cannot pass this check: ReadFrame must skip the old prefix,
 /// the driver's copied count must stay still, and the recorder must subsequently receive the new marker.
 fn idle_test(args: &[String]) -> Result<Verdict, String> {
-    let opts = Opts::parse(args, &["--device"], &[])?;
-    let name: String = opts.value("--device", ENDPOINT.to_string())?;
+    let opts = Opts::parse(args, &["--path", "--mic", "--device"], &[])?;
+    let cable = Target::of(&opts)?;
+    let endpoint = cable_capture(&opts, &cable)?;
+    println!("cable: {}; recording {:?}", cable.describe(), endpoint.name);
     let _com = Com::mta()?;
-    let device = open_device()?;
+    let device = cable.open()?;
     let attachment = device.attach_live(RingMemory::new(8192).map_err(|e| e.to_string())?).map_err(|e| e.error.to_string())?;
     let mut writer = Writer::new(attachment.ring());
     let header = attachment.ring().header();
@@ -1073,7 +1289,7 @@ fn idle_test(args: &[String]) -> Result<Verdict, String> {
         let copied = header.frames_copied.load(Acquire);
         let queued = writer.produce(1536, |_| [-0.5; 2]);
         let end = writer.write_frame();
-        let mut capture = Capture::open(&name, StreamSpec { exclusive: true, ..StreamSpec::SHARED_FLOAT })?;
+        let mut capture = Capture::open(&endpoint, StreamSpec { exclusive: true, ..StreamSpec::SHARED_FLOAT })?;
         capture.start()?;
         let mut stale = 0;
         let mut observe = |f: [f32; 2]| stale += u32::from(f == [-0.5; 2]);
@@ -1112,26 +1328,31 @@ fn idle_test(args: &[String]) -> Result<Verdict, String> {
 // ---- verify ----
 
 fn verify(args: &[String]) -> Result<Verdict, String> {
-    let o = Opts::parse(args, &["--seconds", "--device", "--mode", "--period-frames", "--start"], &[])?;
+    let o = Opts::parse(args, &["--path", "--seconds", "--mic", "--device", "--mode", "--period-frames", "--start"], &[])?;
     let seconds: u64 = o.value("--seconds", 10)?;
-    let name: String = o.value("--device", ENDPOINT.to_string())?;
     let start: u64 = o.value("--start", 0)?;
     let spec = StreamSpec { period_frames: o.period_frames()?, mode: o.mode(Mode::RawWhereOffered)?, ..StreamSpec::SHARED_FLOAT };
     if seconds == 0 || seconds > 86_400 {
         return Err(format!("--seconds {seconds}: from 1 to 86400"));
     }
-    // The driver's statistics are half the verdict: no driver, no verify.
-    let device = open_device()?;
+    // The driver's statistics are half the verdict: no driver, no verify. The recording is the same cable's (cable_capture).
+    let cable = Target::of(&o)?;
+    let device = cable.open()?;
     if read_stats(&device)?.flags & STATS_ATTACHED == 0 {
-        return Err("no app ring is attached: start `nf-vmic-test feed` first (elevated, in another window) and leave it running".into());
+        return Err(format!(
+            "no app ring is attached to {}: start `nf-vmic-test feed` on it first (elevated, in another window) and leave it running",
+            cable.path
+        ));
     }
+    let endpoint = cable_capture(&o, &cable)?;
+    println!("cable: {}", cable.describe());
     let _com = Com::mta()?;
-    let mut capture = Capture::open(&name, spec)?;
-    println!("recording {name:?} for {seconds} s: {}", capture.describe());
+    let mut capture = Capture::open(&endpoint, spec)?;
+    println!("recording {:?} for {seconds} s: {}", endpoint.name, capture.describe());
     capture.print_volume_notes();
     let _pro_audio = ProAudio::join();
     capture.start()?;
-    let recorded = record(&mut capture, Duration::from_secs(seconds));
+    let recorded = record(&mut capture, &cable, Duration::from_secs(seconds));
     capture.stop();
     let Recorded { before, after, checker, vacancy, losses } = recorded?;
 
@@ -2042,12 +2263,12 @@ impl StreamLosses {
 /// The later STATS is the recording's `after` (a wider window takes in nothing the recording's frames could need). The
 /// stream's own losses are split where the measured recording starts and ends ([`StreamLosses`]): what the drains after it
 /// carried isn't the recording's.
-fn record(capture: &mut Capture, duration: Duration) -> Result<Recorded, String> {
+fn record(capture: &mut Capture, cable: &Target, duration: Duration) -> Result<Recorded, String> {
     let t0 = Instant::now();
     let mut signal_seen = false;
     let before = loop {
         capture.read(|f| signal_seen |= signal::decode(f).is_some())?;
-        let s = stats_while_draining(capture, |f| signal_seen |= signal::decode(f).is_some())?;
+        let s = stats_while_draining(capture, cable, |f| signal_seen |= signal::decode(f).is_some())?;
         if (signal_seen && is_reading(&s)) || t0.elapsed() >= READING_WAIT {
             break s;
         }
@@ -2066,13 +2287,13 @@ fn record(capture: &mut Capture, duration: Duration) -> Result<Recorded, String>
     }
     // The measured recording ends here: the drains below are for STATS and the reader slot, and record nothing.
     let end = capture.losses();
-    let mut after = stats_while_draining(capture, |_| {})?;
+    let mut after = stats_while_draining(capture, cable, |_| {})?;
     let mut vacancy = None;
     if slot_vacant(&before, &after) {
         let t = Instant::now();
         while slot_vacant(&before, &after) && t.elapsed() < VACANCY_WAIT {
             capture.read(|_| {})?;
-            after = stats_while_draining(capture, |_| {})?;
+            after = stats_while_draining(capture, cable, |_| {})?;
         }
         vacancy = Some(t.elapsed());
     }
@@ -2084,9 +2305,9 @@ fn record(capture: &mut Capture, duration: Duration) -> Result<Recorded, String>
 /// 1 ms, up to 36 ms, with no stream running; a rejected control code on the same handle never over 0.4 ms, so it's our
 /// handler's), longer than a 128-frame shared client's buffer: read on the capture thread, it cost every recording 104 frames
 /// at its start (p65 and its rerun, 10 of 12 verifies).
-fn stats_while_draining(capture: &mut Capture, mut on_frame: impl FnMut([f32; 2])) -> Result<Stats, String> {
+fn stats_while_draining(capture: &mut Capture, cable: &Target, mut on_frame: impl FnMut([f32; 2])) -> Result<Stats, String> {
     std::thread::scope(|s| {
-        let reader = s.spawn(|| open_device().and_then(|d| read_stats(&d)));
+        let reader = s.spawn(|| cable.open().and_then(|d| read_stats(&d)));
         while !reader.is_finished() {
             capture.read(&mut on_frame)?;
         }
@@ -2234,10 +2455,11 @@ fn werr(e: wasapi::WasapiError) -> String {
 }
 
 impl Capture {
-    /// verify's, kill-test's and latency's stream on the capture endpoint `name`: shared float32, as `spec` says (its mode and
-    /// IAudioClient3 period), after a check that the endpoint mixes at 48 kHz float32 stereo (bit-exact needs it).
-    fn open(name: &str, spec: StreamSpec) -> Result<Self, String> {
-        let device = find_endpoint(name, Direction::Capture)?;
+    /// verify's, kill-test's and latency's stream on the capture endpoint `endpoint`: shared float32, as `spec` says (its mode
+    /// and IAudioClient3 period), after a check that the endpoint mixes at 48 kHz float32 stereo (bit-exact needs it).
+    fn open(endpoint: &Endpoint, spec: StreamSpec) -> Result<Self, String> {
+        let name = &endpoint.name;
+        let device = find_endpoint(endpoint)?;
         let mix = device.get_iaudioclient().map_err(werr)?.get_mixformat().map_err(werr)?;
         let float = matches!(mix.get_subformat(), Ok(SampleType::Float));
         if mix.get_samplespersec() != protocol::SAMPLE_RATE || mix.get_nchannels() != 2 || mix.get_bitspersample() != 32 || !float {
@@ -2491,10 +2713,12 @@ fn endpoint_volume(device: &wasapi::Device) -> Option<Volume> {
 // ---- stats ----
 
 fn stats(args: &[String]) -> Result<Verdict, String> {
-    let o = Opts::parse(args, &["--time"], &[])?;
-    let device = open_device()?;
+    let o = Opts::parse(args, &["--path", "--time"], &[])?;
+    let cable = Target::of(&o)?;
+    let device = cable.open()?;
     let reads: usize = o.value("--time", 0)?;
     if reads == 0 {
+        println!("cable: {}", cable.describe());
         print_stats(&read_stats(&device)?);
         return Ok(Verdict::Pass);
     }
@@ -2635,7 +2859,7 @@ struct CaptureSummary {
 }
 
 /// Reads the endpoint until `stop`, counting frames (kill-test's "the capture keeps running"). Reports on `ready` once streaming.
-fn capture_thread(name: String, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>) -> CaptureSummary {
+fn capture_thread(endpoint: Endpoint, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>) -> CaptureSummary {
     let _com = match Com::mta() {
         Ok(c) => c,
         Err(e) => {
@@ -2643,7 +2867,7 @@ fn capture_thread(name: String, stop: Arc<AtomicBool>, ready: mpsc::Sender<Resul
             return CaptureSummary::default();
         }
     };
-    let mut capture = match Capture::open(&name, StreamSpec::SHARED_FLOAT).and_then(|c| c.start().map(|()| c)) {
+    let mut capture = match Capture::open(&endpoint, StreamSpec::SHARED_FLOAT).and_then(|c| c.start().map(|()| c)) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -2723,9 +2947,10 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    fn spawn(exe: &Path, job: &KillJob) -> Result<Self, String> {
+    /// A `feed` child on the cable at `path` (kill-test's own, so both work on one cable).
+    fn spawn(exe: &Path, job: &KillJob, path: &str) -> Result<Self, String> {
         let child = Command::new(exe)
-            .args(["feed", "--seconds", "0", "--quiet"])
+            .args(["feed", "--path", path, "--seconds", "0", "--quiet"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .spawn()
@@ -2768,11 +2993,10 @@ impl Drop for ChildGuard {
 }
 
 fn kill_test(args: &[String]) -> Result<Verdict, String> {
-    let o = Opts::parse(args, &["--kills", "--min-ms", "--max-ms", "--device"], &["--no-capture"])?;
+    let o = Opts::parse(args, &["--path", "--kills", "--min-ms", "--max-ms", "--mic", "--device"], &["--no-capture"])?;
     let kills: u32 = o.value("--kills", 10)?;
     let min_ms: u64 = o.value("--min-ms", 300)?;
     let max_ms: u64 = o.value("--max-ms", 2_000)?;
-    let name: String = o.value("--device", ENDPOINT.to_string())?;
     let no_capture = o.flag("--no-capture");
     let window_ms = READ_WINDOW.as_millis() as u64;
     if !(1..=10_000).contains(&kills) || min_ms < window_ms || min_ms > max_ms || max_ms > 600_000 {
@@ -2780,7 +3004,9 @@ fn kill_test(args: &[String]) -> Result<Verdict, String> {
             "--kills from 1 to 10000; --min-ms from {window_ms} (the reading check's window) to --max-ms; --max-ms at most 600000"
         ));
     }
-    let device = open_device()?;
+    let cable = Target::of(&o)?;
+    println!("cable: {}", cable.describe());
+    let device = cable.open()?;
     let first = read_stats(&device)?;
     if first.flags & STATS_ATTACHED != 0 {
         return Err(format!("process {} has a ring attached already: stop it first", first.attached_pid));
@@ -2788,12 +3014,17 @@ fn kill_test(args: &[String]) -> Result<Verdict, String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader = if no_capture {
-        println!("--no-capture: the reading checks need another capture client on {name:?}; without one the result is INCONCLUSIVE");
+        mic_kind(&o)?;
+        println!(
+            "--no-capture: the reading checks need another capture client on the cable's microphone; without one the result is INCONCLUSIVE"
+        );
         None
     } else {
+        let endpoint = cable_capture(&o, &cable)?;
+        let name = endpoint.name.clone();
         let (tx, rx) = mpsc::channel();
-        let (stop2, name2) = (Arc::clone(&stop), name.clone());
-        let handle = thread::spawn(move || capture_thread(name2, stop2, tx));
+        let stop2 = Arc::clone(&stop);
+        let handle = thread::spawn(move || capture_thread(endpoint, stop2, tx));
         rx.recv().map_err(|_| "the capture thread ended before it started".to_string())??;
         println!("capturing {name:?} throughout");
         Some(handle)
@@ -2805,7 +3036,7 @@ fn kill_test(args: &[String]) -> Result<Verdict, String> {
     let (mut failures, mut unread) = (0u32, 0u32);
     for k in 1..=kills {
         let start = read_stats(&device)?;
-        let mut child = ChildGuard::spawn(&exe, &job)?;
+        let mut child = ChildGuard::spawn(&exe, &job, &cable.path)?;
         let pid = child.pid;
         if wait_for(&device, ATTACH_WAIT, |s| s.flags & STATS_ATTACHED != 0 && s.attached_pid == pid)?.is_none() {
             let exit = match child.exited_within(Duration::ZERO) {
@@ -3040,7 +3271,13 @@ fn kill_test_verdict(failed_checks: u32, unread_kills: u32, timer_runs: bool) ->
 /// open's options.
 #[derive(Debug, PartialEq, Eq)]
 struct OpenArgs {
-    name: String,
+    /// `--device NAME`: any endpoint, by its name; `None`: the cable's own, `kind`.
+    name: Option<String>,
+    /// `--path`: the cable whose statistics are read (and whose endpoint is opened without `--device`); `None`: the endpoint's
+    /// own cable, or the default cable.
+    path: Option<String>,
+    /// The cable's endpoint opened without `--device`: its Speakers with `--render`, else the microphone `--mic` says.
+    kind: EndpointKind,
     render: bool,
     spec: StreamSpec,
     seconds: u64,
@@ -3049,9 +3286,16 @@ struct OpenArgs {
 }
 
 fn open_args(args: &[String]) -> Result<OpenArgs, String> {
-    let valued = ["--device", "--format", "--period-frames", "--mode", "--seconds", "--start"];
+    let valued = ["--path", "--mic", "--device", "--format", "--period-frames", "--mode", "--seconds", "--start"];
     let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared", "--signal"])?;
-    let name: String = o.optional("--device")?.ok_or("--device NAME is required: the endpoint's name, as Sound settings shows it")?;
+    let name: Option<String> = o.optional("--device")?;
+    let path: Option<String> = o.optional("--path")?;
+    let render = o.flag("--render");
+    let kind = match (render, o.optional::<String>("--mic")?) {
+        (true, Some(_)) => return Err("--mic is a microphone's: with --render the cable's Speakers are opened".into()),
+        (true, None) => EndpointKind::Speakers,
+        (false, _) => mic_kind(&o)?,
+    };
     let exclusive = match (o.flag("--exclusive"), o.flag("--shared")) {
         (true, false) => true,
         (false, true) => false,
@@ -3063,7 +3307,6 @@ fn open_args(args: &[String]) -> Result<OpenArgs, String> {
         return Err(format!("--seconds {seconds}: from 1 to 86400"));
     }
     let spec = StreamSpec { exclusive, format, period_frames: o.period_frames()?, mode: o.mode(Mode::Default)? };
-    let render = o.flag("--render");
     let start: Option<u64> = o.optional("--start")?;
     let signal = match (o.flag("--signal"), start) {
         (false, None) => None,
@@ -3071,7 +3314,51 @@ fn open_args(args: &[String]) -> Result<OpenArgs, String> {
         (true, _) if !render || format != Format::Float => return Err("--signal needs --render and --format float".into()),
         (true, start) => Some(start.unwrap_or(0)),
     };
-    Ok(OpenArgs { name, render, spec, seconds, signal })
+    Ok(OpenArgs { name, path, kind, render, spec, seconds, signal })
+}
+
+/// open's endpoint and the cable whose statistics it reads. With `--device NAME`, that endpoint (any vendor's), and the cable
+/// `--path` names, which must be the endpoint's own where it's ours, else the endpoint's own cable, else none (another vendor's
+/// endpoint: the driver's statistics don't concern it). Without `--device`, the cable (`--path`, or the default) and its
+/// endpoint of `a.kind`. COM must be initialised on this thread (`--device`'s lookup).
+fn open_target(a: &OpenArgs, dir: Direction) -> Result<(wasapi::Device, String, Option<Target>), String> {
+    let Some(name) = &a.name else {
+        let cable = Target::of_option(a.path.as_deref())?;
+        let listed = sessions::cable_endpoints().map_err(|e| format!("can't list the cables' endpoints: {e}"))?;
+        let endpoint = cable_endpoint(&listed, &cable, a.kind)?;
+        return Ok((find_endpoint(&endpoint)?, endpoint.name, Some(cable)));
+    };
+    let device = find_named(name, dir)?;
+    let id = device.get_id().map_err(werr)?;
+    let ours = match &sessions::cable_endpoints() {
+        Ok(listed) => sessions::endpoint_by_id(listed, &id).cloned(),
+        Err(e) => {
+            println!("note: can't list the cables' endpoints ({e}), so whether {name:?} is one of ours isn't known");
+            None
+        }
+    };
+    let cable = match (a.path.as_deref(), ours.as_ref().and_then(|e| e.cable.as_ref())) {
+        (Some(path), Some(on)) => {
+            let cable = Target::of_path(path)?;
+            if cable.id != on.id {
+                return Err(format!(
+                    "--device {name:?} is cable {}'s ({}), not {}'s: its statistics wouldn't be the stream's",
+                    on.label, on.id, cable.path
+                ));
+            }
+            Some(cable)
+        }
+        (Some(path), None) => Some(Target::of_path(path)?),
+        (None, Some(on)) => Some(Target::of_id(on.id)),
+        (None, None) => {
+            match &ours {
+                Some(e) => println!("note: no driver statistics: {}", e.describe()),
+                None => println!("note: no driver statistics: {name:?} isn't an ACX-LL-Cable endpoint (give --path to read a cable's)"),
+            }
+            None
+        }
+    };
+    Ok((device, name.clone(), cable))
 }
 
 /// How long open's stream ran once started, the events it served (each waited for and its buffer read or filled), and why it
@@ -3086,19 +3373,16 @@ struct OpenRun {
 fn open(args: &[String]) -> Result<Verdict, String> {
     let a = open_args(args)?;
     let (dir, kind) = if a.render { (Direction::Render, "render") } else { (Direction::Capture, "capture") };
-    // The driver's view, where its control device opens (elevated, the driver loaded): it counts its refusals.
-    let driver = match Device::open() {
-        Ok(d) => Some(d),
-        Err(e) => {
-            println!("note: no driver statistics: {} didn't open ({e})", protocol::USER_PATH);
-            None
-        }
-    };
+    let _com = Com::mta()?;
+    let (endpoint, name, cable) = open_target(&a, dir)?;
+    // The driver's view, where the cable's control device opens (elevated, the driver loaded): it counts its refusals.
+    let driver = cable.as_ref().and_then(|c| {
+        println!("cable: {}", c.describe());
+        c.open().map_err(|e| println!("note: no driver statistics: {e}")).ok()
+    });
     let stats = || driver.as_ref().and_then(|d| d.stats().ok());
     let before = stats();
-    let _com = Com::mta()?;
-    let endpoint = find_endpoint(&a.name, dir)?;
-    print_endpoint(&endpoint, &a.name, kind, &a.spec);
+    print_endpoint(&endpoint, &name, kind, &a.spec);
     println!("asking for {}", a.spec.describe());
     let share = if a.spec.exclusive { "exclusive" } else { "shared" };
     match is_format_supported(&endpoint, &a.spec.format.wave(), a.spec.exclusive) {
@@ -3208,8 +3492,7 @@ fn refusal_outcome(r: &Refusal, kind: &str, who: &Refuser) -> (Verdict, String) 
             format!(
                 "OUTCOME: REFUSED, not by the driver's format rules (RefusedCaptureOpens and the loopback's RefusedOpens +0): {r}; \
                  the {kind} stream never ran. Something else refused it: another client holding the device \
-                 (AUDCLNT_E_DEVICE_IN_USE), the period asked for, the engine, or, on a device of the driver other than the first \
-                 installed, its loopback rule (STATS carries only the first device's loopback counters)"
+                 (AUDCLNT_E_DEVICE_IN_USE), the period asked for, or the engine (the counters are the endpoint's own cable's)"
             ),
         ),
         Refuser::Unknown(why) => {
@@ -3462,13 +3745,15 @@ fn slot_holder(state: u32, packet_frames: u32) -> Option<u32> {
 
 /// latency's capture thread: opens the stream, sizes its logs, and records every packet until the feed says stop. Nothing
 /// allocates per packet once the stream runs.
-fn latency_capture(name: &str, spec: StreamSpec, seconds: u64, header: &RingHeader, shared: &LatencyShared) -> Result<CaptureLog, String> {
+fn latency_capture(
+    endpoint: &Endpoint, spec: StreamSpec, seconds: u64, header: &RingHeader, shared: &LatencyShared,
+) -> Result<CaptureLog, String> {
     let failed = |e: String| {
         shared.state.store(FAILED, Release);
         e
     };
     let _com = Com::mta().map_err(failed)?;
-    let mut capture = Capture::open(name, spec).map_err(failed)?;
+    let mut capture = Capture::open(endpoint, spec).map_err(failed)?;
     // Sized before the start: every packet of the run at half the granted period (32 frames at the least), four runs each.
     let packets = latency::packets_for(seconds + LATENCY_WARMUP.as_secs() + 1, (capture.opened.period_frames() / 2).clamp(32, 480));
     let mut receipts = Log::with_capacity(packets);
@@ -3738,7 +4023,7 @@ fn check_steps(rows: &[StampRow]) -> StepCheck {
 /// timestamps reading a packet late), and whether the stamps step as the audio does, across Stop/Start too (Astra's review).
 /// No ring needed: the stream's silence carries the same stamps.
 fn stamps(args: &[String]) -> Result<Verdict, String> {
-    let valued = ["--packets", "--period-frames", "--mode", "--device", "--resumes"];
+    let valued = ["--path", "--packets", "--period-frames", "--mode", "--mic", "--device", "--resumes"];
     let o = Opts::parse(args, &valued, &["--exclusive", "--verbose"])?;
     let packets: usize = o.value("--packets", 200)?;
     if !(1..=100_000).contains(&packets) {
@@ -3748,18 +4033,20 @@ fn stamps(args: &[String]) -> Result<Verdict, String> {
     if resumes > 1_000 {
         return Err(format!("--resumes {resumes}: from 0 to 1000"));
     }
-    let name: String = o.value("--device", ENDPOINT.to_string())?;
     let spec = StreamSpec {
         exclusive: o.flag("--exclusive"),
         period_frames: o.period_frames()?,
         mode: o.mode(Mode::RawWhereOffered)?,
         ..StreamSpec::SHARED_FLOAT
     };
-    let device = open_device()?;
+    let cable = Target::of(&o)?;
+    let device = cable.open()?;
     let frequency = read_stats(&device)?.qpc_frequency;
+    let endpoint = cable_capture(&o, &cable)?;
+    println!("cable: {}", cable.describe());
     let _com = Com::mta()?;
-    let mut capture = Capture::open(&name, spec)?;
-    println!("recording {name:?}: {}", capture.describe());
+    let mut capture = Capture::open(&endpoint, spec)?;
+    println!("recording {:?}: {}", endpoint.name, capture.describe());
     let mut rows = Vec::with_capacity(packets + resumes * RESUME_PACKETS);
     let mut done: Vec<Resume> = Vec::with_capacity(resumes);
     // The last packet read, recorded or not (a drain reads on past the rows wanted): its receipt, device time and frames.
@@ -4108,12 +4395,11 @@ fn print_stamps(rows: &[StampRow], frequency: u64) {
 }
 
 fn latency(args: &[String]) -> Result<Verdict, String> {
-    let valued = ["--seconds", "--target", "--capacity", "--period-frames", "--mode", "--device"];
+    let valued = ["--path", "--seconds", "--target", "--capacity", "--period-frames", "--mode", "--mic", "--device"];
     let o = Opts::parse(args, &valued, &["--exclusive"])?;
     let seconds: u64 = o.value("--seconds", 10)?;
     let target: u64 = o.value("--target", 960)?;
     let capacity: u32 = o.value("--capacity", 8192)?;
-    let name: String = o.value("--device", ENDPOINT.to_string())?;
     let spec = StreamSpec {
         exclusive: o.flag("--exclusive"),
         period_frames: o.period_frames()?,
@@ -4130,11 +4416,15 @@ fn latency(args: &[String]) -> Result<Verdict, String> {
     if target == 0 || target > u64::from(capacity) {
         return Err(format!("--target {target}: from 1 to the capacity ({capacity}), and at least one capture packet"));
     }
-    let device = open_device()?;
+    let cable = Target::of(&o)?;
+    let device = cable.open()?;
     let first = read_stats(&device)?;
     if first.flags & STATS_ATTACHED != 0 {
         return Err(format!("process {}'s ring is attached: stop that feed first (latency attaches its own)", first.attached_pid));
     }
+    let endpoint = cable_capture(&o, &cable)?;
+    let name = endpoint.name.clone();
+    println!("cable: {}", cable.describe());
     let frequency = qpc_frequency();
     // The feed's log, sized before the start: at most one block a tick (1 ms or more), twice over.
     let mut blocks = Log::with_capacity(((seconds + LATENCY_WARMUP.as_secs() + 2) * 2_000) as usize);
@@ -4156,7 +4446,7 @@ fn latency(args: &[String]) -> Result<Verdict, String> {
     let shared = LatencyShared { stop: AtomicBool::new(false), state: AtomicU32::new(OPENING), started_qpc: AtomicU64::new(0) };
     let header = attachment.ring().header();
     let (fed, captured) = thread::scope(|s| {
-        let capture = s.spawn(|| latency_capture(&name, spec, seconds, header, &shared));
+        let capture = s.spawn(|| latency_capture(&endpoint, spec, seconds, header, &shared));
         let fed = latency_feed(&attachment, &device, target, seconds, frequency, &shared, &mut blocks);
         shared.stop.store(true, Relaxed);
         (fed, capture.join().unwrap_or_else(|_| Err("the capture thread panicked".to_string())))
@@ -5787,18 +6077,39 @@ mod tests {
     }
 
     #[test]
-    fn open_needs_a_device_a_share_mode_and_a_format() {
+    fn open_needs_a_share_mode_and_a_format() {
         let open = |list: &[&str]| open_args(&args(list));
         let a = open(&["--device", "Mic (X)", "--exclusive", "--format", "pcm24"]).unwrap();
         let spec = StreamSpec { exclusive: true, format: Format::Pcm24, period_frames: None, mode: Mode::Default };
-        assert_eq!(a, OpenArgs { name: "Mic (X)".into(), render: false, spec, seconds: 10, signal: None });
+        let mic = EndpointKind::Microphone;
+        let want = OpenArgs { name: Some("Mic (X)".into()), path: None, kind: mic, render: false, spec, seconds: 10, signal: None };
+        assert_eq!(a, want);
         let a = open(&[
             "--render", "--shared", "--device", "Speakers", "--format", "float", "--period-frames", "128", "--mode", "raw", "--seconds",
             "3",
         ])
         .unwrap();
         let spec = StreamSpec { exclusive: false, format: Format::Float, period_frames: Some(128), mode: Mode::Raw };
-        assert_eq!(a, OpenArgs { name: "Speakers".into(), render: true, spec, seconds: 3, signal: None });
+        let speakers = EndpointKind::Speakers;
+        let want = OpenArgs { name: Some("Speakers".into()), path: None, kind: speakers, render: true, spec, seconds: 3, signal: None };
+        assert_eq!(a, want);
+        // Without --device, the cable's own endpoint: its Speakers with --render, else its Microphone or (--mic call) its Call
+        // Microphone; --path the cable, else the default one.
+        let path = format!(r"\\.\AcxLlCable_{ID}");
+        let a = open(&["--path", &path, "--exclusive", "--format", "float"]).unwrap();
+        assert_eq!((a.name, a.path.as_deref(), a.kind, a.render), (None, Some(path.as_str()), EndpointKind::Microphone, false));
+        let a = open(&["--mic", "call", "--shared", "--format", "float"]).unwrap();
+        assert_eq!((a.name, a.path, a.kind), (None, None, EndpointKind::CallMicrophone));
+        let a = open(&["--render", "--shared", "--format", "float", "--signal"]).unwrap();
+        assert_eq!((a.kind, a.render, a.signal), (EndpointKind::Speakers, true, Some(0)));
+        for (list, why) in [
+            (&["--render", "--mic", "call", "--shared", "--format", "float"][..], "--mic is a microphone's"),
+            (&["--mic", "call", "--device", "M", "--shared", "--format", "float"], "--mic and --device both"),
+            (&["--mic", "speakers", "--shared", "--format", "float"], "low-latency (the Microphone) or call"),
+        ] {
+            let e = open(list).unwrap_err();
+            assert!(e.contains(why), "{list:?}: {e}");
+        }
         // The test signal, from frame 0 or from --start.
         let signal = |extra: &[&str]| {
             let list = [&["--render", "--shared", "--device", "S", "--format", "float"][..], extra].concat();
@@ -5807,8 +6118,7 @@ mod tests {
         assert_eq!(signal(&["--signal"]), Ok(Some(0)));
         assert_eq!(signal(&["--signal", "--start", "2097152"]), Ok(Some(2_097_152)));
         for (list, why) in [
-            (&["--exclusive", "--format", "float"][..], "--device NAME is required"),
-            (&["--device", "M", "--format", "float"], "one of --exclusive and --shared"),
+            (&["--device", "M", "--format", "float"][..], "one of --exclusive and --shared"),
             (&["--device", "M", "--exclusive", "--shared", "--format", "float"], "one of --exclusive and --shared"),
             (&["--device", "M", "--exclusive"], "--format float|pcm24 is required"),
             (&["--device", "M", "--exclusive", "--format", "int16"], "float or pcm24"),
@@ -5824,6 +6134,108 @@ mod tests {
             let e = open(list).unwrap_err();
             assert!(e.contains(why), "{list:?}: {e}");
         }
+    }
+
+    const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    const OTHER_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// N0 (the per-cable design, section 10): `--path` names a cable by its control device, in either case, and the canonical
+    /// path is what's opened; the old names say what replaced them.
+    #[test]
+    fn a_path_names_the_cable() {
+        let id: CableId = ID.parse().unwrap();
+        let canonical = format!(r"\\.\AcxLlCable_{ID}");
+        let t = Target::of_path(&format!(r"\\.\ACXLLCABLE_{}", ID.to_ascii_uppercase())).unwrap();
+        assert_eq!(t, Target { id, path: canonical.clone(), node: None });
+        assert_eq!(t.describe(), canonical);
+        let a = args(&["--path", &canonical]);
+        assert_eq!(Target::of(&Opts::parse(&a, &["--path"], &[]).unwrap()), Ok(t.clone()));
+        assert_eq!(Target::of_option(Some(&canonical)), Ok(t));
+        for (path, why) in [
+            (r"\\.\NoiseFilterVmic".to_string(), "that name went with the per-cable driver"),
+            (r"\\.\NoiseFilterVmicB".to_string(), "that name went with the per-cable driver"),
+            (ID.to_string(), "a cable's control device"),
+            (format!(r"\\.\AcxLlCable_{{{ID}}}"), "a cable's control device"),
+            (format!(r"\\.\AcxLlCable_{ID}_1"), "a cable's control device"),
+        ] {
+            let e = Target::of_path(&path).unwrap_err();
+            assert!(e.contains(why), "{path}: {e}");
+        }
+        // The default cable says which node it was found by
+        let cable = cables::CableInstance { label: "A".into(), id, n: 1 };
+        let node = PresentCable { instance_id: cable.instance_id(), cable, health: nf_vmic::variant::Health::Problem(22) };
+        let t = Target { id, path: canonical.clone(), node: Some(node) };
+        assert_eq!(
+            t.describe(),
+            format!(r"cable A (ROOT\MEDIA\ACXLLCABLE_A_{}_1, disabled (Code 22)), {canonical}", ID.to_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn mic_says_which_of_the_cables_microphones() {
+        let kind = |list: &[&str]| {
+            let a = args(list);
+            mic_kind(&Opts::parse(&a, &["--mic", "--device"], &[]).unwrap())
+        };
+        assert_eq!(kind(&[]), Ok(EndpointKind::Microphone));
+        assert_eq!(kind(&["--mic", "low-latency"]), Ok(EndpointKind::Microphone));
+        assert_eq!(kind(&["--mic", "call"]), Ok(EndpointKind::CallMicrophone));
+        assert_eq!(kind(&["--device", "Mic (X)"]), Ok(EndpointKind::Microphone), "--device decides, not the kind");
+        assert!(kind(&["--mic", "speakers"]).unwrap_err().contains("low-latency (the Microphone) or call"));
+        assert!(kind(&["--mic", "call", "--device", "M"]).unwrap_err().contains("give one"));
+    }
+
+    fn endpoint_on(id: &str, label: &str, cable_id: &str, kind: EndpointKind, state: EndpointState) -> CableEndpoint {
+        let instance = format!(r"root\media\acxllcable_{}_{cable_id}_1", label.to_lowercase());
+        CableEndpoint {
+            id: id.into(),
+            name: format!("{} (ACX-LL-Cable {label})", kind.name()),
+            render: kind.is_render(),
+            kind: Some(kind),
+            state,
+            cable: cables::CableInstance::parse(&instance),
+            instance: Some(instance),
+        }
+    }
+
+    /// N0: a mode records its cable's own microphone, found by the instance ID its filter names, and `--device` must name one
+    /// of that cable's, so verify can't judge one cable's recording by another's statistics.
+    #[test]
+    fn the_endpoint_is_the_cables_own() {
+        use EndpointKind::{CallMicrophone, Microphone, Speakers};
+        use EndpointState::{Active, Disabled};
+        let a = Target::of_path(&format!(r"\\.\AcxLlCable_{ID}")).unwrap();
+        let mut list = vec![
+            endpoint_on("{a-spk}", "A", ID, Speakers, Active),
+            endpoint_on("{a-mic}", "A", ID, Microphone, Active),
+            endpoint_on("{a-call}", "A", ID, CallMicrophone, Disabled),
+            endpoint_on("{b-mic}", "B", OTHER_ID, Microphone, Active),
+        ];
+        // Renamed in the Sound panel: still A's, by its filter
+        list[1].name = "Studio mic (ACX-LL-Cable A)".into();
+        let found = |id: &str, name: &str| Ok(Endpoint { id: id.into(), name: name.into() });
+        assert_eq!(cable_endpoint(&list, &a, Microphone), found("{a-mic}", "Studio mic (ACX-LL-Cable A)"));
+        assert_eq!(cable_endpoint(&list, &a, Speakers), found("{a-spk}", "Speakers (ACX-LL-Cable A)"));
+        let e = cable_endpoint(&list, &a, CallMicrophone).unwrap_err();
+        assert!(e.contains("has no active Call Microphone (Microphone1)") && e.contains("disabled in the Sound panel"), "{e}");
+        let b = Target::of_path(&format!(r"\\.\AcxLlCable_{OTHER_ID}")).unwrap();
+        assert_eq!(cable_endpoint(&list, &b, Microphone), found("{b-mic}", "Microphone (ACX-LL-Cable B)"));
+        let e = cable_endpoint(&list, &b, CallMicrophone).unwrap_err();
+        assert!(e.contains("the low-latency variant has only the Microphone: leave out --mic"), "{e}");
+        // By name: A's is taken, B's refused for A, another vendor's and a disabled one not found
+        assert_eq!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a), found("{a-mic}", "Studio mic (ACX-LL-Cable A)"));
+        let e = named_on_cable(&list, "Microphone (ACX-LL-Cable B)", &a).unwrap_err();
+        assert!(e.contains("is cable B's") && e.contains("statistics wouldn't be the recording's"), "{e}");
+        for name in ["CABLE Output (VB-Audio Virtual Cable)", "Call Microphone (ACX-LL-Cable A)", "Speakers (ACX-LL-Cable A)"] {
+            let e = named_on_cable(&list, name, &a).unwrap_err();
+            assert!(e.contains("no active ACX-LL-Cable microphone has that name"), "{name}: {e}");
+        }
+        // Two of ours with one name: which isn't known
+        list[3].name = "Studio mic (ACX-LL-Cable A)".into();
+        assert!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a).unwrap_err().contains("more than one"));
+        // One of ours by its name alone (its filter unread) is taken, with a note
+        let unread = CableEndpoint { instance: None, cable: None, ..endpoint_on("{x}", "C", ID, Microphone, Active) };
+        assert_eq!(named_on_cable(&[unread], "Microphone (ACX-LL-Cable C)", &a), found("{x}", "Microphone (ACX-LL-Cable C)"));
     }
 
     #[test]

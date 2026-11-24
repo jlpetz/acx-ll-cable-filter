@@ -7,14 +7,24 @@
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use crate::cables::CableId;
+
 /// `NF_VMIC_MAGIC`: "NFVM" in memory order.
 pub const MAGIC: u32 = 0x4D56_464E;
 /// `NF_VMIC_VERSION`.
 pub const VERSION: u32 = 1;
 /// `NF_VMIC_LIVE_VERSION`: live ATTACH request and its ring. Ordinary feeds and STATS keep the v1 contract.
 pub const LIVE_VERSION: u32 = 2;
-/// `NF_VMIC_USER_PATH`: the control device, opened from user mode.
-pub const USER_PATH: &str = r"\\.\NoiseFilterVmic";
+/// `NF_VMIC_USER_PREFIX`: a cable's control device, opened from user mode, is this followed by the cable's identity in lower
+/// case ([`control_path`]). One control device per cable (TODO 19, the per-cable design, section 3); `\\.\NoiseFilterVmic` is
+/// gone, and opening it gets ERROR_FILE_NOT_FOUND.
+pub const USER_PREFIX: &str = r"\\.\AcxLlCable_";
+
+/// A cable's control device as the driver names it (D1: `\DosDevices\AcxLlCable_<id>`, the identity's 36 lower-case characters),
+/// opened from user mode: `\\.\AcxLlCable_<id>`. Built from the identity, never taken from a string a user could set.
+pub fn control_path(id: &CableId) -> String {
+    format!("{USER_PREFIX}{id}")
+}
 
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 const METHOD_BUFFERED: u32 = 0;

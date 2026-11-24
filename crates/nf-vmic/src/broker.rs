@@ -146,7 +146,7 @@ impl Drop for LiveFeed {
 }
 
 pub fn attach_live(capacity: u32) -> io::Result<LiveFeed> {
-    match Device::open() {
+    match Device::open_default() {
         Ok(device) => return device.attach_live(RingMemory::new(capacity)?).map(|a| LiveFeed(Feed::Direct(a))).map_err(|e| e.error),
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {}
         Err(e) => return Err(e),

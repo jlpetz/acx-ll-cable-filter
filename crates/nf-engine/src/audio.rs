@@ -398,8 +398,8 @@ fn open_session(
     let mic_dev = resolve(&en, config.devices.mic.as_deref(), Direction::Capture, StreamRole::Mic)?;
     let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
     let out_dev = if direct {
-        let from_ring = mic_dev.get_interface_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours)
-            || mic_dev.get_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours);
+        let from_ring = mic_dev.get_interface_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::has_our_name)
+            || mic_dev.get_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::has_our_name);
         if from_ring {
             return if config.devices.mic.is_none() {
                 Err(StartFailure::DefaultMicIsOutput("Noise Filter virtual microphone".into()))

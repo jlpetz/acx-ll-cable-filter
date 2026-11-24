@@ -1,31 +1,35 @@
-//! Which apps record from our microphones, and which of the two suits each (TODO 19, the owner's option A: two microphones,
-//! and the app says which apps use which).
+//! Our cables' endpoints, which apps record from our microphones, and which of the two suits each (TODO 19, the owner's option A:
+//! two microphones, and the app says which apps use which; the per-cable design, doc/todo/19-per-cable-design.md, section 2).
 //!
-//! [`list`] reads Windows' audio sessions: each active capture endpoint whose name has "AudioCodec Device" in it
-//! (`IMMDeviceEnumerator::EnumAudioEndpoints`), its `IAudioSessionManager2`'s sessions, and for each session its process
-//! (`IAudioSessionControl2::GetProcessId`, then `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and
-//! `QueryFullProcessImageNameW`) and its state. It returns data, for the CLI's `mic sessions` and later the window. A session
-//! exists for each app that opened the endpoint in shared mode; an app recording it in exclusive mode has none, so it isn't
-//! listed.
+//! An endpoint is ours, and which cable's, by the KS filter it's connected to ([`identify_endpoint`]): the filter's device
+//! interface path holds the device's instance ID (`root#media#acxllcable_d_<id>_1`, which names the cable: [`CableInstance`])
+//! and the circuit's reference string (`speaker0` the Speakers, `microphone0` the low-latency Microphone, `microphone1` the Call
+//! Microphone), which hold whatever the endpoint is named. Windows may number a device's names
+//! ("Microphone (2- ACX-LL-Cable A)"), and the user may rename an endpoint in the Sound panel; only when no copy of the filter's
+//! path parses does the name decide ([`is_ours`], [`mic_of`]): its part in brackets, the cable's device's friendly name
+//! ("ACX-LL-Cable D"), which a rename leaves alone.
+//!
+//! [`cable_endpoints`] lists our endpoints, render and capture, active, disabled or unplugged, each with its cable; [`pick`]
+//! finds one cable's Speakers or microphone among them, and [`endpoint_by_id`] the cable of an endpoint already chosen.
+//!
+//! [`list`] reads Windows' audio sessions: each of our active capture endpoints (`IMMDeviceEnumerator::EnumAudioEndpoints`), its
+//! `IAudioSessionManager2`'s sessions, and for each session its process (`IAudioSessionControl2::GetProcessId`, then
+//! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `QueryFullProcessImageNameW`) and its state. It returns data, for the
+//! CLI's `mic sessions` and later the window. A session exists for each app that opened the endpoint in shared mode; an app
+//! recording it in exclusive mode has none, so it isn't listed.
 //!
 //! [`classify`] (pure) sorts an app by its exe's name with [`KNOWN_APPS`]; [`fit`] says whether the microphone it records
 //! from suits it.
 //!
 //! [`capture_endpoints`] reads our capture endpoints alone, active or disabled, without their sessions: what `mic variant`
 //! shows, and what its switch waits for (`variant::check_mics`).
-//!
-//! Which microphone an endpoint is, and which device it's on, come from the KS filter it's connected to ([`identify`]): the
-//! filter's device interface path holds the device's instance ID (`root#media#0004`) and the circuit's reference string
-//! (`microphone0` the low-latency one, `microphone1` the call one), which hold whatever the endpoint is named. Windows numbers
-//! a second device's names ("Microphone (2- AudioCodec Device)"), and the user may rename an endpoint in the Sound panel;
-//! only when no copy of the filter's path names one of our microphones does the name decide ([`mic_of`]). The endpoint is
-//! ours by its name: a rename in the Sound panel changes the part before the brackets, not the device's name in them.
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{PROPERTYKEY, S_OK};
 use windows::Win32::Media::Audio::{
     AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
-    IAudioSessionControl2, IAudioSessionManager2, IDeviceTopology, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    DEVICE_STATE_UNPLUGGED, EDataFlow, IAudioSessionControl2, IAudioSessionManager2, IDeviceTopology, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, eCapture, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
@@ -35,23 +39,23 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::core::{GUID, Interface, Owned, PWSTR};
 
-use crate::variant::{CALL_MICROPHONE_FILTER, DEVICE_NAME, MICROPHONE_FILTER};
+use crate::cables::{self, CableId, CableInstance, EndpointKind};
 use crate::win_error::WinError;
 
 /// The endpoint's copy of the KS filter path it's connected to, in its property store: not documented; seen on Windows
 /// build 26100 as `{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0`, on a disabled endpoint too.
-/// [`identify`] goes by it only when the documented route (the endpoint's device topology) doesn't name one of our
-/// microphones.
+/// [`identify_endpoint`] goes by it only when the documented route (the endpoint's device topology) doesn't name one of a
+/// cable's endpoints.
 const PKEY_ENDPOINT_FILTER: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x233164c8_1b2c_4c7d_bc68_b671687a2567), pid: 1 };
 
 /// Which of our microphones an endpoint is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mic {
-    /// "Microphone (AudioCodec Device)": IAudioClient3's small periods (2.67-10 ms), for apps that ask for them.
+    /// "Microphone (ACX-LL-Cable A)" (Microphone0): IAudioClient3's small periods (2.67-10 ms), for apps that ask for them.
     LowLatency,
-    /// "Call Microphone (AudioCodec Device)": a 5 ms default period, for apps that ask for none (call apps).
+    /// "Call Microphone (ACX-LL-Cable A)" (Microphone1): a 5 ms default period, for apps that ask for none (call apps).
     Call,
-    /// Another AudioCodec endpoint: one whose filter isn't either microphone's, or, without its filter, one by another name
+    /// Another endpoint of ours: one whose filter isn't either microphone's, or, without its filter, one by another name
     /// (renamed in the Sound panel, say).
     Other,
 }
@@ -62,13 +66,22 @@ impl Mic {
         match self {
             Mic::LowLatency => "the Microphone",
             Mic::Call => "the Call Microphone",
-            Mic::Other => "another AudioCodec microphone",
+            Mic::Other => "another ACX-LL-Cable microphone",
+        }
+    }
+
+    /// The microphone a cable endpoint's kind is (the Speakers, or none known, are [`Mic::Other`]).
+    pub fn of_kind(kind: Option<EndpointKind>) -> Mic {
+        match kind {
+            Some(EndpointKind::Microphone) => Mic::LowLatency,
+            Some(EndpointKind::CallMicrophone) => Mic::Call,
+            Some(EndpointKind::Speakers) | None => Mic::Other,
         }
     }
 }
 
 /// An endpoint's [`Mic`], from its friendly name (when its filter can't be read: [`identify`]). A numbered name
-/// ("Microphone (2- AudioCodec Device)") is still the microphone; a renamed one is [`Mic::Other`].
+/// ("Microphone (2- ACX-LL-Cable A)") is still the microphone; a renamed one is [`Mic::Other`].
 pub fn mic_of(endpoint_name: &str) -> Mic {
     let name = endpoint_name.trim_start().to_ascii_lowercase();
     if name.starts_with("call microphone") {
@@ -80,23 +93,45 @@ pub fn mic_of(endpoint_name: &str) -> Mic {
     }
 }
 
-/// Whether an endpoint is one of the driver's (its name has "AudioCodec Device" in it, any case).
-pub fn is_ours(endpoint_name: &str) -> bool {
-    endpoint_name.to_ascii_lowercase().contains(&DEVICE_NAME.to_ascii_lowercase())
+/// An endpoint's kind from its friendly name, when its filter can't be read: a render endpoint named "Speakers ..." is the
+/// Speakers, a capture one as [`mic_of`] reads it (a numbered name still counts; a renamed one is none).
+fn kind_of_name(endpoint_name: &str, render: bool) -> Option<EndpointKind> {
+    if render {
+        endpoint_name.trim_start().to_ascii_lowercase().starts_with("speakers").then_some(EndpointKind::Speakers)
+    } else {
+        match mic_of(endpoint_name) {
+            Mic::LowLatency => Some(EndpointKind::Microphone),
+            Mic::Call => Some(EndpointKind::CallMicrophone),
+            Mic::Other => None,
+        }
+    }
+}
+
+/// Whether an endpoint is one of our cables': by the KS filter it's connected to (`filters`, the copies of the filter's device
+/// interface path that were read, the documented route's first, as [`identify`] takes them), whose device's instance ID has
+/// our form, `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>` ([`CableInstance::parse`]), whatever the endpoint is named. The first copy
+/// that parses decides: a renamed endpoint of ours is ours, and another vendor's renamed to look like one isn't. Only where
+/// none parses (none read, or each in a form [`parse_filter`] doesn't know) does the name decide ([`has_our_name`]).
+pub fn is_ours(filters: &[&str], name: &str) -> bool {
+    match filters.iter().find_map(|p| parse_filter(p)) {
+        Some((instance, _)) => CableInstance::parse(&instance).is_some(),
+        None => has_our_name(name),
+    }
+}
+
+/// Whether an endpoint's name has "ACX-LL-Cable" in it, any case: its part in brackets is its device's friendly name
+/// ("ACX-LL-Cable D"), which a rename in the Sound panel leaves alone. [`is_ours`]'s fallback, for an endpoint whose filter
+/// can't be read, and the engine's check on a name alone.
+pub fn has_our_name(endpoint_name: &str) -> bool {
+    endpoint_name.to_ascii_lowercase().contains(&cables::NAME.to_ascii_lowercase())
 }
 
 /// The microphone a KS filter's reference string names: the driver's capture circuits (`microphone0`, `microphone1`; any
 /// case, as the path has them in lower case), with or without a suffix after the name (`microphone0/00010001`: whatever
-/// follows its first character that isn't a letter or a digit), so `microphone01` isn't `microphone0`.
+/// follows its first character that isn't a letter or a digit), so `microphone01` isn't `microphone0`
+/// ([`EndpointKind::of_reference`]).
 pub fn mic_of_filter(reference: &str) -> Mic {
-    let name = reference.trim_start().split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default();
-    if name.eq_ignore_ascii_case(MICROPHONE_FILTER) {
-        Mic::LowLatency
-    } else if name.eq_ignore_ascii_case(CALL_MICROPHONE_FILTER) {
-        Mic::Call
-    } else {
-        Mic::Other
-    }
+    Mic::of_kind(EndpointKind::of_reference(reference))
 }
 
 /// A KS filter's device interface path, with or without DeviceTopology's `{2}.` before it
@@ -116,21 +151,108 @@ pub fn parse_filter(path: &str) -> Option<(String, String)> {
     (!instance.is_empty()).then(|| (instance, reference.to_string()))
 }
 
-/// An endpoint's microphone and the instance ID of the device it's on, from the KS filter it's connected to: `filters` are
-/// the copies of the filter's device interface path that were read, the documented route's first. The first that parses
-/// and names one of our microphones decides. If none does (none read or parsed, or each in a form [`parse_filter`] and
-/// [`mic_of_filter`] don't know), the name decides the microphone ([`mic_of`]), and the device is the first parsed path's,
-/// if any.
-pub fn identify(filters: &[&str], name: &str) -> (Mic, Option<String>) {
+/// An endpoint's kind and the instance ID of the device it's on, from the KS filter it's connected to: `filters` are the copies
+/// of the filter's device interface path that were read, the documented route's first; `render` its flow. The first that
+/// parses and names one of a cable's endpoints of that flow decides (`speaker0` for render, `microphone0` and `microphone1`
+/// for capture). If none does (none read or parsed, or each in a form [`parse_filter`] and [`EndpointKind::of_reference`]
+/// don't know), the name decides the kind, and the device is the first parsed path's, if any.
+pub fn identify_endpoint(filters: &[&str], name: &str, render: bool) -> (Option<EndpointKind>, Option<String>) {
     let parsed: Vec<(String, String)> = filters.iter().filter_map(|p| parse_filter(p)).collect();
-    let named = parsed.iter().find_map(|(instance, reference)| match mic_of_filter(reference) {
-        Mic::Other => None,
-        mic => Some((mic, instance.clone())),
+    let named = parsed.iter().find_map(|(instance, reference)| {
+        EndpointKind::of_reference(reference).filter(|k| k.is_render() == render).map(|k| (k, instance.clone()))
     });
     match named {
-        Some((mic, instance)) => (mic, Some(instance)),
-        None => (mic_of(name), parsed.into_iter().next().map(|(instance, _)| instance)),
+        Some((kind, instance)) => (Some(kind), Some(instance)),
+        None => (kind_of_name(name, render), parsed.into_iter().next().map(|(instance, _)| instance)),
     }
+}
+
+/// A capture endpoint's microphone and the instance ID of the device it's on ([`identify_endpoint`] for capture): the first
+/// copy of the filter's path that parses and names one of our microphones decides; else the name ([`mic_of`]), on the device
+/// the first parsed path names, if any.
+pub fn identify(filters: &[&str], name: &str) -> (Mic, Option<String>) {
+    let (kind, instance) = identify_endpoint(filters, name, false);
+    (Mic::of_kind(kind), instance)
+}
+
+/// An endpoint's state, as Windows keeps it (a removed device's endpoints, NOTPRESENT, aren't listed: [`cable_endpoints`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointState {
+    Active,
+    /// Disabled in the Sound panel: apps don't see it.
+    Disabled,
+    /// Its device is there, the endpoint unplugged (a jack's state; not expected for a cable).
+    Unplugged,
+}
+
+impl EndpointState {
+    pub fn describe(self) -> &'static str {
+        match self {
+            EndpointState::Active => "active",
+            EndpointState::Disabled => "disabled in the Sound panel",
+            EndpointState::Unplugged => "unplugged",
+        }
+    }
+}
+
+/// One of our cables' endpoints, render or capture, as [`cable_endpoints`] finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CableEndpoint {
+    /// The MMDevice endpoint id (`{0.0.1.00000000}.{...}`).
+    pub id: String,
+    /// "Microphone (ACX-LL-Cable A)", as Windows names it now (numbered, or renamed in the Sound panel).
+    pub name: String,
+    /// A render endpoint (the Speakers); otherwise capture.
+    pub render: bool,
+    /// Which of the cable's endpoints it is ([`identify_endpoint`]); `None` where neither its filter nor its name says.
+    pub kind: Option<EndpointKind>,
+    pub state: EndpointState,
+    /// The instance ID of the device it's on, if its filter was read.
+    pub instance: Option<String>,
+    /// The cable that instance ID names; `None` where the filter wasn't read (it's ours by its name alone, [`is_ours`]).
+    pub cable: Option<CableInstance>,
+}
+
+impl CableEndpoint {
+    /// "\"Microphone (ACX-LL-Cable A)\": cable A's Microphone (Microphone0), active".
+    pub fn describe(&self) -> String {
+        let what = match (&self.cable, self.kind) {
+            (Some(c), Some(k)) => format!("cable {}'s {} ({})", c.label, k.name(), k.reference()),
+            (Some(c), None) => format!("cable {}'s, neither its Speakers nor a microphone", c.label),
+            (None, Some(k)) => format!("a {} of ours by its name, its device unknown (its filter wasn't read)", k.name()),
+            (None, None) => "ours by its name, its device unknown (its filter wasn't read)".to_string(),
+        };
+        format!("{:?}: {what}, {}", self.name, self.state.describe())
+    }
+}
+
+/// What [`pick`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick<'a> {
+    /// The one active endpoint of that kind on that cable.
+    Found(&'a CableEndpoint),
+    /// None of that kind is active on the cable: the cable's endpoints that are listed (of any kind and state), to name them.
+    NotActive(Vec<&'a CableEndpoint>),
+    /// More than one is active (two device nodes of one cable present at once: a variant switch midway).
+    Several(Vec<&'a CableEndpoint>),
+}
+
+/// The endpoint of `kind` on cable `id` among `endpoints` ([`cable_endpoints`]), by the instance ID its KS filter names, never by
+/// its name: active, and the only one.
+pub fn pick<'a>(endpoints: &'a [CableEndpoint], id: &CableId, kind: EndpointKind) -> Pick<'a> {
+    let on_cable: Vec<&CableEndpoint> = endpoints.iter().filter(|e| e.cable.as_ref().is_some_and(|c| c.id == *id)).collect();
+    let active: Vec<&CableEndpoint> =
+        on_cable.iter().copied().filter(|e| e.kind == Some(kind) && e.state == EndpointState::Active).collect();
+    match active.as_slice() {
+        [one] => Pick::Found(one),
+        [] => Pick::NotActive(on_cable),
+        _ => Pick::Several(active),
+    }
+}
+
+/// The endpoint with MMDevice id `endpoint_id` among `endpoints`, if it's ours (ids compared without case).
+pub fn endpoint_by_id<'a>(endpoints: &'a [CableEndpoint], endpoint_id: &str) -> Option<&'a CableEndpoint> {
+    endpoints.iter().find(|e| e.id.eq_ignore_ascii_case(endpoint_id))
 }
 
 /// One of our capture endpoints and the sessions on it.
@@ -138,7 +260,7 @@ pub fn identify(filters: &[&str], name: &str) -> (Mic, Option<String>) {
 pub struct Endpoint {
     /// The endpoint's id (`{0.0.1.00000000}.{...}`), as `noise-filter devices` shows it.
     pub id: String,
-    /// "Call Microphone (AudioCodec Device)".
+    /// "Call Microphone (ACX-LL-Cable A)".
     pub name: String,
     pub mic: Mic,
     pub sessions: Vec<Session>,
@@ -306,13 +428,13 @@ pub fn list() -> Result<Vec<Endpoint>, WinError> {
 pub struct CaptureEndpoint {
     /// `{0.0.1.00000000}.{...}`: a new device's endpoints get new ones.
     pub id: String,
-    /// "Call Microphone (AudioCodec Device)", as Windows names it now (numbered, or renamed in the Sound panel).
+    /// "Call Microphone (ACX-LL-Cable A)", as Windows names it now (numbered, or renamed in the Sound panel).
     pub name: String,
     /// Active; otherwise disabled (in the Sound panel's Recording tab).
     pub active: bool,
     /// Which microphone it is ([`identify`]).
     pub mic: Mic,
-    /// The instance ID of the device it's on (`root\media\0004`), if its filter was read ([`identify`]).
+    /// The instance ID of the device it's on (`root\media\acxllcable_a_<id>_1`), if its filter was read ([`identify`]).
     pub device: Option<String>,
 }
 
@@ -355,11 +477,11 @@ impl Drop for Mta {
 
 fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
     let mut out = Vec::new();
-    for ours in our_capture_endpoints(DEVICE_STATE_ACTIVE)? {
+    for ours in our_endpoints(eCapture, DEVICE_STATE_ACTIVE)? {
         // One that went away meanwhile isn't listed, nor one whose sessions can't be read: the others still are
         let Ok(id) = device_id(&ours.device) else { continue };
         let Ok(sessions) = sessions_of(&ours.device) else { continue };
-        let (mic, _) = ours.identify();
+        let (mic, _) = identify(&ours.filters(), &ours.name);
         out.push(Endpoint { id, mic, sessions, name: ours.name });
     }
     Ok(out)
@@ -367,43 +489,73 @@ fn list_on_this_thread() -> Result<Vec<Endpoint>, WinError> {
 
 fn capture_endpoints_on_this_thread() -> Result<Vec<CaptureEndpoint>, WinError> {
     let mut out = Vec::new();
-    for ours in our_capture_endpoints(DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0))? {
+    for ours in our_endpoints(eCapture, DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0))? {
         // One that went away meanwhile isn't listed, as one whose name couldn't be read isn't
         // SAFETY: a live device.
         let Ok(state) = (unsafe { ours.device.GetState() }) else { continue };
         let Ok(id) = device_id(&ours.device) else { continue };
-        let (mic, device) = ours.identify();
+        let (mic, device) = identify(&ours.filters(), &ours.name);
         out.push(CaptureEndpoint { id, active: state == DEVICE_STATE_ACTIVE, mic, device, name: ours.name });
     }
     Ok(out)
 }
 
-/// One of our endpoints, as [`our_capture_endpoints`] reads it.
+/// Our cables' endpoints, render and capture, active, disabled or unplugged, each with the cable its KS filter's instance ID
+/// names ([`identify_endpoint`], [`CableInstance::parse`]). Not NOTPRESENT: a removed device's endpoints linger in that state,
+/// and a cable's instance ID is never another cable's (the design, section 4), so no lingering endpoint is credited to
+/// another cable. On a thread of its own, as [`list`]; any user may call it, as [`capture_endpoints`].
+pub fn cable_endpoints() -> Result<Vec<CableEndpoint>, WinError> {
+    on_mta_thread(cable_endpoints_on_this_thread)
+}
+
+fn cable_endpoints_on_this_thread() -> Result<Vec<CableEndpoint>, WinError> {
+    let states = DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0 | DEVICE_STATE_UNPLUGGED.0);
+    let mut out = Vec::new();
+    for (flow, render) in [(eRender, true), (eCapture, false)] {
+        for ours in our_endpoints(flow, states)? {
+            // One that went away meanwhile isn't listed, as one whose name couldn't be read isn't
+            // SAFETY: a live device.
+            let Ok(state) = (unsafe { ours.device.GetState() }) else { continue };
+            let state = match state {
+                DEVICE_STATE_ACTIVE => EndpointState::Active,
+                DEVICE_STATE_DISABLED => EndpointState::Disabled,
+                DEVICE_STATE_UNPLUGGED => EndpointState::Unplugged,
+                _ => continue,
+            };
+            let Ok(id) = device_id(&ours.device) else { continue };
+            let (kind, instance) = identify_endpoint(&ours.filters(), &ours.name, render);
+            let cable = instance.as_deref().and_then(CableInstance::parse);
+            out.push(CableEndpoint { id, name: ours.name, render, kind, state, instance, cable });
+        }
+    }
+    Ok(out)
+}
+
+/// One of our endpoints, as [`our_endpoints`] reads it.
 struct Ours {
     device: IMMDevice,
     name: String,
-    /// The filter path the endpoint's property store keeps ([`PKEY_ENDPOINT_FILTER`]), if it has one.
-    cached_filter: Option<String>,
+    /// The copies of the KS filter's path that were read: the one its device topology is connected to (the documented route),
+    /// then the one its property store keeps ([`PKEY_ENDPOINT_FILTER`]), each where there is one.
+    filters: Vec<String>,
 }
 
 impl Ours {
-    /// Its microphone and device ([`identify`]): by the filter its device topology is connected to, else the property
-    /// store's copy, whichever first names one of our microphones; else by its name.
-    fn identify(&self) -> (Mic, Option<String>) {
-        let topology = connected_filter(&self.device);
-        let filters: Vec<&str> = topology.iter().chain(&self.cached_filter).map(String::as_str).collect();
-        identify(&filters, &self.name)
+    /// Its filter's paths, as [`identify`] and [`is_ours`] take them.
+    fn filters(&self) -> Vec<&str> {
+        self.filters.iter().map(String::as_str).collect()
     }
 }
 
-/// Our capture endpoints in `states`, with their names. COM must be initialised on this thread.
-fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
+/// Our endpoints of `flow` in `states`, with their names and their filters' paths: every endpoint's filter is read, since an
+/// endpoint is ours by its filter's instance ID ([`is_ours`]). COM must be initialised on this thread.
+fn our_endpoints(flow: EDataFlow, states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
     // SAFETY: COM is initialised on this thread (the caller's); a plain in-process creation.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
     // SAFETY: a live enumerator; constant arguments.
     let endpoints =
-        unsafe { enumerator.EnumAudioEndpoints(eCapture, states) }.map_err(WinError::of("IMMDeviceEnumerator::EnumAudioEndpoints"))?;
+        unsafe { enumerator.EnumAudioEndpoints(flow, states) }.map_err(WinError::of("IMMDeviceEnumerator::EnumAudioEndpoints"))?;
     // SAFETY: a live collection.
     let count = unsafe { endpoints.GetCount() }.map_err(WinError::of("IMMDeviceCollection::GetCount"))?;
     let mut out = Vec::new();
@@ -414,9 +566,11 @@ fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
         // SAFETY: a live device; read access only.
         let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
         let Ok(name) = string_property(&store, &PKEY_Device_FriendlyName) else { continue };
-        if is_ours(&name) {
-            let cached_filter = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
-            out.push(Ours { device, name, cached_filter });
+        let cached = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
+        let filters: Vec<String> = connected_filter(&device).into_iter().chain(cached).collect();
+        let ours = is_ours(&filters.iter().map(String::as_str).collect::<Vec<_>>(), &name);
+        if ours {
+            out.push(Ours { device, name, filters });
         }
     }
     Ok(out)
@@ -558,18 +712,137 @@ mod tests {
     }
 
     #[test]
-    fn our_endpoints_are_told_apart_by_name() {
-        assert!(is_ours("Microphone (AudioCodec Device)") && is_ours("Call Microphone (AudioCodec Device)"));
-        assert!(is_ours("Studio mic (audiocodec device)"), "any case");
-        assert!(!is_ours("CABLE Output (VB-Audio Virtual Cable)") && !is_ours("Microphone (USB Audio Device)"));
-        assert_eq!(mic_of(crate::variant::MICROPHONE), Mic::LowLatency);
-        assert_eq!(mic_of(crate::variant::CALL_MICROPHONE), Mic::Call);
+    fn our_endpoints_are_told_apart_by_name_when_their_filter_cant_be_read() {
+        assert!(has_our_name("Microphone (ACX-LL-Cable A)") && has_our_name("Call Microphone (ACX-LL-Cable B)"));
+        assert!(has_our_name("Speakers (ACX-LL-Cable D)") && has_our_name("ACX-LL-Cable Microphone"), "an interface's name too");
+        assert!(has_our_name("Studio mic (acx-ll-cable a)"), "any case");
+        assert!(!has_our_name("CABLE Output (VB-Audio Virtual Cable)") && !has_our_name("Microphone (USB Audio Device)"));
+        assert!(!has_our_name("Microphone (AudioCodec Device)"), "the old driver's name isn't ours any more");
+        // No filter read: the name decides
+        assert!(is_ours(&[], "Microphone (ACX-LL-Cable A)") && !is_ours(&[], "Microphone (AudioCodec Device)"));
+        assert!(is_ours(&["garbage"], "Studio mic (ACX-LL-Cable A)"), "a copy that doesn't parse is no copy");
+        assert_eq!(mic_of("Microphone (ACX-LL-Cable A)"), Mic::LowLatency);
+        assert_eq!(mic_of("Call Microphone (ACX-LL-Cable A)"), Mic::Call);
         // Windows numbers a second device's names in the brackets
-        assert!(is_ours("Microphone (2- AudioCodec Device)"));
-        assert_eq!(mic_of("Microphone (2- AudioCodec Device)"), Mic::LowLatency);
-        assert_eq!(mic_of("Call Microphone (2- AudioCodec Device)"), Mic::Call);
-        assert_eq!(mic_of("2- Microphone (AudioCodec Device)"), Mic::Other);
-        assert_eq!(mic_of("Studio mic (AudioCodec Device)"), Mic::Other);
+        assert!(has_our_name("Microphone (2- ACX-LL-Cable A)"));
+        assert_eq!(mic_of("Microphone (2- ACX-LL-Cable A)"), Mic::LowLatency);
+        assert_eq!(mic_of("Call Microphone (2- ACX-LL-Cable A)"), Mic::Call);
+        assert_eq!(mic_of("2- Microphone (ACX-LL-Cable A)"), Mic::Other);
+        assert_eq!(mic_of("Studio mic (ACX-LL-Cable A)"), Mic::Other);
+    }
+
+    const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    const OTHER_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// A KS filter path on cable `label`, as DeviceTopology gives it (lower case, `#` for `\`).
+    fn on_cable(label: &str, id: &str, n: u32, reference: &str) -> String {
+        format!(r"\\?\root#media#acxllcable_{}_{id}_{n}#{{6994ad04-93ef-11d0-a3cc-00a0c9223196}}\{reference}", label.to_lowercase())
+    }
+
+    /// N0 (the per-cable design, section 2): an endpoint is ours by the instance ID its filter names, whatever its name.
+    #[test]
+    fn our_endpoints_are_known_by_their_filters_instance_id() {
+        let a_mic = on_cable("A", ID, 1, "microphone0");
+        let id: CableId = ID.parse().unwrap();
+        // Ours, whatever the name: renamed, or numbered
+        for name in ["Microphone (ACX-LL-Cable A)", "Studio mic (ACX-LL-Cable A)", "Anything at all"] {
+            assert!(is_ours(&[&a_mic], name), "{name}");
+        }
+        // The property store's copy counts the same, prefix and all
+        assert!(is_ours(&[&format!("{{2}}.{a_mic}")], "x"));
+        // A filter on a device that isn't a cable's isn't ours, even named like one: the old driver's ROOT\MEDIA\NNNN, or
+        // another vendor's endpoint renamed
+        let old = r"{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0";
+        let vb = r"\\?\root#media#0001#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\wave";
+        assert!(!is_ours(&[old], "Microphone (AudioCodec Device)"));
+        assert!(!is_ours(&[vb], "Microphone (ACX-LL-Cable A)"));
+        // The documented route's copy comes first: it decides over a stale cached one
+        assert!(!is_ours(&[vb, &a_mic], "Microphone (ACX-LL-Cable A)"));
+        assert!(is_ours(&["garbage", &a_mic], "CABLE Output (VB-Audio Virtual Cable)"));
+        // The instance ID it names is the cable's
+        let (mic, instance) = identify(&[&a_mic], "Studio mic (ACX-LL-Cable A)");
+        assert_eq!(mic, Mic::LowLatency);
+        let cable = CableInstance::parse(&instance.unwrap()).unwrap();
+        assert_eq!((cable.label.as_str(), cable.id, cable.n), ("A", id, 1));
+    }
+
+    #[test]
+    fn a_render_endpoint_is_known_by_its_speakers_filter() {
+        let speakers = on_cable("B", ID, 3, "speaker0");
+        let instance = Some(format!(r"root\media\acxllcable_b_{ID}_3"));
+        assert_eq!(identify_endpoint(&[&speakers], "Renamed", true), (Some(EndpointKind::Speakers), instance.clone()));
+        // A capture filter path doesn't name a render endpoint, nor the other way round: the name decides, on that device
+        let mic = on_cable("B", ID, 3, "microphone1");
+        assert_eq!(identify_endpoint(&[&mic], "Speakers (ACX-LL-Cable B)", true), (Some(EndpointKind::Speakers), instance.clone()));
+        assert_eq!(identify_endpoint(&[&mic], "Studio", true), (None, instance.clone()));
+        assert_eq!(identify_endpoint(&[&speakers], "Studio", false), (None, instance.clone()));
+        assert_eq!(identify_endpoint(&[&mic], "Studio", false), (Some(EndpointKind::CallMicrophone), instance));
+        // No filter: the name, and no device
+        assert_eq!(identify_endpoint(&[], "Speakers (2- ACX-LL-Cable B)", true), (Some(EndpointKind::Speakers), None));
+        assert_eq!(identify_endpoint(&[], "Headphones (ACX-LL-Cable B)", true), (None, None));
+        assert_eq!(identify_endpoint(&[], "Microphone (ACX-LL-Cable B)", false), (Some(EndpointKind::Microphone), None));
+    }
+
+    fn endpoint(id: &str, label: &str, cable_id: &str, n: u32, kind: EndpointKind, state: EndpointState) -> CableEndpoint {
+        let instance = format!(r"root\media\acxllcable_{}_{cable_id}_{n}", label.to_lowercase());
+        CableEndpoint {
+            id: id.into(),
+            name: format!("{} (ACX-LL-Cable {label})", kind.name()),
+            render: kind.is_render(),
+            kind: Some(kind),
+            state,
+            cable: CableInstance::parse(&instance),
+            instance: Some(instance),
+        }
+    }
+
+    #[test]
+    fn a_cables_endpoint_is_picked_by_its_identity_not_its_name() {
+        use EndpointKind::{CallMicrophone, Microphone, Speakers};
+        use EndpointState::{Active, Disabled};
+        let (a, b): (CableId, CableId) = (ID.parse().unwrap(), OTHER_ID.parse().unwrap());
+        let mut list = vec![
+            endpoint("{a-spk}", "A", ID, 1, Speakers, Active),
+            endpoint("{a-mic}", "A", ID, 1, Microphone, Active),
+            endpoint("{a-call}", "A", ID, 1, CallMicrophone, Disabled),
+            endpoint("{b-mic}", "B", OTHER_ID, 1, Microphone, Active),
+            // Ours by name alone: never any cable's
+            CableEndpoint {
+                id: "{unknown}".into(),
+                name: "Microphone (ACX-LL-Cable A)".into(),
+                render: false,
+                kind: Some(Microphone),
+                state: Active,
+                instance: None,
+                cable: None,
+            },
+        ];
+        // B's microphone is named like A's: still B's
+        list[3].name = "Microphone (ACX-LL-Cable A)".into();
+        let id_of = |p: Pick| match p {
+            Pick::Found(e) => e.id.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(id_of(pick(&list, &a, Speakers)), "{a-spk}");
+        assert_eq!(id_of(pick(&list, &a, Microphone)), "{a-mic}");
+        assert_eq!(id_of(pick(&list, &b, Microphone)), "{b-mic}");
+        // Disabled isn't picked: the cable's endpoints are named instead
+        match pick(&list, &a, CallMicrophone) {
+            Pick::NotActive(on_a) => assert_eq!(on_a.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["{a-spk}", "{a-mic}", "{a-call}"]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(pick(&list, &b, Speakers), Pick::NotActive(vec![&list[3]]));
+        let none: CableId = "99999999-9999-9999-9999-999999999999".parse().unwrap();
+        assert_eq!(pick(&list, &none, Microphone), Pick::NotActive(vec![]));
+        // Two nodes of one cable at once (n and n + 1, a variant switch midway): which one is ambiguous
+        list.push(endpoint("{a2-mic}", "A", ID, 2, Microphone, Active));
+        assert_eq!(pick(&list, &a, Microphone), Pick::Several(vec![&list[1], &list[5]]));
+        // An endpoint chosen by name finds its cable by its id
+        assert_eq!(endpoint_by_id(&list, "{B-MIC}").and_then(|e| e.cable.as_ref()).map(|c| c.id), Some(b));
+        assert_eq!(endpoint_by_id(&list, "{unknown}").map(|e| e.cable.is_none()), Some(true));
+        assert_eq!(endpoint_by_id(&list, "{vb-cable}"), None);
+        assert_eq!(list[1].describe(), "\"Microphone (ACX-LL-Cable A)\": cable A's Microphone (Microphone0), active");
+        assert!(list[4].describe().contains("its device unknown"), "{}", list[4].describe());
     }
 
     /// Astra's review: the switch matched endpoints by their exact names, so a numbered or renamed one never counted. The KS
