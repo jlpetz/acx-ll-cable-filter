@@ -1,6 +1,45 @@
 ## TODO 19 design: accessible diagnostics on every cable
 
-**Status: a proposal (ours, 2026-11-24, a workflow's read-only design on the owner's decision of that day), for the owner's questions at the end; nothing built.** Its section 9 is the acceptance test's plan.
+**Status: the owner answered its questions (2026-11-24, with Astra; below), and asked for three revisions before it is
+built: discovery without hard-coded cables, diagnostics reset when a cable is re-created, and no compatibility promise
+(pre-release). Being revised; nothing built.**
+
+**The owner's decisions (2026-11-24, with Astra):**
+- **Any number of cables, discovered.** Adding a cable (C, D, E...) is a setup action: another instance of the same
+  installed driver package, which the existing app finds by asking Windows; no new driver binary or app build, and a plain
+  cable needs no filter setup. A discovery-only device interface per cable is enumerated, then the chosen cable's own
+  control device opened; arrival notifications can wait. No fixed slot count and no compiled-in paths: letters are labels,
+  gaps allowed. Acceptance: add D while A carries audio, B and C absent; D appears and works at once, A keeps playing,
+  nothing rebuilt.
+- **Diagnostics without UAC, redacted:** signed-in interactive users may read a cable's statistics and logs; feeding stays
+  behind the write permission and the broker's approval. Document the trade-off: another signed-in user (Remote Desktop
+  included) can tell when a cable is active. The feeder's process id is hidden from read-only handles.
+- **Snapshots:** the 10 ms limit applies to refreshing the snapshot; readers arriving together get the same timestamped,
+  redacted snapshot (no ERROR_BUSY, so no reader can starve another); the GUI refreshes once a second.
+- **No compatibility promise (pre-release; the owner: breaking changes welcome now for a clearer layout):** the statistics
+  get the clearest layout now and their own version, changed when the layout changes; a mismatched tool is told to update.
+  The audio-protocol version changes only for changes to how audio is exchanged.
+- **Identity and generations:** a cable keeps a stable identity across removal and re-adding; each binding gets a fresh
+  generation, with its counters and logs reset (so "how many frames has this instance lost" is unambiguous); A's continue.
+  The diagnostics view may keep history across generations, marking each restart.
+- **Names:** the product's short name is **ACX-LL-Cable** (from the repository's acx-ll-cable-filter): endpoints like
+  "Microphone (ACX-LL-Cable A)" and "Speakers (ACX-LL-Cable B)"; in docs and the GUI, "ACX-LL-Cable B" beside "VB-CABLE B".
+  `\\.\NoiseFilterVmicB` style names and `--cable b` are aliases; the CLI lists installed cables and takes a stable id too.
+- **Writers:** one independent writer per cable, two feeds from the one broker included; stopping or removing B leaves A
+  running; the broker resolves the requested cable from the driver's discovered devices; the session approval's scope made
+  clear. A user running only plain cables needs neither the broker nor the app.
+- **Input guard:** reject the destination cable's own microphones as the app's input; another cable is allowed (a mic ->
+  effects -> B); match by cable identity, not endpoint name; reject a known cycle (A -> B -> A) where the app runs several
+  routes.
+- **Fan-out (the owner, 2026-11-24):** capture the physical microphone once and send it to one or more cables, each
+  receiving the dry mic, the output of a shared effects chain, or its own chain; stopping or reconfiguring one destination
+  leaves the others playing. Acceptance: Cable A carries the dry mic to OBS while Cable B carries the echo-cancelled,
+  denoised mic to Discord.
+- **Acceptance runs:** WASAPI into B counts as an interim milestone; the effect is the gain at 0.25: the receiving mic
+  measures -12.04 dB while the other cable carries its own signal unchanged (as already shown on A, TODO 17); then direct
+  to B, swapped to direct to A, then B removed while A keeps recording. A reduced-rights token for an early access check;
+  a real standard account for release (diagnostics without UAC, direct attach refused without approval, the broker's
+  approval and cancellation).
 
 Read-only analysis. I changed nothing. The tree is clean on main, now at d0c39e1, a docs-only commit by the lead after e2fc539. Two public sources were read through `gh api` into a scratch folder, which is now deleted: WDF's open-source `FxPkgGeneral` and microsoft/low-latency-audio's ACX driver.
 

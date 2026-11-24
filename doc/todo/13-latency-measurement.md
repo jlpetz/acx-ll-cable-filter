@@ -248,15 +248,20 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
   reports a real underrun and loses it again after clean running (three failed lowerings keep it; ours). Live under
   Verifier (p66, `nf-scratch/latency/direct-1124-170354`, VB-CABLE A as the mic, 3 runs a period): the sweep against the
   readout plus the chain's 10 ms, 23.5-24.5 against 23.9-25.0 ms at a 10 ms reader, 18.2-18.4 against 18.5-18.9 at 2.67 ms
-  (128 frames), 18.1-18.7 against about 19.4 at 3.33 ms (160): within 0.7 ms everywhere, where it read a packet high
-  before (Astra's 20.14 ms readout against 9.91). The delivery figure moves with the phase, within a packet. Two runs'
+  (128 frames), 18.1-18.7 against about 19.4 at 3.33 ms (160): within about 1 ms everywhere (the most, 0.93 ms against
+  one run's median, 0.63 against its one undisturbed sweep; Astra's check, 2026-11-24), where it read a packet high before
+  (Astra's 20.14 ms readout against 9.91). The headline worth quoting: app + output cable 18.19-18.43 ms on the direct
+  route at 128 frames, against about 38 ms on the previous default route (WASAPI, exclusive both); the full path from the
+  probe to the recorder, VB-CABLE A's input on this VM included, 74.18-81.11 ms. The delivery figure moves with the phase,
+  within a packet. Two runs'
   re-anchors were named as disturbed sweeps. Left (ours): the sample time comes from the last pass's QPC, taken after its
   deadline, so it reads the pass lateness late (0.15-0.3 ms); exact needs the pass's deadline in the ring header (a
   version bump by the owner's rule).
 - **A lead on the late wake (2026-11-24, from the STATS stall's trace):** under Driver Verifier any of our driver's spin
   locks taken from PASSIVE_LEVEL can stall its caller for milliseconds (Force IRQL checking's memory trim; TODO 19's spike
   file). The 12.7-15.8 ms holds were on runs with the exclusive output on our driver: if that wake made such a call into
-  AudioCodec.sys, they are a dev-box artefact. To check (ours): a kernel trace across a latency run.
+  AudioCodec.sys, they are a dev-box artefact. To check (ours): a kernel trace across a latency run. Open until a trace
+  catches one (Astra, 2026-11-24, with the owner).
 - Next: that check; then the exclusive figure against an exclusive cable-only probe.
 
 ## Budget (built and run 2026-11-01)
