@@ -22,7 +22,7 @@ use nf_core::noise::InferenceStats;
 use nf_core::rt::Dither;
 use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, SAMPLE_RATE};
-use nf_vmic::cables::CableInstance;
+use nf_vmic::identity::CableInstance;
 use rtrb::Producer;
 use wasapi::{DeviceEnumerator, Direction, Role};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -633,13 +633,19 @@ pub(crate) fn direct_feed_check(mic: &MicCable, feed: Option<&CableInstance>, fo
     let (name, why) = match mic {
         MicCable::NotOurs => return None,
         MicCable::On(cable) if feed.is_some_and(|f| f.id == cable.id) => (
-            cable.name(),
-            format!("is a microphone of {}, the cable direct output feeds, so it records the filter's own output", cable.name()),
+            cable.label.friendly_name(),
+            format!(
+                "is a microphone of {}, the cable direct output feeds, so it records the filter's own output",
+                cable.label.friendly_name()
+            ),
         ),
         MicCable::On(_) => return None,
         MicCable::Unknown => (
-            nf_vmic::cables::NAME.to_owned(),
-            format!("is an {} microphone whose cable couldn't be read, so it may record the filter's own output", nf_vmic::cables::NAME),
+            nf_vmic::identity::PRODUCT.to_owned(),
+            format!(
+                "is an {} microphone whose cable couldn't be read, so it may record the filter's own output",
+                nf_vmic::identity::PRODUCT
+            ),
         ),
     };
     Some(if following_default {
@@ -996,11 +1002,7 @@ mod tests {
     /// feeds, by identity, and allows another cable's; one of ours whose cable isn't known is refused.
     #[test]
     fn direct_output_refuses_its_own_cables_microphone() {
-        let cable = |label: &str, id: u128| CableInstance {
-            label: label.into(),
-            id: nf_vmic::cables::CableId(windows::core::GUID::from_u128(id)),
-            n: 1,
-        };
+        let cable = |label: &str, id: u128| CableInstance { label: label.parse().unwrap(), id: nf_vmic::identity::CableId(id), n: 1 };
         let (a, b) = (cable("A", 0xa), cable("B", 0xb));
         // The fed cable's: refused, waited out where it's the default, naming the cable
         assert_eq!(
@@ -1013,7 +1015,7 @@ mod tests {
         };
         assert!(message.contains("is a microphone of ACX-LL-Cable A, the cable direct output feeds"), "{message}");
         // Renamed or relabelled, the identity decides: same id, another label, is still the fed cable
-        assert!(direct_feed_check(&MicCable::On(CableInstance { label: "Z".into(), ..a.clone() }), Some(&a), true).is_some());
+        assert!(direct_feed_check(&MicCable::On(CableInstance { label: "Z".parse().unwrap(), ..a.clone() }), Some(&a), true).is_some());
         // Another cable's, a real microphone, or the fed cable unknown (the ring's open says why): allowed
         assert_eq!(direct_feed_check(&MicCable::On(b.clone()), Some(&a), true), None);
         assert_eq!(direct_feed_check(&MicCable::On(b), Some(&a), false), None);

@@ -6,8 +6,8 @@
 //! `METHOD_OUT_DIRECT` IOCTL; that cable's microphones ("Microphone (ACX-LL-Cable A)") then deliver what the app writes there,
 //! sample for sample, until the request ends. The protocol is `driver/src/Shared/nf_vmic.h`.
 //!
-//! - [`cables`]: a cable's identity, the instance ID that carries it (`ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`), and the cables
-//!   present (interim, until discovery through each cable's device interface: N1).
+//! - [`cables`]: the cables present, by the instance IDs Plug and Play lists (interim, until discovery through each cable's
+//!   device interface: N1), the default one, and which of a cable's endpoints a KS filter's reference string names.
 //! - [`protocol`]: its constants and layouts, checked against the header's offsets at compile time, and every status ATTACH
 //!   completes with, in Win32 terms.
 //! - [`ring`]: the ring's arithmetic, and [`ring::ReaderModel`], the driver's capture pass in Rust (the tests' reader).

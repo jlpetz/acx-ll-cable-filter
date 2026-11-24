@@ -34,18 +34,10 @@ use crate::setup::plan::{self, Entry, Node, PlanError, Resolved, VariantPlan};
 use crate::setup::{self, Present, SetupError};
 use crate::win_error::WinError;
 
-/// The old driver's device description, which [`crate::sessions::is_ours`] still matches endpoints by until N0 matches them
-/// by instance ID. The per-cable driver's is [`crate::identity::PRODUCT`].
-pub const DEVICE_NAME: &str = "AudioCodec Device";
 /// Cable A's low-latency microphone, by the name we expect Windows to give it.
 pub const MICROPHONE: &str = "Microphone (ACX-LL-Cable A)";
 /// Cable A's call microphone, by the name we expect Windows to give it.
 pub const CALL_MICROPHONE: &str = "Call Microphone (ACX-LL-Cable A)";
-/// The low-latency microphone's KS filter, by its device interface's reference string: the INF's `KSNAME_Microphone`, the
-/// driver's `captureCircuitName` (DriverSettings.h).
-pub const MICROPHONE_FILTER: &str = "Microphone0";
-/// The call microphone's KS filter: the INF's `KSNAME_CallMicrophone`, the driver's `capture2CircuitName`.
-pub const CALL_MICROPHONE_FILTER: &str = "Microphone1";
 
 /// One of the driver's three variants, by the hardware ID its cable's node has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -214,7 +206,7 @@ pub fn found_lines(check: &EndpointCheck) -> Vec<String> {
         .iter()
         .map(|(kind, e)| {
             let off = if e.state == endpoints::State::Disabled { ", disabled in the Sound panel" } else { "" };
-            format!("  {}: \"{}\"{off}", kind.word(), e.name)
+            format!("  {}: \"{}\"{off}", kind.name(), e.name)
         })
         .collect();
     lines.extend(
@@ -328,11 +320,11 @@ pub fn switch(label: &Label, target: Variant, say: &mut dyn FnMut(&str)) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cables::{CALL_MICROPHONE_FILTER, EndpointKind, MICROPHONE_FILTER};
     use crate::identity::CableInstance;
-    use crate::setup::endpoints::Kind;
     use crate::setup::plan::tests::{A_ID, B_ID, label, node};
 
-    fn ep(c: &CableInstance, kind: Kind, state: endpoints::State) -> Endpoint {
+    fn ep(c: &CableInstance, kind: EndpointKind, state: endpoints::State) -> Endpoint {
         Endpoint {
             id: format!("{kind:?}"),
             name: endpoints::expected_name(c, kind),
@@ -371,28 +363,20 @@ mod tests {
         String::from_utf16_lossy(&crate::setup::devices::wide_of_bytes(&inf[2..]))
     }
 
-    /// Whether the tree has D1's driver, by either of its marks: Cable.h, or the per-cable models in the INF. S1 is written
-    /// for it; until the branches meet, the tree may have the old driver, and then neither mark is there. Once either is, both
-    /// checks below are made in full, so after the merge a moved Cable.h, or an INF that lost its per-cable models, fails them
-    /// rather than skipping them.
-    fn has_d1() -> bool {
-        std::path::Path::new(&format!("{DRIVER}Shared/Cable.h")).exists() || inf_text().contains("AcxLlCable.DeviceDesc")
-    }
-
-    /// The INF and the driver agree on the microphones' filters and the hardware IDs.
+    /// The INF and the driver agree on the microphones' filters and the hardware IDs (D1 and S1 in one tree since step 1's
+    /// merge, so nothing here is skipped).
     #[test]
     fn the_microphones_filters_are_the_drivers() {
         let inf = inf_text();
         assert!(inf.contains(&format!("KSNAME_Microphone=\"{MICROPHONE_FILTER}\"")));
         assert!(inf.contains(&format!("KSNAME_CallMicrophone=\"{CALL_MICROPHONE_FILTER}\"")));
-        assert!(inf.contains(&format!("KSNAME_Speaker=\"{}\"", endpoints::SPEAKERS_FILTER)));
+        assert!(inf.contains(&format!("KSNAME_Speaker=\"{}\"", crate::cables::SPEAKERS_FILTER)));
         let settings = std::fs::read_to_string(format!("{DRIVER}AudioCodec/Driver/DriverSettings.h")).unwrap();
         assert!(settings.contains(&format!("captureCircuitName, L\"{MICROPHONE_FILTER}\")")));
         assert!(settings.contains(&format!("capture2CircuitName, L\"{CALL_MICROPHONE_FILTER}\")")));
-        if !has_d1() {
-            eprintln!("skipped D1's part: neither Cable.h nor the per-cable models are in this tree (the old driver's)");
-            return;
-        }
+        // What AddDevice reads of the hardware key, which the INF's .HW AddReg writes
+        let device = std::fs::read_to_string(format!("{DRIVER}AudioCodec/Driver/Device.cpp")).unwrap();
+        assert!(device.contains("DECLARE_CONST_UNICODE_STRING(valueName, L\"NfMicrophones\")"));
         // D1's INF (the per-cable driver): each hardware ID's install section and NfMicrophones, and none of the old IDs
         for (v, section, mics) in [
             (Variant::Both, "Audio_Device", 3),
@@ -407,13 +391,22 @@ mod tests {
         }
     }
 
+    /// The driver scripts' hardware IDs (common.ps1, which Install-Driver.ps1 decides between the migration, update and add
+    /// by) are the setup's: the three variants', and the old driver's that the migration removes.
+    #[test]
+    fn the_scripts_hardware_ids_are_the_setups() {
+        let common = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/scripts/common.ps1")).unwrap();
+        for v in Variant::ALL {
+            assert!(common.contains(&format!("'{}'", v.hardware_id())), "{v:?}");
+            assert!(common.contains(&format!("'{}'", v.arg())), "{v:?}");
+        }
+        let legacy: Vec<String> = crate::setup::plan::Legacy::ALL.iter().map(|l| format!("'{}'", l.hardware_id())).collect();
+        assert!(common.contains(&format!("$script:LegacyHardwareIds = @({})", legacy.join(", "))), "{legacy:?}");
+    }
+
     /// D1's Cable.h names what the setup mirrors: the instance ID's prefix, the start count's value, its limit and the status.
     #[test]
     fn the_setup_mirrors_cable_h() {
-        if !has_d1() {
-            eprintln!("skipped: neither Cable.h nor the per-cable models are in this tree (the old driver's)");
-            return;
-        }
         let h = std::fs::read_to_string(format!("{DRIVER}Shared/Cable.h")).expect("D1's Cable.h, beside its INF");
         assert!(h.contains(&format!("#define NF_CABLE_INSTANCE_PREFIX        L\"{}\"", crate::identity::INSTANCE_PREFIX)));
         assert!(h.contains(&format!("#define NF_CABLE_START_ATTEMPTS_VALUE   L\"{}\"", crate::setup::devices::START_ATTEMPTS_VALUE)));
@@ -429,14 +422,15 @@ mod tests {
         let b = node("B", B_ID, 1, Variant::LowLatency);
         let (ac, bc) = (a.cable.clone().unwrap(), b.cable.clone().unwrap());
         let nodes = vec![a, b];
-        let mut eps: Vec<Endpoint> = Kind::of_variant(Variant::Both).into_iter().map(|k| ep(&ac, k, endpoints::State::Active)).collect();
+        let mut eps: Vec<Endpoint> =
+            EndpointKind::of_variant(Variant::Both).into_iter().map(|k| ep(&ac, k, endpoints::State::Active)).collect();
         // B's endpoints not there yet: a switch to its own variant re-creates it
         let Precheck::Switch(Some(note)) = precheck(&label("B"), Variant::LowLatency, &[], &nodes, &Ok(eps.clone())) else { panic!() };
         assert!(
             note.starts_with("ACX-LL-Cable B is the low-latency microphone only already, but Windows hasn't made Speakers, Microphone"),
             "{note}"
         );
-        eps.extend(Kind::of_variant(Variant::LowLatency).into_iter().map(|k| ep(&bc, k, endpoints::State::Active)));
+        eps.extend(EndpointKind::of_variant(Variant::LowLatency).into_iter().map(|k| ep(&bc, k, endpoints::State::Active)));
         let Precheck::Nothing(lines) = precheck(&label("B"), Variant::LowLatency, &[], &nodes, &Ok(eps.clone())) else { panic!() };
         assert_eq!(lines, [
             "ACX-LL-Cable B is the low-latency microphone only already, working: nothing to do.",
@@ -453,7 +447,8 @@ mod tests {
     fn a_cable_shows_its_variant_and_endpoints() {
         let b = node("B", B_ID, 2, Variant::Call);
         let bc = b.cable.clone().unwrap();
-        let mut eps: Vec<Endpoint> = Kind::of_variant(Variant::Call).into_iter().map(|k| ep(&bc, k, endpoints::State::Active)).collect();
+        let mut eps: Vec<Endpoint> =
+            EndpointKind::of_variant(Variant::Call).into_iter().map(|k| ep(&bc, k, endpoints::State::Active)).collect();
         eps[1].state = endpoints::State::Disabled;
         let shown = Shown { label: label("B"), resolved: None, nodes: vec![b], endpoints: Ok(eps), legacy: vec![] };
         let text = format_shown(&shown);

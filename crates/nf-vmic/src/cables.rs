@@ -1,17 +1,14 @@
-//! A cable's identity, the instance ID that carries it, and the cables present (TODO 19, the per-cable design,
-//! doc/todo/19-per-cable-design.md, sections 3, 4 and 10; this is N0's slice of it, the interim one).
+//! The cables present and their endpoints' kinds (TODO 19, the per-cable design, doc/todo/19-per-cable-design.md, sections 3,
+//! 4 and 10; this is N0's slice of it, the interim one).
 //!
 //! Every cable is a device node of the one driver package, and the setup tool gives each node a fixed instance ID,
-//! `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`: the label (one to eight of A-Z and 0-9, "D"), the identity ([`CableId`], a GUID that
-//! outlives removal) and an instance number n from 1. The driver parses it at AddDevice (D1, `Device.cpp`,
-//! `NfParseCableInstanceId`) and names the cable's control device from the identity, `\\.\AcxLlCable_<id>`
-//! ([`crate::protocol::control_path`]). [`CableInstance::parse`] parses it as the driver does, so the app, the tools and the
-//! driver agree on which node is which cable.
+//! `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`: the label, the identity and an instance number n from 1 ([`crate::identity`], whose
+//! [`CableInstance::parse`] parses it as the driver does). The driver names the cable's control device from the identity,
+//! `\\.\AcxLlCable_<id>` ([`crate::protocol::control_path`]).
 //!
-//! - [`CableId`]: the identity, written as its 36 lower-case characters (the driver's form), read in either case.
-//! - [`CableInstance`]: what an instance ID names, parsed from it or written as the setup tool writes it.
 //! - [`parse_control_path`]: the identity back from a control path (`nf-vmic-test --path`).
-//! - [`EndpointKind`]: which of a cable's endpoints a KS filter's reference string names (Speaker0, Microphone0, Microphone1).
+//! - [`EndpointKind`]: which of a cable's endpoints a KS filter's reference string names (Speaker0, Microphone0, Microphone1),
+//!   and which a variant makes.
 //! - [`present`] and [`choose_default`]: the cables whose device nodes are present, from Plug and Play's list of device
 //!   instance IDs (CfgMgr32), and the one a tool uses when it isn't told which: the cable labelled A, else the only one. This
 //!   is interim (N0): discovery through each cable's own device interface and its properties comes with D2 and N1, and the
@@ -25,139 +22,21 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_MapCrToWin32Err, CONFIGRET, CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
 };
 use windows::Win32::Foundation::{ERROR_AMBIGUOUS_SYSTEM_DEVICE, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE};
-use windows::core::{GUID, HSTRING};
+use windows::core::HSTRING;
 
-use crate::variant::Health;
+use crate::identity::{CableId, CableInstance, ENUMERATOR, INSTANCE_PREFIX, LABEL_MAX_CHARS, Label, PRODUCT};
+use crate::sessions::Mic;
+use crate::setup::plan::Health;
+use crate::variant::Variant;
 use crate::win_error::WinError;
 
-/// The product's short name (the owner, 2026-11-24): the driver's manufacturer and device description, and the start of each
-/// cable's friendly name, "ACX-LL-Cable D", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)").
-pub const NAME: &str = "ACX-LL-Cable";
-/// What follows the instance ID's last backslash starts with this (Cable.h's `NF_CABLE_INSTANCE_PREFIX`), in any case.
-pub const INSTANCE_PREFIX: &str = "ACXLLCABLE_";
-/// Where the setup tool makes the nodes: a root-enumerated device of the MEDIA class. The driver doesn't check this part.
-pub const INSTANCE_PARENT: &str = r"ROOT\MEDIA";
-/// A label is one to this many of A-Z and 0-9 (Cable.h's `NF_CABLE_LABEL_MAX_CHARS`).
-pub const LABEL_MAX_CHARS: usize = 8;
-/// An identity's characters, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (Cable.h's `NF_CABLE_ID_CHARS`).
-pub const ID_CHARS: usize = 36;
-
-/// A cable's identity: a GUID that outlives the cable's removal (the setup tool keeps it). Written as the driver writes it, 36
-/// lower-case characters without braces; read in either case, but only in that form.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CableId(pub GUID);
-
-impl CableId {
-    /// The 36 characters `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex digits in either case, hyphens where they go, nothing else
-    /// (the driver's `NfParseGuid36`).
-    fn parse36(text: &str) -> Option<Self> {
-        let bytes = text.as_bytes();
-        if bytes.len() != ID_CHARS {
-            return None;
-        }
-        let mut value = 0u128;
-        for (i, &b) in bytes.iter().enumerate() {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                if b != b'-' {
-                    return None;
-                }
-                continue;
-            }
-            value = value << 4 | u128::from((b as char).to_digit(16)?);
-        }
-        // The text's order is the GUID's: Data1, Data2 and Data3 most significant first, then Data4's bytes, as from_u128 reads.
-        Some(Self(GUID::from_u128(value)))
-    }
-}
-
-impl fmt::Display for CableId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let v = self.0.to_u128();
-        write!(
-            f,
-            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            v >> 96,
-            (v >> 80) & 0xFFFF,
-            (v >> 64) & 0xFFFF,
-            (v >> 48) & 0xFFFF,
-            v & 0xFFFF_FFFF_FFFF
-        )
-    }
-}
-
-impl fmt::Debug for CableId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CableId({self})")
-    }
-}
-
-/// A string that isn't a cable's identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BadCableId(pub String);
-
-impl fmt::Display for BadCableId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?} isn't a cable's identity: a GUID's {ID_CHARS} characters, xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, no braces", self.0)
-    }
-}
-
-impl std::error::Error for BadCableId {}
-
-impl FromStr for CableId {
-    type Err = BadCableId;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse36(s).ok_or_else(|| BadCableId(s.to_string()))
-    }
-}
-
-/// What a cable's instance ID names: `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CableInstance {
-    /// One to eight of A-Z and 0-9, upper case: "D".
-    pub label: String,
-    pub id: CableId,
-    /// The instance number, from 1: kept when a cable is re-added, the next for a variant switch (the design, section 4).
-    pub n: u32,
-}
-
-impl CableInstance {
-    /// Parses an instance ID as the driver does at AddDevice (D1, `NfParseCableInstanceId`): what follows its last backslash
-    /// (the whole string if it has none), without case, must be the prefix `ACXLLCABLE_`, a label of one to eight of A-Z and
-    /// 0-9, `_`, the identity's 36 characters, `_`, and n in decimal, 1 to 4294967295 with no leading zero and nothing after it.
-    /// The part before the last backslash isn't checked. `None` for anything else: a node the setup tool didn't make
-    /// (`ROOT\MEDIA\0004`), which the driver refuses (code 31). KS filter paths carry the instance ID in lower case
-    /// (`root\media\acxllcable_d_..._1`, [`crate::sessions::parse_filter`]); the label comes back upper case.
-    pub fn parse(instance_id: &str) -> Option<Self> {
-        let tail = instance_id.rsplit('\\').next().unwrap_or(instance_id);
-        if !tail.get(..INSTANCE_PREFIX.len())?.eq_ignore_ascii_case(INSTANCE_PREFIX) {
-            return None;
-        }
-        let rest = &tail[INSTANCE_PREFIX.len()..];
-        let (label, rest) = rest.split_once('_')?;
-        if label.is_empty() || label.len() > LABEL_MAX_CHARS || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return None;
-        }
-        let (id, n) = (rest.get(..ID_CHARS)?, rest.get(ID_CHARS..)?);
-        let id = CableId::parse36(id)?;
-        let n = n.strip_prefix('_')?;
-        if n.is_empty() || n.len() > 10 || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        Some(Self { label: label.to_ascii_uppercase(), id, n: n.parse().ok()? })
-    }
-
-    /// The instance ID as the setup tool writes it, upper case: `ROOT\MEDIA\ACXLLCABLE_D_<ID>_1`. Windows and the driver compare
-    /// it without case.
-    pub fn instance_id(&self) -> String {
-        format!(r"{INSTANCE_PARENT}\{INSTANCE_PREFIX}{}_{}_{}", self.label, self.id.to_string().to_ascii_uppercase(), self.n)
-    }
-
-    /// "ACX-LL-Cable D": the friendly name the driver gives the cable's device, and the part of its endpoints' names in brackets.
-    pub fn name(&self) -> String {
-        format!("{NAME} {}", self.label)
-    }
-}
+/// The low-latency microphone's KS filter, by its device interface's reference string: the INF's `KSNAME_Microphone`, the
+/// driver's `captureCircuitName` (DriverSettings.h).
+pub const MICROPHONE_FILTER: &str = "Microphone0";
+/// The call microphone's KS filter: the INF's `KSNAME_CallMicrophone`, the driver's `capture2CircuitName`.
+pub const CALL_MICROPHONE_FILTER: &str = "Microphone1";
+/// The render circuit's KS filter: the INF's `KSNAME_Speaker`.
+pub const SPEAKERS_FILTER: &str = "Speaker0";
 
 /// Whether `path` is one of the driver's old control-device names, `\\.\NoiseFilterVmic` or `\\.\NoiseFilterVmic<letter>`, which
 /// the per-cable driver no longer makes (any case). The owner's aliases for them are served through discovery, N1's selector.
@@ -176,12 +55,13 @@ pub fn parse_control_path(path: &str) -> Option<CableId> {
     let p = path.trim();
     let prefix = crate::protocol::USER_PREFIX;
     p.get(..prefix.len()).filter(|s| s.eq_ignore_ascii_case(prefix))?;
-    CableId::parse36(&p[prefix.len()..])
+    CableId::from_str(&p[prefix.len()..]).ok()
 }
 
 /// One of a cable's endpoints, by the KS filter its MMDevice endpoint is connected to: the circuits' reference strings
-/// (`Speaker0`, `Microphone0`, `Microphone1`). A cable makes its Speakers and the microphones its variant has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// (`Speaker0`, `Microphone0`, `Microphone1`). A cable makes its Speakers and the microphones its variant has
+/// ([`EndpointKind::of_variant`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EndpointKind {
     /// Speaker0: "Speakers (ACX-LL-Cable D)", what is played into the cable.
     Speakers,
@@ -195,9 +75,9 @@ impl EndpointKind {
     /// The circuit's reference string, as the INF and the driver write it.
     pub fn reference(self) -> &'static str {
         match self {
-            EndpointKind::Speakers => "Speaker0",
-            EndpointKind::Microphone => "Microphone0",
-            EndpointKind::CallMicrophone => "Microphone1",
+            EndpointKind::Speakers => SPEAKERS_FILTER,
+            EndpointKind::Microphone => MICROPHONE_FILTER,
+            EndpointKind::CallMicrophone => CALL_MICROPHONE_FILTER,
         }
     }
 
@@ -224,6 +104,16 @@ impl EndpointKind {
             .into_iter()
             .find(|k| name.eq_ignore_ascii_case(k.reference()))
     }
+
+    /// A variant's endpoints: the Speakers, then its microphones.
+    pub fn of_variant(v: Variant) -> Vec<Self> {
+        let mut kinds = vec![EndpointKind::Speakers];
+        kinds.extend(v.mics().iter().map(|m| match m {
+            Mic::Call => EndpointKind::CallMicrophone,
+            _ => EndpointKind::Microphone,
+        }));
+        kinds
+    }
 }
 
 /// One of our cables' device nodes, present in the device tree.
@@ -232,7 +122,7 @@ pub struct PresentCable {
     /// As Plug and Play keeps it (`ROOT\MEDIA\ACXLLCABLE_A_<ID>_1`).
     pub instance_id: String,
     pub cable: CableInstance,
-    /// Started, disabled (Code 22), refused at AddDevice (Code 31: the boot crash breaker, or a duplicate's ...), and so on.
+    /// Started, disabled (Code 22), refused at AddDevice (Code 31: the boot crash breaker), and so on.
     pub health: Health,
 }
 
@@ -336,12 +226,12 @@ impl fmt::Display for NoDefault {
         match self {
             NoDefault::NoCable => write!(
                 f,
-                "no {NAME} is installed: no device node is {INSTANCE_PARENT}\\{INSTANCE_PREFIX}<label>_<id>_<n> (the setup tool makes \
+                "no {PRODUCT} is installed: no device node is {ENUMERATOR}\\{INSTANCE_PREFIX}<label>_<id>_<n> (the setup tool makes \
                  them; the old driver's ROOT\\MEDIA\\NNNN nodes aren't cables)"
             ),
             NoDefault::Ambiguous(cables) => {
                 let list: Vec<String> = cables.iter().map(PresentCable::describe).collect();
-                let a = cables.iter().filter(|c| c.cable.label == "A").count();
+                let a = cables.iter().filter(|c| c.cable.label == Label::a()).count();
                 let why = if a > 1 { "more than one is labelled A" } else { "none is labelled A, and there are several" };
                 write!(f, "which cable? {why}: {}", list.join("; "))
             }
@@ -354,7 +244,7 @@ impl std::error::Error for NoDefault {}
 /// The cable a tool uses when it isn't told which (the design, section 10): the one labelled A, else the only cable. Whatever
 /// its state: an open of a cable that isn't working says so.
 pub fn choose_default(cables: &[PresentCable]) -> Result<&PresentCable, NoDefault> {
-    let labelled_a: Vec<&PresentCable> = cables.iter().filter(|c| c.cable.label == "A").collect();
+    let labelled_a: Vec<&PresentCable> = cables.iter().filter(|c| c.cable.label == Label::a()).collect();
     match (labelled_a.as_slice(), cables) {
         ([a], _) => Ok(*a),
         ([], []) => Err(NoDefault::NoCable),
@@ -382,84 +272,6 @@ mod tests {
 
     fn id() -> CableId {
         ID.parse().unwrap()
-    }
-
-    #[test]
-    fn an_identity_reads_either_case_and_writes_lower_case() {
-        let id = id();
-        assert_eq!(id.0, GUID::from_u128(0x0f1e2d3c_4b5a_6978_8796_a5b4c3d2e1f0));
-        assert_eq!(id.to_string(), ID);
-        assert_eq!(ID.to_ascii_uppercase().parse::<CableId>(), Ok(id));
-        assert_eq!("0F1e2D3c-4b5A-6978-8796-A5b4c3d2e1F0".parse::<CableId>(), Ok(id));
-        assert_eq!(format!("{id:?}"), format!("CableId({ID})"));
-        // The GUID's fields in the text's order, as the driver's NfParseGuid36 fills them.
-        assert_eq!((id.0.data1, id.0.data2, id.0.data3), (0x0f1e_2d3c, 0x4b5a, 0x6978));
-        assert_eq!(id.0.data4, [0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0]);
-        // Leading zeros are written, every field its width.
-        let small: CableId = "00000001-0002-0003-0004-000000000005".parse().unwrap();
-        assert_eq!(small.to_string(), "00000001-0002-0003-0004-000000000005");
-        for bad in [
-            "",
-            "{0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0}",
-            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f",
-            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f00",
-            "0f1e2d3c4b5a-6978-8796-a5b4c3d2e1f0-",
-            "0f1e2d3c_4b5a_6978_8796_a5b4c3d2e1f0",
-            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1fg",
-            " 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f",
-            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f\u{e9}",
-            "+f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
-        ] {
-            assert_eq!(bad.parse::<CableId>(), Err(BadCableId(bad.into())), "{bad:?}");
-        }
-        assert!(BadCableId("x".into()).to_string().contains("36 characters"));
-    }
-
-    #[test]
-    fn an_instance_id_is_parsed_as_the_driver_parses_it() {
-        let want = CableInstance { label: "D".into(), id: id(), n: 1 };
-        let upper = format!(r"ROOT\MEDIA\ACXLLCABLE_D_{}_1", ID.to_ascii_uppercase());
-        assert_eq!(CableInstance::parse(&upper), Some(want.clone()));
-        assert_eq!(want.instance_id(), upper, "the setup tool's form, upper case");
-        assert_eq!(want.name(), "ACX-LL-Cable D");
-        // As a KS filter's path carries it: lower case; the label comes back upper case.
-        assert_eq!(CableInstance::parse(&format!(r"root\media\acxllcable_d_{ID}_1")), Some(want.clone()));
-        // Only what follows the last backslash counts, as in the driver; none at all is the whole string.
-        assert_eq!(CableInstance::parse(&format!(r"ROOT\OTHER\ACXLLCABLE_D_{ID}_1")), Some(want.clone()));
-        assert_eq!(CableInstance::parse(&format!("ACXLLCABLE_D_{ID}_1")), Some(want.clone()));
-        // Labels: one to eight of A-Z and 0-9.
-        let with = |label: &str, n: &str| CableInstance::parse(&format!(r"ROOT\MEDIA\ACXLLCABLE_{label}_{ID}_{n}"));
-        assert_eq!(with("CABLE12Z", "7").map(|c| (c.label, c.n)), Some(("CABLE12Z".into(), 7)));
-        assert_eq!(with("0", "1").map(|c| c.label), Some("0".into()));
-        assert_eq!(with("b", "4294967295").map(|c| (c.label, c.n)), Some(("B".into(), u32::MAX)));
-        for label in ["", "ABCDEFGHI", "A-B", "A B", "\u{c4}", "\u{131}"] {
-            assert_eq!(with(label, "1"), None, "label {label:?}");
-        }
-        // n: decimal from 1, no leading zero, nothing after it, at most 4294967295.
-        for n in ["", "0", "01", "4294967296", "99999999999", "1x", "1 ", "+1", "-1", "1_"] {
-            assert_eq!(with("D", n), None, "n {n:?}");
-        }
-        // The identity: its 36 characters, then an underscore.
-        for bad in [
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{{{ID}}}_1"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{}_1", &ID[1..]),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{ID}1"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{ID}"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{ID}_"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D{ID}_1"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE__{ID}_1"),
-            format!(r"ROOT\MEDIA\ACXLLCABLED_{ID}_1"),
-            format!(r"ROOT\MEDIA\XACXLLCABLE_D_{ID}_1"),
-            format!(r"ROOT\MEDIA\ACXLLCABLE_D_{ID}_1\"),
-            r"ROOT\MEDIA\0004".to_string(),
-            r"ROOT\NoiseFilterCableB\0000".to_string(),
-            String::new(),
-            r"\".to_string(),
-        ] {
-            assert_eq!(CableInstance::parse(&bad), None, "{bad:?}");
-        }
-        // A multi-byte character where the identity starts can't split a character.
-        assert_eq!(CableInstance::parse("ACXLLCABLE_D_\u{e9}"), None);
     }
 
     #[test]
@@ -503,10 +315,14 @@ mod tests {
         }
         assert!(EndpointKind::Speakers.is_render() && !EndpointKind::Microphone.is_render() && !EndpointKind::CallMicrophone.is_render());
         assert_eq!(EndpointKind::CallMicrophone.name(), "Call Microphone");
+        use EndpointKind::*;
+        assert_eq!(EndpointKind::of_variant(Variant::Both), [Speakers, Microphone, CallMicrophone]);
+        assert_eq!(EndpointKind::of_variant(Variant::Call), [Speakers, CallMicrophone]);
+        assert_eq!(EndpointKind::of_variant(Variant::LowLatency), [Speakers, Microphone]);
     }
 
     fn node(label: &str, n: u32) -> PresentCable {
-        let cable = CableInstance { label: label.into(), id: id(), n };
+        let cable = CableInstance { label: label.parse().unwrap(), id: id(), n };
         PresentCable { instance_id: cable.instance_id(), cable, health: Health::Working }
     }
 

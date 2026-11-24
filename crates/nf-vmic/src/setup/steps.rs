@@ -154,7 +154,7 @@ pub(super) fn endpoint_problems(
         Some(c) => {
             for (kind, e) in &c.found {
                 let state = if e.state == endpoints::State::Active { String::new() } else { format!(" ({:?})", e.state) };
-                say(&format!("  {}: \"{}\"{state}", kind.word(), e.name));
+                say(&format!("  {}: \"{}\"{state}", kind.name(), e.name));
             }
             if !c.is_done() {
                 problems.push(format!("{}: {c}", cable.label.friendly_name()));
@@ -435,6 +435,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::cables::EndpointKind;
     use crate::setup::package::tests::candidate;
     use crate::setup::package::version_text;
     use crate::setup::plan::tests::{A_ID, B_ID, cid, label, legacy, node};
@@ -571,7 +572,7 @@ mod tests {
         }
 
         fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>) {
-            let eps: Vec<Endpoint> = endpoints::Kind::of_variant(variant)
+            let eps: Vec<Endpoint> = EndpointKind::of_variant(variant)
                 .into_iter()
                 .map(|kind| Endpoint {
                     id: format!("{}.{kind:?}", cable.instance_id()),

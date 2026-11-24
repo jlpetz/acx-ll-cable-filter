@@ -120,9 +120,12 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
 deletes the packages; `-KeepIdentities` keeps the store, so cables added again keep their identities. A cable's id is a
 random GUID unique to the machine: scrub it from logs pasted into docs.
 
-**Pending N0.** nf-vmic, its tools and the app's **Direct driver ring** open `\\.\NoiseFilterVmic`, which this driver no
-longer makes, until N0 gives them the cable's own path (`--path \\.\AcxLlCable_<id>`). The box's installed package (the old
-one: "AudioCodec Device" and "Noise Filter Cable B") stays until the owner's go for S0a, which migrates both.
+**Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
+\\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker
+always, take the cable labelled A, else the only cable. Each mode records or plays that cable's own endpoints, found by the
+instance ID in their KS filter's path. `\\.\NoiseFilterVmic` is gone: a tool that opens it gets ERROR_FILE_NOT_FOUND. The
+control device admits SYSTEM and Administrators only, so the tools run elevated. The box's installed package (the old one:
+"AudioCodec Device" and "Noise Filter Cable B") stays until the owner's go for S0a, which migrates both.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
 on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with

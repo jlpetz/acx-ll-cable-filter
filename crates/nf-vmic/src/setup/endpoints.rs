@@ -26,63 +26,19 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, STGM_READ};
 
 use super::Clock;
+use crate::cables::EndpointKind;
 use crate::identity::{CableInstance, PRODUCT, same_instance};
 use crate::sessions::{self, PKEY_ENDPOINT_FILTER, connected_filter, device_id, on_mta_thread, string_property};
 use crate::variant::Variant;
 use crate::win_error::WinError;
 
-/// The render circuit's KS filter, by its device interface's reference string (the INF's `KSNAME_Speaker`).
-pub const SPEAKERS_FILTER: &str = "Speaker0";
 /// How long Windows has, once a node works, to make its endpoints.
 pub const ENDPOINTS_WAIT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(250);
 
-/// Which of a cable's endpoints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Kind {
-    Speakers,
-    Microphone,
-    CallMicrophone,
-}
-
-impl Kind {
-    /// The part of the endpoint's name before the brackets, as Windows names it: "Speakers", "Microphone", "Call Microphone".
-    pub fn word(self) -> &'static str {
-        match self {
-            Kind::Speakers => "Speakers",
-            Kind::Microphone => "Microphone",
-            Kind::CallMicrophone => "Call Microphone",
-        }
-    }
-
-    /// The kind a KS filter's reference string names, with or without a suffix (`microphone0/00010001`), any case.
-    pub fn of_reference(reference: &str) -> Option<Self> {
-        let name = reference.trim_start().split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default();
-        if name.eq_ignore_ascii_case(SPEAKERS_FILTER) {
-            Some(Kind::Speakers)
-        } else {
-            match sessions::mic_of_filter(name) {
-                sessions::Mic::LowLatency => Some(Kind::Microphone),
-                sessions::Mic::Call => Some(Kind::CallMicrophone),
-                sessions::Mic::Other => None,
-            }
-        }
-    }
-
-    /// A variant's endpoints: the Speakers, then its microphones.
-    pub fn of_variant(v: Variant) -> Vec<Kind> {
-        let mut kinds = vec![Kind::Speakers];
-        kinds.extend(v.mics().iter().map(|m| match m {
-            sessions::Mic::Call => Kind::CallMicrophone,
-            _ => Kind::Microphone,
-        }));
-        kinds
-    }
-}
-
 /// "Speakers (ACX-LL-Cable D)": the name we expect Windows to give (to confirm on the box: D1's FriendlyName).
-pub fn expected_name(cable: &CableInstance, kind: Kind) -> String {
-    format!("{} ({})", kind.word(), cable.label.friendly_name())
+pub fn expected_name(cable: &CableInstance, kind: EndpointKind) -> String {
+    format!("{} ({})", kind.name(), cable.label.friendly_name())
 }
 
 /// A name whose adapter part lacks the cable's label: "Speakers (ACX-LL-Cable)", the device's description, or Windows'
@@ -145,7 +101,7 @@ pub struct Endpoint {
     pub id: String,
     /// As Windows names it now.
     pub name: String,
-    pub kind: Kind,
+    pub kind: EndpointKind,
     pub state: State,
     /// The node it's on, as its KS filter path has it (lower case, usually).
     pub instance_id: String,
@@ -200,11 +156,11 @@ fn read(not_present: bool) -> Result<Vec<Endpoint>, WinError> {
 
 /// The node and kind of an endpoint, from the copies of its KS filter path read (the topology's first): the first that parses,
 /// names one of our circuits, and is on a node of our instance-ID form.
-pub fn attribute(filters: &[Option<&str>]) -> Option<(String, Kind)> {
+pub fn attribute(filters: &[Option<&str>]) -> Option<(String, EndpointKind)> {
     filters.iter().flatten().find_map(|path| {
         let (instance, reference) = sessions::parse_filter(path)?;
         CableInstance::parse(&instance)?;
-        Some((instance, Kind::of_reference(&reference)?))
+        Some((instance, EndpointKind::of_reference(&reference)?))
     })
 }
 
@@ -212,10 +168,10 @@ pub fn attribute(filters: &[Option<&str>]) -> Option<(String, Kind)> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EndpointCheck {
     /// Each expected endpoint there, its name as Windows has it.
-    pub found: Vec<(Kind, Endpoint)>,
-    pub missing: Vec<Kind>,
+    pub found: Vec<(EndpointKind, Endpoint)>,
+    pub missing: Vec<EndpointKind>,
     /// There, but not named as it should be ([`Names`]): the kind, Windows' name, the one it should have.
-    pub misnamed: Vec<(Kind, String, String)>,
+    pub misnamed: Vec<(EndpointKind, String, String)>,
 }
 
 impl EndpointCheck {
@@ -228,7 +184,7 @@ impl fmt::Display for EndpointCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
         if !self.missing.is_empty() {
-            parts.push(format!("Windows hasn't made {}", self.missing.iter().map(|k| k.word()).collect::<Vec<_>>().join(", ")));
+            parts.push(format!("Windows hasn't made {}", self.missing.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")));
         }
         for (_, got, want) in &self.misnamed {
             parts.push(format!("\"{got}\" isn't named \"{want}\""));
@@ -242,7 +198,7 @@ impl fmt::Display for EndpointCheck {
 pub fn check(cable: &CableInstance, variant: Variant, now: &[Endpoint], names: Names) -> EndpointCheck {
     let id = cable.instance_id();
     let mut out = EndpointCheck::default();
-    for kind in Kind::of_variant(variant) {
+    for kind in EndpointKind::of_variant(variant) {
         let mine = |active: bool| {
             now.iter().find(|e| {
                 e.kind == kind && e.state != State::NotPresent && same_instance(&e.instance_id, &id) && (e.state == State::Active) == active
@@ -302,7 +258,7 @@ mod tests {
     }
 
     /// An endpoint as its KS filter path has the instance ID: lower case.
-    fn ep(c: &CableInstance, kind: Kind, state: State, name: Option<&str>) -> Endpoint {
+    fn ep(c: &CableInstance, kind: EndpointKind, state: State, name: Option<&str>) -> Endpoint {
         Endpoint {
             id: format!("{{{}.{kind:?}}}", c.n),
             name: name.map_or_else(|| expected_name(c, kind), str::to_string),
@@ -319,16 +275,20 @@ mod tests {
             format!(r"{{2}}.\\?\{}#{{6994ad04-93ef-11d0-a3cc-00a0c9223196}}\{reference}", a.instance_id().replace('\\', "#").to_lowercase())
         };
         let speaker = path("speaker0");
-        assert_eq!(attribute(&[Some(&speaker)]), Some((a.instance_id().to_lowercase(), Kind::Speakers)));
-        assert_eq!(attribute(&[Some(&path("microphone1/00010001"))]).map(|x| x.1), Some(Kind::CallMicrophone));
+        assert_eq!(attribute(&[Some(&speaker)]), Some((a.instance_id().to_lowercase(), EndpointKind::Speakers)));
+        assert_eq!(attribute(&[Some(&path("microphone1/00010001"))]).map(|x| x.1), Some(EndpointKind::CallMicrophone));
         // The topology's names neither, or is another node's: the property store's copy decides
         let other = r"\\?\root#media#0003#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0";
-        assert_eq!(attribute(&[Some(other), Some(&path("microphone0"))]).map(|x| x.1), Some(Kind::Microphone));
+        assert_eq!(attribute(&[Some(other), Some(&path("microphone0"))]).map(|x| x.1), Some(EndpointKind::Microphone));
         assert_eq!(attribute(&[Some(&path("pin3")), None]), None);
         assert_eq!(attribute(&[None, Some(other)]), None, "a node made outside the tool isn't a cable");
-        assert_eq!(Kind::of_variant(Variant::Both), [Kind::Speakers, Kind::Microphone, Kind::CallMicrophone]);
-        assert_eq!(Kind::of_variant(Variant::Call), [Kind::Speakers, Kind::CallMicrophone]);
-        assert_eq!(expected_name(&a, Kind::CallMicrophone), "Call Microphone (ACX-LL-Cable A)");
+        assert_eq!(EndpointKind::of_variant(Variant::Both), [
+            EndpointKind::Speakers,
+            EndpointKind::Microphone,
+            EndpointKind::CallMicrophone
+        ]);
+        assert_eq!(EndpointKind::of_variant(Variant::Call), [EndpointKind::Speakers, EndpointKind::CallMicrophone]);
+        assert_eq!(expected_name(&a, EndpointKind::CallMicrophone), "Call Microphone (ACX-LL-Cable A)");
     }
 
     /// The per-cable filter on endpoints, with two cables present: B's check sees only B's.
@@ -336,32 +296,34 @@ mod tests {
     fn a_cables_check_sees_only_its_own_endpoints() {
         let a = cable("A", A_ID, 1);
         let b = cable("B", B_ID, 1);
-        let mut now: Vec<Endpoint> = Kind::of_variant(Variant::Both).into_iter().map(|k| ep(&a, k, State::Active, None)).collect();
-        now.push(ep(&b, Kind::Speakers, State::Active, None));
+        let mut now: Vec<Endpoint> = EndpointKind::of_variant(Variant::Both).into_iter().map(|k| ep(&a, k, State::Active, None)).collect();
+        now.push(ep(&b, EndpointKind::Speakers, State::Active, None));
         let check_b = check(&b, Variant::LowLatency, &now, FRESH);
-        assert_eq!((check_b.found.len(), check_b.missing.clone()), (1, vec![Kind::Microphone]), "A's Microphone isn't B's");
-        now.push(ep(&b, Kind::Microphone, State::Active, None));
+        assert_eq!((check_b.found.len(), check_b.missing.clone()), (1, vec![EndpointKind::Microphone]), "A's Microphone isn't B's");
+        now.push(ep(&b, EndpointKind::Microphone, State::Active, None));
         assert!(check(&b, Variant::LowLatency, &now, FRESH).is_done());
         assert!(check(&a, Variant::Both, &now, FRESH).is_done());
         // A disabled one is there; an active one is taken first
         let mut off = now.clone();
-        off.push(ep(&b, Kind::Microphone, State::Disabled, Some("Studio mic (ACX-LL-Cable B)")));
+        off.push(ep(&b, EndpointKind::Microphone, State::Disabled, Some("Studio mic (ACX-LL-Cable B)")));
         assert!(check(&b, Variant::LowLatency, &off, FRESH).is_done());
         // Named otherwise (Windows' "2- " numbering, a missing friendly name): there, but reported
-        let numbered =
-            vec![ep(&b, Kind::Speakers, State::Active, Some("Speakers (2- ACX-LL-Cable)")), ep(&b, Kind::Microphone, State::Active, None)];
+        let numbered = vec![
+            ep(&b, EndpointKind::Speakers, State::Active, Some("Speakers (2- ACX-LL-Cable)")),
+            ep(&b, EndpointKind::Microphone, State::Active, None),
+        ];
         let c = check(&b, Variant::LowLatency, &numbered, FRESH);
         assert!(!c.is_done() && c.missing.is_empty());
         assert_eq!(c.to_string(), "\"Speakers (2- ACX-LL-Cable)\" isn't named \"Speakers (ACX-LL-Cable B)\"");
         // The new instance's endpoints, not the old one's (a variant switch: n + 1)
         let b2 = cable("B", B_ID, 2);
-        assert_eq!(check(&b2, Variant::LowLatency, &now, FRESH).missing, [Kind::Speakers, Kind::Microphone]);
+        assert_eq!(check(&b2, Variant::LowLatency, &now, FRESH).missing, [EndpointKind::Speakers, EndpointKind::Microphone]);
         let old = [b.instance_id()];
         assert_eq!(still_active(&old, &now).len(), 2);
         assert!(still_active(&[a.instance_id()], &now[3..]).is_empty());
         // A removed instance's endpoints (NOTPRESENT, read before an action) are never credited
         let gone: Vec<Endpoint> = now.iter().map(|e| Endpoint { state: State::NotPresent, ..e.clone() }).collect();
-        assert_eq!(check(&b, Variant::LowLatency, &gone, FRESH).missing, [Kind::Speakers, Kind::Microphone]);
+        assert_eq!(check(&b, Variant::LowLatency, &gone, FRESH).missing, [EndpointKind::Speakers, EndpointKind::Microphone]);
     }
 
     /// After an update, a repair or a re-add, an endpoint keeps the name it had (the user's rename included); one Windows
@@ -372,8 +334,8 @@ mod tests {
         assert!(unlabelled("Speakers (ACX-LL-Cable)") && unlabelled("Speakers (2- ACX-LL-Cable)"));
         assert!(unlabelled("Microphone (12- ACX-LL-Cable B)") && unlabelled("Microphone (acx-ll-cable )"));
         assert!(!unlabelled("Speakers (ACX-LL-Cable B)") && !unlabelled("Studio") && !unlabelled("Desk (left- right)"));
-        let renamed = ep(&b, Kind::Speakers, State::Active, Some("Studio out (ACX-LL-Cable B)"));
-        let mic = ep(&b, Kind::Microphone, State::Active, None);
+        let renamed = ep(&b, EndpointKind::Speakers, State::Active, Some("Studio out (ACX-LL-Cable B)"));
+        let mic = ep(&b, EndpointKind::Microphone, State::Active, None);
         let now = vec![renamed.clone(), mic.clone()];
         // The rename was there before the update (by its MMDevice id): kept, so the check passes
         let before = vec![Endpoint { state: State::Disabled, ..renamed.clone() }, mic.clone()];
@@ -383,16 +345,20 @@ mod tests {
         assert!(check(&b, Variant::LowLatency, &now, Names::Since(&gone)).is_done());
         // An endpoint the action made, or one whose id is new: the expected name
         let c = check(&b, Variant::LowLatency, &now, Names::Since(&before[1..]));
-        assert_eq!(c.misnamed, [(Kind::Speakers, "Studio out (ACX-LL-Cable B)".to_string(), "Speakers (ACX-LL-Cable B)".to_string())]);
+        assert_eq!(c.misnamed, [(
+            EndpointKind::Speakers,
+            "Studio out (ACX-LL-Cable B)".to_string(),
+            "Speakers (ACX-LL-Cable B)".to_string()
+        )]);
         // Renamed by the action to something else: reported against the name it had
-        let other = vec![ep(&b, Kind::Speakers, State::Active, Some("Speakers (Other)")), mic.clone()];
+        let other = vec![ep(&b, EndpointKind::Speakers, State::Active, Some("Speakers (Other)")), mic.clone()];
         let c = check(&b, Variant::LowLatency, &other, Names::Since(&before));
         assert_eq!(c.to_string(), "\"Speakers (Other)\" isn't named \"Studio out (ACX-LL-Cable B)\"");
         // Back to the expected name: fine
-        let expected = vec![ep(&b, Kind::Speakers, State::Active, None), mic.clone()];
+        let expected = vec![ep(&b, EndpointKind::Speakers, State::Active, None), mic.clone()];
         assert!(check(&b, Variant::LowLatency, &expected, Names::Since(&before)).is_done());
         // Without the label: always reported, even when it was so before
-        let numbered = vec![ep(&b, Kind::Speakers, State::Active, Some("Speakers (2- ACX-LL-Cable)")), mic.clone()];
+        let numbered = vec![ep(&b, EndpointKind::Speakers, State::Active, Some("Speakers (2- ACX-LL-Cable)")), mic.clone()];
         let was = vec![Endpoint { name: "Speakers (2- ACX-LL-Cable)".into(), ..renamed.clone() }, mic.clone()];
         for names in [Names::Since(&was), Names::Any] {
             let c = check(&b, Variant::LowLatency, &numbered, names);
@@ -405,7 +371,7 @@ mod tests {
     #[test]
     fn the_wait_for_the_endpoints_ends_as_it_should() {
         let b = cable("B", B_ID, 2);
-        let full: Vec<Endpoint> = Kind::of_variant(Variant::Call).into_iter().map(|k| ep(&b, k, State::Active, None)).collect();
+        let full: Vec<Endpoint> = EndpointKind::of_variant(Variant::Call).into_iter().map(|k| ep(&b, k, State::Active, None)).collect();
         let failed = WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 };
         let over = |looks: Vec<Result<Vec<Endpoint>, WinError>>| {
             let mut i = 0;
@@ -423,7 +389,7 @@ mod tests {
         assert!(check.unwrap().is_done());
         assert_eq!(took, POLL * 2);
         let ((check, err), took) = over(vec![Ok(full[..1].to_vec()), Err(failed.clone())]);
-        assert_eq!((check.unwrap().missing, err, took), (vec![Kind::CallMicrophone], Some(failed.clone()), Duration::from_secs(1)));
+        assert_eq!((check.unwrap().missing, err, took), (vec![EndpointKind::CallMicrophone], Some(failed.clone()), Duration::from_secs(1)));
         let ((check, err), _) = over(vec![Err(failed.clone())]);
         assert_eq!((check, err), (None, Some(failed)));
     }

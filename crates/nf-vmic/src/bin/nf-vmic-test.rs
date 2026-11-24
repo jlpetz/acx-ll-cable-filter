@@ -51,7 +51,8 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
-use nf_vmic::cables::{self, CableId, EndpointKind, PresentCable};
+use nf_vmic::cables::{self, EndpointKind, PresentCable};
+use nf_vmic::identity::{self, CableId, Label};
 use nf_vmic::latency::{self, Block, Continuity, FrameCounts, Log, Receipt, Run, Summary, Weighted};
 use nf_vmic::protocol::{
     self, CaptureTrace, EVENT_HANDOFF_SKIP, EVENT_LATE_READ, EVENT_LIVE_DISCARD, EVENT_LOOPBACK_LEAD_SKIP, EVENT_RESYNC,
@@ -622,9 +623,9 @@ fn named_on_cable(
 #[derive(Debug, PartialEq, Eq)]
 enum ByLabel {
     /// The target's label, and no other cable present has it.
-    Target(String),
+    Target(Label),
     /// Another cable's: the only one present with that label.
-    Other { label: String, id: CableId },
+    Other { label: Label, id: CableId },
     /// It can't be told: why.
     Unknown(String),
 }
@@ -634,7 +635,7 @@ enum ByLabel {
 /// share its label and identity (a variant switch midway has two), so a label counts once per identity.
 fn by_label(endpoint_name: &str, target: &CableId, present: Result<Vec<PresentCable>, String>) -> ByLabel {
     let Some(label) = sessions::label_of_name(endpoint_name) else {
-        return ByLabel::Unknown(format!("its name doesn't say which cable (no \"{} <label>\" in its brackets)", cables::NAME));
+        return ByLabel::Unknown(format!("its name doesn't say which cable (no \"{} <label>\" in its brackets)", identity::PRODUCT));
     };
     let present = match present {
         Ok(p) => p,
@@ -4765,6 +4766,8 @@ fn print_latency(r: &LatencyReport, log: &CaptureLog, w: &Window, frequency: u64
 
 #[cfg(test)]
 mod tests {
+    use nf_vmic::identity::CableInstance;
+
     use super::*;
 
     fn row(position: u64, device_ms: f64, segment: u32) -> StampRow {
@@ -6241,7 +6244,7 @@ mod tests {
             assert!(e.contains(why), "{path}: {e}");
         }
         // The default cable says which node it was found by
-        let cable = cables::CableInstance { label: "A".into(), id, n: 1 };
+        let cable = CableInstance { label: Label::a(), id, n: 1 };
         let node = PresentCable { instance_id: cable.instance_id(), cable, health: nf_vmic::variant::Health::Problem(22) };
         let t = Target { id, path: canonical.clone(), node: Some(node) };
         assert_eq!(
@@ -6272,7 +6275,7 @@ mod tests {
             render: kind.is_render(),
             kind: Some(kind),
             state,
-            cable: cables::CableInstance::parse(&instance),
+            cable: CableInstance::parse(&instance),
             instance: Some(instance),
         }
     }
@@ -6317,7 +6320,7 @@ mod tests {
     }
 
     fn present_node(label: &str, id: &str, n: u32) -> PresentCable {
-        let cable = cables::CableInstance { label: label.into(), id: id.parse().unwrap(), n };
+        let cable = CableInstance { label: label.parse().unwrap(), id: id.parse().unwrap(), n };
         PresentCable { instance_id: cable.instance_id(), cable, health: nf_vmic::variant::Health::Working }
     }
 
@@ -6362,7 +6365,7 @@ mod tests {
             let e = named_on_cable(&[unread(name)], name, &a, move || present).unwrap_err();
             assert!(e.contains(why) && e.contains("use --mic") && e.contains("its KS filter wasn't read"), "{name}: {e}");
         }
-        assert_eq!(by_label("Microphone (ACX-LL-Cable A)", &a.id, both()), ByLabel::Target("A".into()));
+        assert_eq!(by_label("Microphone (ACX-LL-Cable A)", &a.id, both()), ByLabel::Target(Label::a()));
     }
 
     #[test]

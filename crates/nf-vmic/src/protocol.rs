@@ -7,7 +7,7 @@
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-use crate::cables::CableId;
+use crate::identity::CableId;
 
 /// `NF_VMIC_MAGIC`: "NFVM" in memory order.
 pub const MAGIC: u32 = 0x4D56_464E;
@@ -726,6 +726,21 @@ mod tests {
         assert_eq!((a.magic, a.version, a.in_bytes, a.flags), (0x4D56_464E, 1, 16, 0));
         // "NFVM" in memory order.
         assert_eq!(&MAGIC.to_le_bytes(), b"NFVM");
+    }
+
+    /// A cable's control path is the driver's (step 1's contract, D1): nf_vmic.h's user-mode prefix, and its kernel names with
+    /// the same `AcxLlCable_` before the identity, which the path carries in lower case.
+    #[test]
+    fn the_control_path_is_the_drivers() {
+        let h = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/Shared/nf_vmic.h")).unwrap();
+        // The header writes each backslash twice (a C string)
+        let c_string = |s: &str| s.replace('\\', r"\\");
+        assert!(h.contains(&format!("#define NF_VMIC_USER_PREFIX             L\"{}\"", c_string(USER_PREFIX))));
+        let tail = USER_PREFIX.trim_start_matches(r"\\.\");
+        assert!(h.contains(&format!("#define NF_VMIC_DEVICE_PREFIX           L\"{}\"", c_string(&format!(r"\Device\{tail}")))));
+        assert!(h.contains(&format!("#define NF_VMIC_SYMLINK_PREFIX          L\"{}\"", c_string(&format!(r"\DosDevices\{tail}")))));
+        let id: CableId = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0".parse().unwrap();
+        assert_eq!(control_path(&id), r"\\.\AcxLlCable_0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0");
     }
 
     /// Every outcome's Win32 error is what RtlNtStatusToDosError makes of its NTSTATUS (ntdll, no device), and its NTSTATUS is

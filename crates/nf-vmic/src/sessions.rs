@@ -41,7 +41,8 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::core::{GUID, HSTRING, Interface, Owned, PWSTR};
 
-use crate::cables::{self, CableId, CableInstance, EndpointKind};
+use crate::cables::EndpointKind;
+use crate::identity::{CableId, CableInstance, Label, PRODUCT};
 use crate::win_error::WinError;
 
 /// The endpoint's copy of the KS filter path it's connected to, in its property store: not documented; seen on Windows
@@ -125,7 +126,7 @@ pub fn is_ours(filters: &[&str], name: &str) -> bool {
 /// ("ACX-LL-Cable D"), which a rename in the Sound panel leaves alone. [`is_ours`]'s fallback, for an endpoint whose filter
 /// can't be read, and the engine's check on a name alone.
 pub fn has_our_name(endpoint_name: &str) -> bool {
-    endpoint_name.to_ascii_lowercase().contains(&cables::NAME.to_ascii_lowercase())
+    endpoint_name.to_ascii_lowercase().contains(&PRODUCT.to_ascii_lowercase())
 }
 
 /// The cable label an endpoint's name carries in its last brackets, upper case: "Microphone (ACX-LL-Cable D)", or with Windows'
@@ -133,7 +134,7 @@ pub fn has_our_name(endpoint_name: &str) -> bool {
 /// driver sets from its label and a rename in the Sound panel leaves alone. `None` where the brackets don't hold
 /// "ACX-LL-Cable <label>" (any case) with a label of one to eight of A-Z and 0-9. A name alone doesn't tell two cables with
 /// one label apart: only for an endpoint whose filter can't be read, and checked against the cables present.
-pub fn label_of_name(endpoint_name: &str) -> Option<String> {
+pub fn label_of_name(endpoint_name: &str) -> Option<Label> {
     let inner = endpoint_name.trim_end().strip_suffix(')')?;
     let mut device = inner[inner.rfind('(')? + 1..].trim();
     // Windows numbers a second device of one name: "2- ACX-LL-Cable D"
@@ -143,10 +144,8 @@ pub fn label_of_name(endpoint_name: &str) -> Option<String> {
     {
         device = rest;
     }
-    let prefix = device.get(..cables::NAME.len()).filter(|s| s.eq_ignore_ascii_case(cables::NAME))?;
-    let label = device[prefix.len()..].strip_prefix(' ')?;
-    let valid = (1..=cables::LABEL_MAX_CHARS).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_alphanumeric());
-    valid.then(|| label.to_ascii_uppercase())
+    let prefix = device.get(..PRODUCT.len()).filter(|s| s.eq_ignore_ascii_case(PRODUCT))?;
+    device[prefix.len()..].strip_prefix(' ')?.parse().ok()
 }
 
 /// The microphone a KS filter's reference string names: the driver's capture circuits (`microphone0`, `microphone1`; any
@@ -815,7 +814,7 @@ mod tests {
             (")", None),
         ];
         for (name, label) in cases {
-            assert_eq!(label_of_name(name).as_deref(), label, "{name:?}");
+            assert_eq!(label_of_name(name).as_ref().map(Label::as_str), label, "{name:?}");
         }
     }
 

@@ -46,6 +46,7 @@ use self::lock::{LOCK, LOCK_WAIT, LockError, SetupLock};
 use self::package::{Candidate, INF_NAME, PackageError, Pick, Running, file_name};
 use self::plan::{AddPlan, Create, Entry, Health, Identity, Node, PlanError, RemoveTarget, UpdatePlan};
 use self::steps::Real;
+use crate::cables::EndpointKind;
 use crate::identity::{CableId, CableInstance, Label};
 use crate::variant::Variant;
 use crate::win_error::WinError;
@@ -118,7 +119,7 @@ pub enum SetupError {
     PackageLacks {
         hardware_id: String,
         package: String,
-        missing: Vec<endpoints::Kind>,
+        missing: Vec<EndpointKind>,
     },
     /// Windows will finish removing `device` at the next restart, so nothing was created.
     RestartFirst {
@@ -230,7 +231,7 @@ impl fmt::Display for SetupError {
                 f,
                 "{package} doesn't make {} for {hardware_id}, by its INF: nothing was changed. Build the package again \
                  (driver\\scripts\\Build-Driver.ps1) and move the cables to it (`acx-ll-cable update`).",
-                missing.iter().map(|k| k.word()).collect::<Vec<_>>().join(" and ")
+                missing.iter().map(|k| k.name()).collect::<Vec<_>>().join(" and ")
             ),
             SetupError::RestartFirst { device } => {
                 write!(f, "Windows will finish removing {device} when it restarts: restart Windows, then run this again")
@@ -365,12 +366,12 @@ fn lacks(c: &Candidate, variant: Variant, hardware_id: &str) -> Result<(), Setup
     match c.makes(variant.mics()) {
         Some(false) => {
             let has = c.mics.as_deref().unwrap_or_default();
-            let missing = endpoints::Kind::of_variant(variant)
+            let missing = EndpointKind::of_variant(variant)
                 .into_iter()
                 .filter(|k| match k {
-                    endpoints::Kind::Speakers => false,
-                    endpoints::Kind::Microphone => !has.contains(&crate::sessions::Mic::LowLatency),
-                    endpoints::Kind::CallMicrophone => !has.contains(&crate::sessions::Mic::Call),
+                    EndpointKind::Speakers => false,
+                    EndpointKind::Microphone => !has.contains(&crate::sessions::Mic::LowLatency),
+                    EndpointKind::CallMicrophone => !has.contains(&crate::sessions::Mic::Call),
                 })
                 .collect();
             Err(SetupError::PackageLacks { hardware_id: hardware_id.into(), package: c.describe(), missing })
@@ -769,14 +770,14 @@ pub fn format_list(r: &Report) -> String {
                 let check: EndpointCheck = endpoints::check(cable, v, eps, Names::Any);
                 for (kind, e) in &check.found {
                     let state = if e.state == endpoints::State::Active { String::new() } else { format!(", {:?}", e.state).to_lowercase() };
-                    line(format!("    {}: \"{}\"{state}", kind.word(), e.name));
+                    line(format!("    {}: \"{}\"{state}", kind.name(), e.name));
                 }
                 if !check.is_done() && n.health == Health::Working {
                     line(format!("    note: {check}"));
                 }
             }
         }
-        line(format!("  control device: {}", crate::identity::control_path(c.id)));
+        line(format!("  control device: {}", crate::protocol::control_path(&c.id)));
     }
     for e in &l.absent {
         let mics = e.mics.map(|m| format!(", {}", m.arg())).unwrap_or_default();
@@ -835,7 +836,7 @@ pub(crate) mod tests {
         b.health = Health::Problem(31);
         b.problem_status = Some(plan::STATUS_START_BREAKER);
         let ac = a.cable.clone().unwrap();
-        let eps = endpoints::Kind::of_variant(Variant::Both)
+        let eps = EndpointKind::of_variant(Variant::Both)
             .into_iter()
             .map(|kind| Endpoint {
                 id: format!("{kind:?}"),
