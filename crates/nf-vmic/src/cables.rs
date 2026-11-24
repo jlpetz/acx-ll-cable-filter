@@ -21,9 +21,8 @@ use std::str::FromStr;
 use std::{fmt, io};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_DEVNODE_STATUS_FLAGS, CM_GETIDLIST_FILTER_ENUMERATOR, CM_Get_DevNode_Status, CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW,
-    CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_MapCrToWin32Err, CM_PROB, CONFIGRET, CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
-    DN_HAS_PROBLEM, DN_STARTED,
+    CM_GETIDLIST_FILTER_ENUMERATOR, CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
+    CM_MapCrToWin32Err, CONFIGRET, CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
 };
 use windows::Win32::Foundation::{ERROR_AMBIGUOUS_SYSTEM_DEVICE, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE};
 use windows::core::{GUID, HSTRING};
@@ -295,27 +294,20 @@ fn multi_sz(buffer: &[u16]) -> Vec<String> {
     buffer.split(|&c| c == 0).take_while(|s| !s.is_empty()).map(String::from_utf16_lossy).collect()
 }
 
-/// A device node's state, or `None` if it isn't in the device tree (CR_NO_SUCH_DEVNODE: not present).
+/// A device node's state ([`crate::variant::health`]), or `None` if it isn't in the device tree (CR_NO_SUCH_DEVNODE from either
+/// call: not present, or gone since the list). A search that fails otherwise is [`Health::Unlocated`], which names its call.
 fn health_of(instance_id: &str) -> Option<Health> {
     let id = HSTRING::from(instance_id);
     let mut devinst = 0u32;
     // SAFETY: `id` is NUL-terminated and outlives the call; `devinst` is a live out-pointer.
     let cr = unsafe { CM_Locate_DevNodeW(&mut devinst, &id, CM_LOCATE_DEVNODE_NORMAL) };
-    if cr == CR_NO_SUCH_DEVNODE {
-        return None;
-    }
-    if cr != CR_SUCCESS {
-        return Some(Health::Unknown(cr.0));
-    }
-    let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
-    // SAFETY: a device node handle just located; two live out-pointers; no flags.
-    let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
     match cr {
+        CR_SUCCESS => match crate::variant::health(devinst) {
+            Health::Unknown(cr) if cr == CR_NO_SUCH_DEVNODE.0 => None,
+            health => Some(health),
+        },
         CR_NO_SUCH_DEVNODE => None,
-        CR_SUCCESS if status.0 & DN_HAS_PROBLEM.0 != 0 => Some(Health::Problem(problem.0)),
-        CR_SUCCESS if status.0 & DN_STARTED.0 != 0 => Some(Health::Working),
-        CR_SUCCESS => Some(Health::NotStarted),
-        _ => Some(Health::Unknown(cr.0)),
+        _ => Some(Health::Unlocated(cr.0)),
     }
 }
 

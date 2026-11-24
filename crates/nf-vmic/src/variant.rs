@@ -227,7 +227,7 @@ pub fn variant_of(hardware_ids: &[String]) -> Option<Variant> {
     hardware_ids.iter().find_map(|id| Variant::from_hardware_id(id))
 }
 
-/// A device's state, from CM_Get_DevNode_Status.
+/// A device's state, from CM_Get_DevNode_Status (or, for a node found by its instance ID, CM_Locate_DevNodeW: `cables::present`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
     /// Started, no problem.
@@ -238,6 +238,9 @@ pub enum Health {
     Problem(u32),
     /// CM_Get_DevNode_Status itself failed with this CONFIGRET.
     Unknown(u32),
+    /// CM_Locate_DevNodeW failed with this CONFIGRET, other than CR_NO_SUCH_DEVNODE (not present): the node is listed, its state
+    /// unread (`cables::present`).
+    Unlocated(u32),
 }
 
 impl Health {
@@ -263,11 +266,17 @@ impl Health {
                 Some(name) => format!("a problem: Code {p} ({name})"),
                 None => format!("a problem: Code {p}"),
             },
-            Health::Unknown(cr) => match configret_name(cr) {
-                Some(name) => format!("state unknown (CM_Get_DevNode_Status: {name}, {cr})"),
-                None => format!("state unknown (CM_Get_DevNode_Status: CONFIGRET {cr})"),
-            },
+            Health::Unknown(cr) => unread("CM_Get_DevNode_Status", cr),
+            Health::Unlocated(cr) => unread("CM_Locate_DevNodeW", cr),
         }
+    }
+}
+
+/// "state unknown (CM_Get_DevNode_Status: CR_NO_SUCH_DEVNODE, 13)": a state `call` couldn't read, failing with CONFIGRET `cr`.
+fn unread(call: &str, cr: u32) -> String {
+    match configret_name(cr) {
+        Some(name) => format!("state unknown ({call}: {name}, {cr})"),
+        None => format!("state unknown ({call}: CONFIGRET {cr})"),
     }
 }
 
@@ -1525,7 +1534,7 @@ pub fn new_package_lacks(target: Variant, newest: &Candidate, others: &[Candidat
 }
 
 /// A devnode's state.
-fn health(devinst: u32) -> Health {
+pub(crate) fn health(devinst: u32) -> Health {
     let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
     // SAFETY: two live out-pointers; `devinst` came from SetupDi (a stale one only makes the call fail).
     let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
@@ -2495,6 +2504,9 @@ mod tests {
         assert_eq!(Health::Problem(10).describe(), "a problem: Code 10 (CM_PROB_FAILED_START)");
         assert_eq!(Health::Problem(99).describe(), "a problem: Code 99");
         assert_eq!(Health::Unknown(13).describe(), "state unknown (CM_Get_DevNode_Status: CR_NO_SUCH_DEVNODE, 13)");
+        // A node whose search failed names that call, not the status's (cables::present)
+        assert_eq!(Health::Unlocated(19).describe(), "state unknown (CM_Locate_DevNodeW: CR_FAILURE, 19)");
+        assert_eq!(Health::Unlocated(30).describe(), "state unknown (CM_Locate_DevNodeW: CONFIGRET 30)");
         let d = OurDevice { driver_version: Some("1.0.0.0".into()), ..dev(Variant::Both, Health::Working) };
         assert_eq!(d.describe(), r"ROOT\MEDIA\0003: both microphones (ROOT\AudioCodec), working, driver oem12.inf 1.0.0.0");
         let bare = OurDevice { inf: None, ..dev(Variant::Call, Health::Problem(28)) };

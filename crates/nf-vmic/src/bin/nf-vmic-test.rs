@@ -108,7 +108,8 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
   or without --path the cable labelled A, else the only cable. kill-test gives its feed children the same path. The endpoint a
   mode records is that cable's own, found by the instance ID its KS filter names, not by its name: its Microphone
   (Microphone0), or with --mic call its Call Microphone (Microphone1). --device NAME (the endpoint's name, as Sound settings
-  shows it) names one instead, which must be that cable's; open's --device may be any endpoint.
+  shows it) names one instead, which must be that cable's: by its filter's instance ID, or where that can't be read, by the
+  label its name ends with, (ACX-LL-Cable A), held by that cable alone. open's --device may be any endpoint.
 
   nf-vmic-test feed [--path PATH] [--seconds N] [--capacity FRAMES] [--target FRAMES] [--start N] [--quiet]
       Attach a ring and write the test signal (frame n carries the code n mod 2^23, a different float32 on each channel),
@@ -523,10 +524,15 @@ fn cable_capture(o: &Opts, target: &Target) -> Result<Endpoint, String> {
     let kind = mic_kind(o)?;
     let listed = sessions::cable_endpoints().map_err(|e| format!("can't list the cables' endpoints: {e}"))?;
     let endpoint = match o.optional::<String>("--device")? {
-        Some(name) => named_on_cable(&listed, &name, target)?,
+        Some(name) => named_on_cable(&listed, &name, target, present_cables)?,
         None => cable_endpoint(&listed, target, kind)?,
     };
     Ok(endpoint)
+}
+
+/// The cables whose device nodes are present ([`cables::present`]), an error in words.
+fn present_cables() -> Result<Vec<PresentCable>, String> {
+    cables::present().map_err(|e| e.to_string())
 }
 
 /// The target cable's active endpoint of `kind`, by its filter's instance ID ([`sessions::pick`]).
@@ -561,8 +567,11 @@ fn cable_endpoint(listed: &[CableEndpoint], target: &Target, kind: EndpointKind)
 
 /// `--device NAME` for a mode that records the target cable: the active capture endpoint of ours with that name, which must
 /// be on the target cable (verify would otherwise judge one cable's recording by another's statistics). One of ours known by
-/// its name alone (its filter couldn't be read) is taken, with a note.
-fn named_on_cable(listed: &[CableEndpoint], name: &str, target: &Target) -> Result<Endpoint, String> {
+/// its name alone (its filter couldn't be read) is taken only if the label in its name is the target's, and no other cable
+/// present (`present`, asked only then) has that label ([`by_label`]); otherwise it's refused.
+fn named_on_cable(
+    listed: &[CableEndpoint], name: &str, target: &Target, present: impl FnOnce() -> Result<Vec<PresentCable>, String>,
+) -> Result<Endpoint, String> {
     let named: Vec<&CableEndpoint> = listed.iter().filter(|e| !e.render && e.state == EndpointState::Active && e.name == name).collect();
     let e = match named.as_slice() {
         [one] => *one,
@@ -588,9 +597,61 @@ fn named_on_cable(listed: &[CableEndpoint], name: &str, target: &Target) -> Resu
                 target.describe()
             ));
         }
-        None => eprintln!("note: {}; taken as the cable's", e.describe()),
+        None => match by_label(&e.name, &target.id, present()) {
+            ByLabel::Target(label) => eprintln!("note: {}; taken as cable {label}'s by the label in its name", e.describe()),
+            ByLabel::Other { label, id } => {
+                return Err(format!(
+                    "--device {name:?}: its name says cable {label} ({id}), not the one this mode works on ({}): its statistics \
+                     wouldn't be the recording's",
+                    target.describe()
+                ));
+            }
+            ByLabel::Unknown(why) => {
+                return Err(format!(
+                    "--device {name:?}: its cable isn't known (its KS filter wasn't read), and {why}, so its recording can't be \
+                     tied to {}'s statistics; use --mic, which finds the cable's own microphone by its instance ID",
+                    target.path
+                ));
+            }
+        },
     }
     Ok(Endpoint { id: e.id.clone(), name: e.name.clone() })
+}
+
+/// What the label in an endpoint's name says of its cable, for one of ours whose filter wasn't read ([`by_label`]).
+#[derive(Debug, PartialEq, Eq)]
+enum ByLabel {
+    /// The target's label, and no other cable present has it.
+    Target(String),
+    /// Another cable's: the only one present with that label.
+    Other { label: String, id: CableId },
+    /// It can't be told: why.
+    Unknown(String),
+}
+
+/// Which cable an endpoint of ours is by the label in its name's brackets ([`sessions::label_of_name`]), among the cables
+/// `present`: the target (`target`) only where the label names exactly one cable's identity, the target's. A cable's nodes
+/// share its label and identity (a variant switch midway has two), so a label counts once per identity.
+fn by_label(endpoint_name: &str, target: &CableId, present: Result<Vec<PresentCable>, String>) -> ByLabel {
+    let Some(label) = sessions::label_of_name(endpoint_name) else {
+        return ByLabel::Unknown(format!("its name doesn't say which cable (no \"{} <label>\" in its brackets)", cables::NAME));
+    };
+    let present = match present {
+        Ok(p) => p,
+        Err(e) => return ByLabel::Unknown(format!("its name says cable {label}, but the cables present can't be listed ({e})")),
+    };
+    let mut ids: Vec<CableId> = Vec::new();
+    for c in present.iter().filter(|c| c.cable.label == label) {
+        if !ids.contains(&c.cable.id) {
+            ids.push(c.cable.id);
+        }
+    }
+    match ids.as_slice() {
+        [one] if one == target => ByLabel::Target(label),
+        [one] => ByLabel::Other { label, id: *one },
+        [] => ByLabel::Unknown(format!("its name says cable {label}, which no cable present is labelled")),
+        _ => ByLabel::Unknown(format!("its name says cable {label}, and more than one cable present is labelled {label}")),
+    }
 }
 
 fn read_stats(device: &Device) -> Result<Stats, String> {
@@ -3348,7 +3409,25 @@ fn open_target(a: &OpenArgs, dir: Direction) -> Result<(wasapi::Device, String, 
             }
             Some(cable)
         }
-        (Some(path), None) => Some(Target::of_path(path)?),
+        (Some(path), None) => {
+            let cable = Target::of_path(path)?;
+            // One of ours by its name alone (its filter unread): its name's label mustn't say it's another cable's
+            if let Some(e) = &ours {
+                match by_label(&e.name, &cable.id, present_cables()) {
+                    ByLabel::Target(_) => {}
+                    ByLabel::Other { label, id } => {
+                        return Err(format!(
+                            "--device {name:?}: its name says cable {label} ({id}), not {}'s: its statistics wouldn't be the stream's",
+                            cable.path
+                        ));
+                    }
+                    ByLabel::Unknown(why) => {
+                        println!("note: {}; its cable isn't known: {why}; the statistics read are {}'s", e.describe(), cable.path)
+                    }
+                }
+            }
+            Some(cable)
+        }
         (None, Some(on)) => Some(Target::of_id(on.id)),
         (None, None) => {
             match &ours {
@@ -6222,20 +6301,68 @@ mod tests {
         assert_eq!(cable_endpoint(&list, &b, Microphone), found("{b-mic}", "Microphone (ACX-LL-Cable B)"));
         let e = cable_endpoint(&list, &b, CallMicrophone).unwrap_err();
         assert!(e.contains("the low-latency variant has only the Microphone: leave out --mic"), "{e}");
-        // By name: A's is taken, B's refused for A, another vendor's and a disabled one not found
-        assert_eq!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a), found("{a-mic}", "Studio mic (ACX-LL-Cable A)"));
-        let e = named_on_cable(&list, "Microphone (ACX-LL-Cable B)", &a).unwrap_err();
+        // By name: A's is taken, B's refused for A, another vendor's and a disabled one not found. The cables present aren't
+        // asked for an endpoint whose filter was read.
+        let unasked = || -> Result<Vec<PresentCable>, String> { panic!("the cables present were asked for") };
+        assert_eq!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a, unasked), found("{a-mic}", "Studio mic (ACX-LL-Cable A)"));
+        let e = named_on_cable(&list, "Microphone (ACX-LL-Cable B)", &a, unasked).unwrap_err();
         assert!(e.contains("is cable B's") && e.contains("statistics wouldn't be the recording's"), "{e}");
         for name in ["CABLE Output (VB-Audio Virtual Cable)", "Call Microphone (ACX-LL-Cable A)", "Speakers (ACX-LL-Cable A)"] {
-            let e = named_on_cable(&list, name, &a).unwrap_err();
+            let e = named_on_cable(&list, name, &a, unasked).unwrap_err();
             assert!(e.contains("no active ACX-LL-Cable microphone has that name"), "{name}: {e}");
         }
         // Two of ours with one name: which isn't known
         list[3].name = "Studio mic (ACX-LL-Cable A)".into();
-        assert!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a).unwrap_err().contains("more than one"));
-        // One of ours by its name alone (its filter unread) is taken, with a note
-        let unread = CableEndpoint { instance: None, cable: None, ..endpoint_on("{x}", "C", ID, Microphone, Active) };
-        assert_eq!(named_on_cable(&[unread], "Microphone (ACX-LL-Cable C)", &a), found("{x}", "Microphone (ACX-LL-Cable C)"));
+        assert!(named_on_cable(&list, "Studio mic (ACX-LL-Cable A)", &a, unasked).unwrap_err().contains("more than one"));
+    }
+
+    fn present_node(label: &str, id: &str, n: u32) -> PresentCable {
+        let cable = cables::CableInstance { label: label.into(), id: id.parse().unwrap(), n };
+        PresentCable { instance_id: cable.instance_id(), cable, health: nf_vmic::variant::Health::Working }
+    }
+
+    /// The review of N0: one of ours whose filter wasn't read was taken as the target's, so verify could judge B's recording by
+    /// A's statistics. The label in its name decides, checked against the cables present; anything less is refused.
+    #[test]
+    fn an_unread_endpoint_is_the_cables_only_by_its_label() {
+        use EndpointKind::Microphone;
+        use EndpointState::Active;
+        let a = Target::of_path(&format!(r"\\.\AcxLlCable_{ID}")).unwrap();
+        let unread = |name: &str| CableEndpoint {
+            instance: None,
+            cable: None,
+            name: name.into(),
+            ..endpoint_on("{x}", "A", ID, Microphone, Active)
+        };
+        let both = || Ok(vec![present_node("A", ID, 1), present_node("B", OTHER_ID, 1)]);
+        let found = |name: &str| Ok(Endpoint { id: "{x}".into(), name: name.into() });
+        // A's label, and only A has it: taken (renamed, or numbered, the brackets still say)
+        for name in ["Microphone (ACX-LL-Cable A)", "Studio mic (ACX-LL-Cable A)", "Microphone (2- acx-ll-cable a)"] {
+            assert_eq!(named_on_cable(&[unread(name)], name, &a, both), found(name), "{name}");
+        }
+        // A variant switch midway: two of A's nodes, one identity, one label
+        let switching = || Ok(vec![present_node("A", ID, 1), present_node("A", ID, 2), present_node("B", OTHER_ID, 1)]);
+        assert!(named_on_cable(&[unread("Microphone (ACX-LL-Cable A)")], "Microphone (ACX-LL-Cable A)", &a, switching).is_ok());
+        // B's label: refused, naming B
+        let name = "Microphone (ACX-LL-Cable B)";
+        let e = named_on_cable(&[unread(name)], name, &a, both).unwrap_err();
+        assert!(e.contains(&format!("its name says cable B ({OTHER_ID})")) && e.contains("wouldn't be the recording's"), "{e}");
+        // No label in the name, a label no cable has, two cables with one label, or the cables unlisted: refused, asking for --mic
+        let two_a = Ok(vec![present_node("A", ID, 1), present_node("A", OTHER_ID, 1)]);
+        let unlisted = Err("CM_Get_Device_ID_ListW failed".to_string());
+        #[rustfmt::skip]
+        let cases = [
+            ("Microphone (USB Audio Device)", both(), "its name doesn't say which cable"),
+            ("ACX-LL-Cable Microphone", both(), "its name doesn't say which cable"),
+            ("Microphone (ACX-LL-Cable C)", both(), "which no cable present is labelled"),
+            ("Microphone (ACX-LL-Cable A)", two_a, "more than one cable present is labelled A"),
+            ("Microphone (ACX-LL-Cable A)", unlisted, "can't be listed (CM_Get_Device_ID_ListW failed)"),
+        ];
+        for (name, present, why) in cases {
+            let e = named_on_cable(&[unread(name)], name, &a, move || present).unwrap_err();
+            assert!(e.contains(why) && e.contains("use --mic") && e.contains("its KS filter wasn't read"), "{name}: {e}");
+        }
+        assert_eq!(by_label("Microphone (ACX-LL-Cable A)", &a.id, both()), ByLabel::Target("A".into()));
     }
 
     #[test]

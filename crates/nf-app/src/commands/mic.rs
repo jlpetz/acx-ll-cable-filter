@@ -49,7 +49,7 @@ fn format_sessions(endpoints: &[Endpoint]) -> String {
     if endpoints.is_empty() {
         let _ = writeln!(
             s,
-            "No AudioCodec Device microphone is active. `noise-filter mic variant` says whether the driver is installed, and \
+            "No ACX-LL-Cable microphone is active. `noise-filter mic variant` says whether the driver is installed, and \
              which microphones it has; the Sound panel's Recording tab may have one disabled."
         );
         return s;
@@ -448,7 +448,7 @@ mod tests {
         // Nothing open, nothing of ours, and sessions without a known program
         let empty = endpoint(MICROPHONE, vec![]);
         assert!(format_sessions(&[empty]).contains("  no app has it open"));
-        assert!(format_sessions(&[]).starts_with("No AudioCodec Device microphone is active."));
+        assert!(format_sessions(&[]).starts_with("No ACX-LL-Cable microphone is active."));
         let odd = vec![
             Session { pid: 0, image: Ok(String::new()), state: SessionState::Active, system_sounds: false },
             Session { pid: 9, image: Err(WinError { call: "OpenProcess", code: 87 }), state: SessionState::Active, system_sounds: false },
@@ -459,7 +459,7 @@ mod tests {
         assert!(text.contains("  pid 9 (its program couldn't be read: OpenProcess failed: ERROR_INVALID_PARAMETER (87)"), "{text}");
         assert!(text.contains("  Windows' system sounds, inactive: unknown, no suggestion."), "{text}");
         // A renamed endpoint: what suits the app, without saying it's the wrong one
-        let renamed = endpoint("Studio mic (AudioCodec Device)", vec![session("zoom.exe", SessionState::Active)]);
+        let renamed = endpoint("Studio mic (ACX-LL-Cable A)", vec![session("zoom.exe", SessionState::Active)]);
         assert!(format_sessions(&[renamed]).contains("  zoom.exe (pid 1234), active: a call app; the Call Microphone suits it."));
     }
 

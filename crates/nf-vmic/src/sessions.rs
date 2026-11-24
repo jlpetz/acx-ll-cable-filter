@@ -11,6 +11,8 @@
 //!
 //! [`cable_endpoints`] lists our endpoints, render and capture, active, disabled or unplugged, each with its cable; [`pick`]
 //! finds one cable's Speakers or microphone among them, and [`endpoint_by_id`] the cable of an endpoint already chosen.
+//! [`cable_of_endpoint`] reads one endpoint by its id alone (the engine's direct-feed guard). Where an endpoint's filter can't
+//! be read, [`label_of_name`] reads the cable's label from its name, for a caller that checks it against the cables present.
 //!
 //! [`list`] reads Windows' audio sessions: each of our active capture endpoints (`IMMDeviceEnumerator::EnumAudioEndpoints`), its
 //! `IAudioSessionManager2`'s sessions, and for each session its process (`IAudioSessionControl2::GetProcessId`, then
@@ -29,7 +31,7 @@ use windows::Win32::Foundation::{PROPERTYKEY, S_OK};
 use windows::Win32::Media::Audio::{
     AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED,
     DEVICE_STATE_UNPLUGGED, EDataFlow, IAudioSessionControl2, IAudioSessionManager2, IDeviceTopology, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, eCapture, eRender,
+    IMMEndpoint, MMDeviceEnumerator, eCapture, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
@@ -37,7 +39,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
-use windows::core::{GUID, Interface, Owned, PWSTR};
+use windows::core::{GUID, HSTRING, Interface, Owned, PWSTR};
 
 use crate::cables::{self, CableId, CableInstance, EndpointKind};
 use crate::win_error::WinError;
@@ -124,6 +126,27 @@ pub fn is_ours(filters: &[&str], name: &str) -> bool {
 /// can't be read, and the engine's check on a name alone.
 pub fn has_our_name(endpoint_name: &str) -> bool {
     endpoint_name.to_ascii_lowercase().contains(&cables::NAME.to_ascii_lowercase())
+}
+
+/// The cable label an endpoint's name carries in its last brackets, upper case: "Microphone (ACX-LL-Cable D)", or with Windows'
+/// numbering, "Microphone (2- ACX-LL-Cable D)", is "D". The part in brackets is the cable's device's friendly name, which the
+/// driver sets from its label and a rename in the Sound panel leaves alone. `None` where the brackets don't hold
+/// "ACX-LL-Cable <label>" (any case) with a label of one to eight of A-Z and 0-9. A name alone doesn't tell two cables with
+/// one label apart: only for an endpoint whose filter can't be read, and checked against the cables present.
+pub fn label_of_name(endpoint_name: &str) -> Option<String> {
+    let inner = endpoint_name.trim_end().strip_suffix(')')?;
+    let mut device = inner[inner.rfind('(')? + 1..].trim();
+    // Windows numbers a second device of one name: "2- ACX-LL-Cable D"
+    if let Some((n, rest)) = device.split_once("- ")
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+    {
+        device = rest;
+    }
+    let prefix = device.get(..cables::NAME.len()).filter(|s| s.eq_ignore_ascii_case(cables::NAME))?;
+    let label = device[prefix.len()..].strip_prefix(' ')?;
+    let valid = (1..=cables::LABEL_MAX_CHARS).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_alphanumeric());
+    valid.then(|| label.to_ascii_uppercase())
 }
 
 /// The microphone a KS filter's reference string names: the driver's capture circuits (`microphone0`, `microphone1`; any
@@ -446,7 +469,7 @@ pub fn capture_endpoints() -> Result<Vec<CaptureEndpoint>, WinError> {
 }
 
 /// Runs `work` on a thread of its own, in the MTA.
-fn on_mta_thread<T: Send + 'static>(work: fn() -> Result<T, WinError>) -> Result<T, WinError> {
+fn on_mta_thread<T: Send + 'static>(work: impl FnOnce() -> Result<T, WinError> + Send + 'static) -> Result<T, WinError> {
     let worker = std::thread::Builder::new()
         .name("nf-sessions".into())
         .spawn(move || {
@@ -514,25 +537,33 @@ fn cable_endpoints_on_this_thread() -> Result<Vec<CableEndpoint>, WinError> {
     for (flow, render) in [(eRender, true), (eCapture, false)] {
         for ours in our_endpoints(flow, states)? {
             // One that went away meanwhile isn't listed, as one whose name couldn't be read isn't
-            // SAFETY: a live device.
-            let Ok(state) = (unsafe { ours.device.GetState() }) else { continue };
-            let state = match state {
-                DEVICE_STATE_ACTIVE => EndpointState::Active,
-                DEVICE_STATE_DISABLED => EndpointState::Disabled,
-                DEVICE_STATE_UNPLUGGED => EndpointState::Unplugged,
-                _ => continue,
-            };
-            let Ok(id) = device_id(&ours.device) else { continue };
-            let (kind, instance) = identify_endpoint(&ours.filters(), &ours.name, render);
-            let cable = instance.as_deref().and_then(CableInstance::parse);
-            out.push(CableEndpoint { id, name: ours.name, render, kind, state, instance, cable });
+            let Ok(Some(endpoint)) = ours.cable_endpoint(render) else { continue };
+            out.push(endpoint);
         }
     }
     Ok(out)
 }
 
-/// One of our endpoints, as [`our_endpoints`] reads it.
-struct Ours {
+/// The endpoint with MMDevice id `endpoint_id` as [`cable_endpoints`] would list it, if it's ours ([`is_ours`]): `Ok(None)` for
+/// another vendor's endpoint, or one of ours that is NOTPRESENT. For a caller that has an endpoint already (the engine's
+/// direct-feed guard, `nf-engine`'s `audio.rs`): one endpoint's property store and device topology are read, not every
+/// endpoint's. COM must be initialised on this thread, in either apartment (the engine's audio thread is in the MTA).
+pub fn cable_of_endpoint(endpoint_id: &str) -> Result<Option<CableEndpoint>, WinError> {
+    // SAFETY: COM is initialised on this thread (the caller's); a plain in-process creation.
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
+    let id = HSTRING::from(endpoint_id);
+    // SAFETY: a live enumerator; `id` is NUL-terminated and outlives the call.
+    let device = unsafe { enumerator.GetDevice(&id) }.map_err(WinError::of("IMMDeviceEnumerator::GetDevice"))?;
+    let endpoint: IMMEndpoint = device.cast().map_err(WinError::of("IMMDevice as IMMEndpoint"))?;
+    // SAFETY: a live endpoint.
+    let render = unsafe { endpoint.GetDataFlow() }.map_err(WinError::of("IMMEndpoint::GetDataFlow"))? == eRender;
+    let read = ReadEndpoint::of(device)?;
+    if read.is_ours() { read.cable_endpoint(render) } else { Ok(None) }
+}
+
+/// An endpoint's name and its filter's paths, as [`our_endpoints`] and [`cable_of_endpoint`] read them.
+struct ReadEndpoint {
     device: IMMDevice,
     name: String,
     /// The copies of the KS filter's path that were read: the one its device topology is connected to (the documented route),
@@ -540,16 +571,46 @@ struct Ours {
     filters: Vec<String>,
 }
 
-impl Ours {
+impl ReadEndpoint {
+    /// Reads its name (which must be there) and its filter's paths (where they are).
+    fn of(device: IMMDevice) -> Result<Self, WinError> {
+        // SAFETY: a live device; read access only.
+        let store = unsafe { device.OpenPropertyStore(STGM_READ) }.map_err(WinError::of("IMMDevice::OpenPropertyStore"))?;
+        let name = string_property(&store, &PKEY_Device_FriendlyName)?;
+        let cached = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
+        let filters: Vec<String> = connected_filter(&device).into_iter().chain(cached).collect();
+        Ok(Self { device, name, filters })
+    }
+
     /// Its filter's paths, as [`identify`] and [`is_ours`] take them.
     fn filters(&self) -> Vec<&str> {
         self.filters.iter().map(String::as_str).collect()
+    }
+
+    /// Whether it's one of our cables' ([`is_ours`]).
+    fn is_ours(&self) -> bool {
+        is_ours(&self.filters(), &self.name)
+    }
+
+    /// One of ours as [`cable_endpoints`] lists it (`render`: its flow): `Ok(None)` if it's NOTPRESENT.
+    fn cable_endpoint(self, render: bool) -> Result<Option<CableEndpoint>, WinError> {
+        // SAFETY: a live device.
+        let state = match unsafe { self.device.GetState() }.map_err(WinError::of("IMMDevice::GetState"))? {
+            DEVICE_STATE_ACTIVE => EndpointState::Active,
+            DEVICE_STATE_DISABLED => EndpointState::Disabled,
+            DEVICE_STATE_UNPLUGGED => EndpointState::Unplugged,
+            _ => return Ok(None),
+        };
+        let id = device_id(&self.device)?;
+        let (kind, instance) = identify_endpoint(&self.filters(), &self.name, render);
+        let cable = instance.as_deref().and_then(CableInstance::parse);
+        Ok(Some(CableEndpoint { id, name: self.name, render, kind, state, instance, cable }))
     }
 }
 
 /// Our endpoints of `flow` in `states`, with their names and their filters' paths: every endpoint's filter is read, since an
 /// endpoint is ours by its filter's instance ID ([`is_ours`]). COM must be initialised on this thread.
-fn our_endpoints(flow: EDataFlow, states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
+fn our_endpoints(flow: EDataFlow, states: DEVICE_STATE) -> Result<Vec<ReadEndpoint>, WinError> {
     // SAFETY: COM is initialised on this thread (the caller's); a plain in-process creation.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
@@ -563,14 +624,9 @@ fn our_endpoints(flow: EDataFlow, states: DEVICE_STATE) -> Result<Vec<Ours>, Win
         // An endpoint that went away meanwhile, or whose name can't be read, isn't ours to list; the others still are
         // SAFETY: a live collection and an index below its count.
         let Ok(device) = (unsafe { endpoints.Item(i) }) else { continue };
-        // SAFETY: a live device; read access only.
-        let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
-        let Ok(name) = string_property(&store, &PKEY_Device_FriendlyName) else { continue };
-        let cached = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
-        let filters: Vec<String> = connected_filter(&device).into_iter().chain(cached).collect();
-        let ours = is_ours(&filters.iter().map(String::as_str).collect::<Vec<_>>(), &name);
-        if ours {
-            out.push(Ours { device, name, filters });
+        let Ok(read) = ReadEndpoint::of(device) else { continue };
+        if read.is_ours() {
+            out.push(read);
         }
     }
     Ok(out)
@@ -729,6 +785,38 @@ mod tests {
         assert_eq!(mic_of("Call Microphone (2- ACX-LL-Cable A)"), Mic::Call);
         assert_eq!(mic_of("2- Microphone (ACX-LL-Cable A)"), Mic::Other);
         assert_eq!(mic_of("Studio mic (ACX-LL-Cable A)"), Mic::Other);
+    }
+
+    /// The review of N0: an endpoint whose filter wasn't read says its cable only by the label in its name's brackets.
+    #[test]
+    fn the_label_is_read_from_the_names_brackets() {
+        #[rustfmt::skip]
+        let cases = [
+            ("Microphone (ACX-LL-Cable A)", Some("A")),
+            ("Speakers (ACX-LL-Cable B)", Some("B")),
+            ("Studio mic (ACX-LL-Cable D)", Some("D")),
+            ("Microphone (2- ACX-LL-Cable A)", Some("A")),
+            ("Call Microphone (12- acx-ll-cable c7) ", Some("C7")),
+            ("Mic (old) (ACX-LL-Cable CABLE12Z)", Some("CABLE12Z")),
+            // Not a label: none, too long, not A-Z and 0-9, not ours, not in the last brackets, no brackets
+            ("Microphone (ACX-LL-Cable)", None),
+            ("Microphone (ACX-LL-Cable )", None),
+            ("Microphone (ACX-LL-Cable ABCDEFGHI)", None),
+            ("Microphone (ACX-LL-Cable A-B)", None),
+            ("Microphone (ACX-LL-Cable A B)", None),
+            ("Microphone (ACX-LL-Cable \u{c4})", None),
+            ("Microphone (ACX-LL-CableA)", None),
+            ("Microphone (x- ACX-LL-Cable A)", None),
+            ("Microphone (ACX-LL-Cable A) (USB Audio Device)", None),
+            ("ACX-LL-Cable Microphone", None),
+            ("Microphone (AudioCodec Device)", None),
+            ("Microphone (\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9})", None),
+            ("", None),
+            (")", None),
+        ];
+        for (name, label) in cases {
+            assert_eq!(label_of_name(name).as_deref(), label, "{name:?}");
+        }
     }
 
     const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
