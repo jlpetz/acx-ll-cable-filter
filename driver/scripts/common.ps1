@@ -16,14 +16,16 @@ $script:Solution     = Join-Path $DriverRoot 'src\AudioCodec\Driver\AudioCodec.s
 $script:ProjectDir   = Join-Path $DriverRoot 'src\AudioCodec\Driver'
 $script:PackageName  = 'AudioCodec'
 $script:InfName      = 'AudioCodec.inf'
-$script:HardwareId   = 'ROOT\AudioCodec'
-$script:CableBHardwareId = 'ROOT\NoiseFilterCableB' # optional independent device; never part of the primary variant switch
-# The three variants (TODO 19, the owner's options A and D): one INF, the microphones chosen by hardware ID.
+# The three variants (TODO 19, the owner's options A and D), shared by every cable (the per-cable design, D1's INF): one INF,
+# a cable's microphones chosen by hardware ID. Each cable's device node is ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>, made by the
+# setup tool (acx-ll-cable, crates\nf-vmic) and nothing else: the driver refuses a node devcon makes (Code 31).
 $script:HardwareIds  = [ordered]@{
-    'both'        = 'ROOT\AudioCodec'              # the low-latency and the call microphone
-    'call'        = 'ROOT\AudioCodecCall'          # the call microphone (a 5 ms default period)
-    'low-latency' = 'ROOT\AudioCodecLowLatency'    # the low-latency microphone (IAudioClient3's small periods)
+    'both'        = 'ROOT\AcxLlCable'              # the low-latency and the call microphone
+    'call'        = 'ROOT\AcxLlCableCall'          # the call microphone (a 5 ms default period)
+    'low-latency' = 'ROOT\AcxLlCableLowLatency'    # the low-latency microphone (IAudioClient3's small periods)
 }
+# The old driver's hardware IDs, before the per-cable driver: the migration (Install-Driver.ps1) removes their devices.
+$script:LegacyHardwareIds = @('ROOT\AudioCodec', 'ROOT\AudioCodecCall', 'ROOT\AudioCodecLowLatency', 'ROOT\NoiseFilterCableB')
 # KMDF 1.35 needs Windows 11 24H2 or Server 2025 (build 26100).
 $script:CatalogOs    = '10_GE_X64,Server2025_X64'
 
@@ -55,6 +57,29 @@ function Find-WdkTool([string]$Name) {
     )
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     throw "$Name not found in the WDK $WdkVersion (looked in bin and Tools)."
+}
+
+# The cables' setup tool (TODO 19, the per-cable design, section 9): the release build of crates\nf-vmic's acx-ll-cable.
+# -Build builds it first (cargo build --release -p nf-vmic --bin acx-ll-cable), so no run rebuilds anything unasked; without
+# it, a missing tool is an error.
+$script:RepoRoot = Split-Path -Parent $DriverRoot
+function Get-CableTool([switch]$Build) {
+    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RepoRoot 'target' }
+    $tool = Join-Path $target 'release\acx-ll-cable.exe'
+    if ($Build) {
+        Write-Step 'Build the setup tool (cargo build --release -p nf-vmic --bin acx-ll-cable)'
+        Push-Location $RepoRoot
+        try { cargo build --release -p nf-vmic --bin acx-ll-cable } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+    }
+    if (-not (Test-Path $tool)) { throw "The setup tool isn't built ($tool): run this with -Build, or Cable.ps1 -Build list." }
+    return $tool
+}
+
+# Runs the setup tool with its arguments, its output shown as it comes; its exit code (0 done, 2 an error, 7 a restart).
+function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
+    & $Tool @Arguments | Out-Host
+    return $LASTEXITCODE
 }
 
 function Find-MSBuild {

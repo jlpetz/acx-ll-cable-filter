@@ -42,7 +42,7 @@ use crate::win_error::WinError;
 /// build 26100 as `{2}.\\?\root#media#0004#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0`, on a disabled endpoint too.
 /// [`identify`] goes by it only when the documented route (the endpoint's device topology) doesn't name one of our
 /// microphones.
-const PKEY_ENDPOINT_FILTER: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x233164c8_1b2c_4c7d_bc68_b671687a2567), pid: 1 };
+pub(crate) const PKEY_ENDPOINT_FILTER: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x233164c8_1b2c_4c7d_bc68_b671687a2567), pid: 1 };
 
 /// Which of our microphones an endpoint is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -324,7 +324,7 @@ pub fn capture_endpoints() -> Result<Vec<CaptureEndpoint>, WinError> {
 }
 
 /// Runs `work` on a thread of its own, in the MTA.
-fn on_mta_thread<T: Send + 'static>(work: fn() -> Result<T, WinError>) -> Result<T, WinError> {
+pub(crate) fn on_mta_thread<T: Send + 'static>(work: fn() -> Result<T, WinError>) -> Result<T, WinError> {
     let worker = std::thread::Builder::new()
         .name("nf-sessions".into())
         .spawn(move || {
@@ -425,7 +425,7 @@ fn our_capture_endpoints(states: DEVICE_STATE) -> Result<Vec<Ours>, WinError> {
 /// The device interface path of the KS filter an endpoint is connected to: its device topology's one connector, and the
 /// device on the other side (`IConnector::GetDeviceIdConnectedTo`). `None` if any step fails (a disabled endpoint's may:
 /// to be confirmed live), or the path is empty.
-fn connected_filter(device: &IMMDevice) -> Option<String> {
+pub(crate) fn connected_filter(device: &IMMDevice) -> Option<String> {
     // SAFETY: a live device; no activation parameters.
     let topology: IDeviceTopology = unsafe { device.Activate(CLSCTX_ALL, None) }.ok()?;
     // SAFETY: a live topology; an endpoint's has a single connector, index 0.
@@ -445,14 +445,14 @@ fn take_string(s: PWSTR) -> String {
     }
 }
 
-fn device_id(device: &IMMDevice) -> Result<String, WinError> {
+pub(crate) fn device_id(device: &IMMDevice) -> Result<String, WinError> {
     // SAFETY: a live device.
     let id = unsafe { device.GetId() }.map_err(WinError::of("IMMDevice::GetId"))?;
     Ok(take_string(id))
 }
 
 /// A string property of an endpoint's (an empty string for an empty value).
-fn string_property(store: &IPropertyStore, key: &PROPERTYKEY) -> Result<String, WinError> {
+pub(crate) fn string_property(store: &IPropertyStore, key: &PROPERTYKEY) -> Result<String, WinError> {
     // SAFETY: a live store; the key outlives the call.
     let mut value = unsafe { store.GetValue(key) }.map_err(WinError::of("IPropertyStore::GetValue"))?;
     // SAFETY: `value` is the PROPVARIANT the store returned, converted, then cleared once.
