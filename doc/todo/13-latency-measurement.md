@@ -217,8 +217,32 @@ mic CABLE-A, the chain 10 ms (RNNoise), 5 sweeps a run.
   of the four had a mic glitch at one block and an output underrun at the next (160 frames of silence); the queue then
   stood that much high, and the drift controller trimmed it back by up to about 1.5 ms a second, so sweeps two seconds
   apart came 3 ms apart. The report's events line counts the underrun over the test but says nothing per sweep, and its
-  median mixes them in. Next: the report names a disturbed sweep and gives the clean sweeps' figure (building, 2026-11-24);
-  why the mic woke late (open); then the exclusive figure against an exclusive cable-only probe.
+  median mixes them in.
+- **The report now names a disturbed sweep (083a8d1, ba98d71, 2026-11-24; a workflow, reviewed).** The tap carries each
+  block's facts (its output corrections, mic glitches and stalls, fill and target: a stack copy into the existing ring, no
+  allocation); a sweep is disturbed by an event within its window (its app latency and 25 ms past its last sample, 100 ms
+  at least) or by the queue still recovering (the filter's estimate over 1 ms from its level before the event, a start
+  2.5 ms or more off the target, or the drift loop's net slips over 24 a second). The report gives the undisturbed sweeps'
+  median and spread beside all of them, names each disturbed sweep and why, and its "events" line adds the blocks' mic
+  glitches and stalls. Replayed offline on the saved runs: defaults 1, 5, 7, 8 and every output-shared run whole, 2, 3, 4
+  and 6 named. Live after the merge onto 09e5520: three runs with the defaults, 38.01-38.70 ms, none disturbed.
+- **The late wake (offline, the saved blocks of defaults 2, 3, 4, 6):** neither device. The thread woke on its cadence, then
+  lost 12.7-15.8 ms inside that one wake before its block (normally 0.03 ms, p99 0.11); the mic's stamps stayed on their
+  10 ms grid and its FIFO then held two blocks; the output's next answer came 2+ periods late (counted as 160 frames of
+  stale silence), and its clock's origin moved 9.5-12.4 ms and stayed (3.3 ms the counted silence, the rest the driver's
+  position not advancing through the hold). The data has no time inside a wake, so preemption (the VM, Verifier) can't be
+  told from a blocking call (the exclusive output's or the mic's GetBuffer/ReleaseBuffer). Open, with proposals (ours):
+  time the output service and the mic drain per wake in ThreadFacts; check live whether our driver plays the 160 frames a
+  late answer counts as played (if not, the fill reads 3.3 ms high after one); count the mic's zero-filled frames per
+  block; mark the tap's and the train's start in the --save-blocks CSV. The thresholds (24 slips a second, 2.5 ms, 1 ms)
+  come from one day of the dev box's cables.
+- **The direct driver route (Astra's 09e5520) reads high, found by our review of it (2026-11-24):** its readout times each
+  frame at the capture pass that releases its packet, not at the recorder's stamp (the packet's start), so it reads up to
+  a packet high (about 10 ms at 480 frames: Astra's 20.14 ms readout against 9.91 measured); its output period shows 0
+  because the route sets none; and its fill target is exactly one reader packet, with no block, margin or adaptive term
+  and nothing raising it after an underrun. Proposed (ours, for the owner): fix both here, as the latency report's.
+- Next: the direct route's readout and target (above); why the thread was held (above); then the exclusive figure against
+  an exclusive cable-only probe.
 
 ## Budget (built and run 2026-11-01)
 The readout now comes split into where each block's first sample spends its time (engine.md, "The latency budget", has the

@@ -159,6 +159,6 @@ Rerun from the saved takes (`C:\Users\Administrator\Downloads\nf-quality\`; `ana
 - **Shown now:** the output's events per block (`OutputFacts`; `chain_blocks.csv`'s `out_*` columns: the stream index each
   block went to, padding, pending, fill, target, slip, zeros, dropped, skipped, underrun, re-anchor, the silence an exclusive
   device played since the block before, and the clock reading), over a take or a test
-  (the quality report's and `latency`'s "output events" line) and over a run (`run`'s summary); and the quality analysis
+  (the quality report's "output events" line and `latency`'s "events" line, mic glitches and stalls too, since 083a8d1) and over a run (`run`'s summary); and the quality analysis
   names each step of the delay and the silence that explains it (`analysis::delay_steps`, in the delay warning). The next live
   take should show the output's events clean (slips only) where its delay steps, and the warning naming the silence.
