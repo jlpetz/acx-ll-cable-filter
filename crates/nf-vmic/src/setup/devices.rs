@@ -721,6 +721,9 @@ mod tests {
         assert_eq!(Health::of(13, DN_STARTED.0, 0), Health::Unknown(13));
         assert_eq!(Health::Problem(31).describe(), "a problem: Code 31 (CM_PROB_FAILED_ADD)");
         assert_eq!(Health::Unknown(13).describe(), "state unknown (CM_Get_DevNode_Status: CR_NO_SUCH_DEVNODE, 13)");
+        // A node whose search failed names that call, not the status's (cables::present)
+        assert_eq!(Health::Unlocated(19).describe(), "state unknown (CM_Locate_DevNodeW: CR_FAILURE, 19)");
+        assert_eq!(Health::Unlocated(30).describe(), "state unknown (CM_Locate_DevNodeW: CONFIGRET 30)");
     }
 
     /// Which microphones a package makes comes from its INF, the install section the hardware ID names: the repo's INF (D1

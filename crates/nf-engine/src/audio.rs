@@ -22,6 +22,7 @@ use nf_core::noise::InferenceStats;
 use nf_core::rt::Dither;
 use nf_core::telemetry::Telemetry;
 use nf_core::{BLOCK, SAMPLE_RATE};
+use nf_vmic::cables::CableInstance;
 use rtrb::Producer;
 use wasapi::{DeviceEnumerator, Direction, Role};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -398,17 +399,8 @@ fn open_session(
     let mic_dev = resolve(&en, config.devices.mic.as_deref(), Direction::Capture, StreamRole::Mic)?;
     let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
     let out_dev = if direct {
-        let from_ring = mic_dev.get_interface_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours)
-            || mic_dev.get_friendlyname().ok().as_deref().is_some_and(nf_vmic::sessions::is_ours);
-        if from_ring {
-            return if config.devices.mic.is_none() {
-                Err(StartFailure::DefaultMicIsOutput("Noise Filter virtual microphone".into()))
-            } else {
-                Err(StartFailure::DriverRing {
-                    message: "Choose a different input microphone: the current input records the driver's own output.".into(),
-                    retry: false,
-                })
-            };
+        if let Some(refusal) = direct_feed_check(&mic_cable(&mic_dev), feed_cable().as_ref(), config.devices.mic.is_none()) {
+            return Err(refusal);
         }
         None
     } else {
@@ -594,6 +586,67 @@ pub(crate) fn same_adapter(mic: Option<String>, out: Option<String>) -> Option<S
         (Some(a), Some(b)) if !a.trim().is_empty() && a == b => Some(a),
         _ => None,
     }
+}
+
+/// Which cable the input microphone is on, for the direct feed's check ([`direct_feed_check`]; TODO 19, the per-cable design's
+/// interim until E1's input guard by identity across every route).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MicCable {
+    /// Not one of our cables' endpoints: a real microphone, or another vendor's cable.
+    NotOurs,
+    /// One of this cable's, by the instance ID its KS filter names.
+    On(CableInstance),
+    /// Ours by its name alone ("ACX-LL-Cable" in it): its filter, or the endpoint itself, couldn't be read.
+    Unknown,
+}
+
+/// The input's cable: by its KS filter's instance ID ([`nf_vmic::sessions::cable_of_endpoint`], on this thread, which is in the
+/// MTA), or where the endpoint can't be read that way, by its names (its own and its device's).
+fn mic_cable(mic: &wasapi::Device) -> MicCable {
+    match mic.get_id().ok().map(|id| nf_vmic::sessions::cable_of_endpoint(&id)) {
+        Some(Ok(None)) => MicCable::NotOurs,
+        Some(Ok(Some(endpoint))) => endpoint.cable.map_or(MicCable::Unknown, MicCable::On),
+        Some(Err(_)) | None => {
+            let named = |name: Option<String>| name.as_deref().is_some_and(nf_vmic::sessions::has_our_name);
+            if named(mic.get_interface_friendlyname().ok()) || named(mic.get_friendlyname().ok()) {
+                MicCable::Unknown
+            } else {
+                MicCable::NotOurs
+            }
+        }
+    }
+}
+
+/// The cable the direct feed goes to: the default one, labelled A or else the only cable, as the ring's open chooses it
+/// (`nf_vmic::device::Device::open_default`, directly or through the broker). `None` where it can't be chosen: the open then
+/// fails and says why.
+fn feed_cable() -> Option<CableInstance> {
+    let present = nf_vmic::cables::present().ok()?;
+    nf_vmic::cables::choose_default(&present).ok().map(|c| c.cable.clone())
+}
+
+/// The direct feed's check on the input (the owner's input guard, 2026-11-24): a microphone of the cable it feeds (`feed`)
+/// records the filter's own output, so it's refused, and waited out like a missing microphone where it's the default
+/// (`following_default`). Another cable's microphone is allowed. One of ours whose cable isn't known is refused, as it may be
+/// the fed cable's; where the fed cable can't be chosen, the ring's open fails anyway, so only that one is.
+pub(crate) fn direct_feed_check(mic: &MicCable, feed: Option<&CableInstance>, following_default: bool) -> Option<StartFailure> {
+    let (name, why) = match mic {
+        MicCable::NotOurs => return None,
+        MicCable::On(cable) if feed.is_some_and(|f| f.id == cable.id) => (
+            cable.name(),
+            format!("is a microphone of {}, the cable direct output feeds, so it records the filter's own output", cable.name()),
+        ),
+        MicCable::On(_) => return None,
+        MicCable::Unknown => (
+            nf_vmic::cables::NAME.to_owned(),
+            format!("is an {} microphone whose cable couldn't be read, so it may record the filter's own output", nf_vmic::cables::NAME),
+        ),
+    };
+    Some(if following_default {
+        StartFailure::DefaultMicIsOutput(name)
+    } else {
+        StartFailure::DriverRing { message: format!("Choose a different input microphone: the current input {why}."), retry: false }
+    })
 }
 
 /// A mic on the output's own device (wasapi/E, gui/F1). On a virtual cable that's the cable's
@@ -937,6 +990,39 @@ mod tests {
         let card = Some("Realtek(R) Audio".to_owned());
         assert_eq!(adapter_check(true, card.clone()), Ok(None), "a headset or onboard card isn't a loop");
         assert_eq!(adapter_check(false, card), Ok(None));
+    }
+
+    /// TODO 19 (the owner's input guard, 2026-11-24; the review of N0): direct output refuses a microphone of the cable it
+    /// feeds, by identity, and allows another cable's; one of ours whose cable isn't known is refused.
+    #[test]
+    fn direct_output_refuses_its_own_cables_microphone() {
+        let cable = |label: &str, id: u128| CableInstance {
+            label: label.into(),
+            id: nf_vmic::cables::CableId(windows::core::GUID::from_u128(id)),
+            n: 1,
+        };
+        let (a, b) = (cable("A", 0xa), cable("B", 0xb));
+        // The fed cable's: refused, waited out where it's the default, naming the cable
+        assert_eq!(
+            direct_feed_check(&MicCable::On(a.clone()), Some(&a), true),
+            Some(StartFailure::DefaultMicIsOutput("ACX-LL-Cable A".into()))
+        );
+        assert!(direct_feed_check(&MicCable::On(a.clone()), Some(&a), true).unwrap().transient(), "waits like a missing mic");
+        let Some(StartFailure::DriverRing { message, retry: false }) = direct_feed_check(&MicCable::On(a.clone()), Some(&a), false) else {
+            panic!("a picked microphone of the fed cable is refused");
+        };
+        assert!(message.contains("is a microphone of ACX-LL-Cable A, the cable direct output feeds"), "{message}");
+        // Renamed or relabelled, the identity decides: same id, another label, is still the fed cable
+        assert!(direct_feed_check(&MicCable::On(CableInstance { label: "Z".into(), ..a.clone() }), Some(&a), true).is_some());
+        // Another cable's, a real microphone, or the fed cable unknown (the ring's open says why): allowed
+        assert_eq!(direct_feed_check(&MicCable::On(b.clone()), Some(&a), true), None);
+        assert_eq!(direct_feed_check(&MicCable::On(b), Some(&a), false), None);
+        assert_eq!(direct_feed_check(&MicCable::NotOurs, Some(&a), true), None);
+        assert_eq!(direct_feed_check(&MicCable::On(a.clone()), None, true), None);
+        // Ours by its name alone: it may be the fed cable's, so refused either way
+        assert_eq!(direct_feed_check(&MicCable::Unknown, None, true), Some(StartFailure::DefaultMicIsOutput("ACX-LL-Cable".into())));
+        let Some(StartFailure::DriverRing { message, .. }) = direct_feed_check(&MicCable::Unknown, Some(&a), false) else { panic!() };
+        assert!(message.contains("an ACX-LL-Cable microphone whose cable couldn't be read"), "{message}");
     }
 
     /// gui/F1: the default speakers picked as the output, or the output cable left as Windows'

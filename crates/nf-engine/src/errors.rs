@@ -180,14 +180,16 @@ pub(crate) fn remedy_for_fault(f: Fault) -> Option<Remedy> {
 }
 
 /// Whether an endpoint or interface name is one of the virtual cables users install (VB-Audio's
-/// cables and Voicemeeter, VAC). Both ends of one of these share a name, and its recording side
-/// carries whatever is played into it; two ends of a real sound card share a name too, but are
-/// a real mic and real speakers.
+/// cables and Voicemeeter, VAC) or one of ours: "ACX-LL-Cable A" ([`nf_vmic::sessions::has_our_name`],
+/// TODO 19), or the old driver's "AudioCodec Device" and "Noise Filter Cable B". Both ends of one of
+/// these share a name, and its recording side carries whatever is played into it; two ends of a
+/// real sound card share a name too, but are a real mic and real speakers.
 pub(crate) fn is_virtual_cable(name: &str) -> bool {
     let n = name.to_lowercase();
     ["vb-audio", "voicemeeter", "virtual audio cable", "virtual cable", "audiocodec device", "noise filter cable b"]
         .iter()
         .any(|k| n.contains(k))
+        || nf_vmic::sessions::has_our_name(name)
 }
 
 /// What stopped a running audio thread. Packed into one `AtomicU64` so the audio thread can
@@ -713,6 +715,13 @@ mod tests {
             "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)",
             "Virtual Audio Cable",
             "CABLE Input (VB-Audio Virtual Cable)",
+            // Ours (TODO 19): each cable's device name, its endpoints', numbered or in any case; and the old driver's
+            "ACX-LL-Cable A",
+            "Speakers (ACX-LL-Cable B)",
+            "Microphone (2- ACX-LL-Cable C)",
+            "acx-ll-cable d",
+            "AudioCodec Device",
+            "Speakers (Noise Filter Cable B)",
         ] {
             assert!(is_virtual_cable(n), "{n}");
         }

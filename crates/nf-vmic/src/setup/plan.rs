@@ -28,7 +28,8 @@ pub const PROBLEM_FAILED_ADD: u32 = 31;
 /// Code 22, CM_PROB_DISABLED.
 pub const PROBLEM_DISABLED: u32 = 22;
 
-/// A device node's state, from CM_Get_DevNode_Status.
+/// A device node's state, from CM_Get_DevNode_Status (or, for a node found by its instance ID, CM_Locate_DevNodeW:
+/// `cables::present`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
     /// Started, no problem.
@@ -39,6 +40,9 @@ pub enum Health {
     Problem(u32),
     /// CM_Get_DevNode_Status itself failed with this CONFIGRET.
     Unknown(u32),
+    /// CM_Locate_DevNodeW failed with this CONFIGRET, other than CR_NO_SUCH_DEVNODE (not present): the node is listed, its state
+    /// unread (`cables::present`).
+    Unlocated(u32),
 }
 
 impl Health {
@@ -64,11 +68,17 @@ impl Health {
                 Some(name) => format!("a problem: Code {p} ({name})"),
                 None => format!("a problem: Code {p}"),
             },
-            Health::Unknown(cr) => match configret_name(cr) {
-                Some(name) => format!("state unknown (CM_Get_DevNode_Status: {name}, {cr})"),
-                None => format!("state unknown (CM_Get_DevNode_Status: CONFIGRET {cr})"),
-            },
+            Health::Unknown(cr) => unread("CM_Get_DevNode_Status", cr),
+            Health::Unlocated(cr) => unread("CM_Locate_DevNodeW", cr),
         }
+    }
+}
+
+/// "state unknown (CM_Get_DevNode_Status: CR_NO_SUCH_DEVNODE, 13)": a state `call` couldn't read, failing with CONFIGRET `cr`.
+fn unread(call: &str, cr: u32) -> String {
+    match configret_name(cr) {
+        Some(name) => format!("state unknown ({call}: {name}, {cr})"),
+        None => format!("state unknown ({call}: CONFIGRET {cr})"),
     }
 }
 

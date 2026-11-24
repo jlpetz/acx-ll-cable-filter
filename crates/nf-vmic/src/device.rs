@@ -30,8 +30,9 @@ use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResul
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{HSTRING, Owned, PCWSTR};
 
+use crate::cables;
 use crate::memory::RingMemory;
-use crate::protocol::{AttachIn, IOCTL_ATTACH, IOCTL_STATS, MAGIC, STATE_ATTACHED, Stats, USER_PATH, VERSION};
+use crate::protocol::{AttachIn, IOCTL_ATTACH, IOCTL_STATS, MAGIC, STATE_ATTACHED, Stats, VERSION};
 
 /// How long a detach waits, once, for the driver to complete the request after the cancel before giving up on it (and leaking
 /// the ring and the OVERLAPPED rather than freeing them under the driver).
@@ -67,18 +68,19 @@ fn is_set(event: &Owned<HANDLE>) -> bool {
     (unsafe { WaitForSingleObject(**event, 0) }) == WAIT_OBJECT_0
 }
 
-/// The control device `\\.\NoiseFilterVmic`, opened for overlapped I/O, closed on drop.
+/// A cable's control device (`\\.\AcxLlCable_<id>`, [`crate::protocol::control_path`]), opened for overlapped I/O, closed on
+/// drop.
 #[derive(Clone)]
 pub struct Device {
     handle: Rc<Owned<HANDLE>>,
 }
 
 impl Device {
-    /// Opens the control device. `ERROR_FILE_NOT_FOUND`: there is no control device (the driver, with its app feed, isn't
-    /// running, or its PnP device is gone); `ERROR_ACCESS_DENIED`: the spike's device admits SYSTEM and Administrators only, so
-    /// the caller isn't elevated.
-    pub fn open() -> io::Result<Self> {
-        let path = HSTRING::from(USER_PATH);
+    /// Opens the control device at `path`, read and write. `ERROR_FILE_NOT_FOUND`: there is no such control device (no cable
+    /// has that identity, or its device is disabled, removed or being updated, or the driver running isn't the per-cable one);
+    /// `ERROR_ACCESS_DENIED`: the control device admits SYSTEM and Administrators only, so the caller isn't elevated.
+    pub fn open_path(path: &str) -> io::Result<Self> {
+        let path = HSTRING::from(path);
         // SAFETY: `path` is NUL-terminated and outlives the call; no security attributes, no template.
         let h = unsafe {
             CreateFileW(
@@ -94,6 +96,14 @@ impl Device {
         .map_err(io_error)?;
         // SAFETY: a valid handle that nothing else owns; Owned closes it once.
         Ok(Self { handle: Rc::new(unsafe { Owned::new(h) }) })
+    }
+
+    /// Opens the default cable's control device: the one labelled A, else the only cable ([`cables::choose_default`] over
+    /// [`cables::present`]). Interim (TODO 19, N0): until the broker and the app name the cable they feed (B1, E1), they feed
+    /// this one, as they fed the one control device before. `ERROR_FILE_NOT_FOUND` with no cable,
+    /// `ERROR_AMBIGUOUS_SYSTEM_DEVICE` with several and none labelled A; otherwise as [`Device::open_path`].
+    pub fn open_default() -> io::Result<Self> {
+        Self::open_path(&cables::default_control_path()?)
     }
 
     /// The driver's statistics (NF_VMIC_IOCTL_STATS), checked for the protocol's magic, version and size. `ERROR_BAD_COMMAND`:

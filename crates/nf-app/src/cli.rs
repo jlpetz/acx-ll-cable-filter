@@ -1021,8 +1021,8 @@ Usage:
                                  differences with 95% CIs
   noise-filter setup-large-pages [--sid SID]
                                  Grant the lock-pages privilege (asks for elevation)
-  noise-filter mic sessions      List the apps recording from noise-filter's microphones (the
-                                 AudioCodec Device ones), and which microphone suits each
+  noise-filter mic sessions      List the apps recording from noise-filter's microphones (every
+                                 ACX-LL-Cable's), and which microphone suits each
   noise-filter mic variant [both|call|low-latency]
                                  Say which microphones the AudioCodec driver has, or switch it to
                                  both, the call microphone only (a 5 ms default period, for call
