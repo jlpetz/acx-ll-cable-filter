@@ -429,20 +429,27 @@ NfAssignFriendlyName(
 // back at every boot. AddDevice counts the device's start attempts in its hardware key (NfStartAttempts, Cable.h), flushed
 // before it goes on, and the count is cleared once the start has completed (EvtDeviceSelfManagedIoInit, the last of the
 // start's callbacks) or the binding has ended without a crash (a failed AddDevice or start, a removal: a clean failure doesn't
-// loop the box). A device whose last two starts never completed, so that neither cleared the count, is refused at AddDevice
-// with NF_STATUS_START_BREAKER (Device Manager: code 31, the status in DEVPKEY_Device_ProblemStatus) and a debug message
-// saying why and how to clear it. The setup tool deletes the count when it installs a cable. Everything here is
-// PASSIVE_LEVEL (the registry calls, wdfregistry.h and wdm.h).
+// loop the box). A device whose last start never completed, so that nothing cleared its count, is refused at AddDevice with
+// NF_STATUS_START_BREAKER (Device Manager: code 31, the status in DEVPKEY_Device_ProblemStatus), a System event (source
+// AudioCodec) and a debug message, both saying why, the second how to clear it. The setup tool deletes the count when it
+// installs a cable. Everything here is PASSIVE_LEVEL (the registry calls, wdfregistry.h and wdm.h).
+//
+// Why at one start, not two: at boot the cables most likely start before the Session Manager makes the SYSTEM hive writable
+// (kernel Plug and Play starts the root-enumerated devices of installed drivers before smss.exe runs; to confirm on the box:
+// after a normal boot, a cable's Device Parameters key's last write time, this count's clear, against smss.exe's start time).
+// Registry writes before then stay in memory, and a crash loses them, so no boot's count reaches disk. A crash in start first
+// shows in a session (an install, an update, an enable), whose count of 1 is on disk; at a limit of two every boot after would
+// read 1, count 2 in memory only and crash again, for good. At one, that first boot refuses the device. A false refusal needs a
+// crash of anything, or a power loss, within a cable's start in a session, a fraction of a second; the setup tool's add clears it.
 //
 // What it can't catch:
-// - a crash before the count is on disk: in DriverEntry, in AddDevice before the write (the instance ID's query and parse,
-//   the key's open), and (to confirm on the box) a start at boot that runs before the Session Manager has made the SYSTEM hive
-//   writable: registry writes before then stay in memory, so a crash there loses the count. After a normal boot, a cable's
-//   hardware key's last write time (this count's clear) against smss.exe's start time shows which;
+// - a crash that only happens at boot, if the cables start before the hive is writable (above): its count never reaches disk;
+// - a crash before the count is on disk: in DriverEntry, or in AddDevice before the write (the instance ID's query and parse,
+//   the key's open);
 // - a crash after the start completed: in a stream (Audiosrv's first opens after boot among them), an IOCTL, a removal;
-// - a crash in the framework's or ACX's start work after our last start callback, or in the clear itself;
-// - a crash in another cable's start counts in that cable's key, and in any other cable's whose start was in flight then.
-// A hang in start counts too (no callback clears it): two hung boots refuse the device as two crashes would.
+// - a crash in the framework's or ACX's start work after our last start callback, or in the clear itself.
+// A crash in one cable's start leaves a count on every cable whose start was in flight then (an update starts them together),
+// and each is refused. A hang in start leaves its count too (no callback clears it): the next boot refuses the device.
 //
 DECLARE_CONST_UNICODE_STRING(g_NfStartAttemptsValue, NF_CABLE_START_ATTEMPTS_VALUE);
 
@@ -480,6 +487,58 @@ NfBreakerStore(
 }
 
 //
+// A refusal's System event, so an unattended boot shows why without a debugger: the I/O manager's error log, its source the
+// driver's service name (AudioCodec), its code NF_STATUS_START_BREAKER (an error, event ID 1), its one string naming the cable
+// and the count. No message file is registered for the source, so Event Viewer shows the string under "the following
+// information was included with the event". Best effort: without an entry, no event. IoAllocateErrorLogEntry and
+// IoWriteErrorLogEntry: up to DISPATCH_LEVEL (wdm.h).
+//
+#define NF_BREAKER_EVENT_CHARS      96u         // the most an entry holds after its header: ERROR_LOG_MAXIMUM_SIZE (240 bytes)
+C_ASSERT(sizeof(IO_ERROR_LOG_PACKET) + NF_BREAKER_EVENT_CHARS * sizeof(WCHAR) <= ERROR_LOG_MAXIMUM_SIZE);
+
+PAGED_CODE_SEG
+static
+VOID
+NfBreakerReportRefusal(
+    _In_ WDFDRIVER  Driver,
+    _In_ PCWSTR     Label,
+    _In_ ULONG      Attempts
+)
+{
+    WCHAR                   text[NF_BREAKER_EVENT_CHARS] = {};
+    size_t                  chars = 0;
+    ULONG                   textBytes;
+    PIO_ERROR_LOG_PACKET    entry;
+
+    PAGED_CODE();
+
+    // At most 90 characters with an eight-character label and the largest count.
+    if (!NT_SUCCESS(RtlStringCchPrintfW(text, ARRAYSIZE(text),
+                                        L"ACX-LL-Cable %ws refused: its last start never completed (NfStartAttempts %lu)", Label,
+                                        Attempts)) ||
+        !NT_SUCCESS(RtlStringCchLengthW(text, ARRAYSIZE(text), &chars)))
+    {
+        return;
+    }
+    textBytes = (ULONG)((chars + 1) * sizeof(WCHAR));
+
+    entry = (PIO_ERROR_LOG_PACKET)IoAllocateErrorLogEntry(WdfDriverWdmGetDriverObject(Driver),
+                                                          (UCHAR)(sizeof(IO_ERROR_LOG_PACKET) + textBytes));
+    if (entry == NULL)
+    {
+        return;
+    }
+    RtlZeroMemory(entry, sizeof(IO_ERROR_LOG_PACKET));
+    entry->ErrorCode = NF_STATUS_START_BREAKER;
+    entry->FinalStatus = NF_STATUS_START_BREAKER;
+    entry->UniqueErrorValue = Attempts;
+    entry->NumberOfStrings = 1;
+    entry->StringOffset = (USHORT)sizeof(IO_ERROR_LOG_PACKET);
+    RtlCopyMemory((PUCHAR)entry + sizeof(IO_ERROR_LOG_PACKET), text, textBytes);
+    IoWriteErrorLogEntry(entry);
+}
+
+//
 // AddDevice's part, before anything is made: refuses the device at the limit, else counts this attempt. *Key: the hardware
 // key, open, once the attempt is counted (the caller clears it with NfBreakerClose if AddDevice fails before the framework
 // device exists, as no cleanup callback can then); NULL if the key can't be opened, and the device goes on without the breaker
@@ -489,8 +548,10 @@ PAGED_CODE_SEG
 static
 NTSTATUS
 NfBreakerEnter(
+    _In_    WDFDRIVER       Driver,
     _In_    PWDFDEVICE_INIT DeviceInit,
     _In_    PCWSTR          InstanceId,
+    _In_    PCWSTR          Label,
     _Out_   WDFKEY*         Key
 )
 {
@@ -506,8 +567,8 @@ NfBreakerEnter(
                                        &key);
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: %ws starts without the crash breaker (its hardware key: 0x%08X)\n",
-                   InstanceId, status);
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
+                   "AudioCodec: %ws starts without the crash breaker (its hardware key: 0x%08X)\n", InstanceId, status);
         return STATUS_SUCCESS;
     }
 
@@ -520,10 +581,11 @@ NfBreakerEnter(
     {
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL,
                    // Under DbgPrint's 512 bytes with both instance IDs at their longest (about 80 characters).
-                   "AudioCodec: %ws refused by the crash breaker (0x%08X): its last %lu starts never completed (a crash in start?). "
-                   "To clear: the setup tool's add or update, or delete NfStartAttempts under "
+                   "AudioCodec: %ws refused by the crash breaker (0x%08X): its last start never completed (a crash in start?), "
+                   "NfStartAttempts %lu. To clear: the setup tool's add or update, or delete NfStartAttempts under "
                    "HKLM\\SYSTEM\\CurrentControlSet\\Enum\\%ws\\Device Parameters; then disable and enable it.\n",
                    InstanceId, NF_STATUS_START_BREAKER, attempts, InstanceId);
+        NfBreakerReportRefusal(Driver, Label, attempts);
         WdfRegistryClose(key);
         return NF_STATUS_START_BREAKER;
     }
@@ -677,9 +739,9 @@ Return Value:
         return status;
     }
 
-    // noise-filter (TODO 19, the boot crash breaker, above): refused after two starts in a row that never completed, else
-    // this attempt counted and on disk before anything is made.
-    status = NfBreakerEnter(DeviceInit, instanceId, &breakerKey);
+    // noise-filter (TODO 19, the boot crash breaker, above): refused if its last start never completed, else this attempt
+    // counted and on disk (in a session) before anything is made.
+    status = NfBreakerEnter(Driver, DeviceInit, instanceId, label, &breakerKey);
     if (!NT_SUCCESS(status))
     {
         return status;

@@ -184,12 +184,13 @@ typedef struct _NF_APP_RING {
 
 //
 // The boot crash breaker (Device.cpp; ours, for the owner's go, removable): a device's start attempts that haven't completed, a
-// REG_DWORD in its hardware key (Device Parameters; absent is 0), which the setup tool deletes when it installs a cable; and
-// the status AddDevice refuses a device with once two starts in a row never completed (DEVPKEY_Device_ProblemStatus beside
-// code 31: a customer-defined NTSTATUS, facility 0xAC).
+// REG_DWORD in its hardware key (Device Parameters; absent is 0), which the setup tool deletes when it installs a cable; the
+// count at which AddDevice refuses the device, one (a start that never completed: Device.cpp says why not two); and the status
+// it refuses it with (DEVPKEY_Device_ProblemStatus beside code 31, and the System event's code: a customer-defined NTSTATUS,
+// facility 0xAC).
 //
 #define NF_CABLE_START_ATTEMPTS_VALUE   L"NfStartAttempts"
-#define NF_CABLE_START_ATTEMPTS_LIMIT   2u
+#define NF_CABLE_START_ATTEMPTS_LIMIT   1u
 #define NF_STATUS_START_BREAKER         ((NTSTATUS)0xE0AC0001L)
 
 // The microphones a device makes (Device.cpp, NfReadMicrophones; the INF's NfMicrophones): Microphone0 and Microphone1.

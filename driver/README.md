@@ -71,10 +71,14 @@ circuit's component ID is the identity XOR the sample's constant.
 boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
 attempts in its hardware key (`NfStartAttempts` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters`,
 flushed before it goes on); a completed start (EvtDeviceSelfManagedIoInit) or a binding that ends without a crash clears it.
-A device whose last two starts never completed is refused: code 31, with 0xE0AC0001 as its problem status, and a debug
-message saying how to clear it. The setup tool deletes the count when it installs a cable; by hand, delete the value and
-disable and enable the device. It needs the count on disk first, so it can't catch a crash in DriverEntry, or (to confirm) a
-start at boot before the Session Manager makes the SYSTEM hive writable.
+A device whose last start never completed is refused: code 31, with 0xE0AC0001 as its problem status, a System event from
+the source `AudioCodec` (event ID 1, "ACX-LL-Cable <label> refused: its last start never completed"), and a debug message
+saying how to clear it. The setup tool deletes the count when it installs a cable; by hand, delete the value and disable and
+enable the device. It refuses at one start, not two, because at boot the cables most likely start before the Session Manager
+makes the SYSTEM hive writable (to confirm on the box), and a crash then loses the boot's count: the count that stops a loop
+is the one a crash in start leaves in a session (an install, an update, an enable), and at two every boot after would count
+its second attempt in memory only and crash again. So it stops the loop that follows a crash first seen in a session; it
+can't catch a crash that only happens at boot, nor one in DriverEntry, before the count is written.
 
 ### Independent Cable B
 
