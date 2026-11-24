@@ -1,12 +1,15 @@
 //! The setup's store (TODO 19, the per-cable design, section 4): `HKLM\SOFTWARE\ACX-LL-Cable\Cables\<label>`, with `Id` (the
 //! identity's 36 lower-case characters, REG_SZ), `N` (the instance number its node had last, REG_DWORD) and `Mics` (`both`,
 //! `call` or `low-latency`, REG_SZ). `add` reuses a label's identity and n, `remove` keeps them, `remove --forget` drops them.
-//! The key takes HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
+//! `Pending` (REG_DWORD 1, ours) marks a cable the migration is to make and hasn't yet: written before the old devices go, so
+//! a run that stops after their removal is finished by the next (Install-Driver.ps1 runs the migration while one is pending);
+//! cleared when the cable is made. The key takes HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
-    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
@@ -17,6 +20,8 @@ use crate::win_error::WinError;
 
 /// The store's key under HKLM.
 pub const KEY: &str = r"SOFTWARE\ACX-LL-Cable\Cables";
+/// The value marking a cable the migration hasn't made yet.
+pub const PENDING: &str = "Pending";
 
 /// What the store holds: the entries that read, and what was wrong with those that didn't (left alone, and reported).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,7 +31,7 @@ pub struct Store {
 }
 
 /// An entry from its key's name and values (pure).
-pub fn entry_of(label: &str, id: Option<&str>, n: Option<u32>, mics: Option<&str>) -> Result<Entry, String> {
+pub fn entry_of(label: &str, id: Option<&str>, n: Option<u32>, mics: Option<&str>, pending: Option<u32>) -> Result<Entry, String> {
     let at = format!(r"HKLM\{KEY}\{label}");
     let label: Label = label.parse().map_err(|e| format!("{at}: {e}"))?;
     let id: CableId = id.ok_or_else(|| format!("{at}: no Id"))?.parse().map_err(|e| format!("{at}: {e}"))?;
@@ -35,7 +40,7 @@ pub fn entry_of(label: &str, id: Option<&str>, n: Option<u32>, mics: Option<&str
         None => None,
         Some(m) => Some(Variant::from_arg(m).ok_or_else(|| format!("{at}: Mics '{m}' isn't both, call or low-latency"))?),
     };
-    Ok(Entry { label, id, n, mics })
+    Ok(Entry { label, id, n, mics, pending: pending.is_some_and(|p| p != 0) })
 }
 
 /// A registry key, closed on drop.
@@ -115,7 +120,8 @@ pub fn read() -> Result<Store, WinError> {
         let id = string_value(&key, "Id")?;
         let n = dword_value(&key, "N")?;
         let mics = string_value(&key, "Mics")?;
-        match entry_of(&label, id.as_deref(), n, mics.as_deref()) {
+        let pending = dword_value(&key, PENDING)?;
+        match entry_of(&label, id.as_deref(), n, mics.as_deref(), pending) {
             Ok(e) => store.entries.push(e),
             Err(why) => store.problems.push(why),
         }
@@ -155,7 +161,16 @@ pub fn write(e: &Entry) -> Result<(), WinError> {
     if let Some(m) = e.mics {
         set("Mics", REG_SZ, &sz(m.arg()))?;
     }
-    Ok(())
+    if e.pending {
+        set(PENDING, REG_DWORD, &1u32.to_le_bytes())
+    } else {
+        let name = HSTRING::from(PENDING);
+        // SAFETY: an open key; no subkey; a NUL-terminated value name.
+        match unsafe { RegDeleteKeyValueW(key.0, PCWSTR::null(), &name) } {
+            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+            e => Err(WinError { call: "RegDeleteKeyValueW(Pending)", code: e.0 }),
+        }
+    }
 }
 
 /// Drops a label's entry (`remove --forget`, elevated). Not there is fine.
@@ -175,9 +190,10 @@ mod tests {
 
     #[test]
     fn an_entry_reads_from_its_values() {
-        let e = entry_of("b", Some(ID), Some(3), Some("call")).unwrap();
-        assert_eq!((e.label.as_str(), e.id.to_string(), e.n, e.mics), ("B", ID.to_string(), 3, Some(Variant::Call)));
-        assert_eq!(entry_of("B", Some(&ID.to_uppercase()), Some(1), None).unwrap().mics, None);
+        let e = entry_of("b", Some(ID), Some(3), Some("call"), None).unwrap();
+        assert_eq!((e.label.as_str(), e.id.to_string(), e.n, e.mics, e.pending), ("B", ID.to_string(), 3, Some(Variant::Call), false));
+        assert_eq!(entry_of("B", Some(&ID.to_uppercase()), Some(1), None, Some(0)).unwrap().mics, None);
+        assert!(entry_of("B", Some(ID), Some(1), None, Some(1)).unwrap().pending, "the migration's, not made yet");
         for (label, id, n, mics, why) in [
             ("B_", Some(ID), Some(1), None, "isn't a cable label"),
             ("B", None, Some(1), None, "no Id"),
@@ -186,7 +202,7 @@ mod tests {
             ("B", Some(ID), Some(0), None, "no N"),
             ("B", Some(ID), Some(1), Some("two"), "Mics 'two'"),
         ] {
-            let e = entry_of(label, id, n, mics).unwrap_err();
+            let e = entry_of(label, id, n, mics, None).unwrap_err();
             assert!(e.contains(why) && e.starts_with(r"HKLM\SOFTWARE\ACX-LL-Cable\Cables\"), "{e}");
         }
     }

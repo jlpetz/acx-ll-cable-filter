@@ -17,9 +17,12 @@
 //!   doesn't unload, or a node refuses the disable, it enables what it disabled and stops: the old image is still in use, so
 //!   close the apps using a cable and run it again. Nothing is installed then.
 //! - [`migrate`]: from the old driver's devices (`ROOT\AudioCodec*`, A; `ROOT\NoiseFilterCableB`, the B Cable-B.ps1 made) to
-//!   cables: as `update` to unload the old image, then their nodes removed and A and B made on the package given.
+//!   cables: the package checked for every cable to make, A and B recorded in the store (pending), then as `update` to unload
+//!   the old image, the old nodes removed and A and B made on the package given. A run that stops part way is finished by
+//!   the next.
 //!
-//! The variant switch, per cable, is [`crate::variant::switch`], on the same pieces.
+//! The sequences of `update` and the migration are [`steps`], over a seam the tests fake. The variant switch, per cable, is
+//! [`crate::variant::switch`], on the same pieces.
 
 pub mod devices;
 pub mod endpoints;
@@ -27,6 +30,7 @@ pub mod lock;
 pub mod package;
 pub mod plan;
 pub mod service;
+pub mod steps;
 pub mod store;
 
 use std::fmt;
@@ -36,11 +40,12 @@ use std::time::{Duration, Instant};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W};
 use windows::Win32::System::Com::CoCreateGuid;
 
-use self::devices::{Bound, DRIVER_WAIT, DeviceSet, Disabled, InstallFailure, Installed, NewNode, judge_install};
-use self::endpoints::{ENDPOINTS_WAIT, Endpoint, EndpointCheck};
+use self::devices::{Bound, DRIVER_WAIT, DeviceSet, InstallFailure, Installed, NewNode, judge_install};
+use self::endpoints::{ENDPOINTS_WAIT, Endpoint, EndpointCheck, Names};
 use self::lock::{LOCK, LOCK_WAIT, LockError, SetupLock};
 use self::package::{Candidate, INF_NAME, PackageError, Pick, Running, file_name};
 use self::plan::{AddPlan, Create, Entry, Health, Identity, Node, PlanError, RemoveTarget, UpdatePlan};
+use self::steps::Real;
 use crate::identity::{CableId, CableInstance, Label};
 use crate::variant::Variant;
 use crate::win_error::WinError;
@@ -102,9 +107,11 @@ pub enum SetupError {
         folder: String,
         why: String,
     },
-    /// `update`, the migration: the package given isn't among the drivers compatible with this node. Nothing was changed.
+    /// `update`, the migration: the package given isn't among the drivers compatible with this node, or with the cable to be
+    /// made. Nothing was changed.
     NotCompatible {
         device: String,
+        hardware_id: String,
         package: String,
     },
     /// The package chosen doesn't make the variant's endpoints, by its INF. Nothing was changed.
@@ -136,6 +143,19 @@ pub enum SetupError {
     Endpoints(WinError),
     /// The action was done, but these checks failed; the nodes are left as they are.
     Checks(Vec<String>),
+    /// The migration stopped after the old image unloaded (`error`: an old node's removal failed, or needs a restart): every
+    /// node it disabled and didn't remove was enabled again, but `unrestored`; nothing was installed. The cables to make are in
+    /// the store, pending, for the next run.
+    Stopped {
+        error: Box<SetupError>,
+        unrestored: Vec<(String, WinError)>,
+        to_make: Vec<Label>,
+    },
+    /// The migration's cables `to_make` weren't all made (`problems` says why): they stay in the store, pending, for the next run.
+    Unfinished {
+        problems: Vec<String>,
+        to_make: Vec<Label>,
+    },
 }
 
 /// A node that didn't work on the chosen package ([`SetupError::Install`]).
@@ -178,6 +198,20 @@ fn unrestored_text(unrestored: &[(String, WinError)]) -> String {
     unrestored.iter().map(|(d, e)| format!(" {d} couldn't be enabled again ({e}): enable it in Device Manager.")).collect()
 }
 
+/// " ACX-LL-Cable A and ACX-LL-Cable B are recorded in the setup's store: ...", or nothing.
+fn to_make_text(to_make: &[Label]) -> String {
+    let (is, them) = if to_make.len() == 1 { ("is", "it") } else { ("are", "them") };
+    if to_make.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {} {is} recorded in the setup's store: run Install-Driver.ps1 (or `acx-ll-cable migrate <package folder>`) again to \
+             make {them}.",
+            steps::labels(to_make)
+        )
+    }
+}
+
 impl fmt::Display for SetupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -187,10 +221,10 @@ impl fmt::Display for SetupError {
             SetupError::Windows(e) => e.fmt(f),
             SetupError::Store(e) => write!(f, "the setup's store (HKLM\\{}) couldn't be read or written: {e}", store::KEY),
             SetupError::NotAPackage { folder, why } => write!(f, "{folder} has no driver package of ours ({PACKAGE_INF}): {why}"),
-            SetupError::NotCompatible { device, package } => write!(
+            SetupError::NotCompatible { device, hardware_id, package } => write!(
                 f,
-                "{package} isn't among the drivers compatible with {device} (its hardware ID): nothing was changed. Is it a build of \
-                 the per-cable driver?"
+                "{package} isn't among the drivers compatible with {device} ({hardware_id}): nothing was changed. Is it a build of \
+                 the per-cable driver (driver\\scripts\\Build-Driver.ps1)?"
             ),
             SetupError::PackageLacks { hardware_id, package, missing } => write!(
                 f,
@@ -242,6 +276,13 @@ impl fmt::Display for SetupError {
                  Endpoint Builder service running?"
             ),
             SetupError::Checks(failed) => write!(f, "done, but: {}", failed.join("; ")),
+            SetupError::Stopped { error, unrestored, to_make } => write!(
+                f,
+                "{error}. Every device this run disabled and didn't remove was enabled again, and nothing was installed.{}{}",
+                unrestored_text(unrestored),
+                to_make_text(to_make)
+            ),
+            SetupError::Unfinished { problems, to_make } => write!(f, "not finished: {}.{}", problems.join("; "), to_make_text(to_make)),
         }
     }
 }
@@ -262,9 +303,9 @@ impl Present {
         Ok(Self { set, data, nodes })
     }
 
-    /// The packages the present cables run: one entry a node with a driver (the old driver's nodes left out).
+    /// The packages the present cables run ([`plan::running`]: nodes with an identity only).
     pub fn running(&self) -> Vec<(String, Running)> {
-        self.nodes.iter().filter(|n| !n.is_legacy()).filter_map(|n| Some((n.instance_id.clone(), n.running.clone()?))).collect()
+        plan::running(&self.nodes)
     }
 }
 
@@ -313,7 +354,7 @@ fn choose_driver(
         Want::Published(inf) => candidates
             .iter()
             .position(|c| c.is_ours() && file_name(&c.inf).eq_ignore_ascii_case(file_name(inf)))
-            .ok_or_else(|| SetupError::NotCompatible { device: device.into(), package: inf.into() })?,
+            .ok_or_else(|| SetupError::NotCompatible { device: device.into(), hardware_id: hardware_id.into(), package: inf.into() })?,
     };
     say(&format!("  the driver: {} ({})", candidates[chosen].describe(), candidates[chosen].mics_note()));
     Ok(chosen)
@@ -376,7 +417,8 @@ pub struct Made {
     pub restart: bool,
 }
 
-/// Why [`make`] stopped: on a re-opened element before anything was installed (the caller may try n + 1), or otherwise.
+/// Why [`make`] stopped: on a re-opened element (a removed node's key), which it removed again (the caller may try n + 1), or
+/// otherwise.
 enum MakeError {
     Reopened(SetupError),
     Other(SetupError),
@@ -391,7 +433,8 @@ impl<E: Into<SetupError>> From<E> for MakeError {
 /// Creates `create`'s node (design section 9, `add`'s "Creating it"): the element with its fixed instance ID, its hardware
 /// ID and friendly name; its driver (the package wanted); then the cable's old nodes removed; DIF_REGISTERDEVICE; the start
 /// count cleared; DiInstallDevice; up to [`DRIVER_WAIT`] for it to work; the friendly name again. Nothing is written between
-/// registration and install that the driver reads. A node that doesn't work on the chosen package is removed again.
+/// registration and install that the driver reads. A node that doesn't work on the chosen package is removed again; a
+/// re-opened one so removed is [`MakeError::Reopened`], for [`make_or_next`]'s n + 1.
 fn make(present: &Present, create: &Create, want: Want, say: &mut dyn FnMut(&str)) -> Result<Made, MakeError> {
     let hw = create.variant.hardware_id();
     let mut node = NewNode::prepare(&create.instance, hw)?;
@@ -429,20 +472,20 @@ fn make(present: &Present, create: &Create, want: Want, say: &mut dyn FnMut(&str
         Err(failure) => {
             say(&format!("Removing {id} again: {failure}"));
             let removed = node.set.uninstall(&node.data).map(drop);
-            return Err(MakeError::Other(SetupError::Install(Box::new(NotInstalled {
-                device: id,
-                chosen: candidate.describe(),
-                failure,
-                removed: Some(removed),
-            }))));
+            let fell_back = node.reopened && removed.is_ok();
+            let e =
+                SetupError::Install(Box::new(NotInstalled { device: id, chosen: candidate.describe(), failure, removed: Some(removed) }));
+            // A re-opened element that installed but never worked (what DiUninstallDevice left of a removed node, say): gone
+            // again, so n + 1 can be tried
+            return Err(if fell_back { MakeError::Reopened(e) } else { MakeError::Other(e) });
         }
     }
     rename(&node.set, &mut node.data, &create.instance, say);
     Ok(Made { cable: create.instance.clone(), restart: false })
 }
 
-/// [`make`], and once more with n + 1 if the element re-opened from a removed node's key couldn't take the install (the
-/// design's fallback: the endpoints are new then).
+/// [`make`], and once more with n + 1 if the element re-opened from a removed node's key couldn't be registered, couldn't take
+/// the install, or took it and never worked (the design's fallback: the endpoints are new then).
 fn make_or_next(present: &Present, create: &Create, want: Want, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
     match make(present, create, want, say) {
         Ok(m) => Ok(m),
@@ -459,34 +502,26 @@ fn make_or_next(present: &Present, create: &Create, want: Want, say: &mut dyn Fn
     }
 }
 
-/// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, said; the checks that failed.
-fn wait_endpoints(cable: &CableInstance, variant: Variant, say: &mut dyn FnMut(&str)) -> Vec<String> {
+/// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, said, their names judged by `names`; the checks that failed.
+fn wait_endpoints(cable: &CableInstance, variant: Variant, names: Names, say: &mut dyn FnMut(&str)) -> Vec<String> {
     say(&format!("Waiting for Windows to make {}'s endpoints (up to {} s)", cable.label.friendly_name(), ENDPOINTS_WAIT.as_secs()));
-    let (check, failed) = endpoints::wait_for(cable, variant, ENDPOINTS_WAIT, &mut endpoints::all, &mut SystemClock::start());
-    let mut problems = Vec::new();
-    match &check {
-        Some(c) => {
-            for (kind, e) in &c.found {
-                let state = if e.state == endpoints::State::Active { String::new() } else { format!(" ({:?})", e.state) };
-                say(&format!("  {}: \"{}\"{state}", kind.word(), e.name));
-            }
-            if !c.is_done() {
-                problems.push(format!("{}: {c}", cable.label.friendly_name()));
-            }
-        }
-        None => problems.push(format!("{}'s endpoints couldn't be read", cable.label.friendly_name())),
-    }
-    if let (Some(e), Some(c)) = (&failed, &check)
-        && !c.is_done()
-    {
-        problems.push(format!("the last look at the endpoints failed: {e}"));
-    }
-    problems
+    let found = endpoints::wait_for(cable, variant, names, ENDPOINTS_WAIT, &mut endpoints::all, &mut SystemClock::start());
+    steps::endpoint_problems(cable, found, say)
+}
+
+/// The endpoints before an action (NOTPRESENT ones too), whose names they keep; none if they don't read (said: then every
+/// name is checked against the expected one).
+fn endpoints_before(say: &mut dyn FnMut(&str)) -> Vec<Endpoint> {
+    endpoints::before().unwrap_or_else(|e| {
+        say(&format!("  note: the endpoints couldn't be read before the run ({e}): their names are checked against the expected ones"));
+        Vec::new()
+    })
 }
 
 /// The store's record of a cable as made.
 fn record(cable: &CableInstance, variant: Variant) -> Result<(), SetupError> {
-    store::write(&Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant) }).map_err(SetupError::Store)
+    let entry = Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant), pending: false };
+    store::write(&entry).map_err(SetupError::Store)
 }
 
 /// A cable's node made on the package the cables run (the variant switch's step 4, [`crate::variant::switch`]): `create`'s
@@ -502,9 +537,9 @@ pub fn record_cable(cable: &CableInstance, variant: Variant) -> Result<(), Setup
     record(cable, variant)
 }
 
-/// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, each said; the checks that failed.
-pub fn wait_cable_endpoints(cable: &CableInstance, variant: Variant, say: &mut dyn FnMut(&str)) -> Vec<String> {
-    wait_endpoints(cable, variant, say)
+/// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, each said, their names judged by `names`; the checks that failed.
+pub fn wait_cable_endpoints(cable: &CableInstance, variant: Variant, names: Names, say: &mut dyn FnMut(&str)) -> Vec<String> {
+    wait_endpoints(cable, variant, names, say)
 }
 
 /// `add <label> [--mics m] [--adopt instance]` (the module's docs).
@@ -513,6 +548,8 @@ pub fn add(label: &Label, mics: Option<Variant>, adopt: Option<&str>, say: &mut 
     let present = Present::read()?;
     let entries = read_store(say)?;
     let plan = plan::plan_add(label, mics, adopt, &entries, &present.nodes, new_identity()?)?;
+    // Before anything changes: the names a re-added or repaired cable's endpoints keep (the user's renames among them)
+    let before = if matches!(plan, AddPlan::Nothing { .. }) { Vec::new() } else { endpoints_before(say) };
     match plan {
         AddPlan::Nothing { node, prune, mics_differ, identity } => {
             let n = &present.nodes[node];
@@ -534,7 +571,7 @@ pub fn add(label: &Label, mics: Option<Variant>, adopt: Option<&str>, say: &mut 
             }
             Ok(if prune.is_empty() { Done::Nothing } else { Done::Changed })
         }
-        AddPlan::Repair { node, prune, mics_differ, .. } => repair(&present, node, &prune, mics_differ, say),
+        AddPlan::Repair { node, prune, mics_differ, .. } => repair(&present, node, &prune, mics_differ, &before, say),
         AddPlan::Create(create) => {
             say(&match create.identity {
                 Identity::New => format!("Adding {} with a new identity", label.friendly_name()),
@@ -547,15 +584,16 @@ pub fn add(label: &Label, mics: Option<Variant>, adopt: Option<&str>, say: &mut 
             if made.restart {
                 return Ok(Done::RestartPending { device: made.cable.instance_id() });
             }
-            let problems = wait_endpoints(&made.cable, create.variant, say);
+            // A re-added cable's endpoints come back with their names (we expect: to confirm on the box); a new one's are new
+            let problems = wait_endpoints(&made.cable, create.variant, Names::Since(&before), say);
             if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
         }
     }
 }
 
-/// A present but unhealthy cable's node given the package again in place (`add`'s repair).
+/// A present but unhealthy cable's node given the package again in place (`add`'s repair); `before`, its endpoints before.
 fn repair(
-    present: &Present, node: usize, prune: &[usize], mics_differ: Option<Variant>, say: &mut dyn FnMut(&str),
+    present: &Present, node: usize, prune: &[usize], mics_differ: Option<Variant>, before: &[Endpoint], say: &mut dyn FnMut(&str),
 ) -> Result<Done, SetupError> {
     let n = &present.nodes[node];
     let (Some(cable), Some(variant)) = (n.cable.clone(), n.variant()) else { unreachable!("plan_add repairs cables only") };
@@ -577,6 +615,7 @@ fn repair(
     say(&format!("Installing {} on {} (DiInstallDevice)", candidate.inf, n.instance_id));
     let call = present.set.install(&data, &driver);
     if n.health == Health::Problem(plan::PROBLEM_DISABLED) || matches!(present.set.bound(&data).health, Health::Problem(22)) {
+        clear_count(&present.set, &data, &n.instance_id, say);
         say("  enabling it");
         present.set.enable(&data)?;
     }
@@ -593,7 +632,7 @@ fn repair(
     }
     rename(&present.set, &mut data, &cable, say);
     record(&cable, variant)?;
-    let problems = wait_endpoints(&cable, variant, say);
+    let problems = wait_endpoints(&cable, variant, Names::Since(before), say);
     if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
 }
 
@@ -660,126 +699,7 @@ pub fn stage_package(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<String,
     Ok(published)
 }
 
-/// Each node `which` given the staged package: its driver node and candidate, found before anything is disabled.
-fn staged_drivers(
-    present: &Present, which: &[usize], published: &str, say: &mut dyn FnMut(&str),
-) -> Result<Vec<(usize, SP_DRVINFO_DATA_V2_W, Candidate)>, SetupError> {
-    let mut out = Vec::new();
-    for &i in which {
-        let n = &present.nodes[i];
-        let mut data = present.data[i];
-        let drivers = present.set.compatible(&mut data)?;
-        let hw = n.model.hardware_id();
-        let chosen = choose_driver(&drivers, Want::Published(published), hw, &n.instance_id, say)?;
-        let (driver, candidate) = drivers[chosen].clone();
-        if let Some(v) = n.variant() {
-            lacks(&candidate, v, hw)?;
-        }
-        out.push((i, driver, candidate));
-    }
-    Ok(out)
-}
-
-/// Disables `which` (polite, no persistence) and waits for the driver's image to unload. On a veto, a failure or the timeout,
-/// enables what it disabled and stops. Returns what it disabled.
-fn unload(present: &Present, which: &[usize], say: &mut dyn FnMut(&str)) -> Result<Vec<usize>, SetupError> {
-    let mut disabled = Vec::new();
-    let restore = |disabled: &[usize], say: &mut dyn FnMut(&str)| -> Vec<(String, WinError)> {
-        let mut failed = Vec::new();
-        for &i in disabled {
-            say(&format!("  enabling {} again", present.nodes[i].instance_id));
-            if let Err(e) = present.set.enable(&present.data[i]) {
-                failed.push((present.nodes[i].instance_id.clone(), e));
-            }
-        }
-        failed
-    };
-    for &i in which {
-        let n = &present.nodes[i];
-        say(&format!("Disabling {} (CM_Disable_DevNode, polite, not persistent)", n.instance_id));
-        match present.set.disable(&present.data[i]) {
-            Disabled::Done => disabled.push(i),
-            d => {
-                let unrestored = restore(&disabled, say);
-                let (vetoed, error) = match d {
-                    Disabled::Vetoed => (true, None),
-                    Disabled::Failed(e) => (false, Some(e)),
-                    Disabled::Done => unreachable!(),
-                };
-                return Err(SetupError::Disable { device: n.instance_id.clone(), vetoed, error, unrestored });
-            }
-        }
-    }
-    say(&format!(
-        "Waiting for the driver's image to unload (the {} service, up to {} s)",
-        service::SERVICE,
-        service::UNLOAD_WAIT.as_secs()
-    ));
-    match service::wait_unloaded(service::UNLOAD_WAIT, &mut || service::state(service::SERVICE), &mut SystemClock::start()) {
-        service::Unload::Done(after) => {
-            say(&format!("  unloaded after {:.1} s", after.as_secs_f64()));
-            Ok(disabled)
-        }
-        stuck => {
-            let last = match stuck {
-                service::Unload::StillLoaded(s) => format!("{s:?}"),
-                service::Unload::Unknown(e) => format!("unread, {e}"),
-                service::Unload::Done(_) => unreachable!(),
-            };
-            let unrestored = restore(&disabled, say);
-            Err(SetupError::StillLoaded { last, unrestored })
-        }
-    }
-}
-
-/// Installs the staged package on each node of `drivers`, enables what [`unload`] disabled, and checks each: working on the
-/// package, its endpoints there and named. The checks that failed.
-fn install_all(
-    present: &Present, drivers: &[(usize, SP_DRVINFO_DATA_V2_W, Candidate)], disabled: &[usize], say: &mut dyn FnMut(&str),
-) -> (Vec<String>, Option<String>) {
-    let mut problems = Vec::new();
-    let mut restart = None;
-    for (i, driver, candidate) in drivers {
-        let n = &present.nodes[*i];
-        let mut data = present.data[*i];
-        clear_count(&present.set, &data, &n.instance_id, say);
-        say(&format!("Installing {} on {} (DiInstallDevice)", candidate.inf, n.instance_id));
-        match present.set.install(&data, driver) {
-            Ok(true) => restart = Some(n.instance_id.clone()),
-            Ok(false) => {}
-            Err(e) => problems.push(format!("{}: {e}", n.instance_id)),
-        }
-        if let Some(c) = &n.cable {
-            rename(&present.set, &mut data, c, say);
-        }
-    }
-    for &i in disabled.iter().filter(|&&i| !present.nodes[i].is_legacy()) {
-        say(&format!("Enabling {}", present.nodes[i].instance_id));
-        if let Err(e) = present.set.enable(&present.data[i]) {
-            problems.push(format!("{} couldn't be enabled again ({e}): enable it in Device Manager", present.nodes[i].instance_id));
-        }
-    }
-    for (i, _, candidate) in drivers {
-        let n = &present.nodes[*i];
-        if !disabled.contains(i) {
-            say(&format!("  {} was disabled before: left disabled, on the new package", n.instance_id));
-            continue;
-        }
-        let now = present.set.wait_working(&present.data[*i], DRIVER_WAIT);
-        say(&format!("  {}: {}", n.instance_id, now.describe()));
-        match judge_install(Ok(()), false, &now, candidate) {
-            Ok(_) => {
-                if let (Some(c), Some(v)) = (&n.cable, n.variant()) {
-                    problems.extend(wait_endpoints(c, v, say));
-                }
-            }
-            Err(failure) => problems.push(format!("{}: {failure}", n.instance_id)),
-        }
-    }
-    (problems, restart)
-}
-
-/// `update <package folder>` (the module's docs).
+/// `update <package folder>` (the module's docs; the sequence is [`steps::run_update`]).
 pub fn update(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
     let _lock = SetupLock::take(&LOCK, LOCK_WAIT, say)?;
     let present = Present::read()?;
@@ -787,55 +707,33 @@ pub fn update(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<Done, SetupErr
     for &i in &plan.unidentified {
         say(&format!("  {} has no identity: disabled and enabled with the rest, not installed", present.nodes[i].describe()));
     }
-    let published = stage_package(folder, say)?;
-    let drivers = staged_drivers(&present, &plan.install, &published, say)?;
-    let disabled = unload(&present, &plan.disable, say)?;
-    let (problems, restart) = install_all(&present, &drivers, &disabled, say);
-    if !problems.is_empty() {
-        return Err(SetupError::Checks(problems));
+    for e in read_store(say)?.iter().filter(|e| e.pending) {
+        say(&format!(
+            "  note: {} is a migration's, not made yet: `acx-ll-cable migrate <package folder>` (Install-Driver.ps1) makes it",
+            e.label.friendly_name()
+        ));
     }
-    Ok(match restart {
-        Some(device) => Done::RestartPending { device },
-        None => Done::Changed,
-    })
+    let published = stage_package(folder, say)?;
+    steps::run_update(&mut Real { present: &present }, &present.nodes, &plan, &published, say)
 }
 
-/// `migrate <package folder> [--a-mics m] [--b-mics m]`: today's devices (the old driver's A, Cable-B.ps1's B) to cables
-/// (the module's docs). Written for S0a; not run until the owner's go.
-pub fn migrate(folder: &Path, a_mics: Option<Variant>, b_mics: Variant, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+/// `migrate <package folder> [--a-mics m] [--b-mics m]`: today's devices (the old driver's A, Cable-B.ps1's B) to cables, or
+/// the cables a stopped migration left to make (the module's docs; the sequence is [`steps::run_migrate`]). Written for S0a;
+/// not run until the owner's go.
+pub fn migrate(folder: &Path, a_mics: Option<Variant>, b_mics: Option<Variant>, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
     let _lock = SetupLock::take(&LOCK, LOCK_WAIT, say)?;
     let present = Present::read()?;
     let entries = read_store(say)?;
-    let plan = plan::plan_migrate(&present.nodes, &entries, a_mics, b_mics)?;
+    let plan = plan::plan_migrate(&present.nodes, &entries, a_mics, b_mics, [new_identity()?, new_identity()?])?;
     for &i in &plan.legacy {
         say(&format!("The old driver's: {}", present.nodes[i].describe()));
     }
+    for t in &plan.add {
+        let from = if t.new { "a new identity" } else { "its identity from the setup's store" };
+        say(&format!("To make: {} ({}), with {from}", t.label.friendly_name(), t.variant.describe()));
+    }
     let published = stage_package(folder, say)?;
-    let drivers = staged_drivers(&present, &plan.update.install, &published, say)?;
-    // The old image unloads only once every node of ours is off, the old driver's among them
-    let disabled = unload(&present, &plan.update.disable, say)?;
-    uninstall_nodes(&present, &plan.legacy, say)?;
-    let (mut problems, restart) = install_all(&present, &drivers, &disabled, say);
-    if let Some(device) = restart {
-        return Ok(Done::RestartPending { device });
-    }
-    for (label, variant) in &plan.add {
-        // Read afresh: the old nodes are gone
-        let now = Present::read()?;
-        let entries = read_store(say)?;
-        let AddPlan::Create(create) = plan::plan_add(label, Some(*variant), None, &entries, &now.nodes, new_identity()?)? else {
-            say(&format!("{} is present already", label.friendly_name()));
-            continue;
-        };
-        say(&format!("Adding {} ({})", label.friendly_name(), variant.describe()));
-        let made = make_or_next(&now, &create, Want::Published(&published), say)?;
-        record(&made.cable, *variant)?;
-        if made.restart {
-            return Ok(Done::RestartPending { device: made.cable.instance_id() });
-        }
-        problems.extend(wait_endpoints(&made.cable, *variant, say));
-    }
-    if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
+    steps::run_migrate(&mut Real { present: &present }, &present.nodes, &plan, &published, say)
 }
 
 /// What `list` reads (any user, no lock): the nodes, the store, and the endpoints (or why they couldn't be read).
@@ -868,7 +766,7 @@ pub fn format_list(r: &Report) -> String {
             let n = &r.nodes[i];
             line(format!("  {}", n.describe()));
             if let (Some(cable), Some(v), Ok(eps)) = (&n.cable, n.variant(), &r.endpoints) {
-                let check: EndpointCheck = endpoints::check(cable, v, eps);
+                let check: EndpointCheck = endpoints::check(cable, v, eps, Names::Any);
                 for (kind, e) in &check.found {
                     let state = if e.state == endpoints::State::Active { String::new() } else { format!(", {:?}", e.state).to_lowercase() };
                     line(format!("    {}: \"{}\"{state}", kind.word(), e.name));
@@ -881,14 +779,18 @@ pub fn format_list(r: &Report) -> String {
         line(format!("  control device: {}", crate::identity::control_path(c.id)));
     }
     for e in &l.absent {
-        line(format!(
-            "{} (id {}): absent, remembered (n {}{}): `add {}` brings it back",
-            e.label.friendly_name(),
-            e.id,
-            e.n,
-            e.mics.map(|m| format!(", {}", m.arg())).unwrap_or_default(),
-            e.label
-        ));
+        let mics = e.mics.map(|m| format!(", {}", m.arg())).unwrap_or_default();
+        line(if e.pending {
+            format!(
+                "{} (id {}): absent, the migration's to make (n {}{mics}): Install-Driver.ps1 (or `acx-ll-cable migrate <package \
+                 folder>`) makes it",
+                e.label.friendly_name(),
+                e.id,
+                e.n
+            )
+        } else {
+            format!("{} (id {}): absent, remembered (n {}{mics}): `add {}` brings it back", e.label.friendly_name(), e.id, e.n, e.label)
+        });
     }
     for &i in &l.legacy {
         line(format!("The old driver's device: {}", r.nodes[i].describe()));
@@ -948,8 +850,17 @@ pub(crate) mod tests {
             id: "cccccccc-0000-4000-8000-00000000000c".parse().unwrap(),
             n: 3,
             mics: Some(Variant::Call),
+            pending: false,
         };
-        let r = Report { nodes: vec![a, b], store: store::Store { entries: vec![gone], problems: vec![] }, endpoints: Ok(eps) };
+        let to_make = Entry {
+            label: "E".parse().unwrap(),
+            id: "eeeeeeee-0000-4000-8000-00000000000e".parse().unwrap(),
+            n: 1,
+            mics: Some(Variant::Both),
+            pending: true,
+        };
+        let store = store::Store { entries: vec![gone, to_make], problems: vec![] };
+        let r = Report { nodes: vec![a, b], store, endpoints: Ok(eps) };
         let text = format_list(&r);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], format!("ACX-LL-Cable A (id {A_ID})"));
@@ -969,6 +880,7 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
+        assert!(text.contains("ACX-LL-Cable E (id eeeeeeee-0000-4000-8000-00000000000e): absent, the migration's to make (n 1, both)"));
     }
 
     #[test]

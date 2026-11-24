@@ -3,11 +3,12 @@
 //! needs an elevated administrator, and the caller holds the setup's lock ([`super::lock`]).
 //!
 //! - [`DeviceSet::ours`]: every present node, of any class, whose hardware IDs include one of ours ([`Model::of`]), with its
-//!   state, its driver, its instance ID's cable, D1's start count and its problem status.
+//!   state, its driver, its instance ID's cable, D1's start count, its problem status and its config flags (whether a disable
+//!   persists: the user's, or a run's that was stopped).
 //! - [`NewNode`]: a cable's node made with its fixed instance ID (`SetupDiCreateDeviceInfoW` with the full ID and without
 //!   `DICD_GENERATE_ID`), its hardware ID and friendly name set before `DIF_REGISTERDEVICE`, so nothing the driver reads is
 //!   written after Plug and Play could start it. If the ID's key is still there (ERROR_DEVINST_ALREADY_EXISTS), the element is
-//!   opened instead.
+//!   opened instead. [`NewNode::scratch`]: an element never registered, for a compatible-driver search before anything changes.
 //! - [`DeviceSet::clear_start_attempts`]: D1's boot crash breaker counts a node's unfinished starts in its hardware key
 //!   (`NfStartAttempts`, Cable.h); every install path deletes the count before it installs or enables (D1's contract).
 //! - [`DeviceSet::disable`] and [`DeviceSet::enable`]: `CM_Disable_DevNode`, polite and without `CM_DISABLE_PERSIST` (a crash
@@ -19,12 +20,12 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DEVNODE_STATUS_FLAGS, CM_DISABLE_POLITE, CM_DISABLE_UI_NOT_OK, CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status,
-    CM_MapCrToWin32Err, CM_PROB, CM_PROB_NEED_RESTART, CONFIGRET, CR_SUCCESS, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES,
-    DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DIREG_DEV, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA, HDEVINFO,
-    INF_STYLE_WIN4, INFCONTEXT, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_COPY_STYLE, SP_DEVINFO_DATA,
-    SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W, SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_FRIENDLYNAME,
-    SPDRP_HARDWAREID, SPOST_PATH, SetupCloseInfFile, SetupCopyOEMInfW, SetupDiBuildDriverInfoList, SetupDiCallClassInstaller,
-    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
+    CM_MapCrToWin32Err, CM_PROB, CM_PROB_NEED_RESTART, CONFIGRET, CR_SUCCESS, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE,
+    DIGCF_ALLCLASSES, DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DIREG_DEV, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA,
+    HDEVINFO, INF_STYLE_WIN4, INFCONTEXT, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_COPY_STYLE, SP_DEVINFO_DATA,
+    SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W, SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_CONFIGFLAGS,
+    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SPOST_PATH, SetupCloseInfFile, SetupCopyOEMInfW, SetupDiBuildDriverInfoList,
+    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
     SetupDiGetActualSectionToInstallW, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW,
     SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW, SetupDiOpenDevRegKey, SetupDiOpenDeviceInfoW,
     SetupDiSetDeviceRegistryPropertyW, SetupFindFirstLineW, SetupFindNextMatchLineW, SetupGetInfDriverStoreLocationW,
@@ -195,6 +196,7 @@ impl DeviceSet {
                 running: bound.running(),
                 start_attempts: self.start_attempts(&data),
                 problem_status: self.u32_property(&data, &DEVPKEY_Device_ProblemStatus),
+                config_flags: self.registry_u32(&data, SPDRP_CONFIGFLAGS),
             };
             out.push((data, node));
         }
@@ -253,6 +255,15 @@ impl DeviceSet {
                 Err(e) => return Err(WinError::new("SetupDiGetDeviceRegistryPropertyW", &e)),
             }
         }
+    }
+
+    /// A REG_DWORD registry property (`SPDRP_CONFIGFLAGS`), `None` when it doesn't read.
+    fn registry_u32(&self, data: &SP_DEVINFO_DATA, property: SETUP_DI_REGISTRY_PROPERTY) -> Option<u32> {
+        let mut buf = [0u8; 4];
+        let mut needed = 0u32;
+        // SAFETY: an element of our set; the buffer's length goes with it; `needed` is a live out-pointer.
+        unsafe { SetupDiGetDeviceRegistryPropertyW(self.get(), data, property, None, Some(&mut buf), Some(&mut needed)) }.ok()?;
+        (needed == 4).then(|| u32::from_le_bytes(buf))
     }
 
     /// A string device property, `None` when it isn't set.
@@ -453,6 +464,26 @@ impl NewNode {
             .map_err(WinError::of("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID)"))?;
         set.set_friendly_name(&mut data, &cable.label.friendly_name())?;
         Ok(Self { set, data, instance_id, reopened })
+    }
+
+    /// A scratch element for a compatible-driver search with `hardware_id`, before anything changes (the migration's check of
+    /// the cables it will make): `ROOT\MEDIA\NNNN` (DICD_GENERATE_ID, as devcon makes one), never registered, so dropping it
+    /// deletes it. Never one of the cables' fixed instance IDs, whose key a removed cable may still have.
+    pub fn scratch(hardware_id: &str) -> Result<(DeviceSet, SP_DEVINFO_DATA), WinError> {
+        let set = DeviceSet::new_media()?;
+        let mut data = SP_DEVINFO_DATA { cbSize: size_of::<SP_DEVINFO_DATA>() as u32, ..Default::default() };
+        let description = HSTRING::from(PRODUCT);
+        // SAFETY: our set; NUL-terminated strings; the class GUID is a constant; no window; `data` is a live out-structure with
+        // its size set.
+        unsafe {
+            SetupDiCreateDeviceInfoW(set.get(), w!("MEDIA"), &GUID_DEVCLASS_MEDIA, &description, None, DICD_GENERATE_ID, Some(&mut data))
+        }
+        .map_err(WinError::of("SetupDiCreateDeviceInfoW(DICD_GENERATE_ID)"))?;
+        let ids = multi_sz_bytes(&[hardware_id]);
+        // SAFETY: an element of our set; the buffer's length goes with it.
+        unsafe { SetupDiSetDeviceRegistryPropertyW(set.get(), &mut data, SPDRP_HARDWAREID, Some(ids.as_slice())) }
+            .map_err(WinError::of("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID)"))?;
+        Ok((set, data))
     }
 
     /// DIF_REGISTERDEVICE. A reopened element may be registered already, which isn't an error.

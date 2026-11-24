@@ -17,7 +17,8 @@
 //! - [`identity`]: a cable's names (TODO 19, the per-cable design): its identity, its label and its device node's fixed
 //!   instance ID, `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`, parsed as the driver parses it.
 //! - [`setup`]: the cables' setup, behind the `acx-ll-cable` tool and the driver scripts: list, add, remove, update and the
-//!   migration from the old driver's devices; the package rule, the store of identities, the lock.
+//!   migration from the old driver's devices; the package rule, the store of identities, the lock; the sequences of update and
+//!   the migration over a seam the tests fake.
 //! - [`variant`]: the driver's three variants (one INF, three hardware IDs shared by every cable: both microphones, the call
 //!   one, the low-latency one), and the elevated switch of one cable between them (`noise-filter mic variant`,
 //!   `acx-ll-cable variant`).
@@ -28,7 +29,8 @@
 //! The tool `nf-vmic-test` (src/bin) feeds, verifies, prints the statistics, kills feeders, opens an endpoint in a chosen format
 //! (the format-refusal tests) and measures the ring's latency. The tool `acx-ll-cable` (src/bin) is the cables' setup, over
 //! [`setup`] and [`variant`]. Nothing in the tests opens the driver or an audio device, or changes a device node: they run the
-//! writer against the model reader over real `VirtualAlloc` memory (4 KB pages), and the setup's plans as pure functions.
+//! writer against the model reader over real `VirtualAlloc` memory (4 KB pages), the setup's plans as pure functions, and its
+//! sequences against a fake of Windows.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod broker;

@@ -10,8 +10,8 @@
 //! 0. Take the setup's lock ([`setup::lock`]), held to the end.
 //! 1. Find the switched cable's nodes only: by its identity (the store's for its label, or its nodes' instance IDs:
 //!    [`setup::plan::resolve`]). Every other cable is left alone.
-//! 2. Already that variant, working, with its endpoints (by its instance ID, named "... (ACX-LL-Cable D)"): nothing. One whose
-//!    endpoints didn't come is re-created.
+//! 2. Already that variant, working, with its endpoints (by its instance ID, each name with the label, as "... (ACX-LL-Cable
+//!    D)" or the user's rename of it): nothing. One whose endpoints didn't come, or came without the label, is re-created.
 //! 3. Otherwise the new node: the cable's identity and label with the next instance number, n + 1 (`ROOT\MEDIA\
 //!    ACXLLCABLE_B_<id>_<n+1>`), so its endpoints are new and Windows reads the variant's default period; the variant's hardware
 //!    ID and the friendly name set on the element before registration; and the package the other cables run (the package
@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 
 use crate::identity::Label;
 use crate::sessions::Mic;
-use crate::setup::endpoints::{self, Endpoint, EndpointCheck};
+use crate::setup::endpoints::{self, Endpoint, EndpointCheck, Names};
 use crate::setup::lock::{LOCK, LOCK_WAIT, SetupLock};
 pub use crate::setup::package::INF_NAME;
 pub use crate::setup::plan::Health;
@@ -187,7 +187,7 @@ pub fn precheck(label: &Label, target: Variant, store: &[Entry], nodes: &[Node],
             match now {
                 Err(e) => Precheck::Unchecked(e.clone()),
                 Ok(eps) => {
-                    let check = endpoints::check(cable, target, eps);
+                    let check = endpoints::check(cable, target, eps, Names::Any);
                     if check.is_done() {
                         let mut lines =
                             vec![format!("{} is {} already, working: nothing to do.", label.friendly_name(), target.describe())];
@@ -255,7 +255,7 @@ pub fn format_shown(s: &Shown) -> String {
                 let _ = writeln!(out, "{name}: variant {v}");
                 let _ = writeln!(out, "  {}", n.describe());
                 if let (Some(cable), Some(variant), Ok(eps)) = (&n.cable, n.variant(), &s.endpoints) {
-                    let check = endpoints::check(cable, variant, eps);
+                    let check = endpoints::check(cable, variant, eps, Names::Any);
                     for line in found_lines(&check) {
                         let _ = writeln!(out, "{line}");
                     }
@@ -291,7 +291,7 @@ pub fn switch(label: &Label, target: Variant, say: &mut dyn FnMut(&str)) -> Resu
         say(&format!("  {}", n.describe()));
         let cable = n.cable.clone().expect("a kept node is a cable's");
         let now = endpoints::all().map_err(SetupError::Endpoints)?;
-        let check = endpoints::check(&cable, target, &now);
+        let check = endpoints::check(&cable, target, &now, Names::Any);
         if check.is_done() {
             say(&format!("{} is {} already, working: nothing to do.", label.friendly_name(), target.describe()));
             for line in found_lines(&check) {
@@ -315,7 +315,8 @@ pub fn switch(label: &Label, target: Variant, say: &mut dyn FnMut(&str)) -> Resu
         say(&format!("  Windows needs a restart to finish installing {device}: its endpoints come after it."));
         return Ok(Outcome::RestartPending { device });
     }
-    let problems = setup::wait_cable_endpoints(&made.cable, target, say);
+    // n + 1: endpoints Windows makes now, so every name the expected one
+    let problems = setup::wait_cable_endpoints(&made.cable, target, Names::Since(&[]), say);
     if let Ok(now) = endpoints::all() {
         for e in endpoints::still_active(&old, &now) {
             say(&format!("  also still active: \"{}\", the cable's old instance's (going)", e.name));
@@ -361,42 +362,59 @@ mod tests {
         assert_eq!(Variant::Both.microphones(&Label::a()), [MICROPHONE, CALL_MICROPHONE]);
     }
 
-    /// The INF and the driver agree on the microphones' filters and the hardware IDs, when the repo has D1's INF.
+    const DRIVER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/");
+
+    /// The repo's INF, as text.
+    fn inf_text() -> String {
+        let inf = std::fs::read(format!("{DRIVER}AudioCodec/Driver/AudioCodec.inf")).unwrap();
+        assert_eq!(inf[..2], [0xFF, 0xFE], "UTF-16LE, with a BOM");
+        String::from_utf16_lossy(&crate::setup::devices::wide_of_bytes(&inf[2..]))
+    }
+
+    /// Whether the tree has D1's driver, by either of its marks: Cable.h, or the per-cable models in the INF. S1 is written
+    /// for it; until the branches meet, the tree may have the old driver, and then neither mark is there. Once either is, both
+    /// checks below are made in full, so after the merge a moved Cable.h, or an INF that lost its per-cable models, fails them
+    /// rather than skipping them.
+    fn has_d1() -> bool {
+        std::path::Path::new(&format!("{DRIVER}Shared/Cable.h")).exists() || inf_text().contains("AcxLlCable.DeviceDesc")
+    }
+
+    /// The INF and the driver agree on the microphones' filters and the hardware IDs.
     #[test]
     fn the_microphones_filters_are_the_drivers() {
-        let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/AudioCodec/Driver/");
-        let inf = std::fs::read(format!("{driver}AudioCodec.inf")).unwrap();
-        assert_eq!(inf[..2], [0xFF, 0xFE], "UTF-16LE, with a BOM");
-        let inf = String::from_utf16_lossy(&crate::setup::devices::wide_of_bytes(&inf[2..]));
+        let inf = inf_text();
         assert!(inf.contains(&format!("KSNAME_Microphone=\"{MICROPHONE_FILTER}\"")));
         assert!(inf.contains(&format!("KSNAME_CallMicrophone=\"{CALL_MICROPHONE_FILTER}\"")));
         assert!(inf.contains(&format!("KSNAME_Speaker=\"{}\"", endpoints::SPEAKERS_FILTER)));
-        let settings = std::fs::read_to_string(format!("{driver}DriverSettings.h")).unwrap();
+        let settings = std::fs::read_to_string(format!("{DRIVER}AudioCodec/Driver/DriverSettings.h")).unwrap();
         assert!(settings.contains(&format!("captureCircuitName, L\"{MICROPHONE_FILTER}\")")));
         assert!(settings.contains(&format!("capture2CircuitName, L\"{CALL_MICROPHONE_FILTER}\")")));
-        // D1's INF (the per-cable driver): each hardware ID's install section and NfMicrophones. Checked once this branch has
-        // it; before, the INF still has the old driver's IDs.
-        if inf.contains("AcxLlCable.DeviceDesc") {
-            for (v, section, mics) in [
-                (Variant::Both, "Audio_Device", 3),
-                (Variant::Call, "Audio_Device_Call", 2),
-                (Variant::LowLatency, "Audio_Device_LowLatency", 1),
-            ] {
-                assert!(inf.contains(&format!("%AcxLlCable.DeviceDesc%={section}, {}", v.hardware_id())), "{v:?}");
-                assert!(inf.contains(&format!("[{section}.HW.AddReg]\r\nHKR,,NfMicrophones,0x00010001,{mics}")), "{v:?}");
-            }
-            assert!(!inf.contains(r"ROOT\NoiseFilterCableB"));
+        if !has_d1() {
+            eprintln!("skipped D1's part: neither Cable.h nor the per-cable models are in this tree (the old driver's)");
+            return;
+        }
+        // D1's INF (the per-cable driver): each hardware ID's install section and NfMicrophones, and none of the old IDs
+        for (v, section, mics) in [
+            (Variant::Both, "Audio_Device", 3),
+            (Variant::Call, "Audio_Device_Call", 2),
+            (Variant::LowLatency, "Audio_Device_LowLatency", 1),
+        ] {
+            assert!(inf.contains(&format!("%AcxLlCable.DeviceDesc%={section}, {}", v.hardware_id())), "{v:?}");
+            assert!(inf.contains(&format!("[{section}.HW.AddReg]\r\nHKR,,NfMicrophones,0x00010001,{mics}")), "{v:?}");
+        }
+        for old in crate::setup::plan::Legacy::ALL {
+            assert!(!inf.contains(&format!("{}\r", old.hardware_id())) && !inf.contains(&format!("{},", old.hardware_id())), "{old:?}");
         }
     }
 
     /// D1's Cable.h names what the setup mirrors: the instance ID's prefix, the start count's value, its limit and the status.
     #[test]
     fn the_setup_mirrors_cable_h() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/Shared/Cable.h");
-        let Ok(h) = std::fs::read_to_string(path) else {
-            eprintln!("skipped: no Cable.h on this branch (D1's)");
+        if !has_d1() {
+            eprintln!("skipped: neither Cable.h nor the per-cable models are in this tree (the old driver's)");
             return;
-        };
+        }
+        let h = std::fs::read_to_string(format!("{DRIVER}Shared/Cable.h")).expect("D1's Cable.h, beside its INF");
         assert!(h.contains(&format!("#define NF_CABLE_INSTANCE_PREFIX        L\"{}\"", crate::identity::INSTANCE_PREFIX)));
         assert!(h.contains(&format!("#define NF_CABLE_START_ATTEMPTS_VALUE   L\"{}\"", crate::setup::devices::START_ATTEMPTS_VALUE)));
         assert!(h.contains(&format!("#define NF_CABLE_START_ATTEMPTS_LIMIT   {}u", plan::START_ATTEMPTS_LIMIT)));

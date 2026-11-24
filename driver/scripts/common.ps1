@@ -82,6 +82,18 @@ function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
     return $LASTEXITCODE
 }
 
+# The setup tool's store of cable identities (crates\nf-vmic\src\setup\store.rs), read-only here.
+$script:CableStore = 'HKLM:\SOFTWARE\ACX-LL-Cable\Cables'
+
+# The cables a migration recorded (Pending = 1) and hasn't made yet: a run stopped after the old devices went, by a failure or
+# a restart Windows needed. While there are any, Install-Driver.ps1 runs the migration again, which makes them.
+function Get-PendingCables {
+    if (-not (Test-Path $CableStore)) { return @() }
+    @(Get-ChildItem $CableStore -ErrorAction SilentlyContinue |
+        Where-Object { (Get-ItemProperty -Path $_.PSPath -Name Pending -ErrorAction SilentlyContinue).Pending -eq 1 } |
+        ForEach-Object { $_.PSChildName })
+}
+
 function Find-MSBuild {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found: is Visual Studio installed?' }

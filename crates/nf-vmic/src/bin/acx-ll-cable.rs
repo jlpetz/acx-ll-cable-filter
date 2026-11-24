@@ -34,7 +34,8 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
       If the old driver image doesn't unload (an app has a cable's control device open), every cable is put back as it was.
   acx-ll-cable migrate <package folder> [--a-mics m] [--b-mics m]
       From the old driver's devices (ROOT\\AudioCodec as A, ROOT\\NoiseFilterCableB as B) to cables on the package in the
-      folder. A keeps its variant unless --a-mics; B gets --b-mics (default both).
+      folder. A keeps its variant unless --a-mics; B gets --b-mics (default both). Nothing changes unless the package makes
+      both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
 Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish.";
 
@@ -47,7 +48,7 @@ enum Cmd {
     Remove { target: RemoveTarget, forget: bool },
     Variant { label: Label, target: Variant },
     Update { folder: PathBuf },
-    Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Variant },
+    Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Option<Variant> },
 }
 
 fn mics(flag: &str, v: Option<&String>) -> Result<Variant, String> {
@@ -103,11 +104,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             Cmd::Variant { label: label(positional.first().copied(), "variant")?, target }
         }
         "update" => Cmd::Update { folder: positional.first().ok_or("'update' takes the package's folder")?.into() },
-        "migrate" => Cmd::Migrate {
-            folder: positional.first().ok_or("'migrate' takes the package's folder")?.into(),
-            a_mics,
-            b_mics: b_mics.unwrap_or(Variant::Both),
-        },
+        "migrate" => Cmd::Migrate { folder: positional.first().ok_or("'migrate' takes the package's folder")?.into(), a_mics, b_mics },
         other => return Err(format!("no command '{other}'")),
     };
     // What each command takes, and how many positional arguments
@@ -217,10 +214,10 @@ mod tests {
         assert_eq!(p("remove --all --forget"), Ok(Cmd::Remove { target: RemoveTarget::All, forget: true }));
         assert_eq!(p("variant B low-latency"), Ok(Cmd::Variant { label: l("B"), target: Variant::LowLatency }));
         assert_eq!(p(r"update C:\pkg"), Ok(Cmd::Update { folder: r"C:\pkg".into() }));
-        assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: Variant::Both }));
+        assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: None }));
         assert_eq!(
             p(r"migrate C:\pkg --a-mics call --b-mics low-latency"),
-            Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: Some(Variant::Call), b_mics: Variant::LowLatency })
+            Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: Some(Variant::Call), b_mics: Some(Variant::LowLatency) })
         );
     }
 
