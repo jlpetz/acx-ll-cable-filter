@@ -101,10 +101,25 @@ impl ClockReading {
     }
 }
 
+/// A direct feed's reader at a block ([`RenderSink::driver_reader`]): the driver's ring header as one capture pass left it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DriverReader {
+    /// The recording app's packet (frames), or 0 while none records.
+    pub(crate) packet: usize,
+    /// The driver moved the ring's read position other than by reading it since the last block: a recording app started
+    /// (its first pass's live discard of what was queued) or a resync. It set the ring's fill afresh, as a new reader does, so
+    /// the fill starts again and the silence of its first passes isn't an underrun. A new reader always discards what was
+    /// queued; this says so where no block saw the last one stop (it stopped and another started within a block, at the
+    /// same packet).
+    pub(crate) restarted: bool,
+}
+
 /// A render stream as the pipeline sees it. Frames are at the app's 48 kHz.
 pub(crate) trait RenderSink {
-    /// For a direct feed, the capture reader's actual packet, or zero while no recorder is running.
-    fn driver_packet(&self) -> Option<usize> {
+    /// For a direct feed, its reader, read once a block before [`Self::take_underruns`], from the same capture pass: the
+    /// underruns it gives are those the passes up to that one found (so a new reader's first passes count with its start,
+    /// never as the last reader's). `None` for a device stream.
+    fn driver_reader(&mut self) -> Option<DriverReader> {
         None
     }
     fn buffer_frames(&self) -> usize;
@@ -963,20 +978,25 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         self.last_output = OutputFacts::default();
         // What the sink saw itself (an exclusive output's ring short at an event). Before the first block it's the output
         // running before the mic, as a shared device's dry start is.
-        // A direct feed's reader is read first: the passes that showed a new recording's packet ran before the underruns are
-        // read, so its first passes' silence (the ring empty after the live discard) counts before its starting fill, at the
-        // block that sets it, not as a real underrun.
-        let driver_packet = sink.driver_packet();
+        // A direct feed's reader is read first, with its underruns from the same capture pass: a new recording app's first
+        // passes' silence (the ring empty after the live discard) counts with its start, at the block that sets its starting
+        // fill, not as a real underrun.
+        let driver = sink.driver_reader();
         let sink_dry = sink.take_underruns();
         // Its device events answered late (the thread held up past the device's deadline), and the silence its device
         // played meanwhile; before the first block, as its underruns, they aren't counted.
         let late = sink.take_late();
         let silence = sink.take_silence();
-        if let Some(packet) = driver_packet {
-            if packet != self.out_period {
+        if let Some(DriverReader { packet, restarted }) = driver {
+            // A new reader: another packet (or none), or one that started where no block saw the last one stop (the ring's
+            // live discard at the same packet). Its fill starts again.
+            if packet != self.out_period || (restarted && packet != 0) {
                 self.out_period = packet;
                 self.reanchor_base += self.fill_offset.reanchors;
                 self.fill_offset = FillOffset::new(packet);
+                if let Some(h) = self.headroom.as_mut() {
+                    h.reader(packet);
+                }
                 // One reader packet + the headroom the run has needed so far (a new recording app may bring the same mic).
                 let target = if packet == 0 { 0 } else { packet + self.headroom() };
                 self.set_out_target(target);
@@ -1029,7 +1049,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
         // below fill the device to it.
         let short = low && queued + (BLOCK as f64) < self.out_target as f64;
         // A direct feed counts actual missing frames. Its reader can consume exactly the last queued frame without going short.
-        let dry = self.out_started && (sink_dry > 0 || (driver_packet.is_none() && ((low && padding == 0) || short)));
+        let dry = self.out_started && (sink_dry > 0 || (driver.is_none() && ((low && padding == 0) || short)));
         // A late answer is an underrun too, but not the queue's: it doesn't strike the adaptive target, as a deeper queue
         // can't make the thread answer sooner (a bigger device period can: control.rs's exclusive period guard).
         let late = late > 0;
@@ -1438,8 +1458,10 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
 /// On the direct driver route it's the frame's sample time: the ring's `read_frame` (`pos`) starts the packet the next pass
 /// completes, whose stamp, its first frame's time on the stream's time line, is the deadline of the pass that read up to
 /// `pos` (StreamEngine.cpp's PacketStartQpc), and `qpc` is that pass's QPC (`last_pass_qpc`); frame `pos + j` is stamped `j`
-/// frames on. The pass's QPC is taken a little after its deadline (its timer's lateness and the ring lock: about 0.2 ms
-/// on the dev box under Verifier), so the sample time reads that much late.
+/// frames on. The pass's QPC is taken a little after its deadline (its timer's lateness and the ring lock), so the sample
+/// time reads that much late: on the dev box under Verifier the timers ran 310-353 us late on average, at most 0.8 ms over
+/// runs of minutes and 1.4-1.6 ms over an hour at 128 frames (TODO 19's spike, 2026-11-20), so about 0.33 ms late, now and
+/// then up to 1.5 (`pipeline/tests/driver.rs`'s measured lateness).
 #[inline]
 pub(crate) fn play_time_hns(clock: ClockReading, index: u64, fs: f64) -> f64 {
     clock.qpc_hns + (index as f64 - clock.pos_frames) * (HNS_PER_S / fs)
@@ -1762,7 +1784,7 @@ mod tests {
     /// consumption rate can be simulated.
     struct FakeSink {
         buffer: usize,
-        driver_packet: Option<usize>,
+        driver: Option<DriverReader>,
         padding: f64,
         played: f64,
         now_hns: f64,
@@ -1776,7 +1798,7 @@ mod tests {
         fn new(buffer: usize) -> Self {
             Self {
                 buffer,
-                driver_packet: None,
+                driver: None,
                 padding: 0.0,
                 played: 0.0,
                 now_hns: 1e10,
@@ -1797,8 +1819,8 @@ mod tests {
     }
 
     impl RenderSink for FakeSink {
-        fn driver_packet(&self) -> Option<usize> {
-            self.driver_packet
+        fn driver_reader(&mut self) -> Option<DriverReader> {
+            self.driver.as_mut().map(|r| std::mem::replace(r, DriverReader { restarted: false, ..*r }))
         }
         fn take_late(&mut self) -> u64 {
             0
@@ -1860,17 +1882,24 @@ mod tests {
         assert_eq!(cfg(false).ref_target(), 0);
     }
 
+    fn reader(packet: usize) -> Option<DriverReader> {
+        Some(DriverReader { packet, restarted: false })
+    }
+
+    /// The direct route discards blocks while no app records, sets the starting fill to the reader's packet when one starts,
+    /// and again where a recording app started within a block at the same packet (the driver's live discard, seen as a
+    /// restart: no block saw the last one stop).
     #[test]
     fn driver_feed_discards_idle_blocks_and_uses_the_current_readers_packet() {
         let mut p = pipe(false);
         p.for_driver_ring();
         let mut sink = FakeSink::new(8192);
-        sink.driver_packet = Some(0);
+        sink.driver = reader(0);
         p.out_blk.fill(-0.5);
         p.push_output(&mut sink, None).unwrap();
         assert!(sink.written.is_empty());
         assert_eq!(p.out_target(), 0);
-        sink.driver_packet = Some(128);
+        sink.driver = reader(128);
         p.out_blk.fill(0.25);
         p.push_output(&mut sink, None).unwrap();
         assert_eq!(p.out_target(), 128);
@@ -1879,18 +1908,29 @@ mod tests {
         sink.advance((128 + BLOCK) as f64, 130_000.0);
         p.push_output(&mut sink, None).unwrap();
         assert_eq!(p.counters.render_underruns, 0); // Exactly drained; the device inserted no silence.
-        sink.driver_packet = Some(0);
+        sink.driver = reader(0);
         let old = sink.written.len();
         p.out_blk.fill(-0.5);
         p.push_output(&mut sink, None).unwrap();
         assert_eq!(sink.written.len(), old);
         sink.padding = 0.0; // The live driver's first pass discards the previous recording's unread prefix.
-        sink.driver_packet = Some(480);
+        sink.driver = reader(480);
         p.out_blk.fill(0.75);
         p.push_output(&mut sink, None).unwrap();
         assert_eq!(p.out_target(), 480);
         assert_eq!(sink.written[old + 480..], [0.75; BLOCK]);
         assert!(!sink.written.contains(&-0.5));
+        // Another recording app at the same packet, started within a block: the ring emptied by its live discard, and the
+        // starting fill again (the zeros to the target count as no deficit).
+        let old = sink.written.len();
+        sink.padding = 0.0;
+        sink.driver = Some(DriverReader { packet: 480, restarted: true });
+        p.out_blk.fill(0.5);
+        p.push_output(&mut sink, None).unwrap();
+        assert_eq!(sink.written[old..old + 480], [0.0; 480]);
+        assert_eq!(sink.written[old + 480..], [0.5; BLOCK]);
+        assert_eq!((p.out_target(), p.counters.render_underruns, p.counters.output_deficits), (480, 0, 0));
+        assert_eq!(sink.driver, reader(480), "a restart is one block's");
     }
 
     /// The direct route's two times of a ring frame, from one clock reading (the last pass read up to frame 432, at QPC 1e7),

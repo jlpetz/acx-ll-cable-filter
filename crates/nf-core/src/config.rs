@@ -277,8 +277,9 @@ pub struct IoConfig {
     /// Open the mic in RAW mode where the device supports it (no OEM effects ahead of AEC3).
     pub raw_mic: bool,
     /// Extra render-buffer fill kept on the output cable, in ms, on top of one block and one period. The WASAPI route's
-    /// only: the direct driver route keeps one reader packet in the ring where that runs clean, and headroom on top only
-    /// while the driver reports underruns (the owner, 2026-11-24; nf-engine `ring_headroom.rs`).
+    /// only: the direct driver route keeps one reader packet in the ring where that runs clean, with headroom on top that
+    /// rises after the driver's underruns and comes down after clean running (the owner, 2026-11-24; nf-engine
+    /// `ring_headroom.rs`).
     pub output_margin_ms: f32,
     /// Keep a silent render stream open on the reference endpoint so its loopback never stops.
     pub keep_alive_reference: bool,
@@ -295,7 +296,7 @@ pub struct IoConfig {
     /// margin + the largest lateness measured; up at once after an underrun, which can cost up to three glitches a run
     /// that the fixed target (one period + one block + the margin) would have ridden out. On by default (the owner,
     /// 2026-11-02); off for a recording that must have none. The WASAPI route's only: the direct driver route's target is
-    /// its own (`output_margin_ms`).
+    /// one reader packet and the ring's own headroom (nf-engine `ring_headroom.rs`), whatever this says.
     pub adaptive_output: bool,
     /// The echo-path guard (nf-engine `echo_guard.rs`): with echo cancelling on, when an echo seen comes before its reference
     /// (speakers whose output latency is under the reference's lead), hold the mic back until the reference is in time,

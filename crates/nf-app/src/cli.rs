@@ -1085,7 +1085,9 @@ other side, which stays shared whatever these say.
                      to the fixed one and holds it there for 10 minutes, 20 after a second;
                      after a third it stays fixed. So a rare hiccup the fixed target would
                      ride out can cost a glitch, up to three in a run: turn it off for a
-                     recording that must have none
+                     recording that must have none. The WASAPI route's only: with
+                     --output-backend driver-ring it does nothing (the ring keeps one reader
+                     packet, with headroom after the driver's underruns)
   --no-echo-guard    Never hold the microphone back for the echo canceller. With it on, when
                      the speakers' sound reaches the mic before the canceller has it (speakers
                      faster than the reference's lead) and so echoes through, the filter holds

@@ -5,16 +5,39 @@
 //!
 //! [`DriverSink`] runs the live ring as StreamEngine.cpp's AppRingCapturePass does: one pass a packet on the stream's time
 //! line (each packet stamped at its start, the deadline of the pass before), each pass a little late (its timer and the ring
-//! lock), copying what the ring holds up to a packet and filling the rest with silence, counted (read_frame stops at
-//! write_frame). The header's clock is the last pass's read_frame and QPC. The mic delivers 10 ms packets on its own clock,
-//! a block a wake (jittered), or two blocks every other wake (the VM's bursty mic), with late wakes where a scene asks.
+//! lock: [`Lateness`]), copying what the ring holds up to a packet and filling the rest with silence, counted (read_frame
+//! stops at write_frame); a recording app's first pass discards what was queued (the live discard). The header's clock is
+//! the last pass's read_frame and QPC. The mic delivers 10 ms packets on its own clock, a block a wake (jittered), or two
+//! blocks every other wake (the VM's bursty mic), with late wakes where a scene asks.
 
 use std::collections::VecDeque;
 
 use super::*;
-use crate::ring_headroom::{HOLD_S, MAX, STEP};
+use crate::ring_headroom::{HOLD_S, MAX_FAILED, STEP};
 
 const T0: f64 = 1e10;
+
+/// How late each capture pass runs after its deadline.
+#[derive(Clone, Copy, Debug)]
+enum Lateness {
+    /// Uniform from 0 to this many ms.
+    Uniform(f64),
+    /// As TODO 19's spike measured the driver's timers on the dev box under Verifier (2026-11-20: mean 310-353 us; max
+    /// 0.8 ms over runs of minutes, 1.4-1.6 ms over an hour at 128 frames): 0.25 ms and an exponential tail of mean 0.08 ms,
+    /// and one pass in a thousand 0.8 to 1.5 ms late. Mean about 0.33 ms, at most [`MEASURED_MAX_MS`].
+    Measured,
+}
+
+const MEASURED_MAX_MS: f64 = 1.5;
+
+impl Lateness {
+    fn max_ms(self) -> f64 {
+        match self {
+            Lateness::Uniform(ms) => ms,
+            Lateness::Measured => MEASURED_MAX_MS,
+        }
+    }
+}
 
 /// The driver's live ring and its reader.
 struct DriverSink {
@@ -24,14 +47,20 @@ struct DriverSink {
     reading: bool,
     write: u64,
     read: u64,
+    /// The frames copied into packets (the header's frames_copied), and those the live discards dropped.
+    copied: u64,
+    discarded: u64,
+    /// `read - copied` at the last [`RenderSink::driver_reader`], and whether a move in it is reported as a restart (off: as
+    /// the pipeline saw the driver before it read the move, for the scene that shows what the restart is for).
+    moved: Option<u64>,
+    report_restarts: bool,
     /// The next pass's deadline and the time it actually runs (hns).
     next_deadline: f64,
     next_actual: f64,
     /// The last pass: read_frame after it and its QPC (the header's clock).
     last_pass: Option<(u64, f64)>,
     now: f64,
-    /// Each pass runs up to this late (uniform), hns.
-    eps_max_hns: f64,
+    lateness: Lateness,
     rng: u64,
     underrun_frames: u64,
     taken: u64,
@@ -43,17 +72,21 @@ struct DriverSink {
 }
 
 impl DriverSink {
-    fn new(eps_max_ms: f64) -> Self {
+    fn new(lateness: Lateness) -> Self {
         Self {
             packet: 0,
             reading: false,
             write: 0,
             read: 0,
+            copied: 0,
+            discarded: 0,
+            moved: None,
+            report_restarts: true,
             next_deadline: f64::INFINITY,
             next_actual: f64::INFINITY,
             last_pass: None,
             now: T0,
-            eps_max_hns: eps_max_ms * 1e4,
+            lateness,
             rng: 0x9e37_79b9_7f4a_7c15,
             underrun_frames: 0,
             taken: 0,
@@ -70,18 +103,32 @@ impl DriverSink {
         (self.rng >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// The next pass's lateness (hns).
+    fn late_hns(&mut self) -> f64 {
+        let ms = match self.lateness {
+            Lateness::Uniform(ms) => self.uniform() * ms,
+            Lateness::Measured => {
+                if self.uniform() < 1e-3 {
+                    0.8 + 0.7 * self.uniform()
+                } else {
+                    (0.25 - 0.08 * (1.0 - self.uniform()).ln()).min(MEASURED_MAX_MS)
+                }
+            }
+        };
+        ms * 1e4
+    }
+
     fn packet_hns(&self) -> f64 {
         self.packet as f64 * HNS_PER_SAMPLE
     }
 
-    /// A recording app starts at `t` with `packet`-frame packets: the live discard (nothing queued before it plays), and its
-    /// first pass a packet later.
+    /// A recording app starts at `t` with `packet`-frame packets: its first pass a packet later, which discards what's queued
+    /// (the live discard: nothing written before it plays).
     fn start_reader(&mut self, packet: usize, t: f64) {
         self.packet = packet;
         self.reading = false;
-        self.read = self.write;
         self.next_deadline = t + self.packet_hns();
-        self.next_actual = self.next_deadline + self.uniform() * self.eps_max_hns;
+        self.next_actual = self.next_deadline + self.late_hns();
     }
 
     /// It stops: no passes, no reader.
@@ -95,6 +142,10 @@ impl DriverSink {
     /// Runs the passes due by `t`.
     fn advance_to(&mut self, t: f64) {
         while self.next_actual <= t {
+            if !self.reading {
+                self.discarded += self.write - self.read;
+                self.read = self.write;
+            }
             let p = self.packet as u64;
             let copy = (self.write - self.read).min(p);
             // This packet's stamp: its start, a packet before its deadline; ring frame `read + i` is stamped `i` frames on.
@@ -113,18 +164,22 @@ impl DriverSink {
             }
             self.underrun_frames += p - copy;
             self.read += copy;
+            self.copied += copy;
             self.reading = true;
             self.last_pass = Some((self.read, actual));
             self.next_deadline += self.packet_hns();
-            self.next_actual = self.next_deadline + self.uniform() * self.eps_max_hns;
+            self.next_actual = self.next_deadline + self.late_hns();
         }
         self.now = t;
     }
 }
 
 impl RenderSink for DriverSink {
-    fn driver_packet(&self) -> Option<usize> {
-        Some(if self.reading { self.packet } else { 0 })
+    fn driver_reader(&mut self) -> Option<DriverReader> {
+        let moved = self.read - self.copied;
+        let restarted = self.report_restarts && self.moved.is_some_and(|m| m != moved);
+        self.moved = Some(moved);
+        Some(DriverReader { packet: if self.reading { self.packet } else { 0 }, restarted })
     }
     fn buffer_frames(&self) -> usize {
         8192
@@ -176,13 +231,15 @@ struct Scene {
     /// The mic's clock against the stream's (the driver's passes run on QPC at the nominal rate).
     ppm: f64,
     jitter_ms: f64,
-    eps_max_ms: f64,
+    lateness: Lateness,
     /// The mic's delivery from each time on (s), the first from the start.
     mic: Vec<(f64, Mic)>,
     /// Wakes this many ms late, at these times (s).
     late_wakes: Vec<(f64, f64)>,
     /// The recording apps: (start s, stop s, packet), one after another.
     readers: Vec<(f64, f64, usize)>,
+    /// Whether the sink reports the ring's restarts (off for the scene that shows what they're for).
+    report_restarts: bool,
     run_s: f64,
 }
 
@@ -191,10 +248,11 @@ impl Scene {
         Scene {
             ppm: 0.0,
             jitter_ms: 1.0,
-            eps_max_ms: 0.3,
+            lateness: Lateness::Uniform(0.3),
             mic: vec![(0.0, Mic::Steady)],
             late_wakes: Vec::new(),
             readers: vec![(0.5, f64::INFINITY, packet)],
+            report_restarts: true,
             run_s,
         }
     }
@@ -236,13 +294,19 @@ impl Run {
     fn headroom_at(&self, t_s: f64) -> usize {
         self.seconds.iter().rev().find(|s| s.t_s <= t_s).map_or(0, |s| s.headroom)
     }
+
+    /// The headroom's moves, second by second: (time s, the headroom after).
+    fn moves(&self) -> Vec<(f64, usize)> {
+        self.seconds.windows(2).filter(|w| w[0].headroom != w[1].headroom).map(|w| (w[1].t_s, w[1].headroom)).collect()
+    }
 }
 
 fn run(s: &Scene) -> Run {
     let cfg = PipelineConfig { out_period: BLOCK, out_margin: 0, ref_period: None, max_packet: 4800 };
     let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(0.0), SlipResampler::new(), SlipResampler::new());
     p.for_driver_ring();
-    let mut sink = DriverSink::new(s.eps_max_ms);
+    let mut sink = DriverSink::new(s.lateness);
+    sink.report_restarts = s.report_restarts;
     let tel = Telemetry::new();
     let mut mic = FakeCapture::default();
     let mut ticks = FakeTicks(0);
@@ -268,8 +332,9 @@ fn run(s: &Scene) -> Run {
             now += ms * 1e4;
             late.remove(0);
         }
-        // The recording app starts and stops when the scene says.
-        if let Some(&(start, stop, packet)) = readers.front() {
+        // The recording apps start and stop when the scene says, in order: a stop and the next start can both fall between
+        // two wakes, so that no block sees the ring without a reader.
+        while let Some(&(start, stop, packet)) = readers.front() {
             if !reader_on && t_s >= start {
                 sink.advance_to(T0 + start * 1e7);
                 sink.start_reader(packet, T0 + start * 1e7);
@@ -279,6 +344,8 @@ fn run(s: &Scene) -> Run {
                 sink.stop_reader();
                 reader_on = false;
                 readers.pop_front();
+            } else {
+                break;
             }
         }
         sink.advance_to(now);
@@ -315,11 +382,25 @@ fn run(s: &Scene) -> Run {
     Run { p, sink, tel, seconds, underruns, readouts }
 }
 
+/// The sample time's and the delivery's errors against the passes, each within the lateness's bounds: the sample time late
+/// by the clock's pass's lateness (from 0 to its most), the delivery off by the clock's pass's less the reading one's (or
+/// early by the reading one's, where the reading found it overdue). Returns the mean sample time error (ms).
+fn check_errors(r: &Run, lateness: Lateness, what: &str) -> f64 {
+    let late_hns = lateness.max_ms() * 1e4;
+    assert!(r.sink.errors.len() > 2_000, "{what}: {}", r.sink.errors.len());
+    for &(sample, delivery) in &r.sink.errors {
+        assert!((-1.0..=late_hns + 1.0).contains(&sample), "{what}: the sample time {sample} hns off");
+        assert!(delivery.abs() <= late_hns + 1.0, "{what}: the delivery {delivery} hns off");
+    }
+    r.sink.errors.iter().map(|e| e.0).sum::<f64>() / r.sink.errors.len() as f64 * 1e-4
+}
+
 /// A steady mic at every recording app's period, its clock on the stream's or 150 ppm off: no underrun after the start (its
 /// first passes find the ring empty, before the starting fill), no headroom, the target one reader packet. The readout's
-/// sample time is the recording app's stamp to within the passes' own lateness (0.3 ms here), and its delivery the pass that
-/// reads the frame to within two passes' lateness; the delivery readout is later than the readout, block for block, by
-/// what's left of the packet (a packet at most, so it follows the period).
+/// sample time is the recording app's stamp read late by the clock's pass's own lateness (0 to 0.3 ms here: the error is
+/// that), and its delivery the pass that reads the frame to within the passes' lateness (the clock's pass's less the
+/// reading one's); the delivery readout is later than the readout, block for block, by what's left of the packet (a
+/// packet at most, so it follows the period).
 #[test]
 fn a_steady_mic_runs_clean_at_one_reader_packet() {
     for packet in [128usize, 160, 240, 480] {
@@ -331,11 +412,8 @@ fn a_steady_mic_runs_clean_at_one_reader_packet() {
             assert_eq!((r.p.headroom(), r.p.out_target()), (0, packet), "{what}");
             assert!(r.seconds.iter().all(|s| s.headroom == 0 && s.target == packet), "{what}");
             assert_eq!(r.p.counters.output_deficits, 0, "{what}");
-            assert!(r.sink.errors.len() > 2_000, "{what}: {}", r.sink.errors.len());
-            for &(sample, delivery) in &r.sink.errors {
-                assert!((-1.0..=3_000.0 + 1.0).contains(&sample), "{what}: the sample time {sample} hns off");
-                assert!(delivery.abs() <= 3_000.0 + 1.0, "{what}: the delivery {delivery} hns off");
-            }
+            let mean = check_errors(&r, scene.lateness, &what);
+            assert!((0.12..0.18).contains(&mean), "{what}: the sample time {mean} ms late on average (the lateness's mean)");
             let most = packet as f32 / 48.0 + 0.31;
             assert!(r.readouts.iter().all(|&(_, a, d)| d > a && d - a <= most), "{what}: the rest of a packet at most");
             assert!(f64::from(r.tel.latency_delivery_ms_median.load()) > f64::from(r.tel.latency_ms_median.load()), "{what}");
@@ -346,11 +424,32 @@ fn a_steady_mic_runs_clean_at_one_reader_packet() {
     }
 }
 
+/// The same with the passes as late as the driver's timers were on the dev box under Verifier ([`Lateness::Measured`]:
+/// mean about 0.33 ms, up to 1.5): still clean at one packet at every period, and the sample time reads late by the clock's
+/// pass's lateness, 0.33 ms on average, up to the tail's 0.8 to 1.5 ms. So the live check's sweep less the readout (and
+/// the chain) comes out at about -0.3 ms, not 0 (nf-scratch/latency/direct.sh).
+#[test]
+fn the_measured_pass_lateness_still_runs_clean_and_reads_that_much_late() {
+    for packet in [128usize, 160, 240, 480] {
+        let scene = Scene { lateness: Lateness::Measured, ..Scene::steady(packet, 30.0) };
+        let r = run(&scene);
+        let what = format!("{packet} frames");
+        assert_eq!(r.p.counters.render_underruns, 0, "{what}: {:?}", r.underruns);
+        assert_eq!((r.p.headroom(), r.p.out_target(), r.p.counters.output_deficits), (0, packet, 0), "{what}");
+        let mean = check_errors(&r, scene.lateness, &what);
+        assert!((0.30..0.36).contains(&mean), "{what}: the sample time {mean} ms late on average");
+        let latest = r.sink.errors.iter().map(|e| e.0).fold(0.0, f64::max) * 1e-4;
+        assert!(latest > 0.7, "{what}: the tail shows ({latest} ms)");
+        let most = packet as f32 / 48.0 + MEASURED_MAX_MS as f32 + 0.01;
+        assert!(r.readouts.iter().all(|&(_, a, d)| d > a && d - a <= most), "{what}: the rest of a packet, and a late pass");
+    }
+}
+
 /// The VM's bursty mic (two blocks every other wake, the first a block late) against IAudioClient3's short packets: one
 /// packet of fill can't ride that out, so the ring runs short, and the headroom rises by what the driver filled with
-/// silence, a few underruns at most, within its cap; then it runs clean. Once the mic delivers steadily again, clean running
-/// brings the headroom back down to nothing, a halving a hold, with no lowering failing, and the readout back where a clean
-/// run's is.
+/// silence: two or three underruns, to 2 to 5 ms (at 128 frames three, to 5 ms; at 160 two, to 2 ms); then it runs clean.
+/// Once the mic delivers steadily again, clean running brings the headroom back down to nothing, a halving a hold, in two
+/// or three holds from the last raise, with no lowering failing, and the readout back where a clean run's is.
 #[test]
 fn a_bursty_mic_raises_the_headroom_and_clean_running_lowers_it_again() {
     for packet in [128usize, 160] {
@@ -360,28 +459,90 @@ fn a_bursty_mic_raises_the_headroom_and_clean_running_lowers_it_again() {
         let r = run(&scene);
         let what = format!("{packet} frames");
         let bursty = r.underruns_between(0.0, calm);
-        assert!((1..=6).contains(&bursty), "{what}: {bursty} underruns: {:?}", r.underruns);
+        assert!((2..=3).contains(&bursty), "{what}: {bursty} underruns: {:?}", r.underruns);
         assert_eq!(r.underruns_between(20.0, calm), 0, "{what}: clean once raised: {:?}", r.underruns);
         let raised = r.headroom_at(calm - 1.0);
-        assert!((STEP..=MAX).contains(&raised), "{what}: {raised}");
+        assert!((2 * STEP..=5 * STEP).contains(&raised), "{what}: {raised}");
+        let last_raise = r.underruns.last().unwrap().0;
         assert_eq!(r.underruns_between(calm, f64::INFINITY), 0, "{what}: no lowering failed: {:?}", r.underruns);
-        assert_eq!(r.p.headroom(), 0, "{what}: back to one packet: {:?}", r.seconds.iter().map(|s| s.headroom).collect::<Vec<_>>());
+        assert_eq!(r.p.headroom(), 0, "{what}: back to one packet: {:?}", r.moves());
         assert_eq!(r.p.out_target(), packet, "{what}");
-        // The headroom came down in halvings, each a hold after the last move.
-        let moves: Vec<(f64, usize)> =
-            r.seconds.windows(2).filter(|w| w[0].headroom != w[1].headroom).map(|w| (w[1].t_s, w[1].headroom)).collect();
-        let downs: Vec<&(f64, usize)> = moves.iter().filter(|m| m.0 > calm).collect();
-        assert!(downs.len() >= 2 && downs.windows(2).all(|w| w[1].1 < w[0].1), "{what}: {moves:?}");
-        assert!(downs.windows(2).all(|w| (w[1].0 - w[0].0 - hold).abs() < 1.5), "{what}: a hold apart: {moves:?}");
+        // The headroom came down in halvings, the first a hold after the last raise and each a hold after the one before.
+        let downs: Vec<(f64, usize)> = r.moves().into_iter().filter(|m| m.0 > calm).collect();
+        assert!((2..=3).contains(&downs.len()) && downs.windows(2).all(|w| w[1].1 < w[0].1), "{what}: {:?}", r.moves());
+        assert!((downs[0].0 - last_raise - hold).abs() < 1.5, "{what}: a hold after the last raise: {:?}", r.moves());
+        assert!(downs.windows(2).all(|w| (w[1].0 - w[0].0 - hold).abs() < 1.5), "{what}: a hold apart: {:?}", r.moves());
+        assert_eq!(r.headroom_at(last_raise + downs.len() as f64 * hold + 1.5), 0, "{what}: {:?}", r.moves());
         // The raised headroom shows in the readout while it's up, and is gone from it at the end.
         let (high, _) = r.medians(calm - 20.0, calm);
         let (end, _) = r.medians(calm + 6.0 * hold - 20.0, calm + 6.0 * hold);
         let clean = run(&Scene::steady(packet, 30.0)).medians(5.0, 30.0).0;
-        assert!(high > end + 2.0, "{what}: {high} raised against {end} at the end");
+        assert!(high > end + 1.5, "{what}: {high} raised against {end} at the end");
         // Back to one packet: the latency a clean run holds, to within the fill calibration's phase (half a packet: it's
         // never seeded afresh, pipeline.rs's FillOffset).
         assert!((end - clean).abs() < packet as f64 / 96.0 + 0.3, "{what}: {end} at the end against a clean run's {clean}");
         assert_eq!(r.p.counters.output_deficits, 0, "{what}: the driver's silence, no zeros of ours");
+    }
+}
+
+/// A mic whose need never goes away (the bursty mic for the whole run): each lowering takes the headroom under what the
+/// bursts need, so it fails within its hold, and goes back at once to where it came from (one underrun, not one a step).
+/// After [`MAX_FAILED`] the headroom stays for the run (ring_headroom.rs; ours, proposed): the run underruns at its start
+/// and once a failed lowering, none after the third, where without the bound it went on doing so every 16 minutes at
+/// most (at 128 frames 21 underruns in 3000 s, three a lowering).
+#[test]
+fn a_mic_whose_need_never_goes_away_costs_three_failed_lowerings_at_most() {
+    let hold = f64::from(HOLD_S);
+    for packet in [128usize, 160] {
+        let run_s = 1_500.0;
+        let r = run(&Scene { mic: vec![(0.0, Mic::Bursty)], ..Scene::steady(packet, run_s) });
+        let what = format!("{packet} frames: {:?}, {:?}", r.underruns, r.moves());
+        let start = r.underruns_between(0.0, 20.0);
+        assert!((2..=3).contains(&start), "{what}");
+        let raised = r.headroom_at(20.0);
+        assert!((2 * STEP..=5 * STEP).contains(&raised), "{what}");
+        // Each lowering a doubled hold after the raise before it, and each failing: an underrun within a few seconds, the
+        // headroom back where it was.
+        let moves = r.moves();
+        let downs: Vec<usize> = (0..moves.len()).filter(|&k| k > 0 && moves[k].1 < moves[k - 1].1).collect();
+        assert_eq!(downs.len(), MAX_FAILED as usize, "{what}");
+        let mut wait = hold;
+        for &k in &downs {
+            let (at, prev) = (moves[k].0, moves[k - 1]);
+            assert!((at - prev.0 - wait).abs() < 1.5 && prev.1 == raised, "{what}: lowered {wait} s after the last raise");
+            assert_eq!(r.underruns_between(at - 1.0, at + 5.0), 1, "{what}: one underrun at {at}");
+            assert_eq!(moves.get(k + 1).map(|m| m.1), Some(raised), "{what}: back where it came from");
+            wait *= 2.0;
+        }
+        assert_eq!(r.underruns.len(), start + MAX_FAILED as usize, "{what}");
+        // The third failure and the 8-hold wait the next lowering would have had both inside the run: none came.
+        let third = moves[downs[downs.len() - 1]].0;
+        assert!(third + wait < run_s && r.underruns_between(third + 5.0, f64::INFINITY) == 0, "{what}");
+        assert_eq!((r.p.headroom(), r.p.out_target()), (raised, packet + raised), "{what}: kept for the run");
+    }
+}
+
+/// A recording app that stops and another that starts within one block (5 ms) at the same packet: no block sees the ring
+/// without a reader, but the new one's first pass discards what was queued (the live discard) and finds the ring empty.
+/// The pipeline sees the ring's read position move without a copy (`DriverReader::restarted`) and starts its fill again,
+/// so that silence is the new start's, not an underrun: none counted, no headroom. Without the restart it was taken for a
+/// real underrun (the control: at 128 frames three counted and 5 ms of headroom, at 160 one and 4 ms).
+#[test]
+fn a_recording_app_restarting_within_a_block_is_a_new_start() {
+    for packet in [128usize, 160] {
+        for report_restarts in [true, false] {
+            let readers = vec![(0.5, 10.012, packet), (10.017, f64::INFINITY, packet)];
+            let r = run(&Scene { readers, report_restarts, ..Scene::steady(packet, 20.0) });
+            let what = format!("{packet} frames, restarts reported: {report_restarts}: {:?}, {:?}", r.underruns, r.moves());
+            assert!(r.sink.discarded > packet as u64, "{what}: the second app's first pass discarded {}", r.sink.discarded);
+            assert!(r.seconds.iter().all(|s| s.target > 0), "{what}: no block saw the ring without a reader");
+            if report_restarts {
+                assert_eq!((r.p.counters.render_underruns, r.p.headroom()), (0, 0), "{what}");
+                assert_eq!((r.p.out_target(), r.p.counters.output_deficits), (packet, 0), "{what}");
+            } else {
+                assert!(r.p.counters.render_underruns > 0 && r.p.headroom() > 0, "{what}: the control");
+            }
+        }
     }
 }
 
@@ -433,7 +594,7 @@ fn the_direct_route_never_allocates() {
     let cfg = PipelineConfig { out_period: BLOCK, out_margin: 0, ref_period: None, max_packet: 4800 };
     let mut p: Pipeline = Pipeline::new(cfg, DriftController::new(0.0), SlipResampler::new(), SlipResampler::new());
     p.for_driver_ring();
-    let mut sink = DriverSink::new(0.3);
+    let mut sink = DriverSink::new(Lateness::Uniform(0.3));
     sink.watch = None;
     let tel = Telemetry::new();
     let mut mic = FakeCapture::default();

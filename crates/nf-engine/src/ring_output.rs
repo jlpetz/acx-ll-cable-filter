@@ -1,26 +1,117 @@
 //! Live 48 kHz float32 stereo feed for the ACX capture endpoint. The capture reader owns the clock.
 
-use std::cell::Cell;
 use std::io;
 use std::sync::atomic::{Ordering, fence};
 
 use nf_core::SAMPLE_RATE;
 use nf_vmic::Writer;
 use nf_vmic::broker::{self, LIVE_CAPACITY, LiveFeed};
-use nf_vmic::protocol::{STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_LIVE_HANDOFF, STATE_READING};
+use nf_vmic::protocol::{RingHeader, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_LIVE_HANDOFF, STATE_READING};
 
 use crate::errors::{StartFailure, hr};
-use crate::pipeline::{ClockReading, Hr, RenderSink};
+use crate::pipeline::{ClockReading, DriverReader, Hr, RenderSink};
 use crate::stream::OpenInfo;
 use crate::timing::Qpc;
 
 pub(crate) struct RingOutput {
     attachment: LiveFeed,
     qpc: Qpc,
-    last_reader_packet: Cell<usize>,
-    last_missing: u64,
-    missing: u64,
+    reader: ReaderLine,
     pub(crate) info: OpenInfo,
+}
+
+/// The header's reader line as the pipeline reads it once a block (TODO 13): the recording app's packet, whether the driver
+/// moved the ring's read position other than by reading, and the frames it filled with silence, all as one capture pass
+/// left them. A capture pass stores its state, packet, counters and read_frame inside the clock's sequence
+/// (StreamEngine.cpp's AppRingCapturePass, AppRingStoreCounters), so read inside it they're that pass's together: a new
+/// reader's packet, or its live discard, and the silence of its first passes come in the same read, never the silence
+/// first and the reader a block later, which would count it as a real underrun (the owner, 2026-11-24: only real ones).
+#[derive(Debug, Default)]
+pub(crate) struct ReaderLine {
+    /// The last packet read while READING, kept through a LIVE_HANDOFF.
+    reader_packet: usize,
+    /// What the last read gave.
+    packet: usize,
+    /// `read_frame - frames_copied` at the last read (`None` before it). The driver moves read_frame by what it copies, and
+    /// otherwise only at a live discard (a recording app's first pass, LiveStreams 0 to 1) and a resync; a handoff's skip is
+    /// in the reader's copy, not the ring.
+    moved: Option<u64>,
+    /// `underrun_frames` (this attachment's: reset at ATTACH) at the last read, and at the last [`Self::take_underruns`].
+    underrun_frames: u64,
+    taken: u64,
+    /// The frames the last [`Self::take_underruns`] found, for [`Self::take_silence`].
+    missing: u64,
+}
+
+/// One capture pass's fields of the header's driver line.
+#[derive(Clone, Copy, Debug)]
+struct Line {
+    state: u32,
+    packet: u32,
+    moved: u64,
+    underrun_frames: u64,
+}
+
+/// Tries at a read inside the sequence before a block goes on with the last one's. The driver holds the sequence odd for a
+/// few stores under its spin lock, so a try fails mostly where this thread was preempted between its loads; the counters
+/// are cumulative, so what a block misses the next one reads.
+const READ_TRIES: usize = 4;
+
+/// The header's driver line as one pass left it, or `None` where every try overlapped a pass. A sequence of 0 is a ring no
+/// pass has reached since ATTACH (its line as ATTACH left it); a reader's stop (AppRingReaderStop) stores the state and
+/// packet outside the sequence, and changes no counter. Real-time: a few loads a try, no wait.
+fn read_line(h: &RingHeader) -> Option<Line> {
+    for _ in 0..READ_TRIES {
+        let seq = h.clock_sequence.load(Ordering::Acquire);
+        if seq & 1 == 0 {
+            let line = Line {
+                state: h.state.load(Ordering::Relaxed),
+                packet: h.packet_frames.load(Ordering::Relaxed),
+                moved: h.read_frame.load(Ordering::Relaxed).wrapping_sub(h.frames_copied.load(Ordering::Relaxed)),
+                underrun_frames: h.underrun_frames.load(Ordering::Relaxed),
+            };
+            fence(Ordering::Acquire);
+            if h.clock_sequence.load(Ordering::Relaxed) == seq {
+                return Some(line);
+            }
+        }
+        std::hint::spin_loop();
+    }
+    None
+}
+
+impl ReaderLine {
+    /// The reader at this block, from one read of the header. Where the read failed, the last block's packet with no news:
+    /// its underruns and any restart come with the next read.
+    pub(crate) fn read(&mut self, h: &RingHeader) -> DriverReader {
+        let Some(line) = read_line(h) else { return DriverReader { packet: self.packet, restarted: false } };
+        let restarted = self.moved.is_some_and(|m| m != line.moved);
+        self.moved = Some(line.moved);
+        self.underrun_frames = line.underrun_frames;
+        self.packet = if line.state & STATE_READING != 0 {
+            if line.packet != 0 {
+                self.reader_packet = line.packet as usize;
+            }
+            self.reader_packet
+        } else if line.state & STATE_LIVE_HANDOFF != 0 {
+            self.reader_packet
+        } else {
+            0
+        };
+        DriverReader { packet: self.packet, restarted }
+    }
+
+    /// The frames the driver filled with silence up to the last [`Self::read`], less those already taken, as one underrun;
+    /// its frames for [`Self::take_silence`].
+    pub(crate) fn take_underruns(&mut self) -> u64 {
+        self.missing = self.underrun_frames.saturating_sub(self.taken);
+        self.taken = self.underrun_frames;
+        u64::from(self.missing > 0)
+    }
+
+    pub(crate) fn take_silence(&mut self) -> u64 {
+        std::mem::take(&mut self.missing)
+    }
 }
 
 impl RingOutput {
@@ -29,9 +120,7 @@ impl RingOutput {
         Ok(Self {
             attachment,
             qpc: Qpc::new(),
-            last_reader_packet: Cell::new(0),
-            last_missing: 0,
-            missing: 0,
+            reader: ReaderLine::default(),
             info: OpenInfo {
                 name: "Noise Filter virtual microphone (direct driver ring)".into(),
                 sample_rate: SAMPLE_RATE,
@@ -62,20 +151,9 @@ impl RingOutput {
         Ok(())
     }
 
-    pub(crate) fn packet(&self) -> usize {
-        let header = self.attachment.ring().header();
-        let state = header.state.load(Ordering::Acquire);
-        if state & STATE_READING != 0 {
-            let packet = header.packet_frames.load(Ordering::Relaxed) as usize;
-            if packet != 0 {
-                self.last_reader_packet.set(packet);
-            }
-            self.last_reader_packet.get()
-        } else if state & STATE_LIVE_HANDOFF != 0 {
-            self.last_reader_packet.get()
-        } else {
-            0
-        }
+    /// The recording app reading the ring at this block, and whether the driver set its fill afresh ([`ReaderLine::read`]).
+    pub(crate) fn reader(&mut self) -> DriverReader {
+        self.reader.read(self.attachment.ring().header())
     }
 }
 
@@ -135,29 +213,89 @@ impl RenderSink for RingOutput {
         }
         // The last completed pass consumed the prefix ending just before `pos`. The next packet starts at `pos`, and its stamp
         // (the recording app's sample time of frame `pos`) is that pass's deadline (StreamEngine.cpp's PacketStartQpc); `qpc`
-        // is the pass's own QPC, taken a little after it (the timer's lateness and the ring lock). The pipeline times frame
-        // `pos + j` at `qpc + j` frames (its sample time) and at the pass that completes its packet (its delivery).
+        // is the pass's own QPC, taken a little after it (the timer's lateness and the ring lock: about 0.33 ms on the dev box
+        // under Verifier, up to 1.5: pipeline.rs's `play_time_hns`). The pipeline times frame `pos + j` at `qpc + j` frames
+        // (its sample time) and at the pass that completes its packet (its delivery).
         // TODO 13's open point: the deadline itself in the header would take that lateness out (a ring header change: a
         // protocol version bump by the owner's rule of 2026-11-23).
         Ok(Some(ClockReading { pos_frames: pos as f64, qpc_hns: self.qpc.at_hns(qpc as i64) as f64, now_hns: self.qpc.now_hns() as f64 }))
     }
 
     /// The frames the driver filled with silence since the last call (the header's `underrun_frames`: a pass found less than
-    /// a packet in the ring, and read_frame stopped at write_frame), as one underrun, its frames for `take_silence`. The
-    /// pipeline reads the reader's packet first: a new recording's first passes find the ring empty (the live discard) and
-    /// count before its starting fill.
+    /// a packet in the ring, and read_frame stopped at write_frame), as one underrun, its frames for `take_silence`: as the
+    /// block's [`Self::reader`] read them, with the reader, so a new recording's first passes (the ring empty after the live
+    /// discard) count with its start, before its starting fill.
     fn take_underruns(&mut self) -> u64 {
-        let count = self.attachment.ring().header().underrun_frames.load(Ordering::Relaxed);
-        self.missing = count.saturating_sub(self.last_missing);
-        self.last_missing = count;
-        u64::from(self.missing > 0)
+        self.reader.take_underruns()
     }
 
     fn take_silence(&mut self) -> u64 {
-        std::mem::take(&mut self.missing)
+        self.reader.take_silence()
     }
 
     fn take_late(&mut self) -> u64 {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use nf_vmic::RingMemory;
+
+    use super::*;
+
+    /// A capture pass as the driver stores its line (AppRingCapturePass): the sequence odd, the counters and state, read_frame,
+    /// the sequence even. `discard` moves read_frame first, as a live discard or a resync does.
+    fn pass(h: &RingHeader, packet: u32, copy: u64, under: u64, discard: u64) {
+        h.clock_sequence.fetch_add(1, Relaxed);
+        h.frames_copied.fetch_add(copy, Relaxed);
+        h.underrun_frames.fetch_add(under, Relaxed);
+        h.state.store(STATE_ATTACHED | STATE_READING, Relaxed);
+        h.packet_frames.store(packet, Relaxed);
+        h.read_frame.fetch_add(discard + copy, Relaxed);
+        h.clock_sequence.fetch_add(1, Relaxed);
+    }
+
+    /// The reader line from one read of the header: the packet, a restart where read_frame moved without a copy, and the
+    /// silence since the last read, taken once; a read that overlaps a pass gives the last block's packet and no news, which
+    /// the next read brings; a stop (outside the sequence) is no reader, a live handoff the last reader's packet.
+    #[test]
+    fn the_reader_line_is_read_as_one_pass_left_it() {
+        let ring = RingMemory::new(1024).unwrap();
+        let h = ring.header();
+        let mut line = ReaderLine::default();
+        let read = |line: &mut ReaderLine| {
+            let r = line.read(h);
+            let n = line.take_underruns();
+            (r.packet, r.restarted, n, line.take_silence())
+        };
+        assert_eq!(read(&mut line), (0, false, 0, 0), "attached, no pass yet");
+        // A reader's first pass: the ring empty, a packet of silence, with the packet that read it.
+        pass(h, 128, 0, 128, 0);
+        assert_eq!(read(&mut line), (128, false, 1, 128));
+        pass(h, 128, 128, 0, 0);
+        pass(h, 128, 100, 28, 0);
+        assert_eq!(read(&mut line), (128, false, 1, 28), "copies, and a pass short by 28");
+        assert_eq!(read(&mut line), (128, false, 0, 0), "nothing new");
+        // A pass in progress: the last block's packet, and its news at the next read.
+        h.clock_sequence.fetch_add(1, Relaxed);
+        h.underrun_frames.fetch_add(480, Relaxed);
+        h.packet_frames.store(480, Relaxed);
+        assert_eq!(read(&mut line), (128, false, 0, 0), "a read overlapping a pass");
+        h.clock_sequence.fetch_add(1, Relaxed);
+        assert_eq!(read(&mut line), (480, false, 1, 480), "the handoff's packet with its silence");
+        // A new recording's live discard (read_frame to write_frame, past 600 queued frames) and its first pass's silence.
+        pass(h, 480, 0, 480, 600);
+        assert_eq!(read(&mut line), (480, true, 1, 480), "a restart at the same packet");
+        pass(h, 480, 480, 0, 0);
+        assert_eq!(read(&mut line), (480, false, 0, 0));
+        // The reader stops with another stream to take over (LIVE_HANDOFF: its packet kept), then with none.
+        h.state.store(STATE_ATTACHED | STATE_LIVE_HANDOFF, Relaxed);
+        h.packet_frames.store(0, Relaxed);
+        assert_eq!(read(&mut line).0, 480);
+        h.state.store(STATE_ATTACHED, Relaxed);
+        assert_eq!(read(&mut line).0, 0);
     }
 }

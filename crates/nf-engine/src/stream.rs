@@ -30,7 +30,7 @@ use crate::exclusive::{
     EventRender, ExclusiveFormat, ExclusiveRefusal, PeriodDevice, RING_FRAMES, exclusive_or_shared, exclusive_periods, first_exclusive,
     formats_to_try,
 };
-use crate::pipeline::{CaptureSource, ClockReading, Hr, Packet, RenderSink};
+use crate::pipeline::{CaptureSource, ClockReading, DriverReader, Hr, Packet, RenderSink};
 use crate::timing::Qpc;
 
 /// `PKEY_Devices_AudioDevice_RawProcessingSupported` (copied to avoid the EnhancedStorage feature).
@@ -706,9 +706,9 @@ impl Output {
 }
 
 impl RenderSink for Output {
-    fn driver_packet(&self) -> Option<usize> {
+    fn driver_reader(&mut self) -> Option<DriverReader> {
         match self {
-            Output::Driver(s) => Some(s.packet()),
+            Output::Driver(s) => Some(s.reader()),
             _ => None,
         }
     }

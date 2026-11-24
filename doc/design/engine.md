@@ -476,16 +476,34 @@ delivers two blocks a wake doesn't.
   the spare WASAPI's fixed target keeps, and its default 2 ms margin). The driver's silence is already in the recording
   app's stream (read_frame stops at write_frame), so the raise keeps the fill where the underrun left it. The direct route
   writes no deficit's zeros after the start: they would only come on top of the driver's silence.
+- **Only real underruns:** the reader's packet, the ring's read_frame less frames_copied and `underrun_frames` are read
+  together once a block, inside the clock's sequence a capture pass stores them in (ring_output.rs's `ReaderLine`), so a
+  new reader's packet, or its live discard, comes in the same read as its first passes' silence. A new packet (or none)
+  starts the fill again; so does a move of read_frame that no copy made (the driver moves it otherwise only at a live
+  discard and a resync: a recording app that stopped and another that started within a block at the same packet, which no
+  block saw without a reader). Their silence isn't counted (`pipeline/tests/driver.rs`: a 5 ms stop and start counted
+  three underruns and 5 ms of headroom at 128 frames without it, none with it).
 - **Lowered after clean running:** after 60 s of blocks fed to a recording app without an underrun (an idle ring's blocks
   don't count) it halves, rounded down to 1 ms (1 ms or less goes), and again a hold later, back to one packet; the drift loop
-  slips the fill down. A lowering an underrun follows within its hold doubles the hold, up to 16 minutes, so hiccups that
-  come more often than the hold keep it up. The headroom carries over to the next recording app in a run.
+  slips the fill down. The headroom carries over to the next recording app in a run.
+- **A lowering that fails** (an underrun within a hold of it) goes back at once to the headroom it came down from (or up by
+  the silence, if that's more) and doubles the hold, up to 16 minutes. After three failed lowerings the headroom stays for
+  the run, raised by later underruns but never lowered, until a recording app with another packet reads the ring (the
+  slack one packet leaves goes with the packet), which starts the count again. So the lowerings cost at most three
+  underruns a run at a packet, beside the raises' own; the price is the headroom kept for the rest of the run where three
+  have failed (ours, proposed, 2026-11-24, as the adaptive target's strikes; for the owner's call). Without the bound a
+  mic whose need never goes away underran at every lowering for the whole run, every 16 minutes at most (the VM's bursty
+  mic at 128 frames: 21 underruns in 3000 s, three a lowering, the raises a step at a time); with it, three at its start
+  and one at each of three lowerings, none after 440 s (asserted: the start's and one a failed lowering, three at most).
 - Each move of the headroom (and of the reader's packet) is an event in the latency test's per-sweep lines (disturbed.rs),
   with the block facts' `packet` and `headroom` (the CSVs' `out_packet`, `out_headroom`).
-- The numbers are ours, proposed. `pipeline/tests/driver.rs` runs the driver's passes (each up to 0.3 ms late) against the
-  pipeline: a steady mic at 128, 160, 240 and 480 frames runs clean at one packet, at the mic's clock or 150 ppm off; the
-  VM's bursty mic at 128 and 160 frames underruns two or three times, the headroom rising to 2 or 5 ms, then runs clean, and
-  comes back down to one packet in two to four holds once the mic is steady.
+- The numbers are ours, proposed. `pipeline/tests/driver.rs` runs the driver's passes against the pipeline, each up to
+  0.3 ms late, or as late as the timers on the dev box under Verifier (TODO 19's spike, 2026-11-20: mean 310-353 us, at most
+  0.8 ms over minutes and 1.4-1.6 ms over an hour; modelled as 0.25 ms and a tail, mean 0.33, up to 1.5): a steady mic at
+  128, 160, 240 and 480 frames runs clean at one packet with either, at the mic's clock or 150 ppm off; the VM's bursty mic
+  at 128 and 160 frames underruns two or three times (asserted: 2 to 3), the headroom rising to 2 to 5 ms (asserted), then
+  runs clean, and once the mic is steady comes back down to one packet in two or three holds from its last raise
+  (asserted), with no lowering failing.
 
 ## The latency budget (`budget.rs`, TODO 13)
 Each block's readout split along its first sample's way, into parts that add up to it exactly, block by block
@@ -524,14 +542,16 @@ Each block's readout split along its first sample's way, into parts that add up 
   sample's **sample time**, its capture time on the virtual mic's device time line, the stamp the recording app gets (the
   packet's start plus its place in it: the ring's `read_frame` starts the packet the next pass completes, stamped at the
   last pass's deadline), which is what the latency test's sweeps measure: `qpc + (index - read_frame) / fs` from the
-  header's clock, its QPC the last pass's (a little after its deadline: the timer's lateness and the ring lock, about
-  0.2 ms on the dev box under Verifier, so the sample time reads that much late). The ring is the only queue: the output
+  header's clock, its QPC the last pass's (a little after its deadline: the timer's lateness and the ring lock, on the
+  dev box under Verifier 310-353 us on average, at most 0.8 ms over minutes and 1.4-1.6 ms over an hour: TODO 19's spike,
+  2026-11-20), so the sample time reads that much late, about 0.33 ms, now and then up to 1.5, and a sweep less the
+  readout and the chain comes out at about -0.3 ms. The ring is the only queue: the output
   queue runs from the write to the sample time, and there's no render side. Beside it, `delivery_ms` (not in the
   readout): from the sample time to the **delivery time**, the pass that completes the sample's packet and hands it to
   the recording app, the rest of the packet from the sample on (a sample to one reader packet, 2.67 to 10 ms as the
   recording app's period goes, never a fixed amount). Telemetry has the readout to the delivery too
   (`latency_delivery_ms_median`, `_p95`), the reader's period (`output_period_ms`) and the ring's headroom
-  (`output_headroom_ms`: "The direct route's target" below). Until 2026-11-24 the readout ended at the delivery, up to a
+  (`output_headroom_ms`: "The direct route's target" above). Until 2026-11-24 the readout ended at the delivery, up to a
   packet over the sweeps (20.14 ms against 9.91 at 480-frame packets).
 - **The chain isn't in the readout:** the block's first output sample carries the input from the chain's offset before the
   block's first input sample. The first sample's own way through the app is the readout plus the chain's offset

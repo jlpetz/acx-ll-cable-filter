@@ -184,6 +184,9 @@ pub struct OutputFigures {
     pub target_ms: f32,
     /// Its clock against the mic's, fitted over the check (`None`: not measured).
     pub drift: Option<DriftFit>,
+    /// The direct driver route (`--output-backend driver-ring`: its blocks name the recording app's packet), whose target is
+    /// one reader packet and the ring's headroom, not the WASAPI route's adaptive target.
+    pub direct: bool,
 }
 
 /// Everything the check measured.
@@ -245,6 +248,7 @@ pub fn measure(blocks: &[ChainBlock], counters: &TelemetrySnapshot, status: &Eng
         queue: Spread::of(blocks.iter().filter_map(|b| b.budget).map(|b| b.queue_ms)),
         target_ms: blocks.last().map_or(counters.output_target_ms, |b| b.output.target as f32 * MS_PER_SAMPLE),
         drift: drift.output,
+        direct: blocks.iter().any(|b| b.output.packet > 0),
     };
     let reference = status.reference.as_ref().and_then(|info| {
         let facts: Vec<_> = all.iter().filter_map(|b| b.reference).collect();
@@ -567,10 +571,19 @@ fn output_health(o: &OutputFigures) -> Health {
     }
     if h.glitched {
         h.try_(TRY_LATENCYMON);
-        h.try_(
-            "with the adaptive output target (on by default) a rare hiccup can run it dry once the target has come down: \
-             --no-adaptive-output keeps the spare block",
-        );
+        if o.direct {
+            // The ring's headroom rises after the driver's underruns by itself (the owner, 2026-11-24): no switch for it.
+            h.try_(
+                "the direct driver route raises the ring's headroom after an underrun (up to 12 ms) and lowers it after clean \
+                 running, so one that keeps coming is the mic's delivery or a held-up thread; the WASAPI output \
+                 (--output-backend wasapi) keeps a spare block",
+            );
+        } else {
+            h.try_(
+                "with the adaptive output target (on by default) a rare hiccup can run it dry once the target has come down: \
+                 --no-adaptive-output keeps the spare block",
+            );
+        }
         if o.stream.exclusive {
             h.try_("--no-exclusive-output, to see whether it glitches only in exclusive mode");
         }
@@ -835,6 +848,7 @@ mod tests {
                 queue: spread(12.0, 14.0, 15.5, 16.0, 14.0),
                 target_ms: 14.0,
                 drift: fit(12.2, 0.4),
+                direct: false,
             },
             reference: Some(ReferenceFigures {
                 stream: stream("Speakers (Realtek)", 10.0, false),
@@ -973,6 +987,12 @@ mod tests {
         assert!(
             out.tries.iter().any(|t| t.contains("--no-adaptive-output")) && out.tries.iter().any(|t| t.contains("--no-exclusive-output"))
         );
+        // On the direct driver route the adaptive target doesn't run: the ring's headroom is named instead.
+        let mut direct = f.clone();
+        direct.output.direct = true;
+        let out = &assess(&direct)[1];
+        assert!(out.glitched && !out.tries.iter().any(|t| t.contains("--no-adaptive-output")), "{out:?}");
+        assert!(out.tries.iter().any(|t| t.starts_with("the direct driver route raises the ring's headroom")), "{out:?}");
         // A slow shared output, its exclusive mode refused.
         let mut f = steady();
         f.output.stream = Stream { refused: Some("another app is using it".into()), ..stream("Speakers", 10.0, false) };

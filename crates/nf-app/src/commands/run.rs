@@ -816,14 +816,15 @@ pub const LEGEND: &str = "Each second: input and output peak/RMS dBFS (the input
      since the last line, near-clip: within 0.1 dB of full scale); latency median/p95 (mic capture to cable play-out), \
      then its budget's means in ms [mic delivery+wait+output queue+render side] (the chain's offset, given at the start, \
      isn't in it; with --output-backend driver-ring, to the virtual mic's sample time, the median to the driver's delivery \
-     beside it, and [mic delivery+wait+ring queue]), and with the adaptive output target (unless --no-adaptive-output) the output queue's target now; CPU \
-     p99 per block; drift output/reference; with an echo reference, its lead/target in ms (how long before the mic block \
-     it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a speaker's echo path may not cover); \
-     dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with no packet) and coarse corrections, \
-     output/reference (whole blocks dropped to catch up; on the reference, jumps of its timeline); 'excl', then the streams \
-     in WASAPI exclusive mode (out, mic); with a model pack (--model), its inference worker's misses (blocks it was late \
-     for, which played the delayed input instead), its run time's p99 and the wakes that brought more than one block (each \
-     block past --model-depth in one is a miss); real-time heap allocations (pool allocations per second). Ctrl+C stops.";
+     beside it, and [mic delivery+wait+ring queue]), and with the adaptive output target (unless --no-adaptive-output) the \
+     output queue's target now; CPU p99 per block; drift output/reference; with an echo reference, its lead/target in ms \
+     (how long before the mic block it was tapped; 'by delivery' without trusted stamps, 'high' over 30 ms, which a \
+     speaker's echo path may not cover); dropouts mic/output/reference, then, once there are any, mic stalls (100 ms with \
+     no packet) and coarse corrections, output/reference (whole blocks dropped to catch up; on the reference, jumps of its \
+     timeline); 'excl', then the streams in WASAPI exclusive mode (out, mic); with a model pack (--model), its inference \
+     worker's misses (blocks it was late for, which played the delayed input instead), its run time's p99 and the wakes \
+     that brought more than one block (each block past --model-depth in one is a miss); real-time heap allocations (pool \
+     allocations per second). Ctrl+C stops.";
 
 /// One line of live telemetry. `retrying`: stopped by a fault, with the engine set to restart by
 /// itself (`EngineStatus::retrying`). `clipped`: the input clipped since the last line (the clip latch, taken: TODO 12).
