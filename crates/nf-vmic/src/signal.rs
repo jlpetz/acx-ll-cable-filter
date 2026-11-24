@@ -31,12 +31,16 @@ pub const CORRUPT_EXAMPLES: usize = 8;
 pub const GAP_RECORDS: usize = 256;
 
 /// One forward jump in the codes: the code that was due, the code that came (the frames between never arrived), where in the
-/// recording it came, and the silence between the two codes (an underrun next to the gap, or a late read's silence in place of
-/// the frames it lost).
+/// recording it came, the due code's place on from the first code's, and the silence between the two codes (an underrun next
+/// to the gap, or a late read's silence in place of the frames it lost).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gap {
     /// The frame index in the recording of the code that came.
     pub index: u64,
+    /// The due code's steps on from the recording's first code: one a code frame or corrupt frame, each earlier gap's lost
+    /// frames, a repeat's back. Silence takes none, so the frame the due code names is the first code's plus this however
+    /// much silence the recording holds (the index drifts by it, and would name the wrong frame past 2^22 frames of it).
+    pub offset: u64,
     pub due: u32,
     pub got: u32,
     pub silence: u64,
@@ -128,6 +132,8 @@ pub struct SequenceChecker {
     in_zero_run: bool,
     /// Runs of silence since the last signal frame: inside the signal once another signal frame comes.
     pending_runs: u64,
+    /// The last code's steps on from the first code's ([`Gap::offset`]).
+    position: u64,
 }
 
 impl SequenceChecker {
@@ -163,6 +169,7 @@ impl SequenceChecker {
             // The corrupt frame still takes its place in the sequence: the next one is due after it.
             if due.is_some() {
                 self.last = due;
+                self.position += 1;
             }
             return;
         };
@@ -175,19 +182,26 @@ impl SequenceChecker {
         r.signal_frames += 1;
         r.code_range = Some(r.code_range.map_or((k, k), |(min, max)| (min.min(k), max.max(k))));
         match due {
-            None => (r.first_code, r.first_code_index) = (Some(k), Some(index)),
-            Some(d) if k == d => r.steps_ok += 1,
+            None => (r.first_code, r.first_code_index, self.position) = (Some(k), Some(index), 0),
+            Some(d) if k == d => {
+                r.steps_ok += 1;
+                self.position += 1;
+            }
             Some(d) => {
                 let ahead = k.wrapping_sub(d) & CODE_MASK;
+                let offset = self.position + 1;
                 if u64::from(ahead) < CODE_MODULUS / 2 {
                     r.gaps += 1;
                     r.gap_frames += u64::from(ahead);
                     if r.gap_list.len() < GAP_RECORDS {
-                        r.gap_list.push(Gap { index, due: d, got: k, silence });
+                        r.gap_list.push(Gap { index, offset, due: d, got: k, silence });
                     }
+                    self.position = offset + u64::from(ahead);
                 } else {
+                    let back = d.wrapping_sub(k) & CODE_MASK;
                     r.repeats += 1;
-                    r.repeat_frames += u64::from(d.wrapping_sub(k) & CODE_MASK);
+                    r.repeat_frames += u64::from(back);
+                    self.position = offset.wrapping_sub(u64::from(back));
                 }
             }
         }
@@ -348,7 +362,10 @@ mod tests {
         assert_eq!((r.gaps, r.gap_frames), (1, 5));
         assert_eq!((r.repeats, r.repeat_frames), (1, 3));
         // The gap's codes either side and its place: frames 20 to 24 never came, code 25 at index 10.
-        assert_eq!(r.gap_list, [Gap { index: 10, due: 20, got: 25, silence: 0 }]);
+        assert_eq!(r.gap_list, [Gap { index: 10, offset: 10, due: 20, got: 25, silence: 0 }]);
+        // After the repeat (back 3 from 30, its offset 20) the codes' steps go on from 27's: a gap at 45 is due 40, 30 on.
+        let after = check((10..20).chain(25..30).chain(27..40).chain(45..47).map(frame));
+        assert_eq!(after.report().gap_list[1], Gap { index: 28, offset: 30, due: 40, got: 45, silence: 0 });
     }
 
     /// A gap with silence before the code that came (a late read: silence in place of the frames it lost), one at the codes'
@@ -359,9 +376,22 @@ mod tests {
         let end = CODE_MODULUS;
         let c = check((0..10).map(frame).chain(silence(4)).chain((14..20).map(frame)).chain((40..43).map(frame)));
         let r = c.report();
-        assert_eq!(r.gap_list, [Gap { index: 14, due: 10, got: 14, silence: 4 }, Gap { index: 20, due: 20, got: 40, silence: 0 }]);
+        assert_eq!(r.gap_list, [Gap { index: 14, offset: 10, due: 10, got: 14, silence: 4 }, Gap {
+            index: 20,
+            offset: 20,
+            due: 20,
+            got: 40,
+            silence: 0
+        }]);
         let wrap = check((end - 3..end).chain(2..4).map(frame));
-        assert_eq!(wrap.report().gap_list, [Gap { index: 3, due: 0, got: 2, silence: 0 }]);
+        assert_eq!(wrap.report().gap_list, [Gap { index: 3, offset: 3, due: 0, got: 2, silence: 0 }]);
+        // A corrupt frame takes its step; silence none, however long: past 2^22 frames of it the index is far from the
+        // offset, which still names the due code's frame from the first code's.
+        let mut corrupt = frame(12);
+        corrupt.swap(0, 1);
+        let long = 5_000_000;
+        let c = check((10..12).map(frame).chain([corrupt]).chain(silence(long)).chain((13..15).chain(20..21).map(frame)));
+        assert_eq!(c.report().gap_list, [Gap { index: 5 + long as u64, offset: 5, due: 15, got: 20, silence: 0 }]);
         let many = check((0..2 * GAP_RECORDS as u64 + 2).map(|n| frame(2 * n)));
         assert_eq!((many.report().gaps, many.report().gap_list.len()), (2 * GAP_RECORDS as u64 + 1, GAP_RECORDS));
     }

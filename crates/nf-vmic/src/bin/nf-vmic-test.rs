@@ -112,16 +112,18 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       --start (default 0), so the codes name the ring's frames. Unmute the endpoint. The first capture stream to run
       reads the ring; the driver gives the others its audio as secondary streams. When the reader stops, another takes the
       slot with one skip; the rest play on with no repeat, getting silence where the new reader's packet is longer and
-      skipping once where it is shorter. Each gap must be the driver's own record of it: the codes either side name the
-      ring's frames it lost, and the driver's skip log (in STATS, read before and after) must hold an entry for exactly
-      those frames, or a chain of one stream's entries end to end (a skip and the late read after it): a handoff's skip, a
-      skip to a shorter lag, a jump in the stream's own time line, or a late read (the reader's timer late: silence, and
-      the frames the reader then wrote there never reach it). A gap with no entry, or with one for its first frame that
-      doesn't end with it, fails, as does one tied to a resync (the feed's write position invalid). INCONCLUSIVE only
-      where the log can't say: more events in the recording than it keeps (64), an entry unreadable, or one still being
-      filled in. The log's skips over the recording must also add up to the driver's counters' rise. Where no stream holds
-      the reader slot just after the recording (the last reader stopped as it ended), verify waits up to 200 ms for one
-      to (its own stream takes it at its next pass).
+      skipping once where it is shorter. Each gap must be the driver's own record of one of those two skips: the codes
+      either side name the ring's frames it lost, and the driver's skip log (in STATS, read before and after) must hold an
+      entry for exactly those frames, or a chain of one stream's entries end to end (any stream's: verify doesn't know its
+      own), each a handoff's skip or a skip to a shorter lag. A gap with no entry, or with one for its first frame that
+      doesn't end with it, fails; so does one tied to a late read (a read past the copy's end: silence, and the frames the
+      reader then wrote there never reach it), a jump in a stream's own time line, or a resync (the feed's write position
+      invalid): the log's record of a loss, not a skip the ring's rules allow. INCONCLUSIVE only where the log can't say:
+      more events in the recording than it keeps (64), an entry unreadable, one whose ring frames may be short (still
+      being filled in, or untracked), or entries of two streams for one gap judged differently. The log's skips over the
+      recording must also add up to the driver's counters' rise. Where no stream holds the reader slot just after the
+      recording (the last reader stopped as it ended), verify waits up to 200 ms for one to (its own stream takes it at
+      its next pass).
   nf-vmic-test stats
       Print the driver's statistics, and its skip and underrun logs (newest last, times before the snapshot, each entry's
       stream by its serial).
@@ -1121,19 +1123,13 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
     capture.start()?;
     let recorded = record(&device, &mut capture, Duration::from_secs(seconds));
     capture.stop();
-    let (before, after, checker, vacancy) = recorded?;
+    let Recorded { before, after, checker, vacancy, lost_frames, discontinuities } = recorded?;
 
     let r = checker.report();
     let (b, a) = (&before.ring, &after.ring);
     let mut c = Checks::default();
     println!("checks:");
-    let seen = StreamSeen {
-        lost_frames: capture.lost_frames,
-        discontinuities: capture.discontinuities,
-        packet: capture.opened.period_frames(),
-        start,
-        vacancy,
-    };
+    let seen = StreamSeen { lost_frames, discontinuities, packet: capture.opened.period_frames(), start, vacancy };
     let checks = verify_checks(&before, &after, r, &seen);
     for check in &checks {
         c.judge(check.outcome, check.name, &check.detail);
@@ -1186,15 +1182,26 @@ fn verify(args: &[String]) -> Result<Verdict, String> {
         println!("  corrupt at frame {index}: left {left:#010x} ({l}), right {right:#010x} ({rt})");
     }
     capture.print_counters();
+    if let Some(d) = vacancy
+        && (capture.lost_frames, capture.discontinuities) != (lost_frames, discontinuities)
+    {
+        println!(
+            "  (those include the {:.1} ms drained, unrecorded, after the recording; its check takes the counts at the \
+             recording's end: {lost_frames} frames lost, {discontinuities} discontinuities)",
+            d.as_secs_f64() * 1e3
+        );
+    }
     let verdict = verdict_of(&checks);
     match verdict {
         Verdict::Pass => println!(
             "PASS: the app ring fed the recording, bit-exact on both channels, in order, nothing repeated, and nothing lost but \
-             what the driver's skip log records of it, to the frame"
+             a reader handoff's skip or a skip to a shorter lag, each the driver's skip log's record of the ring's frames it \
+             lost, to the frame"
         ),
         Verdict::Inconclusive => println!(
             "INCONCLUSIVE: nothing failed, but {} of the checks couldn't be decided from the driver's skip log (more events in \
-             the recording than it keeps, an entry unreadable, or one still being filled in: the lines above say which)",
+             the recording than it keeps, an entry unreadable, one whose ring frames may be short, or entries of two streams \
+             for one gap judged differently: the lines above say which)",
             c.inconclusive
         ),
         _ => println!("FAIL: {} of the checks", c.failed),
@@ -1217,8 +1224,9 @@ struct StreamSeen {
 
 /// verify's checks of a recording (`r`) against the driver's statistics just before and just after it, and the capture stream's
 /// own counts. All must pass for proof that the app ring fed the recording. Each gap is tied to the driver's skip log
-/// ([`tie_gaps`]); with none failed, a gap the log can't decide (it wrapped, or an entry is unreadable or still being filled
-/// in) makes the verdict INCONCLUSIVE, and so does a window the log can't check the counters over.
+/// ([`tie_gaps`]) and must be a skip the ring's rules allow; with none failed, a gap the log can't decide (it wrapped, an
+/// entry is unreadable or its ring frames may be short, or two streams' entries for it are judged differently) makes the
+/// verdict INCONCLUSIVE, and so does a window the log can't check the counters over.
 ///
 /// The recording may come from the reader or from a secondary stream (another capture stream ran first): the silence allowed is
 /// what the driver zero-filled for either (UnderrunFrames and SecondaryUnderrunFrames over the recording), and the slack at the
@@ -1235,10 +1243,12 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     let silence = r.zeros_before_signal + r.zeros_inside + r.zeros_after_signal;
     // Each gap is the driver's own record of it (the owner, 2026-11-24: "build it rather than marking things inconclusive"):
     // the codes either side name the ring's frames it lost, and the skip log must hold an entry for exactly those frames, or
-    // a chain of one stream's entries end to end ([`tie_gaps`]). So a gap is tied to the skip that made it with any number of
-    // streams, where the driver-wide counters (two streams playing on through one handoff to a shorter packet each skip, the
-    // counter holding both) could only say it might be among them. A gap past the recording's gap list (more than
-    // signal::GAP_RECORDS) can't be tied: it fails. Any repeat fails.
+    // a chain of one stream's entries end to end ([`tie_gaps`]), and they must be skips the ring's rules allow (a taker's
+    // handoff skip, a skip to a shorter lag). So a gap is tied to the skip that made it with any number of streams, where the
+    // driver-wide counters (two streams playing on through one handoff to a shorter packet each skip, the counter holding
+    // both) could only say it might be among them; the tie is to an entry for exactly those frames, any stream's (verify
+    // doesn't know its own). A gap past the recording's gap list (more than signal::GAP_RECORDS) can't be tied: it fails.
+    // Any repeat fails.
     let window = LogWindow::of(before, after);
     let ties = tie_gaps(before, r, seen.start, &window);
     let untied = r.gaps.saturating_sub(ties.len() as u64);
@@ -1254,14 +1264,16 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
     let fails_on = if others.is_empty() { String::new() } else { format!(", but the check fails on {}", others.join(" and ")) };
     let gaps_text = match (r.gaps, gaps) {
         (0, _) => String::new(),
-        (_, Outcome::Ok) => format!("; every gap is its entries in the skip log, to the frame (listed below){fails_on}"),
+        (_, Outcome::Ok) => {
+            format!("; every gap is the skip log's record of a skip the ring's rules allow, to the frame (listed below){fails_on}")
+        }
         (_, Outcome::Inconclusive) => format!(
-            "; {} gaps tied to the skip log, {} it can't decide (listed below){fails_on}",
+            "; {} gaps tied to allowed skips in the skip log, {} it can't decide (listed below){fails_on}",
             count(Outcome::Ok),
             count(Outcome::Inconclusive)
         ),
         (_, Outcome::Fail) => format!(
-            "; {} gaps not the skip log's record of them{} (listed below)",
+            "; {} gaps not the skip log's record of a skip the ring's rules allow{} (listed below)",
             count(Outcome::Fail) as u64 + untied,
             if untied != 0 { format!(", {untied} of them past the {} the recording lists", signal::GAP_RECORDS) } else { String::new() }
         ),
@@ -1336,7 +1348,8 @@ fn verify_checks(before: &Stats, after: &Stats, r: &CheckReport, seen: &StreamSe
             name: "bit-exact and in order",
             detail: format!(
                 "gaps {} ({} frames lost), repeats {} ({} frames), corrupt frames {}; codes {:?} to {:?}, {} steps of one: a gap \
-                 is allowed only as the skip log's record of the ring's frames it lost{gaps_text}",
+                 is allowed only as the skip log's record, to the frame, of a reader handoff's skip or a skip to a shorter \
+                 lag{gaps_text}",
                 r.gaps, r.gap_frames, r.repeats, r.repeat_frames, r.corrupt_frames, r.first_code, r.last_code, r.steps_ok
             ),
         },
@@ -1396,6 +1409,14 @@ fn ring_wide(kind: u16) -> bool {
     kind == EVENT_RESYNC || kind == EVENT_LIVE_DISCARD
 }
 
+/// The skips the ring's rules allow a recording: a taker's handoff skip (the owner, 2026-11-20) and a skip to a shorter lag
+/// (the owner, 2026-11-23). The skip log's other kinds are the driver's record of a loss (a late read, a jump in a stream's own
+/// time line) or of frames no stream got (a resync, a live discard): a gap tied to them fails, as it did before the log, when
+/// no counter held it (the slot held while the reader's timer stopped, 2026-11-23: verify's FAIL found it).
+fn allowed(kind: u16) -> bool {
+    kind == EVENT_HANDOFF_SKIP || kind == EVENT_SECONDARY_SKIP
+}
+
 /// The ring frame nearest `near` whose code is `code`, for a feed whose frame n carries the code of n + `start` (its --start).
 fn ring_frame(code: u32, start: u64, near: u64) -> u64 {
     let m = signal::CODE_MODULUS;
@@ -1404,34 +1425,37 @@ fn ring_frame(code: u32, start: u64, near: u64) -> u64 {
     if ahead < m / 2 { near.wrapping_add(ahead) } else { near.wrapping_sub(m - ahead) }
 }
 
-/// Each listed gap of the recording `r` tied to the skip log (verify's rule; tools/test_app_ring_model.py's `tie`). The codes
-/// either side of a gap name the ring frames it lost (the first code's frame is the one nearest the reader's position just
-/// before, each later one a recorded frame further on, to within the recording's silence and gaps: far less than the codes'
-/// 2^23). Its entries are the skip log's of this attachment with a ring span: one whose span starts at the gap's first frame,
-/// then the same stream's following on (or the reader's ring-wide ones), to the gap's end.
+/// Each listed gap of the recording `r` tied to the skip log (verify's rule; tools/test_app_ring_model.py's `tie` and
+/// `judge`). The codes either side of a gap name the ring frames it lost: the first code's frame is the one nearest the
+/// reader's position just before, and each gap's due code that plus its steps on from the first ([`signal::Gap::offset`]:
+/// silence takes none, so no amount of it moves the mapping). Its entries are the skip log's of this attachment with a ring
+/// span: one whose span starts at the gap's first frame, then the same stream's following on (or the reader's ring-wide
+/// ones), to the gap's end. verify doesn't know its own stream, so the entries are any stream's: a tie proves the driver
+/// logged exactly those ring frames as lost, and where another stream's entries tie them too, every chain that ties is named.
 ///
-/// Ok: such a chain ends exactly at the gap's end (a resync or live discard among them fails: the feed's position was invalid,
-/// and those frames reached no stream). Fail: one starts there but none ends there (an entry for its span with other frames),
-/// or none starts there. Inconclusive instead where the chain that falls short holds an entry still being filled in or
-/// untracked, or where none starts there and the window's events weren't all read ([`LogWindow::lost`]).
+/// Ok: such a chain ends exactly at the gap's end and holds only skips the ring's rules allow ([`allowed`]). Fail: a chain
+/// that ties holds another kind (a late read or a jump: a loss; a resync or a live discard: frames no stream got); or one
+/// starts there but none ends there (an entry for its span with other frames), or none starts there. Inconclusive instead
+/// where chains of different streams tie and are judged differently, where the window's events weren't all read
+/// ([`LogWindow::lost`]) and no chain ties, or where an entry whose ring span may be short (still being filled in, or
+/// untracked: the driver's records ran out) could hold the frames no chain reached.
 fn tie_gaps(before: &Stats, r: &CheckReport, start: u64, window: &LogWindow) -> Vec<GapTie> {
     // No code, no gap (the checker sets the two together).
     let Some(first_code) = r.first_code else { return Vec::new() };
-    let first_index = r.first_code_index.unwrap_or(0);
     let first = ring_frame(first_code, start, before.attached_read_frame);
     let attach = before.ring.attaches as u32;
-    let spans: Vec<&Event> = window
-        .entries
-        .iter()
-        .filter(|e| RING_SKIPS.contains(&e.kind) && e.attach == attach && e.ring().is_some_and(|(lo, hi)| hi > lo))
-        .collect();
+    let ours: Vec<&Event> = window.entries.iter().filter(|e| RING_SKIPS.contains(&e.kind) && e.attach == attach).collect();
+    let spans: Vec<&Event> = ours.iter().copied().filter(|e| e.ring().is_some_and(|(lo, hi)| hi > lo)).collect();
+    // Entries whose true ring span may reach further than the one logged (or that have none yet): frames no chain reaches may
+    // be theirs.
+    let unsure: Vec<&Event> = ours.iter().copied().filter(|e| e.flags & (EVENTF_PENDING | EVENTF_UNTRACKED) != 0).collect();
     r.gap_list
         .iter()
         .map(|g| {
-            let near = first.wrapping_add(g.index.saturating_sub(first_index));
-            let (lo, hi) = (ring_frame(g.due, start, near), ring_frame(g.got, start, near));
+            let lo = first.wrapping_add(g.offset);
+            let hi = lo.wrapping_add(u64::from(g.got.wrapping_sub(g.due)) % signal::CODE_MODULUS);
             let mut short: Option<(Vec<&Event>, u64)> = None;
-            let mut tied: Option<Vec<&Event>> = None;
+            let mut tied: Vec<Vec<&Event>> = Vec::new();
             for head in spans.iter().filter(|e| e.ring_from == lo) {
                 let mut chain = vec![*head];
                 let mut at = head.ring_to;
@@ -1446,34 +1470,36 @@ fn tie_gaps(before: &Stats, r: &CheckReport, start: u64, window: &LogWindow) -> 
                     at = next.ring_to;
                 }
                 if at == hi {
-                    tied = Some(chain);
-                    break;
+                    tied.push(chain);
+                } else {
+                    short.get_or_insert((chain, at));
                 }
-                short.get_or_insert((chain, at));
             }
+            // An unsure entry may hold frames from `from` to the gap's end: it has no ring span yet, or its span overlaps or
+            // meets them.
+            let unsure_from = |from: u64| unsure.iter().any(|e| e.ring().is_none_or(|(a, b)| b <= a || (a <= hi && b >= from)));
             let what = format!(
-                "ring frames [{lo}, {hi}) ({} frames{})",
+                "ring frames [{lo}, {hi}) ({} frames, the code after them the recording's frame {}{})",
                 hi.wrapping_sub(lo),
+                g.index,
                 if g.silence != 0 { format!(", {} frames of silence before the code after it", g.silence) } else { String::new() }
             );
             let list = |chain: &[&Event]| chain.iter().map(|&e| entry_brief(e)).collect::<Vec<_>>().join(", then ");
-            let (outcome, why) = match (tied, short) {
-                (Some(chain), _) if chain.iter().any(|e| ring_wide(e.kind)) => (
-                    Outcome::Fail,
-                    format!("the skip log's {}: the feed's write position was invalid, and those frames reached no stream", list(&chain)),
-                ),
-                (Some(chain), _) => (Outcome::Ok, format!("the skip log's {}", list(&chain))),
-                (None, Some((chain, at))) if chain.iter().any(|e| e.flags & (EVENTF_PENDING | EVENTF_UNTRACKED) != 0) => (
-                    Outcome::Inconclusive,
-                    format!(
-                        "the skip log's {} reach only to {at}, one of them still being filled in, or untracked: inconclusive",
-                        list(&chain)
-                    ),
-                ),
-                (None, Some((chain, at))) => {
+            let (outcome, why) = match (tied.as_slice(), short) {
+                ([], Some((chain, at)))
+                    if window.lost != 0 || unsure_from(at) || chain.iter().any(|e| e.flags & (EVENTF_PENDING | EVENTF_UNTRACKED) != 0) =>
+                {
+                    let unsure_why = if window.lost != 0 {
+                        format!("{} of the log's events over the recording are no longer in it (it keeps {SKIP_LOG_ENTRIES})", window.lost)
+                    } else {
+                        "an entry's ring frames may be short (still being filled in, or untracked)".to_string()
+                    };
+                    (Outcome::Inconclusive, format!("the skip log's {} reach only to {at}, but {unsure_why}: inconclusive", list(&chain)))
+                }
+                ([], Some((chain, at))) => {
                     (Outcome::Fail, format!("the skip log's {} for its first frame reach to {at}, not its end", list(&chain)))
                 }
-                (None, None) if window.lost != 0 => (
+                ([], None) if window.lost != 0 => (
                     Outcome::Inconclusive,
                     format!(
                         "no entry in the skip log, but {} of its events over the recording are no longer in it (it keeps {}): \
@@ -1481,11 +1507,58 @@ fn tie_gaps(before: &Stats, r: &CheckReport, start: u64, window: &LogWindow) -> 
                         window.lost, SKIP_LOG_ENTRIES
                     ),
                 ),
-                (None, None) => (Outcome::Fail, "no entry in the skip log for it".to_string()),
+                ([], None) if unsure_from(lo) => (
+                    Outcome::Inconclusive,
+                    "no entry in the skip log starts at its first frame, but one whose ring frames may be short (still being \
+                     filled in, or untracked: the driver's records ran out) may hold them: inconclusive"
+                        .to_string(),
+                ),
+                ([], None) => (Outcome::Fail, "no entry in the skip log for it".to_string()),
+                (chains, _) => {
+                    let judged: Vec<(Outcome, String)> = chains.iter().map(|c| judge_chain(c, &list(c))).collect();
+                    if judged.iter().all(|(o, _)| *o == judged[0].0) {
+                        let others: Vec<String> = chains[1..].iter().map(|c| list(c)).collect();
+                        let tail = if others.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (also exactly its frames: {}; the log doesn't say whose the gap was)", others.join("; "))
+                        };
+                        (judged[0].0, format!("{}{tail}", judged[0].1))
+                    } else {
+                        let all: Vec<&str> = judged.iter().map(|(_, w)| w.as_str()).collect();
+                        (
+                            Outcome::Inconclusive,
+                            format!(
+                                "entries of more than one stream for exactly its frames, judged differently ({}): the log doesn't \
+                                 say whose the gap was: inconclusive",
+                                all.join("; ")
+                            ),
+                        )
+                    }
+                }
             };
             GapTie { outcome, text: format!("{what}: {why}") }
         })
         .collect()
+}
+
+/// A chain of entries that ties a gap (`list`: it in words), judged: Ok only if every entry is a skip the ring's rules allow
+/// ([`allowed`]).
+fn judge_chain(chain: &[&Event], list: &str) -> (Outcome, String) {
+    if chain.iter().any(|e| ring_wide(e.kind)) {
+        (Outcome::Fail, format!("the skip log's {list}: the feed's write position was invalid, and those frames reached no stream"))
+    } else if let Some(e) = chain.iter().find(|e| !allowed(e.kind)) {
+        (
+            Outcome::Fail,
+            format!(
+                "the skip log's {list}: the driver's record of a loss (a {}), not a skip the ring's rules allow (a taker's \
+                 handoff skip, or a skip to a shorter lag)",
+                e.kind_name()
+            ),
+        )
+    } else {
+        (Outcome::Ok, format!("the skip log's {list}"))
+    }
 }
 
 /// An entry in a few words: its number, kind, stream and frames.
@@ -1541,7 +1614,8 @@ fn log_counts_check(before: &Stats, after: &Stats, window: &LogWindow) -> Check 
 /// An entry as `stats` and verify print it: its number, its time before the snapshot (`now`), kind, stream and packet, its
 /// frames and spans, and its flags.
 fn event_text(e: &Event, now: u64, frequency: u64) -> String {
-    let ago = if frequency == 0 { 0.0 } else { now.wrapping_sub(e.qpc) as i64 as f64 / frequency as f64 };
+    // The driver reads QpcNow last (Control.cpp), so no entry is after it; one that is (a driver that read it first) shows 0.
+    let ago = if frequency == 0 { 0.0 } else { (now.wrapping_sub(e.qpc) as i64).max(0) as f64 / frequency as f64 };
     let ring = match e.ring() {
         Some((lo, hi)) if e.flags & EVENTF_BACKWARD != 0 => format!(", ring {lo} back to {hi}"),
         Some((lo, hi)) => format!(", ring [{lo}, {hi}) ({} frames)", hi.saturating_sub(lo)),
@@ -1573,9 +1647,17 @@ fn event_text(e: &Event, now: u64, frequency: u64) -> String {
     )
 }
 
-/// What [`record`] returns: STATS just before and just after the recording, the checker over its frames, and how long it waited
-/// after it for a stream to hold the reader slot, where none did as it ended.
-type Recorded = (Stats, Stats, SequenceChecker, Option<Duration>);
+/// What [`record`] returns: STATS just before and just after the recording, the checker over its frames, how long it waited
+/// after it for a stream to hold the reader slot (where none did as it ended), and the capture stream's own counts of frames
+/// the engine lost and discontinuities as the recording ended (before that wait's drain, which no check is of).
+struct Recorded {
+    before: Stats,
+    after: Stats,
+    checker: SequenceChecker,
+    vacancy: Option<Duration>,
+    lost_frames: u64,
+    discontinuities: u64,
+}
 
 /// Waits (draining the stream, up to [`READING_WAIT`]) for STATS to show a capture stream reading the ring and for the stream to
 /// deliver the signal, then records for `duration`: STATS just before and just after, and the checker over the frames between.
@@ -1606,6 +1688,7 @@ fn record(device: &Device, capture: &mut Capture, duration: Duration) -> Result<
         eprintln!("{what} within {wait} s of the stream's start: not recorded");
     }
     let mut after = read_stats(device)?;
+    let (lost_frames, discontinuities) = (capture.lost_frames, capture.discontinuities);
     let mut vacancy = None;
     if slot_vacant(&before, &after) {
         let t = Instant::now();
@@ -1615,7 +1698,7 @@ fn record(device: &Device, capture: &mut Capture, duration: Duration) -> Result<
         }
         vacancy = Some(t.elapsed());
     }
-    Ok((before, after, checker, vacancy))
+    Ok(Recorded { before, after, checker, vacancy, lost_frames, discontinuities })
 }
 
 /// `after` shows `before`'s attachment still published with no stream holding the reader slot.
@@ -4260,7 +4343,7 @@ mod tests {
         CheckReport {
             gaps: spans.len() as u64,
             gap_frames: spans.iter().map(|(lo, hi)| hi - lo).sum(),
-            gap_list: spans.iter().map(|&(lo, hi)| Gap { index: lo, due: lo as u32, got: hi as u32, silence: 0 }).collect(),
+            gap_list: spans.iter().map(|&(lo, hi)| Gap { index: lo, offset: lo, due: lo as u32, got: hi as u32, silence: 0 }).collect(),
             first_code_index: Some(0),
             steps_ok: FRAMES - 1 - spans.len() as u64,
             ..clean_recording()
@@ -4549,12 +4632,24 @@ mod tests {
         assert_eq!(failed(&verify_checks(&before, &counted(801), &more, &seen)), Vec::<&str>::new());
         // The live run on a66d8ab (A1, 2026-11-23): the stopping reader held the slot while its timer stopped, so the stream that
         // played on read past the copy's end and lost the 55 frames the taker then wrote there. Its silence was counted (430:
-        // the 320, and the 110 past the copy's end), its gap nowhere (it failed). The skip log now has it as a late read, its
-        // ring span the taker's writes there: tied. Without that entry it still fails.
+        // the 320, and the 110 past the copy's end), its gap nowhere: verify failed it, which found the bug (m_AppNoSlot). The
+        // skip log now has it as a late read, its ring span the taker's writes there: tied, and still failed, a loss the
+        // ring's rules don't allow (the owner allowed a taker's skip and a skip to a shorter lag). Without the entry it fails
+        // as no entry's.
         let late = entry(2, EVENT_LATE_READ, 9, 110, (300_209, 300_264));
         let live = CheckReport { signal_frames: FRAMES - 430, zeros_inside: 430, zero_runs_inside: 1, ..gapped(&[(300_209, 300_264)]) };
-        assert_eq!(failed(&verify_checks(&before, &logged(counted(430), &[late]), &live, &seen)), Vec::<&str>::new());
+        let with_late = logged(counted(430), &[late]);
+        assert_eq!(failed(&verify_checks(&before, &with_late, &live, &seen)), ["bit-exact and in order"]);
+        let ties = tie_gaps(&before, &live, 0, &LogWindow::of(&before, &with_late));
+        assert_eq!(ties[0].outcome, Outcome::Fail);
+        assert!(
+            ties[0].text.contains("#2 late read (stream 9, 110 frames): the driver's record of a loss (a late read)"),
+            "{}",
+            ties[0].text
+        );
         assert_eq!(failed(&verify_checks(&before, &counted(430), &live, &seen)), ["bit-exact and in order"]);
+        let ties = tie_gaps(&before, &live, 0, &LogWindow::of(&before, &counted(430)));
+        assert!(ties[0].text.ends_with("no entry in the skip log for it"), "{}", ties[0].text);
         // A skip to a shorter lag logged in the window (another stream's, say) ties a gap of exactly its frames, and no other.
         let other = entry(2, EVENT_SECONDARY_SKIP, 10, 80, (310_000, 310_080));
         let skipped_too = logged(Stats { secondary_skips: 1, secondary_skipped_frames: 80, ..after }, &[other]);
@@ -4637,7 +4732,7 @@ mod tests {
             let c = checks(&r);
             assert_eq!(failed(&c), bad);
             let detail = &c.iter().find(|c| c.name == "bit-exact and in order").unwrap().detail;
-            assert!(detail.contains("every gap is its entries in the skip log"), "{detail}");
+            assert!(detail.contains("every gap is the skip log's record of a skip the ring's rules allow"), "{detail}");
             assert_eq!(others_named(&r), [what]);
         }
         // Another check failing makes the verdict FAIL.
@@ -4653,10 +4748,11 @@ mod tests {
             .collect()
     }
 
-    /// A gap may be a chain of one stream's entries end to end (a skip to a shorter lag, then its late read: the copy didn't
-    /// hold the whole span yet), and a recording may hold a gap of each kind (three.sh's B runs: a stream played on through one
-    /// handoff, skipping, and took the slot at the next). Another stream's entry doesn't extend the chain; one that falls
-    /// short with an entry still being filled in is inconclusive.
+    /// A gap may be a chain of one stream's entries end to end, and a recording may hold a gap of each kind (three.sh's B runs:
+    /// a stream played on through one handoff, skipping, and took the slot at the next). Another stream's entry doesn't extend
+    /// the chain. A chain that holds a late read (a skip to a shorter lag, then its late read: the copy didn't hold the whole
+    /// span yet) ties, and fails: the late read is a loss the ring's rules don't allow. One that falls short with an entry
+    /// still being filled in is inconclusive.
     #[test]
     fn verify_ties_a_gap_to_a_chain_of_one_streams_entries() {
         let before = reading(counters(3, 1_000_000, 0));
@@ -4664,29 +4760,63 @@ mod tests {
         let late = entry(2, EVENT_LATE_READ, 9, 240, (300_320, 300_400));
         let other = entry(3, EVENT_LATE_READ, 10, 240, (300_320, 300_500));
         let handoff = entry(4, EVENT_HANDOFF_SKIP, 9, 209, (400_000, 400_209));
+        // Two allowed skips of one stream's end to end (synthetic: a chain of the two kinds the rules allow).
+        let first = entry(5, EVENT_SECONDARY_SKIP, 11, 100, (450_000, 450_100));
+        let then = entry(6, EVENT_HANDOFF_SKIP, 11, 50, (450_100, 450_150));
         let counted = Stats {
-            reader_handoffs: 1,
-            handoff_skipped_frames: 209,
-            secondary_skips: 1,
-            secondary_skipped_frames: 320,
+            reader_handoffs: 2,
+            handoff_skipped_frames: 259,
+            secondary_skips: 2,
+            secondary_skipped_frames: 420,
             ..reading(counters(3, 1_000_000 + FRAMES, 0))
         };
-        let after = logged(counted, &[skip, late, other, handoff]);
+        let after = logged(counted, &[skip, late, other, handoff, first, then]);
         let judge = |after: &Stats, r: &CheckReport| failed(&verify_checks(&before, after, r, &StreamSeen::default()));
-        assert_eq!(judge(&after, &gapped(&[(300_000, 300_400)])), Vec::<&str>::new(), "a skip and its late read");
-        assert_eq!(judge(&after, &gapped(&[(300_000, 300_400), (400_000, 400_209)])), Vec::<&str>::new(), "a gap of each kind");
-        assert_eq!(judge(&after, &gapped(&[(300_320, 300_500)])), Vec::<&str>::new(), "the other stream's late read alone");
-        assert_eq!(judge(&after, &gapped(&[(300_000, 300_500)])), ["bit-exact and in order"], "another stream's entry");
+        let bad = ["bit-exact and in order"];
+        let text = |after: &Stats, spans: &[(u64, u64)]| {
+            tie_gaps(&before, &gapped(spans), 0, &LogWindow::of(&before, after)).into_iter().map(|t| t.text).collect::<Vec<_>>()
+        };
+        assert_eq!(judge(&after, &gapped(&[(450_000, 450_150)])), Vec::<&str>::new(), "a chain of allowed skips");
+        assert_eq!(judge(&after, &gapped(&[(450_000, 450_150), (400_000, 400_209)])), Vec::<&str>::new(), "a gap of each kind");
+        assert_eq!(judge(&after, &gapped(&[(300_000, 300_320)])), Vec::<&str>::new(), "the skip alone");
+        assert_eq!(judge(&after, &gapped(&[(300_000, 300_400)])), bad, "a skip and its late read: tied, and a loss");
+        let [t] = &text(&after, &[(300_000, 300_400)])[..] else { panic!() };
+        assert!(t.contains("#1 skip to a shorter lag (stream 9, 320 frames), then #2 late read (stream 9, 240 frames)"), "{t}");
+        assert!(t.contains("the driver's record of a loss (a late read)"), "{t}");
+        assert_eq!(judge(&after, &gapped(&[(300_320, 300_500)])), bad, "the other stream's late read alone");
+        assert_eq!(judge(&after, &gapped(&[(300_000, 300_500)])), bad, "another stream's entry");
         let pending = logged(after, &[Event { flags: EVENTF_RING | EVENTF_PENDING, ..late }]);
         assert_eq!(judge(&pending, &gapped(&[(300_000, 300_480)])), ["bit-exact and in order: inconclusive"]);
-        assert_eq!(judge(&after, &gapped(&[(300_000, 300_480)])), ["bit-exact and in order"], "settled: its frames are final");
+        assert_eq!(judge(&after, &gapped(&[(300_000, 300_480)])), bad, "settled: its frames are final");
         // A resync's frames reached no stream: tied, and failed (the feed's write position was invalid).
-        let resync = entry(5, EVENT_RESYNC, 7, 500, (500_000, 500_500));
+        let resync = entry(7, EVENT_RESYNC, 7, 500, (500_000, 500_500));
         let resynced = logged(Stats { ring: RingStats { resyncs: 1, ..counted.ring }, ..after }, &[resync]);
-        let c = verify_checks(&before, &resynced, &gapped(&[(500_000, 500_500)]), &StreamSeen::default());
-        assert_eq!(failed(&c), ["bit-exact and in order"]);
-        let ties = tie_gaps(&before, &gapped(&[(500_000, 500_500)]), 0, &LogWindow::of(&before, &resynced));
-        assert!(ties[0].text.contains("#5 resync (stream 7, 500 frames): the feed's write position was invalid"), "{}", ties[0].text);
+        assert_eq!(judge(&resynced, &gapped(&[(500_000, 500_500)])), bad);
+        let [t] = &text(&resynced, &[(500_000, 500_500)])[..] else { panic!() };
+        assert!(t.contains("#7 resync (stream 7, 500 frames): the feed's write position was invalid"), "{t}");
+        // A jump in a stream's own time line: tied, and failed.
+        let jump = entry(7, EVENT_SECONDARY_JUMP, 9, 192, (600_000, 600_192));
+        assert_eq!(judge(&logged(after, &[jump]), &gapped(&[(600_000, 600_192)])), bad);
+    }
+
+    /// verify doesn't know its own stream: an entry of any stream's for exactly the gap's frames ties it, and where two
+    /// streams' entries do (two streams' identical skips: the app ring model has them), both are named. Judged differently
+    /// (an allowed skip and a late read for the same frames), the log can't say whose the gap was: inconclusive.
+    #[test]
+    fn verify_names_every_streams_entry_for_a_gaps_frames() {
+        let before = reading(counters(3, 1_000_000, 0));
+        let counted = Stats { secondary_skips: 2, secondary_skipped_frames: 640, ..reading(counters(3, 1_000_000 + FRAMES, 0)) };
+        let s2 = entry(1, EVENT_SECONDARY_SKIP, 12, 320, (4_789, 5_109));
+        let s3 = entry(2, EVENT_SECONDARY_SKIP, 13, 320, (4_789, 5_109));
+        let after = logged(counted, &[s2, s3]);
+        let r = gapped(&[(4_789, 5_109)]);
+        assert_eq!(failed(&verify_checks(&before, &after, &r, &StreamSeen::default())), Vec::<&str>::new());
+        let ties = tie_gaps(&before, &r, 0, &LogWindow::of(&before, &after));
+        assert!(ties[0].text.contains("stream 12") && ties[0].text.contains("stream 13"), "{}", ties[0].text);
+        assert!(ties[0].text.contains("the log doesn't say whose the gap was"), "{}", ties[0].text);
+        let late = Stats { secondary_skips: 1, secondary_skipped_frames: 320, ..counted };
+        let late = logged(late, &[s2, Event { kind: EVENT_LATE_READ, ..s3 }]);
+        assert_eq!(failed(&verify_checks(&before, &late, &r, &StreamSeen::default())), ["bit-exact and in order: inconclusive"]);
     }
 
     /// INCONCLUSIVE only where the skip log can't say: more events over the recording than it keeps, so some of the window's
@@ -4694,26 +4824,85 @@ mod tests {
     /// a gap with no entry fails.
     #[test]
     fn verify_is_inconclusive_only_where_the_log_cant_say() {
-        let jump = |n: u64| entry(n, EVENT_SECONDARY_JUMP, 9, 10, (n * 1_000, n * 1_000 + 10));
-        let before = logged(reading(counters(3, 1_000_000, 0)), &(1..=10).map(jump).collect::<Vec<_>>());
+        let skip = |n: u64| entry(n, EVENT_SECONDARY_SKIP, 9, 10, (n * 1_000, n * 1_000 + 10));
+        let skips = |n: u64, frames_copied| {
+            let s = Stats { secondary_skips: n, secondary_skipped_frames: 10 * n, ..reading(counters(3, frames_copied, 0)) };
+            logged(s, &(1..=n).map(skip).collect::<Vec<_>>())
+        };
+        let before = skips(10, 1_000_000);
         // The after copies hold what the driver's slots would: every event so far, the latest 64 kept.
-        let wrapped = logged(reading(counters(3, 1_000_000 + FRAMES, 0)), &(1..=80).map(jump).collect::<Vec<_>>());
+        let wrapped = skips(80, 1_000_000 + FRAMES);
         let seen = StreamSeen::default();
         let judge = |after: &Stats, r: &CheckReport| failed(&verify_checks(&before, after, r, &seen));
+        let unsure = "bit-exact and in order: inconclusive";
         let unsure_counts = "the skip log against the counters: inconclusive";
         // 70 events, 64 kept: events 11 to 16 are in neither copy.
         assert_eq!(LogWindow::of(&before, &wrapped).lost, 6);
         assert_eq!(judge(&wrapped, &gapped(&[(20_000, 20_010)])), [unsure_counts], "its entry is still there");
-        assert_eq!(judge(&wrapped, &gapped(&[(12_000, 12_010)])), ["bit-exact and in order: inconclusive", unsure_counts]);
+        assert_eq!(judge(&wrapped, &gapped(&[(12_000, 12_010)])), [unsure, unsure_counts]);
         assert_eq!(judge(&wrapped, &gapped(&[(5_000, 5_010)])), [unsure_counts], "before's copy has it");
-        // 60 events: every one read. A gap with no entry fails.
-        let whole = logged(reading(counters(3, 1_000_000 + FRAMES, 0)), &(1..=70).map(jump).collect::<Vec<_>>());
+        // A chain that falls short where the rest may be among the events no longer in the log: inconclusive too.
+        assert_eq!(judge(&wrapped, &gapped(&[(20_000, 20_020)])), [unsure, unsure_counts]);
+        // 60 events: every one read. A gap with no entry fails, as does one an entry starts but doesn't end.
+        let whole = skips(70, 1_000_000 + FRAMES);
         assert_eq!(LogWindow::of(&before, &whole).lost, 0);
         assert_eq!(judge(&whole, &gapped(&[(3_500, 3_510)])), ["bit-exact and in order"]);
+        assert_eq!(judge(&whole, &gapped(&[(20_000, 20_020)])), ["bit-exact and in order"]);
         // A slot holding another number than its own can't be read: the same.
         let mut torn = whole;
         torn.skip_log.0[20].sequence = 999;
-        assert_eq!(judge(&torn, &gapped(&[(3_500, 3_510)])), ["bit-exact and in order: inconclusive", unsure_counts]);
+        assert_eq!(judge(&torn, &gapped(&[(3_500, 3_510)])), [unsure, unsure_counts]);
+    }
+
+    /// An entry the driver marked UNTRACKED (its records of the copy, or of the spans being filled in, ran out) may have a ring
+    /// span short at its start, or none: no entry then starts at the gap's first frame, but the log can't rule that one out.
+    /// Inconclusive, not failed; without the flag, the same gap fails.
+    #[test]
+    fn verify_is_inconclusive_for_a_gap_an_untracked_entry_may_hold() {
+        let before = reading(counters(3, 1_000_000, 0));
+        let counted = Stats { secondary_skips: 1, secondary_skipped_frames: 320, ..reading(counters(3, 1_000_000 + FRAMES, 0)) };
+        let skip = entry(1, EVENT_SECONDARY_SKIP, 9, 320, (300_040, 300_320));
+        let judge =
+            |e: Event| failed(&verify_checks(&before, &logged(counted, &[e]), &gapped(&[(300_000, 300_320)]), &StreamSeen::default()));
+        assert_eq!(judge(skip), ["bit-exact and in order"], "an entry for other frames");
+        let untracked = Event { flags: EVENTF_RING | EVENTF_UNTRACKED, ..skip };
+        assert_eq!(judge(untracked), ["bit-exact and in order: inconclusive"], "its start may be short");
+        let no_span = Event { flags: EVENTF_UNTRACKED, ring_from: 0, ring_to: 0, ..skip };
+        assert_eq!(judge(no_span), ["bit-exact and in order: inconclusive"], "no ring span at all");
+        // One far from the gap's frames holds none of them.
+        let far = Event { ring_from: 900_000, ring_to: 900_320, ..untracked };
+        assert_eq!(judge(far), ["bit-exact and in order"]);
+        // An untracked entry that ties it exactly is judged as any other.
+        let exact = Event { ring_from: 300_000, ..untracked };
+        assert_eq!(judge(exact), Vec::<&str>::new());
+    }
+
+    /// Each gap's ring frames come from its steps on from the first code, not its place in the recording: silence past 2^22
+    /// frames before a gap (a long soak's counted underruns) moves its index that far from its frames, and it still ties.
+    #[test]
+    fn a_gap_after_long_silence_still_names_its_frames() {
+        // A long soak: 50,000,000 frames of signal, and 5,000,000 of the reader's underrun silence before the gap.
+        let (signal, silence) = (50_000_000, 5_000_000);
+        let before = reading(counters(3, 1_000_000, 0));
+        let skip = entry(1, EVENT_HANDOFF_SKIP, 8, 449, (30_000_000, 30_000_449));
+        let ring = counters(3, 1_000_000 + signal + silence, silence);
+        let after = logged(Stats { reader_handoffs: 1, handoff_skipped_frames: 449, ..reading(ring) }, &[skip]);
+        let gap =
+            Gap { index: 30_000_000 + silence, offset: 30_000_000, due: 30_000_000 % (1 << 23), got: 30_000_449 % (1 << 23), silence: 0 };
+        let r = CheckReport {
+            frames: signal + silence,
+            signal_frames: signal,
+            zeros_inside: silence,
+            zero_runs_inside: 1,
+            gaps: 1,
+            gap_frames: 449,
+            gap_list: vec![gap],
+            ..clean_recording()
+        };
+        assert_eq!(failed(&verify_checks(&before, &after, &r, &StreamSeen::default())), Vec::<&str>::new());
+        // Its index alone, the silence taken as steps, would name frames 5,000,000 on: no entry there.
+        let drifted = CheckReport { gap_list: vec![Gap { offset: gap.index, ..gap }], ..r.clone() };
+        assert_eq!(failed(&verify_checks(&before, &after, &drifted, &StreamSeen::default())), ["bit-exact and in order"]);
     }
 
     /// The codes name the ring's frames: nearest the reader's position, with the feed's --start, through the codes' wrap and
@@ -4734,7 +4923,7 @@ mod tests {
             logged(Stats { reader_handoffs: 1, handoff_skipped_frames: 449, ..reading(counters(3, 1_000_000 + FRAMES, 0)) }, &[skip]);
         let code = |ring: u64| ((ring + start) % m) as u32;
         let r = CheckReport {
-            gap_list: vec![Gap { index: 1_000, due: code(1_000), got: code(1_449), silence: 0 }],
+            gap_list: vec![Gap { index: 1_000, offset: 1_000, due: code(1_000), got: code(1_449), silence: 0 }],
             first_code: Some(code(0)),
             ..gapped(&[(1_000, 1_449)])
         };

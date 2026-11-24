@@ -599,11 +599,15 @@ protected:
     BOOLEAN         m_AppNoSlot;        // it gave the reader slot up (AppRingReaderStop) and may take it only after its next Run
 
     // noise-filter (TODO 19): its open entries in the event logs (Sequence; 0: none), each a run extended while it lasts
-    // (nf_vmic.h, "The event logs"), cleared at Run. App ring lock held for the first three, the loopback's for the last.
+    // (nf_vmic.h, "The event logs"). A run ends at a pass without its silence, at Run, and wherever its source stops serving
+    // the stream's passes: the app ring's runs at a pass with no ring attached or of another attachment than m_EvAttach (an
+    // ATTACH between two passes), the loopback's at a pass the app ring served or the loopback zero-filled for want of a
+    // render stream or format. Only this stream's passes (and Run, its timer stopped) touch them, the app ring's under its lock.
     ULONGLONG       m_EvUnderrun;       // its underrun run as the reader (READER_UNDERRUN)
     ULONGLONG       m_EvSilence;        // its run of silence playing the copy (SECONDARY_UNDERRUN)
     ULONGLONG       m_EvLate;           // its reads past the copy's end (LATE_READ), and the time-line frame they reach
     ULONGLONG       m_EvLateEnd;
+    ULONGLONG       m_EvAttach;         // the attachment (NF_VMIC_RING_STATS.Attaches) the three above are of
     ULONGLONG       m_EvLbUnderrun;     // its loopback underrun run (LOOPBACK_UNDERRUN)
 
     // noinline: takes the ring's spin lock; kept out of line as its render counterparts are, so no PAGE caller can inline it.

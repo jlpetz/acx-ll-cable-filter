@@ -113,7 +113,8 @@ is shorter moving on to its lag at once and skipping the difference once, counte
 `SecondarySkippedFrames`: the owner, 2026-11-23, lower latency over a one-time skip; from a66d8ab to e801320 they kept the
 longer lag until they next ran). A reader gives the reader slot up as its Pause starts, while its timer still runs: given
 up after the timer stopped, it left the copy short for as long as the stop took, and the streams playing on lost 55 to 111
-frames at live handoffs (2026-11-23).
+frames at live handoffs (2026-11-23). More than one can run: the microphones of two of the driver's devices share the one
+ring, and a RAW and a DEFAULT client make two device streams on one (spike check 4's live runs).
 
 Each device also keeps two event logs, which STATS copies for the app feed's device (`nf_vmic.h`, "The event logs"; the
 owner, 2026-11-24: telemetry to find bugs by, and to prove the design). The skip log (64 entries) holds every event in which
@@ -121,11 +122,12 @@ a capture stream never got some of the audio it was due, each with its stream (a
 span on the QPC time line and the ring's frames it concerns: a taker's handoff skip, a skip to a shorter lag, a jump in a
 stream's own time line, a late read (a stream that read past the copy's end gets silence, and the frames the reader then
 writes there never reach it: the entry's ring frames are filled in by those writes), a resync, a live discard, and the
-loopback's lead skip. The underrun log (32) holds the silence streams got with nothing lost, one entry a run. So
-`nf-vmic-test verify` ties each gap in a recording to its own entries, by the ring frames its codes name, with any number of
-recorders (where driver-wide counters can't say whose a skip was), and checks the log against the counters.
-More than one can run: the microphones of two of the driver's devices share the one ring, and a RAW and a DEFAULT client
-make two device streams on one (spike check 4's live runs).
+loopback's lead skip. The underrun log (32) holds the silence streams got with nothing lost, one entry a run (of one
+attachment). So `nf-vmic-test verify` ties each gap in a recording to an entry for exactly the ring frames its codes name,
+with any number of recorders (where driver-wide counters can't say whose a skip was); the entry may be any stream's, since
+verify doesn't know its own, and where two streams' entries name the same frames it lists both. A gap passes only as one of
+the two skips the owner allowed (a taker's, 2026-11-20; to a shorter lag, 2026-11-23): one tied to a late read, a jump or a
+resync is the driver's record of a loss, and fails. verify also checks the log against the counters.
 
 The ring is raw float32, so a conflict with another format shows at open time, both ways: while a ring is attached, a
 capture stream in another format is refused at creation (STATUS_NOT_SUPPORTED, `RefusedCaptureOpens`), and an ATTACH

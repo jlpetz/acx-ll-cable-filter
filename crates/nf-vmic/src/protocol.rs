@@ -512,6 +512,7 @@ pub struct Stats {
     /// `STATS_*` bits.
     pub flags: u32,
     pub qpc_frequency: u64,
+    /// The snapshot's QPC, read last: every count and event-log entry in it is earlier.
     pub qpc_now: u64,
     /// The attached app's process (0: none attached).
     pub attached_pid: u32,

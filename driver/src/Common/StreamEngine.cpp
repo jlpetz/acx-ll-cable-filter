@@ -1745,6 +1745,7 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_EvSilence(0),
     m_EvLate(0),
     m_EvLateEnd(0),
+    m_EvAttach(0),
     m_EvLbUnderrun(0)
 {
     PAGED_CODE();
@@ -1869,6 +1870,11 @@ CCaptureStreamEngine::ProcessPacket()
     {
         LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
     }
+    else
+    {
+        // The app ring served the pass: its loopback underrun run, if any, has ended (only this stream's passes touch it).
+        m_EvLbUnderrun = 0;
+    }
 }
 
 _Use_decl_annotations_
@@ -1905,6 +1911,7 @@ CCaptureStreamEngine::Run()
         m_EvSilence = 0;
         m_EvLate = 0;
         m_EvLateEnd = 0;
+        m_EvAttach = 0;
         m_EvLbUnderrun = 0;
     }
 
@@ -1933,6 +1940,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
 
     if (ring == NULL)
     {
+        m_EvLbUnderrun = 0;
         RtlZeroMemory(PacketBuffer, PacketSize);
         return;
     }
@@ -2091,6 +2099,8 @@ CCaptureStreamEngine::LoopbackCapturePass(
     return;
 
 zero:
+    // Idle or in another format: no render audio this pass, so its underrun run (render audio due but not there) has ended.
+    m_EvLbUnderrun = 0;
     KeReleaseSpinLock(&ring->Lock, oldIrql);
     RtlZeroMemory(PacketBuffer, PacketSize);
 }
@@ -2472,13 +2482,27 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     if (ring->Header == NULL)
     {
-        // No app ring attached: the loopback serves this pass. A place in an earlier attachment's copy means nothing now.
+        // No app ring attached: the loopback serves this pass. A place in an earlier attachment's copy means nothing now, and
+        // its open runs in the event logs have ended (the next attachment's silence starts its own).
         m_AppOtherValid = FALSE;
+        m_EvUnderrun = 0;
+        m_EvSilence = 0;
+        m_EvLate = 0;
         KeReleaseSpinLock(&ring->Lock, oldIrql);
         return FALSE;
     }
 
     ring->Stats.Passes++;
+
+    // Its open runs in the event logs are of one attachment: an ATTACH since its latest pass (a detach and an attach between
+    // two of its passes) ends them, so no entry spans two attachments or keeps an earlier one's Attach.
+    if (m_EvAttach != ring->Stats.Attaches)
+    {
+        m_EvUnderrun = 0;
+        m_EvSilence = 0;
+        m_EvLate = 0;
+        m_EvAttach = ring->Stats.Attaches;
+    }
 
     if (ring->LiveFeed && m_AppFormatOk && !m_AppNoSlot && m_AppLiveAttach != ring->Stats.Attaches)
     {
@@ -2565,6 +2589,8 @@ CCaptureStreamEngine::AppRingCapturePass(
         //
         ring->Stats.MismatchPackets++;
         ring->AttachMismatchPackets++;
+        // Not an underrun (MismatchPackets counts it): its underrun run as the reader, if any, has ended.
+        m_EvUnderrun = 0;
         AppRingStoreCounters(ring, NF_VMIC_STATE_ATTACHED | NF_VMIC_STATE_FORMAT_MISMATCH, m_LbPacketFrames, qpc);
         KeReleaseSpinLock(&ring->Lock, oldIrql);
         RtlZeroMemory(PacketBuffer, PacketSize);
@@ -2586,6 +2612,12 @@ CCaptureStreamEngine::AppRingCapturePass(
     {
         held = (ULONG)MIN(ring->HistoryEnd - frame, (ULONGLONG)packetFrames);
         AppRingPlayCopy(frame, held, PacketBuffer);
+    }
+    else
+    {
+        // Nothing of the copy played at this pass: its runs playing it (silence, reads past its end), if any, have ended.
+        m_EvSilence = 0;
+        m_EvLate = 0;
     }
     want = packetFrames - held;
     dest = PacketBuffer + (SIZE_T)held * NF_VMIC_FRAME_BYTES;

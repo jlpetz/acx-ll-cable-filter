@@ -172,9 +172,9 @@ NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; time
 
     Offset Size Field                    Content
     ------ ---- ------------------------ -----------------------------------------------------------------------------
-       0     4  Magic, 4 Version, 8 StatsBytes (672), 12 Flags (NF_VMIC_STATS_*)
+       0     4  Magic, 4 Version, 8 StatsBytes (6848), 12 Flags (NF_VMIC_STATS_*)
       16     8  QpcFrequency             KeQueryPerformanceCounter's frequency
-      24     8  QpcNow                   the QPC when the snapshot was taken
+      24     8  QpcNow                   the QPC when the snapshot was taken (read last: every count and entry in it is earlier)
       32     4  AttachedPid              the attached app's process id (0: none)
       36     4  AttachedCapacityFrames
       40     8  AttachedReadFrame        the driver's position in the attached ring
@@ -268,7 +268,9 @@ NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; time
     HANDOFF_SKIP, SECONDARY_SKIP, SECONDARY_JUMP, LATE_READ, RESYNC, LIVE_DISCARD and LOOPBACK_LEAD_SKIP. The underrun log
     holds the silence a stream got with nothing lost (READER_UNDERRUN, SECONDARY_UNDERRUN, LOOPBACK_UNDERRUN), one entry a
     run of a stream's passes that each had some, logged at the run's first pass and extended in place while it lasts, so
-    silence can't flood it, and kept apart so that it can't push skips out of theirs. Each log numbers its events from 1
+    silence can't flood it, and kept apart so that it can't push skips out of theirs. A run is of one attachment and one
+    source: it ends at a pass without such silence, at the stream's Run, at a pass of another attachment or with none, and
+    (the loopback's) at a pass the app ring served or the loopback zero-filled idle. Each log numbers its events from 1
     (Sequence) and keeps the latest NF_VMIC_*_LOG_ENTRIES: event n in slot (n - 1) % entries; *EventsLogged is the newest's
     number, so the window between two snapshots holds every event in it unless its count rose by more than the slots. STATS
     copies the logs under their own lock, nested in the app ring's and the loopback's (which every writer of the app feed
@@ -297,7 +299,9 @@ NF_VMIC_STATS (6848 bytes; all counters cumulative since the driver loaded; time
         it (Frames), and the audio the reader then writes there never reaches it. One entry for a stream's contiguous reads
         past the end, extended while they last; its ring span is the audio the reader writes there, filled in by those
         writes (NF_VMIC_EVENTF_PENDING until the copy's end has passed the span). Frames: SecondaryUnderrunFrames' part.
-        A SECONDARY_SKIP or SECONDARY_JUMP whose span ran past the copy's end is filled in the same way.
+        A SECONDARY_SKIP or SECONDARY_JUMP whose span ran past the copy's end is filled in the same way. SECONDARY_JUMP and
+        LATE_READ are the driver's record of a loss, not one of the two skips the owner allowed (a taker's, 2026-11-20; to a
+        shorter lag, 2026-11-23): nf-vmic-test verify ties a gap to them and fails it.
       - RESYNC: the reader found WriteFrame invalid (Resyncs): ReadFrame moved from RingFrom to RingTo, and the frames
         between never reach any stream (NF_VMIC_EVENTF_BACKWARD: WriteFrame was behind). Frames: the move, if forward.
       - LIVE_DISCARD: a live attachment's first pass after every reader stopped discarded RingFrom to RingTo. Frames: those.

@@ -528,12 +528,11 @@ NfVmic_Stats(
     }
 
     RtlZeroMemory(out, sizeof(*out));
-    now = KeQueryPerformanceCounter(&frequency);
+    (void)KeQueryPerformanceCounter(&frequency);
     out->Magic = NF_VMIC_MAGIC;
     out->Version = NF_VMIC_VERSION;
     out->StatsBytes = sizeof(NF_VMIC_STATS);
     out->QpcFrequency = (UINT64)frequency.QuadPart;
-    out->QpcNow = (UINT64)now.QuadPart;
     out->SkipLogEntries = NF_VMIC_SKIP_LOG_ENTRIES;
     out->UnderrunLogEntries = NF_VMIC_UNDERRUN_LOG_ENTRIES;
     out->EventBytes = sizeof(NF_VMIC_EVENT);
@@ -604,6 +603,11 @@ NfVmic_Stats(
         KeReleaseSpinLockFromDpcLevel(&loopback->Lock);
         out->Flags |= NF_VMIC_STATS_LOOPBACK;
     }
+
+    // The snapshot's time, read last: every counter and event-log entry it holds is from before it (an entry's Qpc is read as it
+    // is logged), so nf-vmic-test's ages of the entries are never negative.
+    now = KeQueryPerformanceCounter(NULL);
+    out->QpcNow = (UINT64)now.QuadPart;
 
     KeReleaseSpinLock(&ring->Lock, oldIrql);
 
