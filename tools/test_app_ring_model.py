@@ -266,8 +266,11 @@ ALLOWED = ("handoff", "secondary")  # the skips the owner allowed: a taker's (20
 
 
 def candidates(lo, hi, entries):
-    """Every chain that ties [lo, hi) (ties()), each with its verdict: "ok" where it holds only allowed skips, else "fail"."""
-    return [(chain, "ok" if all(e.kind in ALLOWED for e in chain) else "fail") for chain in ties(lo, hi, entries)]
+    """Every chain that ties [lo, hi) (ties()), each with its verdict: "ok" where it holds only allowed skips, else "fail". An
+    entry still pending is no gap's record (nf-vmic-test's LogWindow::settling: a stream's own entries for a gap are settled
+    before it reads the code after it, which check_log asserts), so verify leaves it out, and so does this."""
+    settled = [e for e in entries if not e.pending]
+    return [(chain, "ok" if all(e.kind in ALLOWED for e in chain) else "fail") for chain in ties(lo, hi, settled)]
 
 
 def judge(lo, hi, entries):
@@ -275,8 +278,9 @@ def judge(lo, hi, entries):
     ambiguity changes the verdict): the candidates' verdict where they agree, however many streams' they are ("ok" where
     every chain that ties it holds only allowed skips, "fail" where every one holds a loss, a late read or a jump), "fail"
     where none ties it, and "inconclusive" only where chains tie it and are judged differently (the log can't say whose the
-    gap was, and that decides it). A stream's own entries for a gap are settled by the end of a run (it got a code after
-    them, so the copy's end has passed them), so verify's rule for entries still being filled in isn't modelled here."""
+    gap was, and that decides it). An entry still pending is no candidate (candidates()). The model's driver never runs out
+    of records of the copy or of claims, so it has no untracked entry, and verify's rule for them (an untracked entry that
+    may hold a gap's frames is weighed against its candidates, nf-vmic-test's Rival) isn't modelled here."""
     verdicts = {verdict for _chain, verdict in candidates(lo, hi, entries)}
     if not verdicts:
         return "fail"
@@ -335,6 +339,9 @@ class AppRingModel(unittest.TestCase):
             for lo, hi in gaps:
                 chain = tie(lo, hi, own)
                 self.assertIsNotNone(chain, f"{s.name} ({s.packet}): gap [{lo}, {hi}) has its own entries: {own}")
+                # verify's rule rests on this (LogWindow::settling): the stream got the code after the gap, so the copy's end
+                # passed every claim of its entries for it, and each was settled; a settled one is never pending again.
+                self.assertFalse(any(e.pending for e in chain), f"{s.name}: [{lo}, {hi}) {chain} settled")
                 self.assertIn(chain, ties(lo, hi, ring.log), f"{s.name}: verify's rule ties [{lo}, {hi}) to its own")
                 verdict = judge(lo, hi, ring.log)
                 own_verdict = "ok" if all(e.kind in ALLOWED for e in chain) else "fail"

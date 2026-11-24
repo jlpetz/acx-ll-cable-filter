@@ -2799,7 +2799,8 @@ CCaptureStreamEngine::AppRingOtherPass(
         // what the copy holds between never reaches it. Logged, so its gap has an entry too, and counted in the device whose
         // skip log takes the entry (NF_APP_RING.Loopback, the app feed's: SecondaryJumps, SecondaryJumpFrames, the owner,
         // 2026-11-24), the frames as the entry has them (the copy's, at most its length: the entry's 32 bits hold them), so
-        // the log's jumps over a window add up to the counters' rise.
+        // the log's jumps over a window add up to the counters' rise. Those are the frames the copy holds there now, as a
+        // skip's are counted: what lies past its end (claimed below) joins only the entry's ring span as the reader writes it.
         //
         if (jumpEnd > m_AppEnd)
         {

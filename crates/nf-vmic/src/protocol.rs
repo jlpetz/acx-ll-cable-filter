@@ -569,7 +569,9 @@ pub struct Stats {
     pub underrun_log: EventSlots<UNDERRUN_LOG_ENTRIES>,
     /// Times a capture stream playing the driver's copy found its own time line moved later (a late timer's glitch adjustment),
     /// each an [`EVENT_SECONDARY_JUMP`] entry in the skip log, and the copy's frames they passed over (the entries' frames,
-    /// added up): the device's, as the logs are (valid with [`STATS_LOOPBACK`]; the owner, 2026-11-24).
+    /// added up): the device's, as the logs are (valid with [`STATS_LOOPBACK`]; the owner, 2026-11-24). The frames are what the
+    /// copy held there as each jump was logged, as a skip's are counted (`secondary_skipped_frames`): where a jump's span ran
+    /// past the copy's end, the audio the reader later wrote there joins only the entry's ring frames, not its frames or these.
     pub secondary_jumps: u64,
     pub secondary_jump_frames: u64,
 }

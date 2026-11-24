@@ -212,7 +212,9 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
     6848     8  SecondaryJumps           times a capture stream playing the copy found its own time line moved later (a
                                          late timer's glitch adjustment), each a SECONDARY_JUMP entry in the skip log (the
                                          device's, as the logs are: valid with NF_VMIC_STATS_LOOPBACK)
-    6856     8  SecondaryJumpFrames      the copy's frames those jumps passed over (their entries' Frames, added up)
+    6856     8  SecondaryJumpFrames      the copy's frames those jumps passed over (their entries' Frames, added up): what
+                                         the copy held there as each was logged, as SecondarySkippedFrames counts a skip; a
+                                         span past the copy's end then is filled in only in the entry's ring frames
 
     The reader (with NF_VMIC_STATS_ATTACHED): Flags' READING and FORMAT_MISMATCH are the State bits the stream holding the
     reader slot wrote to the header at its latest pass, and ReaderPacketFrames is the PacketFrames it wrote, so STATS and the
@@ -297,9 +299,10 @@ NF_VMIC_STATS (6864 bytes; all counters cumulative since the driver loaded; time
       - SECONDARY_SKIP: a stream playing on moved to a shorter reader packet's lag (SecondarySkips, one entry each; Frames:
         SecondarySkippedFrames' part). Span and ring span: what it passed over.
       - SECONDARY_JUMP: a stream playing the copy whose own time line moved later (a late timer's glitch adjustment): what the
-        copy holds between its place and its new read never reaches it. Frames: the copy's frames there, as a skip counts
-        them. Counted in SecondaryJumps and SecondaryJumpFrames (one entry each; the device's, as the log is: the owner,
-        2026-11-24); its glitch adjustment in Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses too.
+        copy holds between its place and its new read never reaches it. Frames: the copy's frames there as it was logged, as
+        a skip counts them (what lay past the copy's end then is filled in only in its ring span, below, never in Frames).
+        Counted in SecondaryJumps and SecondaryJumpFrames (one entry each, its Frames; the device's, as the log is: the
+        owner, 2026-11-24); its glitch adjustment in Stream[NF_VMIC_KIND_CAPTURE].GlitchPasses too.
       - LATE_READ: a stream playing the copy read past the copy's end (the reader late, or none yet): silence, SpanFrames of
         it (Frames), and the audio the reader then writes there never reaches it. One entry for a stream's contiguous reads
         past the end, extended while they last; its ring span is the audio the reader writes there, filled in by those
