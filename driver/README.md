@@ -151,12 +151,17 @@ one, `added`; only `same` and `moved` are remapped. B's one microphone maps to i
 Microphone is `added`. The tool publishes the file whole at the end, once it has read the endpoints before the run: written
 to `<file>.tmp` beside it, flushed, then renamed over it, so a reader finds the file as it was or the new map, never part of
 one; a run that publishes none (stopped earlier, killed) leaves the file as it was (format and fields:
-`crates\nf-vmic\src\setup\endpoint_map.rs`). A migration's cable keeps the old devices it replaces in its record (`Replaces`)
-once it is made, and every run maps each cable that has them, so the map of the run that finishes the migration (no record
-left pending) holds all of it, whatever runs came before (killed, stopped by a restart); that run then drops them, a record
-at a time, each keeping them as `Replaced`, so a drop cut short loses no cable from the next run's map. An earlier run's map
-holds what it saw (`result` says how it ended). A map asked for and not published keeps them, and the next
-`Install-Driver.ps1` runs the migration again to publish it.
+`crates\nf-vmic\src\setup\endpoint_map.rs`). A reader closes the file before the run ends: Windows doesn't rename over a file
+another process has open, so the tool waits about a second for it, then refuses the run at the start (nothing changed) or
+doesn't publish (the file as it was). A migration's cable keeps the old devices it replaces in its record (`Replaces`) once
+it is made. Each run maps the cables it makes or checks, and every present cable recorded as made whose record has them,
+however the run ends, so the map of the run that finishes the migration (no record left pending) holds all of it, whatever
+runs came before (killed, stopped by a restart); that run then drops them, a record at a time, each keeping them as
+`Replaced`, so a drop cut short loses no cable from the next run's map. A map published while a record is pending may lack
+a cable not made or recorded yet (`result` is then `error` or `restart`). Whichever run publishes the whole map, its rows
+are the same (cable, role, old and new ids, `match`); an old endpoint's `state` may differ (a retry after the old devices'
+removal finds them `notpresent`). A map asked for and not published keeps them, and the next `Install-Driver.ps1` runs the
+migration again to publish it.
 
 **Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker

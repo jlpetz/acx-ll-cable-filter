@@ -42,8 +42,10 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
 
   --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
       names), as JSON, published whole at the end (a temporary file beside it, flushed, renamed over it) once the endpoints
-      before the run were read; a run that publishes none leaves the file as it was. Every run before the migration is final
-      maps all of it, whatever runs came before.
+      before the run were read; a run that publishes none leaves the file as it was. Each run maps the cables it makes or
+      checks and those a migration made whose map isn't final; the run that leaves nothing pending maps all of it, whatever
+      runs came before. Close the file before a run ends: one open in another process is waited for about a second, then
+      the run is refused at the start (nothing changed) or its map not published (the file as it was).
 
 Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish, other errors beside it or not (stop there:
 restart, then run this again, which says what is still wrong).";

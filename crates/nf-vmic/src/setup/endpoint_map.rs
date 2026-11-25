@@ -8,9 +8,10 @@
 //! store until the migration's map is final, so a run after their removal still finds their lingering endpoints), a node `add
 //! --adopt` re-creates, and every earlier instance of its identity (a re-add's, a repair's: the same node). A migration's cable
 //! takes its identity's other instances only, never its own now: those endpoints are this run's or an earlier attempt's, so its
-//! map is the same whichever attempt publishes it (B's Call Microphone `added` after a retry too). Its new endpoints are those
-//! on its instance after the run. Each old endpoint is matched to the new one of the same role (Speakers, render; Microphone and Call
-//! Microphone, capture): the old driver's circuits have the cable's reference strings (Speaker0, Microphone0, Microphone1).
+//! map has the same rows whichever attempt publishes it (B's Call Microphone `added` after a retry too; see "Across runs" for
+//! what may differ). Its new endpoints are those on its instance after the run. Each old endpoint is matched to the new one of
+//! the same role (Speakers, render; Microphone and Call Microphone, capture): the old driver's circuits have the cable's
+//! reference strings (Speaker0, Microphone0, Microphone1).
 //!
 //! **`match`:**
 //! - `same`: Windows kept the endpoint (the same MMDevice id): nothing to remap.
@@ -25,23 +26,37 @@
 //! file as it was or this run's map, never part of one, and never no file where there was one. A run that publishes none (it
 //! stopped before reading the endpoints, or was killed, or its map couldn't be made) leaves the file as it was: an earlier
 //! run's map, the whole migration's among them, stays until a run publishes another. `start` only checks, before anything
-//! changes, that the file can be published (its folder there, a file beside it writable, the file itself replaceable). So a
-//! file there afterwards is this run's only if the run said so ("The endpoint map: <file> ..."): a reader that needs this run's
-//! own map passes a path no earlier run used.
+//! changes, that the file can be published (its folder there, a file beside it writable, the file itself replaceable and open
+//! in no other process: it opens it exclusively). So a file there afterwards is this run's only if the run said so ("The
+//! endpoint map: <file> ..."): a reader that needs this run's own map passes a path no earlier run used.
 //!
-//! **Across runs.** A migration's cable keeps the old nodes it replaces in its store record (`Replaces`) once it is made, and
-//! every migrate or add run maps each present cable whose record has them, so the map of the run that leaves no record pending
-//! holds the whole migration, whatever its earlier attempts did (killed, stopped by a restart: a cable made by a run that needs
-//! one stays pending, and the run after the restart checks and maps it). That run drops them once its map is published, a
-//! record at a time; each record keeps them for good as `Replaced`, so a drop that stops part way loses no cable: while any
-//! record keeps Replaces, every run maps the cables of both ([`super::plan::mapped`]), and the map is final once none does. A
-//! map asked for and not published keeps them, so the next migration run maps them again. An earlier attempt's map holds what
-//! that attempt saw (`result` says how it ended).
+//! **A reader closes the file before the run ends.** Windows doesn't rename over a file another process has open, whatever it
+//! shares (ERROR_ACCESS_DENIED). The start's check and the publish each try again for about a second ([`BUSY`]: a scanner's
+//! brief look); a reader that holds the file longer makes the start refuse the run (nothing changed), or the publish fail with
+//! the file as it was (a run that was done: exit 2, "done, but the endpoint map wasn't published"; the old nodes' names kept,
+//! so the next migrate or add run maps them again).
+//!
+//! **Across runs.** A migration's cable keeps the old nodes it replaces in its store record (`Replaces`) once it is made. Every
+//! migrate or add run maps the cables it makes, finishes or repairs, and every present cable recorded as made whose record has
+//! them, however the run ends (a veto, a failure, a restart); so the map of the run that leaves no record pending holds the
+//! whole migration, whatever its earlier attempts did (killed, stopped by a restart: a cable made by a run that needs one stays
+//! pending, and the run after the restart checks and maps it). That run drops them once its map is published, a record at a
+//! time; each record keeps them for good as `Replaced`, so a drop that stops part way loses no cable: while any record keeps
+//! Replaces, every run maps the cables of both ([`super::plan::mapped`]), and the map is final once none does. A map asked for
+//! and not published keeps them, so the next migrate or add run maps them again. A map published while a record is pending may
+//! lack a migration cable that isn't made or recorded yet (one whose make failed, or failed its check, or that a restart stopped
+//! the run before), and its old endpoints with it; `result` is then `error` or `restart`. Whichever run publishes the whole
+//! migration's map, its rows are the same: each cable, role, old and new MMDevice id and `match`. Not every field is: a single
+//! run reads the old endpoints before it disables the old nodes (`active`, `disabled`), a retry after their removal finds them
+//! lingering (`notpresent`).
 
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
 use windows::core::HSTRING;
 
@@ -65,7 +80,7 @@ pub enum Old {
     /// Any instance of the cable's identity: an earlier n, or the same one (a re-add with its instance ID, a repair).
     Identity(CableId),
     /// An instance of the cable's identity other than its own now (n): a migration's cable, whose own instance's endpoints in
-    /// the look before are this run's or an earlier attempt's, so its map is the same whichever attempt publishes it (its
+    /// the look before are this run's or an earlier attempt's, so its map has the same rows whichever attempt publishes it (its
     /// Call Microphone `added`, not `same`, after a retry too).
     OtherInstance { id: CableId, n: u32 },
 }
@@ -276,17 +291,54 @@ fn temporary(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(tmp))
 }
 
+/// How long the start's check and the publish wait out another process that has the file open (a scanner's brief look, a
+/// reader not done yet): this many tries, this pause apart, about a second in all (the module's docs).
+pub const BUSY: Busy = Busy { tries: 10, pause: Duration::from_millis(100) };
+
+/// How often, and how far apart, a call on the map's file is tried while another process has the file open.
+#[derive(Clone, Copy, Debug)]
+pub struct Busy {
+    pub tries: u32,
+    pub pause: Duration,
+}
+
+impl Busy {
+    /// `f` until it succeeds, fails for another reason, or the tries are spent: tried again while `code` of its error is a
+    /// Win32 code of a file another process has open (ERROR_SHARING_VIOLATION; ERROR_ACCESS_DENIED, which a rename over an open
+    /// file gives whatever the reader shares; a read-only file gives it too, and waits the tries out for nothing).
+    fn retry<T, E>(self, code: impl Fn(&E) -> Option<u32>, mut f: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+        let busy = |c: u32| c == ERROR_SHARING_VIOLATION.0 || c == ERROR_ACCESS_DENIED.0;
+        let mut left = self.tries.max(1);
+        loop {
+            match f() {
+                Err(e) if left > 1 && code(&e).is_some_and(busy) => {
+                    left -= 1;
+                    std::thread::sleep(self.pause);
+                }
+                r => return r,
+            }
+        }
+    }
+}
+
 /// The map's file at the start of a run, before anything changes: whether it can be published (the module's docs). It isn't
 /// touched: a map an earlier run published stays until this run publishes its own.
 pub fn start(path: Option<&Path>) -> Result<(), SetupError> {
+    start_within(path, BUSY)
+}
+
+/// [`start`], another process's open waited out as `busy` says.
+fn start_within(path: Option<&Path>, busy: Busy) -> Result<(), SetupError> {
     let Some(path) = path else { return Ok(()) };
     let refuse = |why: String| Err(SetupError::EndpointMap(format!("{why}: nothing was changed")));
     let shown = path.display();
     let Some(tmp) = temporary(path).filter(|_| !path.is_dir()) else { return refuse(format!("{shown} isn't a file's name")) };
-    if path.exists()
-        && let Err(e) = std::fs::OpenOptions::new().write(true).open(path)
-    {
-        return refuse(format!("{shown} is there and can't be replaced ({e})"));
+    if path.exists() {
+        // Exclusively (no sharing): it fails while any other process has the file open, as the publish's rename would
+        let open = || std::fs::OpenOptions::new().write(true).share_mode(0).open(path);
+        if let Err(e) = busy.retry(|e: &std::io::Error| e.raw_os_error().map(|c| c as u32), open) {
+            return refuse(format!("{shown} is there and can't be replaced: open in another process, or read-only ({e})"));
+        }
     }
     if let Err(e) = std::fs::File::create(&tmp) {
         return refuse(format!("{} can't be written beside it ({e})", tmp.display()));
@@ -297,9 +349,15 @@ pub fn start(path: Option<&Path>) -> Result<(), SetupError> {
 
 /// `text` published at `path` whole (Astra's review, 2026-11-25): written to `<file>.tmp` beside it (one a killed run left is
 /// written over), flushed to disk (FlushFileBuffers), then renamed over `path` (MoveFileExW with MOVEFILE_REPLACE_EXISTING, and
-/// MOVEFILE_WRITE_THROUGH: it returns once the rename is on disk). A reader finds `path` as it was, or `text`. On a failure the
-/// temporary file is deleted and `path` is as it was.
+/// MOVEFILE_WRITE_THROUGH: it returns once the rename is on disk), tried again for about a second while another process has
+/// `path` open ([`BUSY`]). A reader finds `path` as it was, or `text`. On a failure the temporary file is deleted and `path` is
+/// as it was.
 pub fn publish(path: &Path, text: &str) -> Result<(), String> {
+    publish_within(path, text, BUSY)
+}
+
+/// [`publish`], another process's open waited out as `busy` says.
+fn publish_within(path: &Path, text: &str, busy: Busy) -> Result<(), String> {
     let tmp = temporary(path).ok_or_else(|| format!("{} isn't a file's name", path.display()))?;
     let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
@@ -311,9 +369,11 @@ pub fn publish(path: &Path, text: &str) -> Result<(), String> {
         return Err(format!("{} couldn't be written ({e})", tmp.display()));
     }
     let (from, to) = (HSTRING::from(tmp.as_path()), HSTRING::from(path));
-    // SAFETY: two NUL-terminated paths that outlive the call; constant flags.
-    let moved = unsafe { MoveFileExW(&from, &to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if let Err(e) = moved.map_err(WinError::of("MoveFileExW")) {
+    let rename = || {
+        // SAFETY: two NUL-terminated paths that outlive the call; constant flags.
+        unsafe { MoveFileExW(&from, &to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }.map_err(WinError::of("MoveFileExW"))
+    };
+    if let Err(e) = busy.retry(|e: &WinError| Some(e.code), rename) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{} couldn't be renamed over {} ({e})", tmp.display(), path.display()));
     }
@@ -584,12 +644,44 @@ pub(crate) mod tests {
         let mut read_only = writable.clone();
         read_only.set_readonly(true);
         std::fs::set_permissions(&path, read_only).unwrap();
-        let why = publish(&path, "fourth").unwrap_err();
+        let why = publish_within(&path, "fourth", QUICK).unwrap_err();
         assert!(why.contains("couldn't be renamed over") && why.contains("MoveFileExW failed"), "{why}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         assert!(!dir.join("map.json.tmp").exists());
-        assert!(start(Some(&path)).unwrap_err().to_string().contains("is there and can't be replaced"));
+        assert!(start_within(Some(&path), QUICK).unwrap_err().to_string().contains("is there and can't be replaced"));
         std::fs::set_permissions(&path, writable).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The busy waits, short: where the wait isn't what is tested.
+    const QUICK: Busy = Busy { tries: 2, pause: Duration::from_millis(10) };
+
+    /// Astra's review (2026-11-25): a reader that has the file open blocks the rename, whatever it shares (std's open shares
+    /// read, write and delete, the most a reader can). The start refuses the run while it is open; the publish waits for it
+    /// (about a second: [`BUSY`]), then fails with the file as it was. A reader that closes it within the wait doesn't stop it.
+    #[test]
+    fn a_reader_with_the_file_open_is_waited_for_then_refused() {
+        let dir = scratch("reader");
+        let path = dir.join("map.json");
+        publish(&path, "first").unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+        let e = start_within(Some(&path), QUICK).unwrap_err().to_string();
+        assert!(e.contains("is there and can't be replaced: open in another process") && e.ends_with("nothing was changed"), "{e}");
+        let why = publish_within(&path, "second", QUICK).unwrap_err();
+        assert!(why.contains("couldn't be renamed over") && why.contains("MoveFileExW failed"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first", "the file as it was");
+        assert!(!dir.join("map.json.tmp").exists());
+        // Closed within the wait: published
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(reader);
+        });
+        let waited = std::time::Instant::now();
+        publish(&path, "third").unwrap();
+        closer.join().unwrap();
+        assert!(waited.elapsed() >= Duration::from_millis(100), "it waited for the reader: {:?}", waited.elapsed());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third");
+        start(Some(&path)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
