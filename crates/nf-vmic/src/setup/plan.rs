@@ -5,9 +5,10 @@
 //! one its nodes' instance IDs carry) and the nodes with it; `add`, `variant` and `remove` act on those nodes alone, so no
 //! other cable is touched. Only `update` and the migration act on every node of ours, as every cable runs one image.
 //!
-//! **Instance numbers.** Re-adding a cable keeps its instance ID (its n), so (we expect, to confirm on the box) Windows brings
-//! back its endpoints; one that is there but unhealthy is repaired in place, the same node. A variant switch takes n + 1:
-//! fresh endpoints, which Windows makes with the variant's default period (TODO 22).
+//! **Instance numbers.** Re-adding a cable with the microphones it had keeps its instance ID (its n), so (we expect, to confirm
+//! on the box) Windows brings back its endpoints, their ids among them (Astra's recommendation, forwarded by the owner,
+//! 2026-11-25); one that is there but unhealthy is repaired in place, the same node. A variant switch, and a re-add with other
+//! microphones, take n + 1: fresh endpoints, which Windows makes with the variant's default period (TODO 22).
 
 use std::fmt;
 
@@ -248,6 +249,9 @@ pub struct Entry {
     pub mics: Option<Variant>,
     /// The migration's, not made yet ([`super::store`]'s `Pending`).
     pub pending: bool,
+    /// While pending: the old driver's nodes (instance IDs) the migration makes it in place of, whose endpoints the endpoint map
+    /// gives this cable's ([`super::endpoint_map`]), on a run after their removal too ([`super::store`]'s `Replaces`).
+    pub replaces: Vec<String>,
 }
 
 /// The packages the present cables run, the package rule's input ([`super::package::pick`]): one entry a node with an identity
@@ -436,12 +440,14 @@ pub struct Create {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddPlan {
     /// Present and healthy: nothing, so `add` is idempotent. `prune`: the cable's other nodes, not working (a leftover), to
-    /// remove; `mics_differ`: microphones asked for that it doesn't have (`variant` switches).
+    /// remove; `mics_differ`: microphones asked for that it doesn't have (`variant` switches); `pending`: its store record is
+    /// still the migration's (a run that made it and stopped before recording it), so it is recorded as made.
     Nothing {
         node: usize,
         prune: Vec<usize>,
         mics_differ: Option<Variant>,
         identity: Identity,
+        pending: bool,
     },
     /// Present but unhealthy (disabled, failing, refused by the crash breaker, or a duplicate): its newest node gets the
     /// package again in place, so it keeps its identity and instance ID (and its endpoints), its start count cleared; the
@@ -479,6 +485,16 @@ pub fn plan_add(
     let instance = |n| CableInstance { label: label.clone(), id, n };
     // Its instance ID was there before (a removed cable's), unless the migration recorded it and never made it
     let had_instance = resolved.as_ref().is_some_and(|r| !r.pending);
+    // The instance ID it had, for the microphones it had: (we expect) its endpoints back, with their ids. Other microphones take
+    // n + 1, as a variant switch does: fresh endpoints, with the variant's default period (TODO 22)
+    let reuse = |variant: Variant| -> Result<(CableInstance, bool), PlanError> {
+        if had_instance && last_mics.is_some_and(|m| m != variant) {
+            let next = n.checked_add(1).ok_or_else(|| PlanError::NoNextInstance(label.clone()))?;
+            Ok((instance(next), false))
+        } else {
+            Ok((instance(n), had_instance))
+        }
+    };
     if let Some(a) = adopt {
         let Some(i) = nodes.iter().position(|n| same_instance(&n.instance_id, a)) else {
             return Err(PlanError::AdoptNotFound(a.into()));
@@ -490,14 +506,16 @@ pub fn plan_add(
             return Err(PlanError::AdoptPresent { label: label.clone(), node: nodes[p].instance_id.clone() });
         }
         let variant = mics.or(nodes[i].variant()).unwrap_or(Variant::Both);
-        return Ok(AddPlan::Create(Create { instance: instance(n), variant, remove: vec![i], identity, same_instance: had_instance }));
+        let (instance, same_instance) = reuse(variant)?;
+        return Ok(AddPlan::Create(Create { instance, variant, remove: vec![i], identity, same_instance }));
     }
     let own = resolved.as_ref().map(|r| r.nodes.clone()).unwrap_or_default();
     let healthy: Vec<usize> = own.iter().copied().filter(|&i| nodes[i].healthy()).collect();
     if let [keep] = healthy.as_slice() {
         let prune = own.iter().copied().filter(|i| i != keep).collect();
         let mics_differ = mics.filter(|&m| nodes[*keep].variant() != Some(m));
-        return Ok(AddPlan::Nothing { node: *keep, prune, mics_differ, identity });
+        let pending = resolved.as_ref().is_some_and(|r| r.pending);
+        return Ok(AddPlan::Nothing { node: *keep, prune, mics_differ, identity, pending });
     }
     // Present but unhealthy (or several working: a setup error mended the same way): the newest node repaired in place
     if let Some(&newest) = own.iter().max_by_key(|&&i| nodes[i].cable.as_ref().map_or(0, |c| c.n)) {
@@ -505,9 +523,11 @@ pub fn plan_add(
         let mics_differ = mics.filter(|&m| nodes[newest].variant() != Some(m));
         return Ok(AddPlan::Repair { node: newest, prune, mics_differ, identity });
     }
-    // Absent: created with its identity and the instance ID it had, or new
+    // Absent: created with its identity (and, for the microphones it had, the instance ID it had), or new; both microphones
+    // unless asked or remembered otherwise
     let variant = mics.or(last_mics).unwrap_or(Variant::Both);
-    Ok(AddPlan::Create(Create { instance: instance(n), variant, remove: Vec::new(), identity, same_instance: had_instance }))
+    let (instance, same_instance) = reuse(variant)?;
+    Ok(AddPlan::Create(Create { instance, variant, remove: Vec::new(), identity, same_instance }))
 }
 
 /// What `remove` does.
@@ -633,6 +653,9 @@ pub struct Target {
     pub variant: Variant,
     /// A new identity (the store had none for the label), written to the store, pending, before anything changes.
     pub new: bool,
+    /// The old driver's nodes it is made in place of (instance IDs): those present now of its kind, and those an earlier run
+    /// recorded. Their endpoints are the old side of its endpoint map.
+    pub replaces: Vec<String>,
 }
 
 impl Target {
@@ -640,9 +663,10 @@ impl Target {
         CableInstance { label: self.label.clone(), id: self.id, n: self.n }
     }
 
-    /// Its store entry: `pending` until it is made.
+    /// Its store entry: `pending` (with the nodes it replaces) until it is made.
     pub fn entry(&self, pending: bool) -> Entry {
-        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending }
+        let replaces = if pending { self.replaces.clone() } else { Vec::new() };
+        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending, replaces }
     }
 
     /// The node to create (nothing to remove: the old driver's nodes go first).
@@ -664,6 +688,30 @@ pub struct MigratePlan {
     /// pending and didn't make (its microphones as recorded, unless asked for others). Their entries go to the store, pending,
     /// before anything is disabled, so a run that stops after the old nodes are gone is finished by the next.
     pub add: Vec<Target>,
+    /// The cables an earlier run made and stopped before recording as made: present, their records still pending. Each is
+    /// checked (its identity on one node, working on the package, its endpoints there), then recorded as made.
+    pub finish: Vec<Finish>,
+}
+
+/// A cable to finish ([`MigratePlan::finish`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finish {
+    pub label: Label,
+    pub id: CableId,
+    /// Indices into the nodes: those with its identity, newest first (one, unless a setup error).
+    pub nodes: Vec<usize>,
+    /// The old driver's nodes it was made in place of, as the store recorded them: the old side of its endpoint map.
+    pub replaces: Vec<String>,
+}
+
+/// `a` and those of `b` not in it, without case.
+fn union(mut a: Vec<String>, b: &[String]) -> Vec<String> {
+    for s in b {
+        if !a.iter().any(|x| same_instance(x, s)) {
+            a.push(s.clone());
+        }
+    }
+    a
 }
 
 /// The migration's plan. `new_ids` are the identities A and B get if the store has none for them.
@@ -671,17 +719,32 @@ pub fn plan_migrate(
     nodes: &[Node], store: &[Entry], a_mics: Option<Variant>, b_mics: Option<Variant>, new_ids: [CableId; 2],
 ) -> Result<MigratePlan, PlanError> {
     let legacy: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_legacy()).collect();
-    let rest: Vec<Node> = nodes.iter().filter(|n| !n.is_legacy()).cloned().collect();
-    let present = |label: &Label| -> Result<bool, PlanError> { Ok(resolve(label, store, &rest)?.is_some_and(|r| !r.nodes.is_empty())) };
     let pending = |label: &Label| store.iter().find(|e| &e.label == label && e.pending);
-    // A target with the store's identity and n for its label, if it has one, else a new identity and n 1
-    let target = |label: Label, variant: Variant, new_id: CableId| -> Result<Target, PlanError> {
-        Ok(match resolve(&label, store, &rest)? {
-            Some(r) => Target { label, id: r.id, n: r.n, variant, new: false },
-            None => Target { label, id: new_id, n: 1, variant, new: true },
-        })
+    let mut add: Vec<Target> = Vec::new();
+    let mut finish: Vec<Finish> = Vec::new();
+    // A label's cable. Present: nothing to make, but finished if its record is still pending (a run that made it and stopped
+    // before recording it: the planner would otherwise find nothing to do while the store says there is). Absent: a target
+    // with the store's identity and n for its label, if it has one, else `new_id` and n 1. (The old driver's nodes have no
+    // identity, so they are no label's.)
+    let want = |add: &mut Vec<Target>, finish: &mut Vec<Finish>, label: Label, variant: Variant, new_id: CableId, replaces| {
+        match resolve(&label, store, nodes)? {
+            Some(r) if !r.nodes.is_empty() => {
+                if r.pending {
+                    let mut own = r.nodes;
+                    own.sort_by_key(|&i| std::cmp::Reverse(nodes[i].cable.as_ref().map_or(0, |c| c.n)));
+                    finish.push(Finish { label, id: r.id, nodes: own, replaces });
+                }
+            }
+            Some(r) => add.push(Target { label, id: r.id, n: r.n, variant, new: false, replaces }),
+            None => add.push(Target { label, id: new_id, n: 1, variant, new: true, replaces }),
+        }
+        Ok::<(), PlanError>(())
     };
-    let mut add = Vec::new();
+    // The old driver's nodes of one cable: Cable-B.ps1's B (`b`), else A's
+    let old_of = |b: bool| -> Vec<String> {
+        let of_b = |i: usize| nodes[i].model == Model::Legacy(Legacy::CableB);
+        legacy.iter().filter(|&&i| of_b(i) == b).map(|&i| nodes[i].instance_id.clone()).collect()
+    };
     // Today's A: the first working one's variant, else the first's
     let old_a = legacy
         .iter()
@@ -694,24 +757,25 @@ pub fn plan_migrate(
     let old_b = legacy.iter().any(|&i| nodes[i].model == Model::Legacy(Legacy::CableB));
     let a = Label::a();
     let b: Label = "B".parse().expect("a label");
-    for (label, old, asked, new_id) in [(a, old_a, a_mics, new_ids[0]), (b, old_b.then_some(Variant::Both), b_mics, new_ids[1])] {
-        if present(&label)? {
-            continue;
-        }
+    for (label, old, asked, new_id, replaced) in
+        [(a, old_a, a_mics, new_ids[0], old_of(false)), (b, old_b.then_some(Variant::Both), b_mics, new_ids[1], old_of(true))]
+    {
         // Asked for, else as an earlier run recorded it, else the old device's
-        let variant = match (old, pending(&label)) {
+        let p = pending(&label);
+        let variant = match (old, p) {
             (None, None) => continue,
             (old, p) => asked.or(p.and_then(|e| e.mics)).or(old).unwrap_or(Variant::Both),
         };
-        add.push(target(label, variant, new_id)?);
+        let replaces = union(p.map(|e| e.replaces.clone()).unwrap_or_default(), &replaced);
+        want(&mut add, &mut finish, label, variant, new_id, replaces)?;
     }
     // Any other cable an earlier run recorded as pending (none today: the migration makes A and B only)
     for e in store.iter().filter(|e| e.pending) {
-        if !add.iter().any(|t| t.label == e.label) && !present(&e.label)? {
-            add.push(target(e.label.clone(), e.mics.unwrap_or(Variant::Both), e.id)?);
+        if !add.iter().any(|t| t.label == e.label) && !finish.iter().any(|f| f.label == e.label) {
+            want(&mut add, &mut finish, e.label.clone(), e.mics.unwrap_or(Variant::Both), e.id, e.replaces.clone())?;
         }
     }
-    if legacy.is_empty() && add.is_empty() {
+    if legacy.is_empty() && add.is_empty() && finish.is_empty() {
         return Err(PlanError::NothingToMigrate);
     }
     let mut update = unload_and_install(nodes, |n| !n.is_legacy());
@@ -725,7 +789,7 @@ pub fn plan_migrate(
     }
     update.disable.sort_unstable();
     update.reenable.sort_unstable();
-    Ok(MigratePlan { legacy, update, add })
+    Ok(MigratePlan { legacy, update, add, finish })
 }
 
 /// `list`'s view (pure): the present cables by identity, the remembered absent ones, and what isn't a working cable.
@@ -841,8 +905,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn entry(l: &str, id: &str, n: u32, mics: Option<Variant>) -> Entry {
-        Entry { label: label(l), id: cid(id), n, mics, pending: false }
+    pub(crate) fn entry(l: &str, id: &str, n: u32, mics: Option<Variant>) -> Entry {
+        Entry { label: label(l), id: cid(id), n, mics, pending: false, replaces: vec![] }
     }
 
     /// Two cables present, A (both) and B (low-latency), both in the store.
@@ -928,7 +992,7 @@ pub(crate) mod tests {
     fn add_is_idempotent_for_a_healthy_cable_and_leaves_the_other_alone() {
         let (store, nodes) = two();
         let p = plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap();
-        assert_eq!(p, AddPlan::Nothing { node: 1, prune: vec![], mics_differ: None, identity: Identity::Stored });
+        assert_eq!(p, AddPlan::Nothing { node: 1, prune: vec![], mics_differ: None, identity: Identity::Stored, pending: false });
         // Other microphones asked for: no change, and it says `variant` switches
         let p = plan_add(&label("B"), Some(Variant::Call), None, &store, &nodes, cid(NEW_ID)).unwrap();
         assert!(matches!(p, AddPlan::Nothing { mics_differ: Some(Variant::Call), .. }));
@@ -988,7 +1052,7 @@ pub(crate) mod tests {
         stale.health = Health::Problem(28);
         nodes.push(stale);
         let p = plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap();
-        assert_eq!(p, AddPlan::Nothing { node: 1, prune: vec![2], mics_differ: None, identity: Identity::Stored });
+        assert_eq!(p, AddPlan::Nothing { node: 1, prune: vec![2], mics_differ: None, identity: Identity::Stored, pending: false });
     }
 
     #[test]
@@ -1117,7 +1181,16 @@ pub(crate) mod tests {
         assert_eq!(targets(&p), [("A", Variant::Both, 1, true), ("B", Variant::Both, 1, true)]);
         assert_eq!((p.add[0].id, p.add[1].id), (cid(NEW_A), cid(NEW_B)));
         // What goes to the store before anything changes: pending; the node made from it carries the identity and n 1
-        assert_eq!(p.add[0].entry(true), Entry { label: label("A"), id: cid(NEW_A), n: 1, mics: Some(Variant::Both), pending: true });
+        let replaces = vec![r"ROOT\MEDIA\0003".to_string()];
+        assert_eq!(p.add[0].entry(true), Entry {
+            label: label("A"),
+            id: cid(NEW_A),
+            n: 1,
+            mics: Some(Variant::Both),
+            pending: true,
+            replaces
+        });
+        assert_eq!((p.add[1].replaces.as_slice(), p.add[1].entry(false).replaces.len()), (&[r"ROOT\MEDIA\0004".to_string()][..], 0));
         assert_eq!(p.add[1].create().instance.instance_id(), format!(r"ROOT\MEDIA\ACXLLCABLE_B_{}_1", NEW_B.to_uppercase()));
         // Install-Driver's -Variant for A, and -CableBMics for B
         let p = migrate(&nodes, &[], Some(Variant::Call), Some(Variant::LowLatency)).unwrap();
@@ -1177,6 +1250,74 @@ pub(crate) mod tests {
         // A pending target is a new instance to `add` too: its endpoints are new
         let AddPlan::Create(c) = plan_add(&label("B"), None, None, &store, &[], cid(NEW_ID)).unwrap() else { panic!() };
         assert_eq!((c.instance.id, c.identity, c.same_instance), (cid(B_ID), Identity::Stored, false));
+    }
+
+    /// Astra's review (2026-11-25): a run that made B and stopped before recording it left B present with its record pending.
+    /// The planner found nothing to do (B present, no old node) while Install-Driver.ps1 saw pending work, so every retry
+    /// stopped at NothingToMigrate. Now B is to finish: checked and recorded.
+    #[test]
+    fn a_cable_made_and_not_recorded_is_finished() {
+        let pending = |l: &str, id: &str, mics| Entry { pending: true, ..entry(l, id, 1, Some(mics)) };
+        let a_made = Entry { pending: false, ..pending("A", A_ID, Variant::Both) };
+        let b_pending = Entry { replaces: vec![r"ROOT\MEDIA\0004".into()], ..pending("B", B_ID, Variant::Both) };
+        let store = vec![a_made.clone(), b_pending.clone()];
+        let both = [node("A", A_ID, 1, Variant::Both), node("B", B_ID, 1, Variant::Both)];
+        let p = migrate(&both, &store, None, None).unwrap();
+        assert!(p.legacy.is_empty() && p.add.is_empty(), "{p:?}");
+        assert_eq!(p.finish, [Finish { label: label("B"), id: cid(B_ID), nodes: vec![1], replaces: vec![r"ROOT\MEDIA\0004".into()] }]);
+        // The update sets as always (the run decides whether any of it is needed)
+        assert_eq!(p.update.install, [0, 1]);
+        // Made but unhealthy (registered, its install not done): still to finish, the run installs it
+        let mut half = both.clone();
+        half[1].health = Health::Problem(28);
+        half[1].running = None;
+        assert_eq!(migrate(&half, &store, None, None).unwrap().finish.len(), 1);
+        // A made and not recorded, B not made: A to finish, B to make, with the identities the first run recorded
+        let store2 = vec![pending("A", A_ID, Variant::Call), pending("B", B_ID, Variant::LowLatency)];
+        let p = migrate(&both[..1], &store2, None, None).unwrap();
+        assert_eq!((p.finish.len(), p.finish[0].label.as_str()), (1, "A"));
+        assert_eq!(targets(&p), [("B", Variant::LowLatency, 1, false)]);
+        // Old B still there beside a pending B that is present (made before its removal: not a sequence the run has, but
+        // planned all the same): B finished, the old B removed
+        let mut with_old = both.to_vec();
+        with_old.push(legacy(r"ROOT\MEDIA\0004", Legacy::CableB));
+        let p = migrate(&with_old, &store, None, None).unwrap();
+        assert_eq!((p.legacy.clone(), p.finish.len(), p.add.len()), (vec![2], 1, 0));
+        // Two nodes with B's identity: both listed, newest first (the run refuses to record it)
+        let mut dup = both.to_vec();
+        dup.push(node("B", B_ID, 2, Variant::Both));
+        assert_eq!(migrate(&dup, &store, None, None).unwrap().finish[0].nodes, [2, 1]);
+        // Recorded since: nothing to do
+        let done = vec![a_made, Entry { pending: false, replaces: vec![], ..b_pending }];
+        assert_eq!(migrate(&both, &done, None, None), Err(PlanError::NothingToMigrate));
+        // `add B` on the present B with its record pending: nothing to change, recorded as made
+        let p = plan_add(&label("B"), None, None, &store, &both, cid(NEW_ID)).unwrap();
+        assert!(matches!(p, AddPlan::Nothing { node: 1, pending: true, .. }), "{p:?}");
+    }
+
+    /// A re-add keeps the identity, and the instance ID (so, we expect, the endpoint ids) only with the microphones it had: other
+    /// microphones take n + 1, as a variant switch does (Astra's recommendation, 2026-11-25).
+    #[test]
+    fn a_re_add_with_other_microphones_takes_the_next_n() {
+        let (mut store, nodes) = two();
+        store[1].n = 4;
+        let add = |mics, adopt: Option<&str>, nodes: &[Node]| plan_add(&label("B"), mics, adopt, &store, nodes, cid(NEW_ID)).unwrap();
+        let AddPlan::Create(c) = add(Some(Variant::LowLatency), None, &nodes[..1]) else { panic!() };
+        assert_eq!((c.instance.n, c.same_instance), (4, true), "the microphones it had");
+        let AddPlan::Create(c) = add(Some(Variant::Both), None, &nodes[..1]) else { panic!() };
+        assert_eq!((c.instance.id, c.instance.n, c.variant, c.same_instance), (cid(B_ID), 5, Variant::Both, false));
+        // Adopted under its remembered label with other microphones: the next n too
+        let mut outside = node("X", NEW_ID, 1, Variant::Call);
+        outside.instance_id = r"ROOT\MEDIA\0007".into();
+        outside.cable = None;
+        let with = vec![nodes[0].clone(), outside];
+        let AddPlan::Create(c) = add(None, Some(r"ROOT\MEDIA\0007"), &with) else { panic!() };
+        assert_eq!((c.instance.n, c.variant, c.same_instance, c.remove.clone()), (5, Variant::Call, false, vec![1]));
+        // A new label: both microphones by default
+        let AddPlan::Create(c) = plan_add(&label("D"), None, None, &store, &nodes, cid(NEW_ID)).unwrap() else { panic!() };
+        assert_eq!((c.instance.n, c.variant), (1, Variant::Both));
+        let max = vec![Entry { n: u32::MAX, ..store[1].clone() }];
+        assert_eq!(plan_add(&label("B"), Some(Variant::Call), None, &max, &[], cid(NEW_ID)), Err(PlanError::NoNextInstance(label("B"))));
     }
 
     /// The old driver's nodes disabled by an earlier run (no CONFIGFLAG_DISABLED) are enabled again on a failure; the user's

@@ -3,7 +3,8 @@
 //! the rest needs an elevated administrator (the setup's lock refuses anyone else before anything is read).
 //!
 //! Exit codes: 0 done (or nothing to do), 1 usage, 2 an error (the message says what changed, if anything), 7 Windows needs a
-//! restart to finish.
+//! restart to finish (stop there: restart, then run it again). `migrate` and `add` take `--endpoint-map <file>`: the old
+//! endpoints' new ones, as JSON (`nf_vmic::setup::endpoint_map`).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::path::PathBuf;
@@ -19,10 +20,11 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
 
   acx-ll-cable list
       The present cables, their devices and endpoints, the remembered absent ones, and setup errors. Any user.
-  acx-ll-cable add <label> [--mics both|call|low-latency] [--adopt <instance ID>]
+  acx-ll-cable add <label> [--mics both|call|low-latency] [--adopt <instance ID>] [--endpoint-map <file>]
       Makes cable <label> (one to eight of A-Z and 0-9), on the driver package the other cables run. Present and working: no
-      change. Present but not working: repaired in place. Removed earlier: back with its identity and endpoints. --mics: its
-      microphones (default both, or what it had). --adopt: re-creates a device made outside this tool as the cable.
+      change. Present but not working: repaired in place. Removed earlier: back with its identity and, with the microphones it
+      had, its endpoints (other microphones: new endpoints). --mics: its microphones (default both, or what it had). --adopt:
+      re-creates a device made outside this tool as the cable (only then: `list` shows such devices).
   acx-ll-cable remove <label> [--forget]
   acx-ll-cable remove --all [--forget]
       Removes the cable's device (every device of ours with --all, the old driver's too). Its identity stays, so `add` brings
@@ -32,23 +34,26 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
   acx-ll-cable update <package folder>
       Moves every cable to the package in the folder (driver\\out\\Release\\AudioCodec): every cable stops for a few seconds.
       If the old driver image doesn't unload (an app has a cable's control device open), every cable is put back as it was.
-  acx-ll-cable migrate <package folder> [--a-mics m] [--b-mics m]
+  acx-ll-cable migrate <package folder> [--a-mics m] [--b-mics m] [--endpoint-map <file>]
       From the old driver's devices (ROOT\\AudioCodec as A, ROOT\\NoiseFilterCableB as B) to cables on the package in the
       folder. A keeps its variant unless --a-mics; B gets --b-mics (default both). Nothing changes unless the package makes
       both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
-Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish.";
+  --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
+      names), as JSON: deleted at the start, written at the end once the endpoints before the run were read.
+
+Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish (stop there: restart, then run this again).";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Cmd {
     Help,
     List,
-    Add { label: Label, mics: Option<Variant>, adopt: Option<String> },
+    Add { label: Label, mics: Option<Variant>, adopt: Option<String>, map: Option<PathBuf> },
     Remove { target: RemoveTarget, forget: bool },
     Variant { label: Label, target: Variant },
     Update { folder: PathBuf },
-    Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Option<Variant> },
+    Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Option<Variant>, map: Option<PathBuf> },
 }
 
 fn mics(flag: &str, v: Option<&String>) -> Result<Variant, String> {
@@ -72,12 +77,14 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     let mut all = false;
     let mut a_mics = None;
     let mut b_mics = None;
+    let mut map: Option<PathBuf> = None;
     while let Some(a) = flags.next() {
         match a.as_str() {
             "--mics" => opt_mics = Some(mics(a, flags.next())?),
             "--a-mics" => a_mics = Some(mics(a, flags.next())?),
             "--b-mics" => b_mics = Some(mics(a, flags.next())?),
             "--adopt" => adopt = Some(flags.next().ok_or("--adopt takes a device's instance ID")?.clone()),
+            "--endpoint-map" => map = Some(flags.next().ok_or("--endpoint-map takes a file")?.into()),
             "--forget" => forget = true,
             "--all" => all = true,
             f if f.starts_with("--") => return Err(format!("'{command}' doesn't take {f}")),
@@ -88,7 +95,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     let cmd = match command.as_str() {
         "help" | "--help" | "-h" | "/?" => Cmd::Help,
         "list" => Cmd::List,
-        "add" => Cmd::Add { label: label(positional.first().copied(), "add")?, mics: opt_mics, adopt: adopt.clone() },
+        "add" => Cmd::Add { label: label(positional.first().copied(), "add")?, mics: opt_mics, adopt: adopt.clone(), map: map.clone() },
         "remove" => {
             let target = match (all, positional.first()) {
                 (true, None) => RemoveTarget::All,
@@ -104,16 +111,26 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             Cmd::Variant { label: label(positional.first().copied(), "variant")?, target }
         }
         "update" => Cmd::Update { folder: positional.first().ok_or("'update' takes the package's folder")?.into() },
-        "migrate" => Cmd::Migrate { folder: positional.first().ok_or("'migrate' takes the package's folder")?.into(), a_mics, b_mics },
+        "migrate" => {
+            let folder = positional.first().ok_or("'migrate' takes the package's folder")?.into();
+            Cmd::Migrate { folder, a_mics, b_mics, map: map.clone() }
+        }
         other => return Err(format!("no command '{other}'")),
     };
     // What each command takes, and how many positional arguments
+    let no_map = map.is_none();
     let (max, ok) = match &cmd {
-        Cmd::Help | Cmd::List => (0, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none()])),
+        Cmd::Help | Cmd::List => {
+            (0, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
+        }
         Cmd::Add { .. } => (1, allowed(&[!forget, !all, a_mics.is_none(), b_mics.is_none()])),
-        Cmd::Remove { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), a_mics.is_none(), b_mics.is_none()])),
-        Cmd::Variant { .. } => (2, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none()])),
-        Cmd::Update { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none()])),
+        Cmd::Remove { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), a_mics.is_none(), b_mics.is_none(), no_map])),
+        Cmd::Variant { .. } => {
+            (2, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
+        }
+        Cmd::Update { .. } => {
+            (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
+        }
         Cmd::Migrate { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all])),
     };
     if positional.len() > max {
@@ -178,7 +195,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Cmd::Add { label, mics, adopt } => exit_of(setup::add(&label, mics, adopt.as_deref(), &mut out)),
+        Cmd::Add { label, mics, adopt, map } => exit_of(setup::add(&label, mics, adopt.as_deref(), map.as_deref(), &mut out)),
         Cmd::Remove { target, forget } => exit_of(setup::remove(&target, forget, &mut out)),
         Cmd::Variant { label, target } => exit_of(variant::switch(&label, target, &mut out).map(|o| match o {
             Outcome::Nothing => Done::Nothing,
@@ -186,7 +203,7 @@ fn main() -> ExitCode {
             Outcome::RestartPending { device } => Done::RestartPending { device },
         })),
         Cmd::Update { folder } => exit_of(setup::update(&folder, &mut out)),
-        Cmd::Migrate { folder, a_mics, b_mics } => exit_of(setup::migrate(&folder, a_mics, b_mics, &mut out)),
+        Cmd::Migrate { folder, a_mics, b_mics, map } => exit_of(setup::migrate(&folder, a_mics, b_mics, map.as_deref(), &mut out)),
     }
 }
 
@@ -206,18 +223,30 @@ mod tests {
     fn the_commands_parse() {
         assert_eq!(p(""), Ok(Cmd::Help));
         assert_eq!(p("list"), Ok(Cmd::List));
-        assert_eq!(p("add d"), Ok(Cmd::Add { label: l("D"), mics: None, adopt: None }));
-        assert_eq!(p("add B --mics call"), Ok(Cmd::Add { label: l("B"), mics: Some(Variant::Call), adopt: None }));
-        assert_eq!(p(r"add C --adopt ROOT\MEDIA\0007"), Ok(Cmd::Add { label: l("C"), mics: None, adopt: Some(r"ROOT\MEDIA\0007".into()) }));
+        assert_eq!(p("add d"), Ok(Cmd::Add { label: l("D"), mics: None, adopt: None, map: None }));
+        assert_eq!(p("add B --mics call"), Ok(Cmd::Add { label: l("B"), mics: Some(Variant::Call), adopt: None, map: None }));
+        assert_eq!(
+            p(r"add B --endpoint-map C:\out\b.json"),
+            Ok(Cmd::Add { label: l("B"), mics: None, adopt: None, map: Some(r"C:\out\b.json".into()) })
+        );
+        assert_eq!(
+            p(r"add C --adopt ROOT\MEDIA\0007"),
+            Ok(Cmd::Add { label: l("C"), mics: None, adopt: Some(r"ROOT\MEDIA\0007".into()), map: None })
+        );
         assert_eq!(p("remove B"), Ok(Cmd::Remove { target: RemoveTarget::Label(l("B")), forget: false }));
         assert_eq!(p("remove B --forget"), Ok(Cmd::Remove { target: RemoveTarget::Label(l("B")), forget: true }));
         assert_eq!(p("remove --all --forget"), Ok(Cmd::Remove { target: RemoveTarget::All, forget: true }));
         assert_eq!(p("variant B low-latency"), Ok(Cmd::Variant { label: l("B"), target: Variant::LowLatency }));
         assert_eq!(p(r"update C:\pkg"), Ok(Cmd::Update { folder: r"C:\pkg".into() }));
-        assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: None }));
+        assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: None, map: None }));
         assert_eq!(
-            p(r"migrate C:\pkg --a-mics call --b-mics low-latency"),
-            Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: Some(Variant::Call), b_mics: Some(Variant::LowLatency) })
+            p(r"migrate C:\pkg --a-mics call --b-mics low-latency --endpoint-map m.json"),
+            Ok(Cmd::Migrate {
+                folder: r"C:\pkg".into(),
+                a_mics: Some(Variant::Call),
+                b_mics: Some(Variant::LowLatency),
+                map: Some("m.json".into())
+            })
         );
     }
 
@@ -239,6 +268,9 @@ mod tests {
             ("list --all", "'list' doesn't take that option"),
             ("list --x", "'list' doesn't take --x"),
             ("migrate C:\\pkg --forget", "'migrate' doesn't take that option"),
+            ("migrate C:\\pkg --endpoint-map", "--endpoint-map takes a file"),
+            ("update C:\\pkg --endpoint-map m.json", "'update' doesn't take that option"),
+            ("remove B --endpoint-map m.json", "'remove' doesn't take that option"),
         ] {
             let e = p(line).unwrap_err();
             assert!(e.contains(why), "{line}: {e}");

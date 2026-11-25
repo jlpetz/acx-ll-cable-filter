@@ -21,17 +21,26 @@
       4. The status.
 
     -Variant keeps its meaning, for cable A: both microphones (the default), the call one, or the low-latency one. Other
-    cables come with Cable.ps1 add. -BuildTool builds the setup tool first.
+    cables come with Cable.ps1 add. -BuildTool builds the setup tool first. -EndpointMap <file>: the migration (and the first
+    add of A) writes which new endpoint takes each old one's place there, as JSON (acx-ll-cable's --endpoint-map); an update
+    keeps the endpoints and writes none.
+
+    Exit codes: 0 done; 7 Windows wants a restart to finish (stop there: restart, then run this again, which finishes what is
+    left); 2 the setup tool's error (its steps above say what changed); 1 this script's own check (not elevated, test signing,
+    no package, no tool).
 
 .EXAMPLE
     .\Install-Driver.ps1
 .EXAMPLE
     .\Install-Driver.ps1 -Variant call -BuildTool
+.EXAMPLE
+    .\Install-Driver.ps1 -EndpointMap C:\temp\endpoint-map.json
 #>
 param(
     [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release',
     [ValidateSet('both', 'call', 'low-latency')][string]$Variant = 'both',
     [ValidateSet('both', 'call', 'low-latency')][string]$CableBMics = 'both',
+    [string]$EndpointMap,
     [switch]$BuildTool
 )
 
@@ -48,39 +57,52 @@ $tool = Get-CableTool -Build:$BuildTool
 
 Write-Step "Add the package to the driver store (pnputil /add-driver, no device installed)"
 pnputil /add-driver $inf
+if ($LASTEXITCODE -eq $RebootRequired) {
+    Write-Note 'pnputil says Windows wants a restart before the package can be used: restart, then run this again. Exit 7.'
+    exit 7
+}
 if ($LASTEXITCODE -ne 0) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
 
 function Test-Present([string[]]$Ids) {
     @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $d = $_; @($Ids | Where-Object { $d.HardwareID -contains $_ }).Count -gt 0 }).Count -gt 0
 }
 
+$status = { & (Join-Path $PSScriptRoot 'Get-DriverStatus.ps1') }
+$map = @()
+if ($EndpointMap) { $map = @('--endpoint-map', $EndpointMap) }
 $pending = @(Get-PendingCables)
 $switchA = $false
 if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
-    if ($pending.Count -gt 0) { Write-Note "an earlier migration left these cables to make: $($pending -join ', ')" }
+    if ($pending.Count -gt 0) { Write-Note "an earlier migration left these cables to make or record: $($pending -join ', ')" }
     Write-Step 'Migrate the old driver''s devices to cables (acx-ll-cable migrate)'
     $arguments = @('migrate', $package)
     if ($PSBoundParameters.ContainsKey('Variant')) { $arguments += @('--a-mics', $Variant) }
     if ($PSBoundParameters.ContainsKey('CableBMics')) { $arguments += @('--b-mics', $CableBMics) }
-    $code = Invoke-CableTool $tool $arguments
+    $code = Invoke-CableTool $tool ($arguments + $map)
+    Exit-ForToolCode $code 'the migration' $status
 } elseif (Test-Present @($HardwareIds.Values)) {
     Write-Step 'Move every cable to the new package (acx-ll-cable update)'
+    if ($EndpointMap) {
+        # As the tool does: a file there afterwards is this run's
+        if (Test-Path -LiteralPath $EndpointMap) { Remove-Item -LiteralPath $EndpointMap }
+        Write-Note 'an update keeps every endpoint: no endpoint map is written'
+    }
     $code = Invoke-CableTool $tool @('update', $package)
+    Exit-ForToolCode $code 'the update' $status
     $switchA = $PSBoundParameters.ContainsKey('Variant')
 } else {
     Write-Step "Make cable A ($Variant)"
-    $code = Invoke-CableTool $tool @('add', 'A', '--mics', $Variant)
+    $code = Invoke-CableTool $tool (@('add', 'A', '--mics', $Variant) + $map)
+    Exit-ForToolCode $code 'cable A' $status
 }
-if ($code -eq 7) { Write-Note 'Windows wants a restart to finish: restart, then run this again if the steps above say so.' }
-elseif ($code -ne 0) { throw "the setup tool failed ($code): its steps are above" }
 
-if ($switchA -and $code -eq 0) {
+if ($switchA) {
     # -Variant switched the one device before cables; with cables, it is cable A's (nothing if A has it already). Like the
     # switch here before, this doesn't restore default roles Windows moves; Cable.ps1 variant A does.
     Write-Step "Cable A's variant: $Variant (acx-ll-cable variant A $Variant)"
     $code = Invoke-CableTool $tool @('variant', 'A', $Variant)
-    if ($code -eq 7) { Write-Note 'Windows wants a restart to finish the switch.' }
-    elseif ($code -ne 0) { throw "the update is done, but cable A's variant switch failed ($code): its steps are above" }
+    Exit-ForToolCode $code "cable A's variant switch (the update is done)" $status
 }
 
-& (Join-Path $PSScriptRoot 'Get-DriverStatus.ps1')
+& $status
+exit 0

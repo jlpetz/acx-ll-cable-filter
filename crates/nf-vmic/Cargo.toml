@@ -20,6 +20,9 @@ path = "src/bin/acx-ll-cable.rs"
 [dependencies]
 # The tool's verify, kill-test, open and latency open the endpoints; the library itself doesn't use it.
 wasapi.workspace = true
+# The setup's endpoint map (acx-ll-cable migrate|add --endpoint-map): JSON.
+serde.workspace = true
+serde_json.workspace = true
 # The library: Foundation, Security (CreateFileW's and CreateEventW's signatures), Storage_FileSystem (CreateFileW), System_IO
 # (DeviceIoControl, OVERLAPPED, CancelIoEx), System_Memory (VirtualAlloc), System_Threading (events). The tool: System_Threading
 # (the waitable timer, MMCSS), System_Console (Ctrl+C handlers), System_JobObjects (kill-test's job for its children),

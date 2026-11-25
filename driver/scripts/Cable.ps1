@@ -12,12 +12,19 @@
     package, and moves every cable together.
 
     -Build builds the tool first (cargo build --release -p nf-vmic --bin acx-ll-cable); without it, a missing tool is an
-    error, so no run rebuilds anything unasked.
+    error, so no run rebuilds anything unasked. add -EndpointMap <file>: which new endpoint takes each old one's place (a
+    re-added or repaired cable's, an adopted device's), as JSON (acx-ll-cable's --endpoint-map).
+
+    Exit codes: 0 done (or nothing to do); 7 Windows wants a restart to finish (stop there: restart, then run this again);
+    2 the setup tool's error (its steps above say what changed); 1 a usage error or this script's own check (not elevated,
+    no tool).
 
 .EXAMPLE
     .\Cable.ps1 list
 .EXAMPLE
     .\Cable.ps1 add B
+.EXAMPLE
+    .\Cable.ps1 add B -EndpointMap C:\temp\b-map.json
 .EXAMPLE
     .\Cable.ps1 add D -Mics call
 .EXAMPLE
@@ -33,11 +40,13 @@ param(
     [Parameter(Position = 2)][ValidateSet('both', 'call', 'low-latency')][string]$To,
     [ValidateSet('both', 'call', 'low-latency')][string]$Mics,
     [string]$Adopt,
+    [string]$EndpointMap,
     [switch]$Forget,
     [switch]$Build
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
+if ($EndpointMap -and $Action -ne 'add') { throw "-EndpointMap goes with add: Cable.ps1 add B -EndpointMap <file>" }
 $tool = Get-CableTool -Build:$Build
 
 if ($Action -eq 'list') {
@@ -51,6 +60,7 @@ $arguments = switch ($Action) {
         $a = @('add', $Label)
         if ($Mics) { $a += @('--mics', $Mics) }
         if ($Adopt) { $a += @('--adopt', $Adopt) }
+        if ($EndpointMap) { $a += @('--endpoint-map', $EndpointMap) }
         $a
     }
     'remove' {
@@ -65,7 +75,8 @@ $arguments = switch ($Action) {
 }
 
 if ($Action -eq 'remove') {
-    exit (Invoke-CableTool $tool $arguments)
+    Exit-ForToolCode (Invoke-CableTool $tool $arguments) "removing cable $Label"
+    exit 0
 }
 
 # add and variant make endpoints: note the default roles and the endpoints there now, and put back any role Windows moved to
@@ -91,4 +102,5 @@ try {
         }
     } }
 }
-exit $code
+Exit-ForToolCode $code "$Action $Label"
+exit 0

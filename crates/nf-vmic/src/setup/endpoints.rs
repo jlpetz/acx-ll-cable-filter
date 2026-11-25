@@ -4,7 +4,9 @@
 //! ([`sessions::parse_filter`]: the documented device topology route first, then the property store's copy) gives the instance
 //! ID of the node it's on and the circuit's reference string: `speaker0` the Speakers, `microphone0` the Microphone,
 //! `microphone1` the Call Microphone. An endpoint belongs to the cable whose node has that instance ID, compared without case;
-//! instance IDs are never another cable's (section 4), so a stale endpoint can't be credited to the wrong cable.
+//! instance IDs are never another cable's (section 4), so a stale endpoint can't be credited to the wrong cable. The look
+//! before an action may also take the endpoints of other nodes, named by instance ID (the old driver's, which the migration
+//! replaces, with the same reference strings), for the endpoint map ([`super::endpoint_map`]); they are never a cable's.
 //!
 //! Names don't decide which cable an endpoint is; they are checked after an action ([`Names`]). An endpoint Windows makes
 //! now must read "Speakers (ACX-LL-Cable D)" and so on. One it had before the action (by its MMDevice id: an update, a
@@ -110,15 +112,17 @@ pub struct Endpoint {
 /// Every endpoint on a node in our instance-ID form, NOTPRESENT ones left out. On a thread of its own, in the MTA. Any user
 /// may call it.
 pub fn all() -> Result<Vec<Endpoint>, WinError> {
-    on_mta_thread(|| read(false))
+    on_mta_thread(|| read(false, &[]))
 }
 
-/// [`all`] with the NOTPRESENT ones too: the look before an action, whose names the endpoints keep ([`Names::Since`]).
-pub fn before() -> Result<Vec<Endpoint>, WinError> {
-    on_mta_thread(|| read(true))
+/// [`all`] with the NOTPRESENT ones too: the look before an action, whose names the endpoints keep ([`Names::Since`]). With
+/// them, the endpoints of the nodes `also` names by instance ID (the old driver's), in every state.
+pub fn before(also: &[String]) -> Result<Vec<Endpoint>, WinError> {
+    let also = also.to_vec();
+    on_mta_thread(move || read(true, &also))
 }
 
-fn read(not_present: bool) -> Result<Vec<Endpoint>, WinError> {
+fn read(not_present: bool, also: &[String]) -> Result<Vec<Endpoint>, WinError> {
     // SAFETY: COM is initialised on this thread (on_mta_thread's); a plain in-process creation.
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(WinError::of("CoCreateInstance(MMDeviceEnumerator)"))?;
@@ -138,7 +142,7 @@ fn read(not_present: bool) -> Result<Vec<Endpoint>, WinError> {
         let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
         let cached = string_property(&store, &PKEY_ENDPOINT_FILTER).ok().filter(|p| !p.is_empty());
         let topology = connected_filter(&device);
-        let Some((instance_id, kind)) = attribute(&[topology.as_deref(), cached.as_deref()]) else { continue };
+        let Some((instance_id, kind)) = attribute(&[topology.as_deref(), cached.as_deref()], also) else { continue };
         // SAFETY: a live device.
         let Ok(state) = (unsafe { device.GetState() }) else { continue };
         let state = match state {
@@ -155,11 +159,13 @@ fn read(not_present: bool) -> Result<Vec<Endpoint>, WinError> {
 }
 
 /// The node and kind of an endpoint, from the copies of its KS filter path read (the topology's first): the first that parses,
-/// names one of our circuits, and is on a node of our instance-ID form.
-pub fn attribute(filters: &[Option<&str>]) -> Option<(String, EndpointKind)> {
+/// names one of our circuits, and is on a node of our instance-ID form or one of `also` (instance IDs, compared without case).
+pub fn attribute(filters: &[Option<&str>], also: &[String]) -> Option<(String, EndpointKind)> {
     filters.iter().flatten().find_map(|path| {
         let (instance, reference) = sessions::parse_filter(path)?;
-        CableInstance::parse(&instance)?;
+        if CableInstance::parse(&instance).is_none() && !also.iter().any(|a| same_instance(a, &instance)) {
+            return None;
+        }
         Some((instance, EndpointKind::of_reference(&reference)?))
     })
 }
@@ -275,13 +281,17 @@ mod tests {
             format!(r"{{2}}.\\?\{}#{{6994ad04-93ef-11d0-a3cc-00a0c9223196}}\{reference}", a.instance_id().replace('\\', "#").to_lowercase())
         };
         let speaker = path("speaker0");
-        assert_eq!(attribute(&[Some(&speaker)]), Some((a.instance_id().to_lowercase(), EndpointKind::Speakers)));
-        assert_eq!(attribute(&[Some(&path("microphone1/00010001"))]).map(|x| x.1), Some(EndpointKind::CallMicrophone));
+        assert_eq!(attribute(&[Some(&speaker)], &[]), Some((a.instance_id().to_lowercase(), EndpointKind::Speakers)));
+        assert_eq!(attribute(&[Some(&path("microphone1/00010001"))], &[]).map(|x| x.1), Some(EndpointKind::CallMicrophone));
         // The topology's names neither, or is another node's: the property store's copy decides
         let other = r"\\?\root#media#0003#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\microphone0";
-        assert_eq!(attribute(&[Some(other), Some(&path("microphone0"))]).map(|x| x.1), Some(EndpointKind::Microphone));
-        assert_eq!(attribute(&[Some(&path("pin3")), None]), None);
-        assert_eq!(attribute(&[None, Some(other)]), None, "a node made outside the tool isn't a cable");
+        assert_eq!(attribute(&[Some(other), Some(&path("microphone0"))], &[]).map(|x| x.1), Some(EndpointKind::Microphone));
+        assert_eq!(attribute(&[Some(&path("pin3")), None], &[]), None);
+        assert_eq!(attribute(&[None, Some(other)], &[]), None, "a node made outside the tool isn't a cable");
+        // ... unless the look names it (the old driver's node, for the endpoint map)
+        let old = [r"ROOT\MEDIA\0003".to_string()];
+        assert_eq!(attribute(&[None, Some(other)], &old), Some((r"root\media\0003".to_string(), EndpointKind::Microphone)));
+        assert_eq!(attribute(&[None, Some(other)], &[r"ROOT\MEDIA\0004".to_string()]), None);
         assert_eq!(EndpointKind::of_variant(Variant::Both), [
             EndpointKind::Speakers,
             EndpointKind::Microphone,

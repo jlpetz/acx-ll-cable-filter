@@ -76,17 +76,38 @@ function Get-CableTool([switch]$Build) {
     return $tool
 }
 
-# Runs the setup tool with its arguments, its output shown as it comes; its exit code (0 done, 2 an error, 7 a restart).
+# Runs the setup tool with its arguments, its output shown as it comes; its exit code (0 done, 1 usage, 2 an error, 7 a
+# restart).
 function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
     & $Tool @Arguments | Out-Host
     return $LASTEXITCODE
 }
 
+# The scripts' exit codes (TODO 19; Install-Driver.ps1, Cable.ps1, Uninstall-Driver.ps1): 0 done; 7 Windows wants a restart to
+# finish (a caller stops there: restart, then run the script again, which finishes what is left); 2 the setup tool's error
+# (its steps say what changed); 1 the tool's usage error, or the script's own check (not elevated, test signing, no package,
+# no tool: a thrown error). pnputil's own "restart required" (ERROR_SUCCESS_REBOOT_REQUIRED) is 7 too.
+$script:RebootRequired = 3010
+
+# Ends the script with the setup tool's exit code `$Code` unless it is 0, saying so (`$What`: the step), after `$Then` (the
+# status, say) if given.
+function Exit-ForToolCode([int]$Code, [string]$What, [scriptblock]$Then) {
+    if ($Code -eq 0) { return }
+    if ($Code -eq 7) {
+        Write-Note "Windows wants a restart to finish $($What): restart, then run this again. Exit 7."
+    } else {
+        Write-Host "   the setup tool failed at $($What) (exit $Code): its steps are above" -ForegroundColor Red
+    }
+    if ($Then) { & $Then }
+    exit $Code
+}
+
 # The setup tool's store of cable identities (crates\nf-vmic\src\setup\store.rs), read-only here.
 $script:CableStore = 'HKLM:\SOFTWARE\ACX-LL-Cable\Cables'
 
-# The cables a migration recorded (Pending = 1) and hasn't made yet: a run stopped after the old devices went, by a failure or
-# a restart Windows needed. While there are any, Install-Driver.ps1 runs the migration again, which makes them.
+# The cables a migration recorded (Pending = 1) and hasn't made, or made and hasn't recorded as made yet: a run stopped after
+# the old devices went, by a failure, a restart Windows needed or a killed tool. While there are any, Install-Driver.ps1 runs
+# the migration again, which makes them, or checks and records the ones there.
 function Get-PendingCables {
     if (-not (Test-Path $CableStore)) { return @() }
     @(Get-ChildItem $CableStore -ErrorAction SilentlyContinue |

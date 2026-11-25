@@ -72,10 +72,16 @@ circuit's component ID is the identity XOR the sample's constant.
 boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
 attempts in its hardware key (`NfStartAttempts` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters`,
 flushed before it goes on); a completed start (EvtDeviceSelfManagedIoInit) or a binding that ends without a crash clears it.
+A clear that fails (the key or the value) is tried again when the binding ends (its context cleanup): the binding forgets
+its count only once the value is gone.
 A device whose last start never completed is refused: code 31, with 0xE0AC0001 as its problem status, a System event from
 the source `AudioCodec` (event ID 1, "ACX-LL-Cable <label> refused: its last start never completed"), and a debug message
-saying how to clear it. The setup tool deletes the count when it installs a cable; by hand, delete the value and disable and
-enable the device. It refuses at one start, not two, because at boot the cables most likely start before the Session Manager
+saying how to clear it. The setup tool deletes the count when it installs a cable (`Cable.ps1 add <label>` repairs a
+refused cable in place). By hand, elevated: `reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters" /v
+NfStartAttempts /t REG_DWORD /d 1 /f` sets it (a test of the refusal: then `pnputil /disable-device "<instance>"` and
+`pnputil /enable-device "<instance>"`; a running binding's own count is cleared already, so its cleanup leaves the value), and
+`reg delete "HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters" /v NfStartAttempts /f` then a disable and an
+enable clears it. It refuses at one start, not two, because at boot the cables most likely start before the Session Manager
 makes the SYSTEM hive writable (to confirm on the box), and a crash then loses the boot's count: the count that stops a loop
 is the one a crash in start leaves in a session (an install, an update, an enable), and at two every boot after would count
 its second attempt in memory only and crash again. So it stops the loop that follows a crash first seen in a session; it
@@ -94,10 +100,12 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
 --bin acx-ll-cable`). In an elevated PowerShell window (`list` takes any user):
 - `scripts\Cable.ps1 list`: the present cables with their devices, endpoints and control devices, the remembered absent ones,
   the old driver's devices and setup errors.
-- `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>]`: makes a cable on the package the others run.
-  Present and working: no change. Present but not working: repaired in place. Removed earlier: back with its identity and
-  instance ID, so (we expect, to confirm on the box) its endpoints. `-Adopt` re-creates a device made outside the tool as
-  the cable.
+- `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>] [-EndpointMap <file>]`: makes a cable on the
+  package the others run, with both microphones unless `-Mics` (or what it had). Present and working: no change. Present but
+  not working: repaired in place. Removed earlier: back with its identity and, with the microphones it had, its instance ID,
+  so (we expect, to confirm on the box) its endpoints and their ids; with other microphones, the next instance number (new
+  endpoints, as a variant switch). `-Adopt` re-creates a device made outside the tool (`list` shows them as "Not a cable")
+  as the cable; nothing adopts one otherwise.
 - `Cable.ps1 remove <label> [-Forget]`: removes that cable's device only; its identity stays in the setup's store
   (`HKLM\SOFTWARE\ACX-LL-Cable\Cables`) unless `-Forget`.
 - `Cable.ps1 variant <label> both|call|low-latency`: re-creates that cable's device with the next instance number (new
@@ -109,7 +117,9 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
 - the old driver's devices present (`ROOT\AudioCodec*` as A, `ROOT\NoiseFilterCableB` as B): the migration, once
   (`acx-ll-cable migrate`). Nothing changes unless the package makes A and B; then A and B are recorded in the store, every
   device of ours is disabled until the old image unloads, the old devices are removed, and A (its variant, or `-Variant`)
-  and B (`-CableBMics`, default both) are made on the new package. A run that stops part way is finished by running it again.
+  and B (`-CableBMics`, default both) are made on the new package. A run that stops part way is finished by running it again:
+  a cable it made and didn't record yet is checked (its identity on one device, working on the package, its endpoints) and
+  recorded, and with the old devices gone and every cable on the package, nothing is disabled or installed again.
 - cables present: `acx-ll-cable update <package folder>`, every cable moved to the package together. Every cable stops for a
   few seconds: one image serves them all. If a cable refuses the disable, or the old image is still loaded 10 s after every
   cable was disabled (an app has a cable's control device open), every cable is enabled again, nothing is installed, and it
@@ -119,6 +129,19 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
 `scripts\Uninstall-Driver.ps1` removes every device of ours (`acx-ll-cable remove --all --forget`, the old driver's too) and
 deletes the packages; `-KeepIdentities` keeps the store, so cables added again keep their identities. A cable's id is a
 random GUID unique to the machine: scrub it from logs pasted into docs.
+
+**Exit codes**, the tool's and the three scripts': 0 done (or nothing to do); 7 Windows wants a restart to finish (a caller
+stops there: restart, then run it again, which finishes what is left; pnputil's own 3010 is 7 too); 2 the tool's error (its
+steps say what changed), or a package Uninstall-Driver.ps1 couldn't delete; 1 a usage error or a script's own check (not
+elevated, test signing, no package, no tool).
+
+**The endpoint map.** `Install-Driver.ps1 -EndpointMap <file>` (the migration, or the first `add A`) and `Cable.ps1 add
+<label> -EndpointMap <file>` pass `--endpoint-map <file>` to the tool, which writes, as JSON, which new endpoint takes each
+old one's place, by cable and role (Speakers, Microphone, Call Microphone), with the ids and names. The old driver's
+endpoints map to A's and B's; a re-added cable's to its own. Each old endpoint's `match` is `same` (Windows kept the
+endpoint), `moved` (one new endpoint of that role: remap the id), `gone`, `ambiguous` or, for a new endpoint without an old
+one, `added`; only `same` and `moved` are remapped. The tool deletes the file at the start and writes it at the end once it
+has read the endpoints before the run (format and fields: `crates\nf-vmic\src\setup\endpoint_map.rs`).
 
 **Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker

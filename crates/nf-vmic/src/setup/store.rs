@@ -3,16 +3,19 @@
 //! `call` or `low-latency`, REG_SZ). `add` reuses a label's identity and n, `remove` keeps them, `remove --forget` drops them.
 //! `Pending` (REG_DWORD 1, ours) marks a cable the migration is to make and hasn't yet: written before the old devices go, so
 //! a run that stops after their removal is finished by the next (Install-Driver.ps1 runs the migration while one is pending);
-//! cleared when the cable is made. The key takes HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
+//! cleared when the cable is made. `Replaces` (REG_MULTI_SZ, ours) goes with it: the instance IDs of the old driver's nodes the
+//! migration makes the cable in place of, so a run after their removal still finds their endpoints for the endpoint map. The
+//! key takes HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
-    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS,
+    REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
+use super::devices::{multi_sz_bytes, parse_multi_sz, wide_of_bytes};
 use super::plan::Entry;
 use crate::identity::{CableId, Label};
 use crate::variant::Variant;
@@ -22,6 +25,8 @@ use crate::win_error::WinError;
 pub const KEY: &str = r"SOFTWARE\ACX-LL-Cable\Cables";
 /// The value marking a cable the migration hasn't made yet.
 pub const PENDING: &str = "Pending";
+/// The old driver's nodes a pending cable is made in place of.
+pub const REPLACES: &str = "Replaces";
 
 /// What the store holds: the entries that read, and what was wrong with those that didn't (left alone, and reported).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -40,7 +45,7 @@ pub fn entry_of(label: &str, id: Option<&str>, n: Option<u32>, mics: Option<&str
         None => None,
         Some(m) => Some(Variant::from_arg(m).ok_or_else(|| format!("{at}: Mics '{m}' isn't both, call or low-latency"))?),
     };
-    Ok(Entry { label, id, n, mics, pending: pending.is_some_and(|p| p != 0) })
+    Ok(Entry { label, id, n, mics, pending: pending.is_some_and(|p| p != 0), replaces: Vec::new() })
 }
 
 /// A registry key, closed on drop.
@@ -101,6 +106,21 @@ fn dword_value(key: &Key, name: &str) -> Result<Option<u32>, WinError> {
     Ok(value(key, name)?.filter(|(k, b)| *k == REG_DWORD && b.len() == 4).map(|(_, b)| u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
 }
 
+/// A REG_MULTI_SZ's strings; none if it isn't there (or isn't one).
+fn strings_value(key: &Key, name: &str) -> Result<Vec<String>, WinError> {
+    Ok(value(key, name)?.filter(|(k, _)| *k == REG_MULTI_SZ).map(|(_, b)| parse_multi_sz(&wide_of_bytes(&b))).unwrap_or_default())
+}
+
+/// Deletes a value of an open key; not there is fine.
+fn delete_value(key: &Key, name: &str, call: &'static str) -> Result<(), WinError> {
+    let name = HSTRING::from(name);
+    // SAFETY: an open key; no subkey; a NUL-terminated value name.
+    match unsafe { RegDeleteKeyValueW(key.0, PCWSTR::null(), &name) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+        e => Err(WinError { call, code: e.0 }),
+    }
+}
+
 /// Every entry. Any user may read it; no store yet is an empty one.
 pub fn read() -> Result<Store, WinError> {
     let mut store = Store::default();
@@ -122,7 +142,12 @@ pub fn read() -> Result<Store, WinError> {
         let mics = string_value(&key, "Mics")?;
         let pending = dword_value(&key, PENDING)?;
         match entry_of(&label, id.as_deref(), n, mics.as_deref(), pending) {
-            Ok(e) => store.entries.push(e),
+            Ok(mut e) => {
+                if e.pending {
+                    e.replaces = strings_value(&key, REPLACES)?;
+                }
+                store.entries.push(e)
+            }
             Err(why) => store.problems.push(why),
         }
     }
@@ -161,15 +186,18 @@ pub fn write(e: &Entry) -> Result<(), WinError> {
     if let Some(m) = e.mics {
         set("Mics", REG_SZ, &sz(m.arg()))?;
     }
+    // Pending last when set, first when cleared: a Pending entry always has its Replaces
     if e.pending {
+        if e.replaces.is_empty() {
+            delete_value(&key, REPLACES, "RegDeleteKeyValueW(Replaces)")?;
+        } else {
+            let replaces: Vec<&str> = e.replaces.iter().map(String::as_str).collect();
+            set(REPLACES, REG_MULTI_SZ, &multi_sz_bytes(&replaces))?;
+        }
         set(PENDING, REG_DWORD, &1u32.to_le_bytes())
     } else {
-        let name = HSTRING::from(PENDING);
-        // SAFETY: an open key; no subkey; a NUL-terminated value name.
-        match unsafe { RegDeleteKeyValueW(key.0, PCWSTR::null(), &name) } {
-            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
-            e => Err(WinError { call: "RegDeleteKeyValueW(Pending)", code: e.0 }),
-        }
+        delete_value(&key, PENDING, "RegDeleteKeyValueW(Pending)")?;
+        delete_value(&key, REPLACES, "RegDeleteKeyValueW(Replaces)")
     }
 }
 
