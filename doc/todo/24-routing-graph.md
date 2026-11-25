@@ -11,6 +11,15 @@ for it."
 So: no mixer app now; the per-cable driver (TODO 19's step 1) and the engine's fan-out (TODO 19's E1, Astra's) are built
 so that one can be added without redoing either.
 
+## Why in the app (the owner, 2026-11-26)
+One capture feeding every destination lets the physical microphone be opened in exclusive mode, which admits a single
+client: several apps opening the mic themselves would force it to shared mode. Measured (TODO 13): mic delivery about
+0.7 ms exclusive against 17-19 ms shared, app + output cable 38.5-41.0 ms with the defaults against 46.7-49.4 with the mic
+shared. Exclusive is the default since 2026-11-02, with the shared fallback for a device that refuses it (some drivers,
+Bluetooth hands-free, or Windows' "Allow applications to take exclusive control" turned off). Two costs to show the user:
+no app can open the mic directly while the filter runs (they record from the cables), and exclusive mode bypasses the mic
+driver's own effects (vendor noise suppression, beamforming).
+
 ## The model (ours, for the owner and Astra)
 A routing graph evaluated block by block on the engine's real-time thread, in topological order:
 - **Sources:** a physical input (WASAPI capture), and later a cable's playback side (below: the render tap).
