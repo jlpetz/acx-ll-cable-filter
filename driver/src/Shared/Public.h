@@ -149,7 +149,10 @@ typedef struct _CODEC_DEVICE_CONTEXT {
     LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
     NF_CABLE        Cable;                  // noise-filter (TODO 19, the per-cable design): this device's cable (Cable.h)
     BOOLEAN         StartCounted;           // noise-filter (TODO 19, the boot crash breaker, Device.cpp): this binding's start
-                                            // is counted in the hardware key and not cleared yet. PASSIVE_LEVEL only.
+                                            // is counted in the hardware key and the count not removed yet. PASSIVE_LEVEL only.
+    BOOLEAN         StartClearUnflushed;    // noise-filter (TODO 19, the boot crash breaker): the count removed, its removal not
+                                            // known to be on disk (its ZwFlushKey failed): flushed again by the next clear, the
+                                            // context cleanup at the latest. PASSIVE_LEVEL only.
 } CODEC_DEVICE_CONTEXT, * PCODEC_DEVICE_CONTEXT;
 
 //

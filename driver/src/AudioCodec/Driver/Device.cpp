@@ -545,14 +545,15 @@ NfAssignFriendlyName(
 //
 // noise-filter (TODO 19): the boot crash breaker (ours, for the owner's go; removable with this block, its calls in
 // Codec_EvtBusDeviceAdd and Codec_EvtDeviceContextCleanup, Codec_EvtDeviceSelfManagedIoInit and CODEC_DEVICE_CONTEXT's
-// StartCounted). Driver Verifier stays on at boot on the dev box, so a deterministic bugcheck in a cable's start would come
-// back at every boot. AddDevice counts the device's start attempts in its hardware key (NfStartAttempts, Cable.h), flushed
-// before it goes on, and the count is cleared once the start has completed (EvtDeviceSelfManagedIoInit, the last of the
-// start's callbacks) or the binding has ended without a crash (a failed AddDevice or start, a removal: a clean failure doesn't
-// loop the box). A device whose last start never completed, so that nothing cleared its count, is refused at AddDevice with
-// NF_STATUS_START_BREAKER (Device Manager: code 31, the status in DEVPKEY_Device_ProblemStatus), a System event (source
-// AudioCodec) and a debug message, both saying why, the second how to clear it. The setup tool deletes the count when it
-// installs a cable. Everything here is PASSIVE_LEVEL (the registry calls, wdfregistry.h and wdm.h).
+// StartCounted and StartClearUnflushed). Driver Verifier stays on at boot on the dev box, so a deterministic bugcheck in a
+// cable's start would come back at every boot. AddDevice counts the device's start attempts in its hardware key
+// (NfStartAttempts, Cable.h), flushed before it goes on, and the count is cleared (removed, then flushed) once the start has
+// completed (EvtDeviceSelfManagedIoInit, the last of the start's callbacks) or the binding has ended without a crash (a failed
+// AddDevice or start, a removal: a clean failure doesn't loop the box). A device whose last start never completed, so that
+// nothing cleared its count, is refused at AddDevice with NF_STATUS_START_BREAKER (Device Manager: code 31, the status in
+// DEVPKEY_Device_ProblemStatus), a System event (source AudioCodec) and a debug message, both saying why, the second how to
+// clear it. The setup tool deletes the count when it installs a cable. Everything here is PASSIVE_LEVEL (the registry calls,
+// wdfregistry.h and wdm.h).
 //
 // Why at one start, not two: at boot the cables most likely start before the Session Manager makes the SYSTEM hive writable
 // (kernel Plug and Play starts the root-enumerated devices of installed drivers before smss.exe runs; to confirm on the box:
@@ -573,11 +574,29 @@ NfAssignFriendlyName(
 //
 DECLARE_CONST_UNICODE_STRING(g_NfStartAttemptsValue, NF_CABLE_START_ATTEMPTS_VALUE);
 
-// Count into the key (0: the value removed), flushed so it is on disk before the caller goes on.
+// The key's changes committed to disk. ZwFlushKey, as Learn documents it: it "forces a registry key to be committed to disk",
+// returns STATUS_SUCCESS "if the key information was transferred to disk", "does not return until all the changed data that
+// is associated with KeyHandle has been written to disk", and "flushes the entire registry hive for the key"; without it "the
+// system flushes key changes automatically every few seconds". So a flush that succeeds commits an earlier change whose own
+// flush failed, and a removal whose flush failed is flushed again, never taken as done because the value is gone (Astra's
+// review, 2026-11-25).
 PAGED_CODE_SEG
 static
 NTSTATUS
-NfBreakerStore(
+NfBreakerFlush(
+    _In_ WDFKEY Key
+)
+{
+    PAGED_CODE();
+
+    return ZwFlushKey(WdfRegistryWdmGetHandle(Key));
+}
+
+// Count into the key, flushed so it is on disk before the caller goes on.
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfBreakerCount(
     _In_ WDFKEY Key,
     _In_ ULONG  Count
 )
@@ -586,24 +605,29 @@ NfBreakerStore(
 
     PAGED_CODE();
 
-    if (Count == 0)
-    {
-        status = WdfRegistryRemoveValue(Key, &g_NfStartAttemptsValue);
-        if (status == STATUS_OBJECT_NAME_NOT_FOUND)
-        {
-            // Nothing counted: nothing to write.
-            return STATUS_SUCCESS;
-        }
-    }
-    else
-    {
-        status = WdfRegistryAssignULong(Key, &g_NfStartAttemptsValue, Count);
-    }
+    status = WdfRegistryAssignULong(Key, &g_NfStartAttemptsValue, Count);
     if (NT_SUCCESS(status))
     {
-        status = ZwFlushKey(WdfRegistryWdmGetHandle(Key));
+        status = NfBreakerFlush(Key);
     }
     return status;
+}
+
+// The count removed from the key, not flushed (the caller flushes): STATUS_SUCCESS whether it was there or not (removed now,
+// or by the setup tool, whose removal is in memory only until a flush).
+PAGED_CODE_SEG
+static
+NTSTATUS
+NfBreakerRemove(
+    _In_ WDFKEY Key
+)
+{
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    status = WdfRegistryRemoveValue(Key, &g_NfStartAttemptsValue);
+    return (status == STATUS_OBJECT_NAME_NOT_FOUND) ? STATUS_SUCCESS : status;
 }
 
 //
@@ -710,7 +734,7 @@ NfBreakerEnter(
         return NF_STATUS_START_BREAKER;
     }
 
-    status = NfBreakerStore(key, attempts + 1);
+    status = NfBreakerCount(key, attempts + 1);
     if (!NT_SUCCESS(status))
     {
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
@@ -723,30 +747,49 @@ NfBreakerEnter(
     return STATUS_SUCCESS;
 }
 
-// Closes AddDevice's key, clearing the count first if Clear (AddDevice failed before the framework device existed).
+// Closes AddDevice's key, clearing the count first if Clear (AddDevice failed before the framework device existed): removed,
+// then flushed. No device is left to try again, so a clear that fails is said (a power loss before the lazy flush writes it
+// leaves the count on disk, and the device refused at its next start: the setup tool's add clears it).
 PAGED_CODE_SEG
 static
 VOID
 NfBreakerClose(
     _In_opt_    WDFKEY  Key,
-    _In_        BOOLEAN Clear
+    _In_        BOOLEAN Clear,
+    _In_        PCWSTR  InstanceId
 )
 {
+    NTSTATUS status;
+
     PAGED_CODE();
 
     if (Key != NULL)
     {
         if (Clear)
         {
-            (void)NfBreakerStore(Key, 0);
+            status = NfBreakerRemove(Key);
+            if (NT_SUCCESS(status))
+            {
+                status = NfBreakerFlush(Key);
+            }
+            if (!NT_SUCCESS(status))
+            {
+                DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
+                           "AudioCodec: %ws's start count not cleared on disk after its AddDevice failed (0x%08X): a power loss "
+                           "now leaves it refused at its next start (the setup tool's add clears it)\n",
+                           InstanceId, status);
+            }
         }
         WdfRegistryClose(Key);
     }
 }
 
-// Clears the device's count: its start completed, or its binding ended without a crash. StartCounted goes only once the value
-// is gone (removed and flushed, or not there), so a clear that fails is tried again by the next caller, the context cleanup
-// (its last chance: a count left on disk refuses the device at its next AddDevice). PASSIVE_LEVEL.
+// Clears the device's count: its start completed, or its binding ended without a crash. Two steps, each tracked so that a
+// step that fails is tried again by the next caller, the context cleanup (its last chance: a count left on disk refuses the
+// device at its next AddDevice): the removal (StartCounted goes once the value is gone: removed now, or not there), then its
+// flush (StartClearUnflushed goes once ZwFlushKey succeeds). A removal whose flush failed is flushed again, not skipped because
+// the value is gone (Astra's review, 2026-11-25): else a power loss before the lazy flush brings the count back and refuses a
+// healthy cable. PASSIVE_LEVEL.
 PAGED_CODE_SEG
 static
 VOID
@@ -757,10 +800,11 @@ NfBreakerClear(
 {
     WDFKEY      key;
     NTSTATUS    status;
+    PCSTR       step = "its hardware key's open";
 
     PAGED_CODE();
 
-    if (!DevCtx->StartCounted)
+    if (!DevCtx->StartCounted && !DevCtx->StartClearUnflushed)
     {
         return;
     }
@@ -768,19 +812,33 @@ NfBreakerClear(
     status = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &key);
     if (NT_SUCCESS(status))
     {
-        status = NfBreakerStore(key, 0);
+        if (DevCtx->StartCounted)
+        {
+            step = "the removal";
+            status = NfBreakerRemove(key);
+            if (NT_SUCCESS(status))
+            {
+                DevCtx->StartCounted = FALSE;
+                DevCtx->StartClearUnflushed = TRUE;
+            }
+        }
+        if (NT_SUCCESS(status))
+        {
+            step = "the flush";
+            status = NfBreakerFlush(key);
+            if (NT_SUCCESS(status))
+            {
+                DevCtx->StartClearUnflushed = FALSE;
+            }
+        }
         WdfRegistryClose(key);
     }
-    if (NT_SUCCESS(status))
-    {
-        DevCtx->StartCounted = FALSE;
-    }
-    else
+    if (!NT_SUCCESS(status))
     {
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
-                   "AudioCodec: cable %ws's start count not cleared (0x%08X): the context cleanup tries again; a count left "
-                   "on disk refuses the device at its next start\n",
-                   DevCtx->Cable.Label, status);
+                   "AudioCodec: cable %ws's start count not cleared on disk (%s: 0x%08X): the context cleanup tries again; a "
+                   "count left on disk refuses the device at its next start\n",
+                   DevCtx->Cable.Label, step, status);
     }
 }
 
@@ -885,7 +943,7 @@ Return Value:
     if (!NT_SUCCESS(status))
     {
         // noise-filter (TODO 19, the boot crash breaker): a clean failure, with no framework device to clear the count later.
-        NfBreakerClose(breakerKey, TRUE);
+        NfBreakerClose(breakerKey, TRUE, instanceId);
         RETURN_IF_FAILED(status);
     }
 
@@ -911,7 +969,7 @@ Return Value:
     // noise-filter (TODO 19, the boot crash breaker): from here the device's own callbacks clear the count (StartCounted);
     // before, a failure clears it now.
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
-    NfBreakerClose(breakerKey, NT_SUCCESS(status) ? FALSE : TRUE);
+    NfBreakerClose(breakerKey, NT_SUCCESS(status) ? FALSE : TRUE, instanceId);
     RETURN_NTSTATUS_IF_FAILED(status);
 
     //
@@ -925,6 +983,7 @@ Return Value:
     devCtx->Capture2 = nullptr;
     devCtx->ExcludeD3Cold = WdfFalse;
     devCtx->StartCounted = startCounted;
+    devCtx->StartClearUnflushed = FALSE;
 
     //
     // noise-filter (TODO 19, the per-cable design, sections 4 and 5): the cable, first, so the context cleanup (which runs if
@@ -1366,7 +1425,8 @@ Return Value:
     //
 
     // noise-filter (TODO 19, the boot crash breaker): the binding ended without a crash (a failed AddDevice or start, or a
-    // removal before the start completed): its count goes; also a count whose clear failed when the start completed
-    // (StartCounted still set), tried again here. PASSIVE_LEVEL (a device's cleanup callback).
+    // removal before the start completed): its count goes; also a clear that failed when the start completed, tried again
+    // here from the step that failed (StartCounted: the removal; StartClearUnflushed: its flush). PASSIVE_LEVEL (a device's
+    // cleanup callback).
     NfBreakerClear(device, devCtx);
 }
