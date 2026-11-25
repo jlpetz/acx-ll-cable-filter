@@ -922,7 +922,7 @@ owner agrees.
   others live, under Verifier (S0a).
 
 ### Open questions
-**The owner's decisions (2026-11-25, adopting Astra's answers):** 1, A's counters reset
+**The owner's decisions (2026-11-25, adopting Astra's answers):** Also: the migrated Cable B keeps both microphones; its existing microphone maps to B's low-latency one (an app's saved choice keeps working) and the Call Microphone appears as a new endpoint; a cable stays pending until Windows shows its expected endpoints, after a restart too; a run stops if it can't put back the user's default devices (keeping the new ones is the user's explicit choice). 1, A's counters reset
 when A itself restarts, and B removed, restarted or updated alone leaves A's running. 2, a re-add keeps the logical
 identity and aims to keep the Windows endpoint IDs on an ordinary same-variant re-add, checked in S0a by default (the
 active endpoint IDs compared, a saved selection opening the intended microphone). 3, both microphones by default on every
