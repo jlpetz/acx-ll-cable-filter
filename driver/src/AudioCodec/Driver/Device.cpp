@@ -744,7 +744,9 @@ NfBreakerClose(
     }
 }
 
-// Clears the device's count, once: its start completed, or its binding ended without a crash. PASSIVE_LEVEL.
+// Clears the device's count: its start completed, or its binding ended without a crash. StartCounted goes only once the value
+// is gone (removed and flushed, or not there), so a clear that fails is tried again by the next caller, the context cleanup
+// (its last chance: a count left on disk refuses the device at its next AddDevice). PASSIVE_LEVEL.
 PAGED_CODE_SEG
 static
 VOID
@@ -762,7 +764,6 @@ NfBreakerClear(
     {
         return;
     }
-    DevCtx->StartCounted = FALSE;
 
     status = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &key);
     if (NT_SUCCESS(status))
@@ -770,9 +771,15 @@ NfBreakerClear(
         status = NfBreakerStore(key, 0);
         WdfRegistryClose(key);
     }
-    if (!NT_SUCCESS(status))
+    if (NT_SUCCESS(status))
     {
-        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL, "AudioCodec: cable %ws's start count not cleared (0x%08X)\n",
+        DevCtx->StartCounted = FALSE;
+    }
+    else
+    {
+        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_WARNING_LEVEL,
+                   "AudioCodec: cable %ws's start count not cleared (0x%08X): the context cleanup tries again; a count left "
+                   "on disk refuses the device at its next start\n",
                    DevCtx->Cable.Label, status);
     }
 }
@@ -1359,6 +1366,7 @@ Return Value:
     //
 
     // noise-filter (TODO 19, the boot crash breaker): the binding ended without a crash (a failed AddDevice or start, or a
-    // removal before the start completed): its count goes. PASSIVE_LEVEL (a device's cleanup callback).
+    // removal before the start completed): its count goes; also a count whose clear failed when the start completed
+    // (StartCounted still set), tried again here. PASSIVE_LEVEL (a device's cleanup callback).
     NfBreakerClear(device, devCtx);
 }
