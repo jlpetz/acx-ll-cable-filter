@@ -249,3 +249,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - The HLK's Device Fundamentals tests (PnP, sleep and reboot cycles, concurrent I/O, penetration tests fuzzing the control device's IOCTLs) and the audio tests that apply; KMDF's verifier; CodeQL's driver queries; ApiValidator on for release builds; physical Windows 11 machines (the owner's).
 **Next**: agree the order with the owner once the driver's feature set settles; code integrity at the owner's next reboot.
 **Detail**: `doc/todo/23-driver-validation.md`
+
+---
+
+### 24. [engine] Routing graph: split and merge feeds (groundwork for a mixer)
+**Priority**: Medium (groundwork now, the mixer later) | **Status**: the owner's intent (2026-11-26): the driver and the engine lay the groundwork for Voicemeeter-style routing (split a feed at any point, merge and split channels and cables) at low latency, without a mixer app yet.
+- Model (ours): a graph on the engine's real-time thread: sources, stages, split (a shared block, copy-on-write, no queue), mix (gains, latency alignment), channel map, sinks (a cable's ring or WASAPI).
+- Our cables share the driver's one clock, so routes among them are synchronous; a device on its own clock joins through a queue and drift control on its own thread; heavy nodes get a worker with a deadline.
+- Driver groundwork: a ring per cable (TODO 19, step 1), a render tap per cable (to design), formats per cable, mixing in user mode.
+**Next**: E1 (TODO 19, Astra's) built as a small graph core with inline branches for our cables; the render tap designed.
+**Detail**: `doc/todo/24-routing-graph.md`

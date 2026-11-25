@@ -690,9 +690,14 @@ compatibility promise).
 **Engine (E1), fan-out:**
 - The physical microphone is captured once and goes to N destinations. Each destination's source is the dry mic, the
   shared chain's output, or its own chain; its output is `Direct(CableId)` or `Wasapi(endpoint id)`.
-- Each destination has its own output or feeding thread (MMCSS, the real-time rules), fed from the capture through
-  lock-free queues. Stopping, reconfiguring, losing a device or underrunning one destination leaves the capture and the
-  others running; each retries on its own, re-resolving its cable after `Rebound` or `Removed`.
+- Amended (ours, 2026-11-26, after the owner's routing intent, TODO 24): our cables' branches run inline on the capture
+  thread, in the same block, and write their rings directly (a split adds no latency: the block is shared read-only, a
+  branch that changes it works on a copy); only a WASAPI destination (its own clock) or a heavy branch gets its own
+  output or feeding thread (MMCSS, the real-time rules), fed through a lock-free queue. Writing into a mapped ring is
+  plain memory any thread may do; each attachment stays on the thread that made it. Built as a small graph core (nodes,
+  edges, topological order, latency per node) so a mixer can be added later (TODO 24). Stopping, reconfiguring, losing
+  a device or underrunning one destination leaves the capture and the others running; each retries on its own,
+  re-resolving its cable after `Rebound` or `Removed`.
 - A direct destination's `LiveFeed` comes from the broker, or for an elevated app from a direct Attachment, which stays on
   the thread that made it (device.rs: `!Send`, since Windows cancels a thread's I/O when it exits). The AEC reference is
   captured once for every chain that uses it.
