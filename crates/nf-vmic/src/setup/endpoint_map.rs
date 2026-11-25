@@ -6,9 +6,10 @@
 //! **Old and new.** A cable's old endpoints are those in the look before the run (NOTPRESENT ones too) on the nodes it replaces:
 //! the old driver's nodes the migration makes it in place of (`ROOT\MEDIA\0003` for A, Cable-B.ps1's for B; recorded in the
 //! store until the migration's map is final, so a run after their removal still finds their lingering endpoints), a node `add
-//! --adopt` re-creates,
-//! and every earlier instance of its identity (a re-add's, a repair's: the same node). Its new endpoints are those on its
-//! instance after the run. Each old endpoint is matched to the new one of the same role (Speakers, render; Microphone and Call
+//! --adopt` re-creates, and every earlier instance of its identity (a re-add's, a repair's: the same node). A migration's cable
+//! takes its identity's other instances only, never its own now: those endpoints are this run's or an earlier attempt's, so its
+//! map is the same whichever attempt publishes it (B's Call Microphone `added` after a retry too). Its new endpoints are those
+//! on its instance after the run. Each old endpoint is matched to the new one of the same role (Speakers, render; Microphone and Call
 //! Microphone, capture): the old driver's circuits have the cable's reference strings (Speaker0, Microphone0, Microphone1).
 //!
 //! **`match`:**
@@ -19,25 +20,37 @@
 //! - `ambiguous`: more than one endpoint of that role on the new instance, none with the old id. Not remapped.
 //! - `added`: a new endpoint no old one maps to (`old` is null).
 //!
-//! The file is replaced at the start of the run (deleted, so a file there afterwards is this run's) and written at its end once
-//! the run has read the endpoints before it; a run that stops earlier (its error says why, nothing was changed) leaves none.
+//! **Publishing** (Astra's review, 2026-11-25). The file is published whole at the end of a run that has read the endpoints
+//! before it ([`publish`]): written to `<file>.tmp` beside it, flushed to disk, then renamed over the file. A reader finds the
+//! file as it was or this run's map, never part of one, and never no file where there was one. A run that publishes none (it
+//! stopped before reading the endpoints, or was killed, or its map couldn't be made) leaves the file as it was: an earlier
+//! run's map, the whole migration's among them, stays until a run publishes another. `start` only checks, before anything
+//! changes, that the file can be published (its folder there, a file beside it writable, the file itself replaceable). So a
+//! file there afterwards is this run's only if the run said so ("The endpoint map: <file> ..."): a reader that needs this run's
+//! own map passes a path no earlier run used.
 //!
 //! **Across runs.** A migration's cable keeps the old nodes it replaces in its store record (`Replaces`) once it is made, and
 //! every migrate or add run maps each present cable whose record has them, so the map of the run that leaves no record pending
 //! holds the whole migration, whatever its earlier attempts did (killed, stopped by a restart: a cable made by a run that needs
-//! one stays pending, and the run after the restart checks and maps it). That run drops them once its map is written; a map
-//! asked for and not written keeps them, so the next migration run maps them again. An earlier attempt's map holds what that
-//! attempt saw (`result` says how it ended).
+//! one stays pending, and the run after the restart checks and maps it). That run drops them once its map is published, a
+//! record at a time; each record keeps them for good as `Replaced`, so a drop that stops part way loses no cable: while any
+//! record keeps Replaces, every run maps the cables of both ([`super::plan::mapped`]), and the map is final once none does. A
+//! map asked for and not published keeps them, so the next migration run maps them again. An earlier attempt's map holds what
+//! that attempt saw (`result` says how it ended).
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+use windows::core::HSTRING;
 
 use super::endpoints::{Endpoint, State};
 use super::{Done, SetupError};
 use crate::cables::EndpointKind;
 use crate::identity::{CableId, CableInstance, same_instance};
 use crate::variant::Variant;
+use crate::win_error::WinError;
 
 /// The file's `format`.
 pub const FORMAT: &str = "acx-ll-cable endpoint map";
@@ -51,6 +64,10 @@ pub enum Old {
     Instance(String),
     /// Any instance of the cable's identity: an earlier n, or the same one (a re-add with its instance ID, a repair).
     Identity(CableId),
+    /// An instance of the cable's identity other than its own now (n): a migration's cable, whose own instance's endpoints in
+    /// the look before are this run's or an earlier attempt's, so its map is the same whichever attempt publishes it (its
+    /// Call Microphone `added`, not `same`, after a retry too).
+    OtherInstance { id: CableId, n: u32 },
 }
 
 impl Old {
@@ -58,6 +75,7 @@ impl Old {
         match self {
             Old::Instance(id) => same_instance(id, &e.instance_id),
             Old::Identity(id) => CableInstance::parse(&e.instance_id).is_some_and(|c| c.id == *id),
+            Old::OtherInstance { id, n } => CableInstance::parse(&e.instance_id).is_some_and(|c| c.id == *id && c.n != *n),
         }
     }
 }
@@ -71,10 +89,19 @@ pub struct Made {
 }
 
 impl Made {
-    /// A cable made in place of the nodes `replaces` (instance IDs), and of its own identity's earlier instances.
+    /// A cable made in place of the nodes `replaces` (instance IDs), and of its own identity's earlier instances (a re-add's,
+    /// a repair's: the same instance too).
     pub fn new(cable: CableInstance, variant: Variant, replaces: &[String]) -> Self {
         let mut old: Vec<Old> = replaces.iter().cloned().map(Old::Instance).collect();
         old.push(Old::Identity(cable.id));
+        Self { cable, variant, old }
+    }
+
+    /// A migration's cable, made in place of the old driver's nodes `replaces`: its identity's other instances too, never its
+    /// own now ([`Old::OtherInstance`]).
+    pub fn migration(cable: CableInstance, variant: Variant, replaces: &[String]) -> Self {
+        let mut old: Vec<Old> = replaces.iter().cloned().map(Old::Instance).collect();
+        old.push(Old::OtherInstance { id: cable.id, n: cable.n });
         Self { cable, variant, old }
     }
 
@@ -82,7 +109,7 @@ impl Made {
     pub fn replaces(&self) -> impl Iterator<Item = &String> {
         self.old.iter().filter_map(|o| match o {
             Old::Instance(id) => Some(id),
-            Old::Identity(_) => None,
+            Old::Identity(_) | Old::OtherInstance { .. } => None,
         })
     }
 }
@@ -240,29 +267,73 @@ pub fn map(
     EndpointMap { format: FORMAT, version: VERSION, command, result, cables }
 }
 
-/// The map's file at the start of a run: an old one deleted, so a file there afterwards is this run's.
-pub fn start(path: Option<&Path>) -> Result<(), SetupError> {
-    let Some(path) = path else { return Ok(()) };
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(SetupError::EndpointMap(format!("{} is there and couldn't be deleted ({e}): nothing was changed", path.display()))),
-    }
+/// The temporary file a map is written to before it is renamed over `path`: `<file>.tmp`, beside it (a rename stays on its
+/// volume). `None` if `path` names no file.
+fn temporary(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let mut tmp = name.to_os_string();
+    tmp.push(".tmp");
+    Some(path.with_file_name(tmp))
 }
 
-/// The map written to `path` at the end of a run (`gathered`, `result`), the endpoints after it read by `after`; said. A map
-/// that can't be made or written turns a run that was done into [`SetupError::EndpointMap`]; any other result stands, the
-/// failure said beside it.
+/// The map's file at the start of a run, before anything changes: whether it can be published (the module's docs). It isn't
+/// touched: a map an earlier run published stays until this run publishes its own.
+pub fn start(path: Option<&Path>) -> Result<(), SetupError> {
+    let Some(path) = path else { return Ok(()) };
+    let refuse = |why: String| Err(SetupError::EndpointMap(format!("{why}: nothing was changed")));
+    let shown = path.display();
+    let Some(tmp) = temporary(path).filter(|_| !path.is_dir()) else { return refuse(format!("{shown} isn't a file's name")) };
+    if path.exists()
+        && let Err(e) = std::fs::OpenOptions::new().write(true).open(path)
+    {
+        return refuse(format!("{shown} is there and can't be replaced ({e})"));
+    }
+    if let Err(e) = std::fs::File::create(&tmp) {
+        return refuse(format!("{} can't be written beside it ({e})", tmp.display()));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
+
+/// `text` published at `path` whole (Astra's review, 2026-11-25): written to `<file>.tmp` beside it (one a killed run left is
+/// written over), flushed to disk (FlushFileBuffers), then renamed over `path` (MoveFileExW with MOVEFILE_REPLACE_EXISTING, and
+/// MOVEFILE_WRITE_THROUGH: it returns once the rename is on disk). A reader finds `path` as it was, or `text`. On a failure the
+/// temporary file is deleted and `path` is as it was.
+pub fn publish(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = temporary(path).ok_or_else(|| format!("{} isn't a file's name", path.display()))?;
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{} couldn't be written ({e})", tmp.display()));
+    }
+    let (from, to) = (HSTRING::from(tmp.as_path()), HSTRING::from(path));
+    // SAFETY: two NUL-terminated paths that outlive the call; constant flags.
+    let moved = unsafe { MoveFileExW(&from, &to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    if let Err(e) = moved.map_err(WinError::of("MoveFileExW")) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{} couldn't be renamed over {} ({e})", tmp.display(), path.display()));
+    }
+    Ok(())
+}
+
+/// The map published at `path` at the end of a run (`gathered`, `result`), the endpoints after it read by `after`; said. A map
+/// that can't be made or published turns a run that was done into [`SetupError::EndpointMap`]; any other result stands, the
+/// failure said beside it. With the result, whether this run published a map (or was asked for none): only then may its
+/// records drop the nodes they replace (`super::settle`).
 pub fn finish(
     path: Option<&Path>, command: &'static str, gathered: Gathered, result: Result<Done, SetupError>,
-    after: &mut dyn FnMut() -> Result<Vec<Endpoint>, crate::win_error::WinError>, say: &mut dyn FnMut(&str),
-) -> Result<Done, SetupError> {
-    let Some(path) = path else { return result };
+    after: &mut dyn FnMut() -> Result<Vec<Endpoint>, WinError>, say: &mut dyn FnMut(&str),
+) -> (Result<Done, SetupError>, bool) {
+    let Some(path) = path else { return (result, true) };
     let mut failed = |why: String, result: Result<Done, SetupError>| match result {
-        Ok(Done::Changed | Done::Nothing) => Err(SetupError::EndpointMap(format!("done, but {why}"))),
+        Ok(Done::Changed | Done::Nothing) => (Err(SetupError::EndpointMap(format!("done, but {why}"))), false),
         other => {
             say(&format!("  warning: {why}"));
-            other
+            (other, false)
         }
     };
     let Some(before) = gathered.before else {
@@ -282,16 +353,16 @@ pub fn finish(
         Ok(t) => t,
         Err(e) => return failed(format!("the endpoint map couldn't be made ({e})"), result),
     };
-    if let Err(e) = std::fs::write(path, text + "\n") {
-        return failed(format!("the endpoint map couldn't be written to {} ({e})", path.display()), result);
+    if let Err(why) = publish(path, &(text + "\n")) {
+        return failed(format!("the endpoint map wasn't published ({why}): {} is as it was", path.display()), result);
     }
     let remaps = m.cables.iter().flat_map(|c| &c.endpoints).filter(|p| p.old.is_some() && p.matched.remaps()).count();
     say(&format!("The endpoint map: {} ({} cable(s), {remaps} old endpoint(s) with a new one)", path.display(), m.cables.len()));
-    result
+    (result, true)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::setup::plan::tests::{A_ID, B_ID, cid, label};
 
@@ -304,6 +375,9 @@ mod tests {
     }
 
     /// The migration: the old A (both microphones) and Cable-B.ps1's B (Speakers and Microphone) to A and B, both with both.
+    /// B's one microphone (the old driver's Microphone0, so a Microphone here) maps to B's low-latency Microphone, so an app's
+    /// saved choice keeps working, and B's Call Microphone is a newly added endpoint (the owner's decision with Astra,
+    /// 2026-11-25).
     #[test]
     fn the_migrations_old_endpoints_map_by_role() {
         let a = cable("A", A_ID, 1);
@@ -325,8 +399,8 @@ mod tests {
             ep(&bi, EndpointKind::CallMicrophone, "{1}.{B-call}", "Call Microphone (ACX-LL-Cable B)", State::Active),
         ];
         let made = [
-            Made::new(a.clone(), Variant::Both, &[r"ROOT\MEDIA\0003".into()]),
-            Made::new(b.clone(), Variant::Both, &[r"ROOT\MEDIA\0004".into()]),
+            Made::migration(a.clone(), Variant::Both, &[r"ROOT\MEDIA\0003".into()]),
+            Made::migration(b.clone(), Variant::Both, &[r"ROOT\MEDIA\0004".into()]),
         ];
         let m = map("migrate", &Ok(Done::Changed), &made, &before, &after);
         assert_eq!((m.format, m.version, m.command, m.result), (FORMAT, 1, "migrate", "done"));
@@ -366,6 +440,23 @@ mod tests {
         ] {
             assert!(text.contains(field), "{field}: {text}");
         }
+        // A retry's look before has the cables an earlier attempt made (A and B on their own instances, now): the same map, B's
+        // Call Microphone still added. Another instance of A's identity (an n + 1 an earlier attempt made, say) still maps
+        let mut retry = before.clone();
+        retry.extend(after.iter().cloned());
+        assert_eq!(map("migrate", &Ok(Done::Changed), &made, &retry, &after), m, "whichever attempt publishes it");
+        retry.push(ep(
+            &cable("A", A_ID, 7).instance_id(),
+            EndpointKind::Speakers,
+            "{0}.{A7}",
+            "Speakers (ACX-LL-Cable A)",
+            State::NotPresent,
+        ));
+        let a7 = map_cable(&made[0], &retry, &after);
+        assert!(a7.endpoints.iter().any(|p| p.old.as_ref().is_some_and(|o| o.id == "{0}.{A7}") && p.matched == Match::Moved), "{a7:?}");
+        // As a re-add is mapped instead (Made::new), its own instance's endpoints are `same`
+        let readd = map_cable(&Made::new(b.clone(), Variant::Both, &[]), &retry, &after);
+        assert!(readd.endpoints.iter().all(|p| p.matched == Match::Same), "{readd:?}");
     }
 
     /// A re-add with its instance ID: the endpoints Windows kept are `same`; one it made anew is `moved`. A re-add with other
@@ -423,35 +514,82 @@ mod tests {
         assert_eq!(r(Err(SetupError::Checks(vec![]).and_restart(Some("X".into())))), "restart");
     }
 
-    /// The file: deleted at the start, written at the end; a map that can't be made fails a run that was done, and only says so
-    /// beside one that wasn't.
-    #[test]
-    fn the_file_is_replaced_and_failures_are_said() {
-        let dir = std::env::temp_dir().join(format!("nf-endpoint-map-{}", std::process::id()));
+    /// A folder of the test's own under the system's temporary folder, empty.
+    pub(crate) fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nf-endpoint-map-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The file: checked at the start and left as it is; published whole at the end. A map that can't be made fails a run that
+    /// was done, and only says so beside one that wasn't; a run that publishes none leaves the file as it was.
+    #[test]
+    fn the_file_is_published_whole_and_failures_are_said() {
+        let dir = scratch("file");
         let path = dir.join("map.json");
-        std::fs::write(&path, "stale").unwrap();
+        std::fs::write(&path, "an earlier run's").unwrap();
         start(Some(&path)).unwrap();
-        assert!(!path.exists());
-        start(Some(&path)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "an earlier run's", "the start doesn't touch it");
+        assert!(!dir.join("map.json.tmp").exists(), "the start's check leaves nothing beside it");
+        // A temporary file a killed run left is written over
+        std::fs::write(dir.join("map.json.tmp"), "a killed run's").unwrap();
         let mut said = Vec::new();
         let gathered = Gathered { before: Some(vec![]), cables: vec![] };
         let r = finish(Some(&path), "add", gathered, Ok(Done::Nothing), &mut || Ok(vec![]), &mut |s: &str| said.push(s.to_string()));
-        assert_eq!(r, Ok(Done::Nothing));
+        assert_eq!(r, (Ok(Done::Nothing), true));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(r#""command": "add""#) && text.contains(r#""cables": []"#), "{text}");
-        // The endpoints before weren't read: a done run fails, a failed one keeps its error
+        assert!(!dir.join("map.json.tmp").exists());
+        // The endpoints before weren't read: a done run fails, a failed one keeps its error; neither publishes, and the file
+        // is as it was
         let none = Gathered::default();
         let r = finish(Some(&path), "migrate", none.clone(), Ok(Done::Changed), &mut || Ok(vec![]), &mut |_: &str| {});
-        assert!(matches!(&r, Err(SetupError::EndpointMap(why)) if why.starts_with("done, but no endpoint map")), "{r:?}");
+        assert!(matches!(&r, (Err(SetupError::EndpointMap(why)), false) if why.starts_with("done, but no endpoint map")), "{r:?}");
         let mut said = Vec::new();
         let r = finish(Some(&path), "migrate", none, Err(SetupError::Checks(vec!["x".into()])), &mut || Ok(vec![]), &mut |s: &str| {
             said.push(s.to_string())
         });
-        assert_eq!(r, Err(SetupError::Checks(vec!["x".into()])));
+        assert_eq!(r, (Err(SetupError::Checks(vec!["x".into()])), false));
         assert!(said[0].starts_with("  warning: no endpoint map"), "{said:?}");
-        // No option: nothing at all
-        assert_eq!(finish(None, "add", Gathered::default(), Ok(Done::Changed), &mut || Ok(vec![]), &mut |_: &str| {}), Ok(Done::Changed));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "the last published map stays");
+        // No option: nothing at all, and nothing holds the records' drop back
+        let r = finish(None, "add", Gathered::default(), Ok(Done::Changed), &mut || Ok(vec![]), &mut |_: &str| {});
+        assert_eq!(r, (Ok(Done::Changed), true));
+        // A path that can't be published is refused at the start, before anything changes
+        let e = start(Some(&dir)).unwrap_err().to_string();
+        assert!(e.contains("isn't a file's name") && e.ends_with("nothing was changed"), "{e}");
+        let e = start(Some(&dir.join("no folder").join("map.json"))).unwrap_err().to_string();
+        assert!(e.contains("map.json.tmp can't be written beside it"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The publish replaces the file in one rename, or not at all: the old file stays if the new one can't be written.
+    #[test]
+    fn a_publish_replaces_the_file_whole_or_not_at_all() {
+        let dir = scratch("publish");
+        let path = dir.join("map.json");
+        publish(&path, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first", "no file before: made");
+        publish(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second", "renamed over the first");
+        // The temporary file can't be made (a folder holds its name): nothing changes
+        std::fs::create_dir(dir.join("map.json.tmp")).unwrap();
+        let why = publish(&path, "third").unwrap_err();
+        assert!(why.contains("map.json.tmp couldn't be written"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        std::fs::remove_dir(dir.join("map.json.tmp")).unwrap();
+        // The rename refused (the file is read-only): the file as it was, the temporary one gone
+        let writable = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        let why = publish(&path, "fourth").unwrap_err();
+        assert!(why.contains("couldn't be renamed over") && why.contains("MoveFileExW failed"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert!(!dir.join("map.json.tmp").exists());
+        assert!(start(Some(&path)).unwrap_err().to_string().contains("is there and can't be replaced"));
+        std::fs::set_permissions(&path, writable).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -122,8 +122,10 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
   and B (`-CableBMics`, default both) are made on the new package. A run that stops part way is finished by running it again:
   a cable it made and didn't record yet (or made in a run that needs a restart, which stays pending until then) is checked (its
   identity on one device, working on the package, its endpoints) and recorded, and with the old devices gone and every cable
-  on the package, nothing is disabled or installed again. It runs the migration while a record in the store has `Pending` or
-  `Replaces` (below).
+  on the package, nothing is disabled or installed again. A cable made stays pending until Windows has made every endpoint of
+  its microphones (after a restart too), and `acx-ll-cable list` says so (a `note:` under it); a restart Windows needs, the
+  removal of a cable that failed to install among them, stops the run (exit 7) before the next cable. It runs the migration
+  while a record in the store has `Pending` or `Replaces` (below).
 - cables present: `acx-ll-cable update <package folder>`, every cable moved to the package together. Every cable stops for a
   few seconds: one image serves them all. If a cable refuses the disable, or the old image is still loaded 10 s after every
   cable was disabled (an app has a cable's control device open), every cable is enabled again, nothing is installed, and it
@@ -145,12 +147,16 @@ couldn't delete; 1 a usage error or a script's own check (not elevated, test sig
 old one's place, by cable and role (Speakers, Microphone, Call Microphone), with the ids and names. The old driver's
 endpoints map to A's and B's; a re-added cable's to its own. Each old endpoint's `match` is `same` (Windows kept the
 endpoint), `moved` (one new endpoint of that role: remap the id), `gone`, `ambiguous` or, for a new endpoint without an old
-one, `added`; only `same` and `moved` are remapped. The tool deletes the file at the start and writes it at the end once it
-has read the endpoints before the run (format and fields: `crates\nf-vmic\src\setup\endpoint_map.rs`). A migration's cable
-keeps the old devices it replaces in its record (`Replaces`) once it is made, and every run maps each cable that has them, so
-the map of the run that finishes the migration (no record left pending) holds all of it, whatever runs came before (killed,
-stopped by a restart); that run then drops them. An earlier run's map holds what it saw (`result` says how it ended). A map
-asked for and not written keeps them, and the next `Install-Driver.ps1` runs the migration again to write it.
+one, `added`; only `same` and `moved` are remapped. B's one microphone maps to its low-latency Microphone, and its Call
+Microphone is `added`. The tool publishes the file whole at the end, once it has read the endpoints before the run: written
+to `<file>.tmp` beside it, flushed, then renamed over it, so a reader finds the file as it was or the new map, never part of
+one; a run that publishes none (stopped earlier, killed) leaves the file as it was (format and fields:
+`crates\nf-vmic\src\setup\endpoint_map.rs`). A migration's cable keeps the old devices it replaces in its record (`Replaces`)
+once it is made, and every run maps each cable that has them, so the map of the run that finishes the migration (no record
+left pending) holds all of it, whatever runs came before (killed, stopped by a restart); that run then drops them, a record
+at a time, each keeping them as `Replaced`, so a drop cut short loses no cable from the next run's map. An earlier run's map
+holds what it saw (`result` says how it ended). A map asked for and not published keeps them, and the next
+`Install-Driver.ps1` runs the migration again to publish it.
 
 **Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker

@@ -23,8 +23,8 @@
 
     -Variant keeps its meaning, for cable A: both microphones (the default), the call one, or the low-latency one. Other
     cables come with Cable.ps1 add. -BuildTool builds the setup tool first. -EndpointMap <file>: the migration (and the first
-    add of A) writes which new endpoint takes each old one's place there, as JSON (acx-ll-cable's --endpoint-map); an update
-    keeps the endpoints and writes none.
+    add of A) writes which new endpoint takes each old one's place there, as JSON (acx-ll-cable's --endpoint-map), published
+    whole (a temporary file renamed over it); an update keeps the endpoints and writes none, leaving the file as it was.
 
     Exit codes: 0 done; 7 Windows wants a restart to finish, with or without other errors beside it (stop there: restart, then
     run this again, which finishes what is left and says what is still wrong); 2 the setup tool's error (its steps above say
@@ -84,9 +84,8 @@ if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
 } elseif (Test-Present @($HardwareIds.Values)) {
     Write-Step 'Move every cable to the new package (acx-ll-cable update)'
     if ($EndpointMap) {
-        # As the tool does: a file there afterwards is this run's
-        if (Test-Path -LiteralPath $EndpointMap) { Remove-Item -LiteralPath $EndpointMap }
-        Write-Note 'an update keeps every endpoint: no endpoint map is written'
+        # As the tool does with a run that publishes none: the file is left as it was (the migration's map, say)
+        Write-Note 'an update keeps every endpoint: no endpoint map is written (a file there is an earlier run''s, left as it is)'
     }
     $code = Invoke-CableTool $tool @('update', $package)
     Exit-ForToolCode $code 'the update' $status

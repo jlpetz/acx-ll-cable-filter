@@ -201,12 +201,17 @@ impl SetupError {
     /// wrong beside it: a removal Windows finishes at the next restart (before anything was made, in the migration's removal of
     /// an old node, or of a re-opened node), an install that needs one alongside other problems.
     pub fn needs_restart(&self) -> bool {
+        self.restart_device().is_some()
+    }
+
+    /// The node Windows needs a restart to finish with, if it does ([`SetupError::needs_restart`]).
+    pub fn restart_device(&self) -> Option<&str> {
         match self {
-            SetupError::RestartFirst { .. } | SetupError::AndRestart { .. } => true,
-            SetupError::StillPresent { restart, .. } => *restart,
-            SetupError::Stopped { error, .. } => error.needs_restart(),
-            SetupError::Install(not) => matches!(not.removed, Some(Ok(true))),
-            _ => false,
+            SetupError::RestartFirst { device } | SetupError::AndRestart { device, .. } => Some(device),
+            SetupError::StillPresent { device, restart: true, .. } => Some(device),
+            SetupError::Stopped { error, .. } => error.restart_device(),
+            SetupError::Install(not) if matches!(not.removed, Some(Ok(true))) => Some(&not.device),
+            _ => None,
         }
     }
 
@@ -255,8 +260,8 @@ fn to_make_text(to_make: &[Label]) -> String {
         String::new()
     } else {
         format!(
-            " {} {is} recorded in the setup's store: run Install-Driver.ps1 (or `acx-ll-cable migrate <package folder>`) again to \
-             make {them}.",
+            " {} {is} recorded in the setup's store, pending: run Install-Driver.ps1 (or `acx-ll-cable migrate <package folder>`) \
+             again to finish {them}.",
             steps::labels(to_make)
         )
     }
@@ -402,7 +407,7 @@ pub fn new_identity() -> Result<CableId, WinError> {
 
 /// The package the new node gets.
 #[derive(Clone, Copy, Debug)]
-enum Want<'a> {
+pub enum Want<'a> {
     /// The package rule: the one the cables run.
     Rule(&'a [(String, Running)]),
     /// The package staged for `update` or the migration, by its published INF.
@@ -657,48 +662,36 @@ fn endpoints_before(also: &[String], say: &mut dyn FnMut(&str)) -> Option<Vec<En
         .ok()
 }
 
-/// The store's record of a cable as made (`pending`: a migration's, made by a run that ends needing a restart, so the run after
-/// it checks it); `replaces`, its record's (a migration's cable: kept until the migration's map is final, [`Entry::replaces`]).
+/// The store's record of a cable: `pending`, a migration's not finished; `replaces`, its record's (a migration's cable: kept
+/// until the migration's map is final, [`Entry::replaces`]).
+pub(crate) fn entry_of(cable: &CableInstance, variant: Variant, replaces: &[String], pending: bool) -> Entry {
+    let replaces = replaces.to_vec();
+    Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant), pending, replaces, replaced: Vec::new() }
+}
+
+/// The store's record of a cable written ([`entry_of`]).
 fn record(cable: &CableInstance, variant: Variant, replaces: &[String], pending: bool) -> Result<(), SetupError> {
-    let entry = Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant), pending, replaces: replaces.to_vec() };
-    store::write(&entry).map_err(SetupError::Store)
+    store::write(&entry_of(cable, variant, replaces, pending)).map_err(SetupError::Store)
 }
 
-/// The nodes `label`'s record says the cable replaces (a migration's: [`Entry::replaces`]), kept by every record of it.
-fn replaces_of(store: &[Entry], label: &Label) -> Vec<String> {
-    store.iter().find(|e| &e.label == label).map(|e| e.replaces.clone()).unwrap_or_default()
+/// How `label`'s cable, made now by `add` or the variant switch, is recorded ([`steps::Recording`]): the nodes its record says it
+/// replaces kept as they are, and pending still while its record is a migration's not finished.
+pub fn recording_of<'a>(store: &'a [Entry], label: &Label) -> steps::Recording<'a> {
+    let e = store.iter().find(|e| &e.label == label);
+    steps::Recording { replaces: e.map_or(&[], |e| e.replaces.as_slice()), pending: e.is_some_and(|e| e.pending) }
 }
 
-/// A cable's node made on the package the cables run (the variant switch's step 4, [`crate::variant::switch`]): `create`'s
-/// old nodes removed once the new one's driver is found.
-pub fn make_cable(
-    present: &Present, create: &Create, running: &[(String, Running)], say: &mut dyn FnMut(&str),
-) -> Result<Made, SetupError> {
-    make_or_next(present, create, Want::Rule(running), say)
-}
-
-/// The store's record of a cable as made; the nodes its record in `store` says it replaces are kept (a migration's cable, its
-/// map not final yet).
-pub fn record_cable(cable: &CableInstance, variant: Variant, store: &[Entry]) -> Result<(), SetupError> {
-    record(cable, variant, &replaces_of(store, &cable.label), false)
-}
-
-/// After a migrate or add run and its endpoint map (`map`): once no record is pending, every record's Replaces dropped
-/// ([`steps::drop_replaces`]), unless a map was asked for and isn't there (it wasn't written: the next migration run writes it,
-/// with every cable that has them).
-fn settle(present: &Present, map: Option<&Path>, say: &mut dyn FnMut(&str)) {
-    if map.is_some_and(|p| !p.is_file()) {
+/// After a migrate or add run and its endpoint map: once no record is pending, every record's Replaces dropped
+/// ([`steps::drop_replaces`]), if the run published its map or was asked for none (`mapped`). A map asked for and not published
+/// keeps them: the next migration run maps every cable they name again and publishes it.
+fn settle(present: &Present, mapped: bool, say: &mut dyn FnMut(&str)) {
+    if !mapped {
         return;
     }
     match store::read() {
         Ok(s) => steps::drop_replaces(&mut Real { present }, &s.entries, say),
         Err(e) => say(&format!("  warning: the setup's store couldn't be read again to drop the old devices' names ({e})")),
     }
-}
-
-/// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, each said, their names judged by `names`; the checks that failed.
-pub fn wait_cable_endpoints(cable: &CableInstance, variant: Variant, names: Names, say: &mut dyn FnMut(&str)) -> Vec<String> {
-    wait_endpoints(cable, variant, names, say)
 }
 
 /// `add <label> [--mics m] [--adopt instance] [--endpoint-map file]` (the module's docs).
@@ -715,7 +708,9 @@ pub fn add(
     let mapped: Vec<endpoint_map::Made> =
         plan::mapped(&entries, &present.nodes, &[]).iter().filter_map(|f| mapped_cable(&present.nodes, f)).collect();
     let mut gathered = Gathered::default();
-    let ours = Ours { label, record: &replaces_of(&entries, label), pending: entries.iter().any(|e| &e.label == label && e.pending) };
+    let entry = entries.iter().find(|e| &e.label == label);
+    let ours =
+        Ours { label, recording: recording_of(&entries, label), mapped_old: entry.map(|e| plan::map_old(&entries, e)).unwrap_or_default() };
     let r = add_planned(&present, &ours, plan, &mapped, &mut gathered, say);
     // The cable this run made, finished or repaired is in the map as it is now; the others (and this one, if nothing was done
     // to it) as their nodes are
@@ -724,23 +719,36 @@ pub fn add(
             gathered.cables.push(m);
         }
     }
-    let r = endpoint_map::finish(map, "add", gathered, r, &mut endpoints::all, say);
-    settle(&present, map, say);
+    let (r, mapped) = endpoint_map::finish(map, "add", gathered, r, &mut endpoints::all, say);
+    settle(&present, mapped, say);
     r
 }
 
 /// A cable a migration made and recorded, as its newest node has it, for the endpoint map ([`plan::mapped`]).
 fn mapped_cable(nodes: &[Node], f: &plan::Finish) -> Option<endpoint_map::Made> {
     let n = &nodes[*f.nodes.first()?];
-    Some(endpoint_map::Made::new(n.cable.clone()?, n.variant()?, &f.replaces))
+    Some(endpoint_map::Made::migration(n.cable.clone()?, n.variant()?, &f.replaces))
 }
 
-/// The cable `add` acts on: its label, the nodes its record says it replaces (a migration's cable), and whether its record is
-/// still the migration's (pending).
+/// The cable `add` acts on: its label; how it is recorded (the nodes its record says it replaces, kept as they are, and whether
+/// its record is still a migration's: pending); and the old nodes the migration's map gives it while that map isn't final
+/// ([`plan::map_old`]).
 struct Ours<'a> {
     label: &'a Label,
-    record: &'a [String],
-    pending: bool,
+    recording: steps::Recording<'a>,
+    mapped_old: Vec<String>,
+}
+
+impl Ours<'_> {
+    /// The cable as the endpoint map has it, in place of the nodes `replaced`: a migration's, while the migration's map isn't
+    /// final ([`endpoint_map::Made::migration`]); otherwise a re-added, repaired or adopted cable's.
+    fn mapped(&self, cable: CableInstance, variant: Variant, replaced: &[String]) -> endpoint_map::Made {
+        if self.mapped_old.is_empty() {
+            endpoint_map::Made::new(cable, variant, replaced)
+        } else {
+            endpoint_map::Made::migration(cable, variant, replaced)
+        }
+    }
 }
 
 /// `add` with its plan made; `mapped`, the cables a migration made whose map isn't final (their old nodes' endpoints are read
@@ -756,7 +764,7 @@ fn add_planned(
         AddPlan::Create(c) => c.remove.iter().map(|&i| present.nodes[i].instance_id.clone()).collect(),
         _ => Vec::new(),
     };
-    let replaced = plan::union(adopted, ours.record);
+    let replaced = plan::union(adopted, &ours.mapped_old);
     let theirs: Vec<String> = mapped.iter().flat_map(|m| m.replaces()).cloned().collect();
     let also = plan::union(replaced.clone(), &theirs);
     let quiet = matches!(plan, AddPlan::Nothing { pending: false, .. }) && mapped.is_empty();
@@ -780,8 +788,8 @@ fn add_planned(
                 // A migration's cable that a run made and stopped before recording: checked as the migration checks one, then
                 // recorded as made
                 say("  its record is still a migration's (the run that made it stopped before recording it)");
-                let misnamed = finish_pending(c, v, &before, ours.record, say)?;
-                gathered.cables.push(endpoint_map::Made::new(c.clone(), v, &replaced));
+                let misnamed = finish_pending(c, v, &before, ours.recording.replaces, say)?;
+                gathered.cables.push(ours.mapped(c.clone(), v, &replaced));
                 return if misnamed.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(misnamed)) };
             }
             let recorded = identity == Identity::FromNode;
@@ -807,16 +815,15 @@ fn add_planned(
                 _ => format!("Adding {} with its identity, as {} (new endpoints)", label.friendly_name(), create.instance.instance_id()),
             });
             let running = present.running();
-            let made = make_or_next(present, &create, Want::Rule(&running), say)?;
-            // A migration's cable made by a run that needs a restart stays pending: the run after the restart checks it
-            record(&made.cable, create.variant, ours.record, ours.pending && made.restart)?;
-            gathered.cables.push(endpoint_map::Made::new(made.cable.clone(), create.variant, &replaced));
-            if made.restart {
-                return Ok(Done::RestartPending { device: made.cable.instance_id() });
+            // A re-added cable's endpoints come back with their names (we expect: to confirm on the box); a new one's are new. A
+            // make that fails is the answer as it is (a restart Windows needs among them: exit 7); a migration's cable stays
+            // pending until its endpoints are there (the run after a restart Windows needs checks it)
+            let names = Names::Since(&before);
+            let (made, r) = steps::make_recorded(&mut Real { present }, &create, Want::Rule(&running), ours.recording, names, say);
+            if let Some(cable) = made {
+                gathered.cables.push(ours.mapped(cable, create.variant, &replaced));
             }
-            // A re-added cable's endpoints come back with their names (we expect: to confirm on the box); a new one's are new
-            let problems = wait_endpoints(&made.cable, create.variant, Names::Since(&before), say);
-            if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
+            r
         }
     }
 }
@@ -859,13 +866,13 @@ fn repair(
         }
     }
     rename(&present.set, &mut data, &cable, say);
-    let problems = if ours.pending {
-        finish_pending(&cable, variant, before, ours.record, say)?
+    let problems = if ours.recording.pending {
+        finish_pending(&cable, variant, before, ours.recording.replaces, say)?
     } else {
-        record(&cable, variant, ours.record, false)?;
+        record(&cable, variant, ours.recording.replaces, false)?;
         wait_endpoints(&cable, variant, Names::Since(before), say)
     };
-    gathered.cables.push(endpoint_map::Made::new(cable, variant, replaced));
+    gathered.cables.push(ours.mapped(cable, variant, replaced));
     if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
 }
 
@@ -999,8 +1006,8 @@ pub fn migrate(
     let published = stage_package(folder, say)?;
     let mut gathered = Gathered::default();
     let r = steps::run_migrate(&mut Real { present: &present }, &present.nodes, &plan, &published, &mut gathered, say);
-    let r = endpoint_map::finish(map, "migrate", gathered, r, &mut endpoints::all, say);
-    settle(&present, map, say);
+    let (r, mapped) = endpoint_map::finish(map, "migrate", gathered, r, &mut endpoints::all, say);
+    settle(&present, mapped, say);
     r
 }
 
@@ -1043,6 +1050,21 @@ pub fn format_list(r: &Report) -> String {
                     line(format!("    note: {check}"));
                 }
             }
+        }
+        // A migration's cable it hasn't finished: pending until its endpoints are there (after a restart too), and its map not
+        // final while its record keeps the old devices it replaces
+        match &c.stored {
+            Some(e) if e.pending => line(
+                "  note: the migration hasn't finished it (its record is pending): Install-Driver.ps1 (or `acx-ll-cable migrate \
+                 <package folder>`) checks it and records it"
+                    .into(),
+            ),
+            Some(e) if !e.replaces.is_empty() => line(
+                "  note: the migration's endpoint map isn't final (its record keeps the old devices it replaces): Install-Driver.ps1 \
+                 (or `acx-ll-cable migrate <package folder>`) maps it and drops them"
+                    .into(),
+            ),
+            _ => {}
         }
         line(format!("  control device: {}", crate::protocol::control_path(&c.id)));
     }
@@ -1120,6 +1142,7 @@ pub(crate) mod tests {
             mics: Some(Variant::Call),
             pending: false,
             replaces: vec![],
+            replaced: vec![],
         };
         let to_make = Entry {
             label: "E".parse().unwrap(),
@@ -1128,6 +1151,7 @@ pub(crate) mod tests {
             mics: Some(Variant::Both),
             pending: true,
             replaces: vec![],
+            replaced: vec![],
         };
         let store = store::Store { entries: vec![gone, to_make], problems: vec![] };
         let r = Report { nodes: vec![a, b], store, endpoints: Ok(eps) };
@@ -1151,6 +1175,32 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains("ACX-LL-Cable E (id eeeeeeee-0000-4000-8000-00000000000e): absent, the migration's to make (n 1, both)"));
+    }
+
+    /// How a migration's unfinished cable shows when it is present (Astra's review, 2026-11-25): its record pending (made, its
+    /// endpoints not there yet, or not checked since a restart), or keeping the old devices it replaces (the map not final).
+    /// Each is a `note:`, as s0a.sh's list check takes a problem; a finished cable has none.
+    #[test]
+    fn the_list_says_what_the_migration_left() {
+        let entry = |pending, replaces: &[&str]| Entry {
+            label: "B".parse().unwrap(),
+            id: B_ID.parse().unwrap(),
+            n: 1,
+            mics: Some(Variant::Both),
+            pending,
+            replaces: replaces.iter().map(|s| s.to_string()).collect(),
+            replaced: vec![r"ROOT\MEDIA\0004".into()],
+        };
+        let list = |e: Entry| {
+            let store = store::Store { entries: vec![e], problems: vec![] };
+            format_list(&Report { nodes: vec![node("B", B_ID, 1, Variant::Both)], store, endpoints: Ok(vec![]) })
+        };
+        let text = list(entry(true, &[r"ROOT\MEDIA\0004"]));
+        assert!(text.contains("  note: the migration hasn't finished it (its record is pending)"), "{text}");
+        let text = list(entry(false, &[r"ROOT\MEDIA\0004"]));
+        assert!(text.contains("  note: the migration's endpoint map isn't final"), "{text}");
+        let text = list(entry(false, &[]));
+        assert!(!text.contains("migration"), "finished: {text}");
     }
 
     /// Astra's review (2026-11-25): the n + 1 fallback makes another instance of a cable only once no node with its identity is
@@ -1294,6 +1344,14 @@ pub(crate) mod tests {
         assert!(text.starts_with("done, but: x. Windows needs a restart to finish with ROOT\\MEDIA\\ACXLLCABLE_A_X_1 as well"), "{text}");
         assert_eq!(checks.clone().and_restart(None), checks, "no restart: as it was");
         assert_eq!(restart.clone().and_restart(Some("Y".into())), restart, "said once");
+        // The node to restart for, which the migration's stop names (Astra's review, 2026-11-25: a failed make's removal)
+        assert_eq!(restart.restart_device(), Some(r"ROOT\MEDIA\0003"));
+        assert_eq!(stopped(restart.clone()).restart_device(), Some(r"ROOT\MEDIA\0003"));
+        assert_eq!(both.restart_device(), Some(r"ROOT\MEDIA\ACXLLCABLE_A_X_1"));
+        assert_eq!(not_installed(Some(Ok(true))).restart_device(), Some(r"ROOT\MEDIA\ACXLLCABLE_B_X_1"));
+        let still = |restart| SetupError::StillPresent { device: "Z".into(), why: "w".into(), restart, error: Box::new(checks.clone()) };
+        assert_eq!((still(true).restart_device(), still(false).restart_device()), (Some("Z"), None));
+        assert_eq!((checks.restart_device(), not_installed(Some(Ok(false))).restart_device()), (None, None));
     }
 
     #[test]

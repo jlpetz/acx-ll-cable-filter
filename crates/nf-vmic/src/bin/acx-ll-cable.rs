@@ -41,8 +41,9 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
       both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
   --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
-      names), as JSON: deleted at the start, written at the end once the endpoints before the run were read. The run that
-      finishes the migration maps all of it, whatever runs came before.
+      names), as JSON, published whole at the end (a temporary file beside it, flushed, renamed over it) once the endpoints
+      before the run were read; a run that publishes none leaves the file as it was. Every run before the migration is final
+      maps all of it, whatever runs came before.
 
 Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish, other errors beside it or not (stop there:
 restart, then run this again, which says what is still wrong).";
@@ -275,7 +276,9 @@ mod tests {
         assert_eq!(code_of(&stopped(restart_first())), 7, "the old node's removal Windows finishes at the next restart");
         assert_eq!(code_of(&stopped(SetupError::Windows(WinError { call: "DiUninstallDevice", code: 5 }))), 2);
         let with_problems = SetupError::Unfinished { problems: vec!["x".into()], to_make: vec![l("B")] }.and_restart(Some("Y".into()));
-        assert_eq!(code_of(&Err(with_problems)), 7, "a restart with other problems");
+        assert_eq!(code_of(&Err(with_problems)), 7, "a restart with other problems: a failed make's removal among them");
+        let unfinished = SetupError::Unfinished { problems: vec!["B's endpoints".into()], to_make: vec![l("B")] };
+        assert_eq!(code_of(&Err(unfinished)), 2, "a cable left pending, its endpoints not there");
         assert_eq!(code_of(&Err(SetupError::Checks(vec!["x".into()]))), 2);
         let still = SetupError::StillPresent { device: "X".into(), why: "w".into(), restart: true, error: Box::new(restart_first()) };
         assert_eq!(code_of(&Err(still)), 7);

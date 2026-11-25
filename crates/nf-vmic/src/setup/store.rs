@@ -6,9 +6,12 @@
 //! run that ends needing a restart stays pending, so the run after the restart checks it). `Replaces` (REG_MULTI_SZ, ours) goes
 //! with it: the instance IDs of the old driver's nodes the migration makes the cable in place of, so a run after their removal
 //! still finds their endpoints for the endpoint map. It stays once the cable is made, until a migrate or add run leaves no
-//! record pending: that run writes its endpoint map first (every cable with Replaces is in it), then drops them all. While a
-//! record has either, Install-Driver.ps1 runs the migration. The key takes HKLM\SOFTWARE's permissions: any user reads it,
-//! administrators write it.
+//! record pending: that run publishes its endpoint map first (every cable with Replaces is in it), then drops them, a record at
+//! a time. `Replaced` (REG_MULTI_SZ, ours) keeps them for good: every node a record's Replaces has named, written before
+//! Replaces and never dropped, so a drop that stops part way (some records keep Replaces, others don't) loses no cable from the
+//! migration's map: while any record keeps Replaces, every run maps each cable with either (`plan::mapped`), and the map is
+//! final once none does. While a record has Pending or Replaces, Install-Driver.ps1 runs the migration. The key takes
+//! HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
@@ -28,8 +31,10 @@ use crate::win_error::WinError;
 pub const KEY: &str = r"SOFTWARE\ACX-LL-Cable\Cables";
 /// The value marking a cable the migration hasn't made yet.
 pub const PENDING: &str = "Pending";
-/// The old driver's nodes a migration's cable is made in place of.
+/// The old driver's nodes a migration's cable is made in place of, while its endpoint map isn't final.
 pub const REPLACES: &str = "Replaces";
+/// Every node a record's Replaces has named, kept for good.
+pub const REPLACED: &str = "Replaced";
 
 /// What the store holds: the entries that read, and what was wrong with those that didn't (left alone, and reported).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,7 +53,15 @@ pub fn entry_of(label: &str, id: Option<&str>, n: Option<u32>, mics: Option<&str
         None => None,
         Some(m) => Some(Variant::from_arg(m).ok_or_else(|| format!("{at}: Mics '{m}' isn't both, call or low-latency"))?),
     };
-    Ok(Entry { label, id, n, mics, pending: pending.is_some_and(|p| p != 0), replaces: Vec::new() })
+    Ok(Entry { label, id, n, mics, pending: pending.is_some_and(|p| p != 0), replaces: Vec::new(), replaced: Vec::new() })
+}
+
+/// What `Replaced` becomes when `e` is written over a record whose Replaced is `kept` (pure): `kept` with every node of
+/// `e.replaces` and `e.replaced` it lacks (compared without case); `None` if it lacks none, and it is left as it is. It is never
+/// dropped (the module's docs).
+pub fn replaced_after(kept: &[String], e: &Entry) -> Option<Vec<String>> {
+    let all = super::plan::union(super::plan::union(kept.to_vec(), &e.replaced), &e.replaces);
+    (all.len() != kept.len()).then_some(all)
 }
 
 /// A registry key, closed on drop.
@@ -147,6 +160,7 @@ pub fn read() -> Result<Store, WinError> {
         match entry_of(&label, id.as_deref(), n, mics.as_deref(), pending) {
             Ok(mut e) => {
                 e.replaces = strings_value(&key, REPLACES)?;
+                e.replaced = strings_value(&key, REPLACED)?;
                 store.entries.push(e)
             }
             Err(why) => store.problems.push(why),
@@ -156,7 +170,8 @@ pub fn read() -> Result<Store, WinError> {
     Ok(store)
 }
 
-/// Records an entry (elevated).
+/// Records an entry (elevated). `Replaced` takes every node of its `replaces` and `replaced` it lacks, first; it is never
+/// dropped (the module's docs).
 pub fn write(e: &Entry) -> Result<(), WinError> {
     let path = HSTRING::from(format!(r"{KEY}\{}", e.label));
     let mut key = HKEY::default();
@@ -168,7 +183,7 @@ pub fn write(e: &Entry) -> Result<(), WinError> {
             None,
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
-            KEY_WRITE | KEY_WOW64_64KEY,
+            KEY_READ | KEY_WRITE | KEY_WOW64_64KEY,
             None,
             &mut key,
             None,
@@ -186,6 +201,11 @@ pub fn write(e: &Entry) -> Result<(), WinError> {
     set("N", REG_DWORD, &e.n.to_le_bytes())?;
     if let Some(m) = e.mics {
         set("Mics", REG_SZ, &sz(m.arg()))?;
+    }
+    // Replaced first: a record that has Replaces always has them in Replaced too
+    if let Some(replaced) = replaced_after(&strings_value(&key, REPLACED)?, e) {
+        let replaced: Vec<&str> = replaced.iter().map(String::as_str).collect();
+        set(REPLACED, REG_MULTI_SZ, &multi_sz_bytes(&replaced))?;
     }
     let replaces = || {
         if e.replaces.is_empty() {
@@ -237,6 +257,23 @@ mod tests {
             let e = entry_of(label, id, n, mics, None).unwrap_err();
             assert!(e.contains(why) && e.starts_with(r"HKLM\SOFTWARE\ACX-LL-Cable\Cables\"), "{e}");
         }
+    }
+
+    /// Astra's review (2026-11-25): Replaced takes every node a record's Replaces names, and keeps them when Replaces is dropped,
+    /// so a drop that stops part way loses no cable from the migration's map.
+    #[test]
+    fn replaced_keeps_every_node_replaces_named() {
+        let e = |replaces: &[&str], replaced: &[&str]| Entry {
+            replaces: replaces.iter().map(|s| s.to_string()).collect(),
+            replaced: replaced.iter().map(|s| s.to_string()).collect(),
+            ..entry_of("B", Some(ID), Some(1), None, None).unwrap()
+        };
+        let old = r"ROOT\MEDIA\0004";
+        assert_eq!(replaced_after(&[], &e(&[old], &[])), Some(vec![old.to_string()]), "written with Replaces");
+        assert_eq!(replaced_after(&[old.into()], &e(&[], &[])), None, "a drop leaves it");
+        assert_eq!(replaced_after(&[old.into()], &e(&[r"root\media\0004"], &[])), None, "without case");
+        assert_eq!(replaced_after(&[old.into()], &e(&[r"ROOT\MEDIA\0005"], &[])), Some(vec![old.into(), r"ROOT\MEDIA\0005".into()]));
+        assert_eq!(replaced_after(&[], &e(&[], &[])), None, "a cable no migration made has none");
     }
 
     /// Read-only: whatever the box's store holds reads without error (an absent store is empty).

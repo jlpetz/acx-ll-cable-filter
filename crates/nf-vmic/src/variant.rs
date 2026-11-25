@@ -20,7 +20,9 @@
 //! 4. Remove only that cable's old nodes, then register the new one, clear D1's start count, install, wait for it to work, and
 //!    set the friendly name again ([`setup`]'s `make`). One that doesn't work on the chosen package is removed again.
 //! 5. Record the new n in the store, then up to [`endpoints::ENDPOINTS_WAIT`] for its endpoints on the new instance; an endpoint of the
-//!    cable's old instance still active is reported.
+//!    cable's old instance still active is reported. A migration's cable not finished yet (its record pending) is recorded as
+//!    made only once its endpoints are there ([`setup::steps::make_recorded`], as `add` has it). A restart Windows needs, to
+//!    finish the new node or to finish removing one that failed, is the answer (exit 7), nothing else done.
 
 use std::fmt::Write as _;
 
@@ -31,7 +33,8 @@ use crate::setup::lock::{LOCK, LOCK_WAIT, SetupLock};
 pub use crate::setup::package::INF_NAME;
 pub use crate::setup::plan::Health;
 use crate::setup::plan::{self, Entry, Node, PlanError, Resolved, VariantPlan};
-use crate::setup::{self, Present, SetupError};
+use crate::setup::steps::{self, Real};
+use crate::setup::{self, Done, Present, SetupError, Want};
 use crate::win_error::WinError;
 
 /// Cable A's low-latency microphone, by the name we expect Windows to give it.
@@ -300,21 +303,22 @@ pub fn switch(label: &Label, target: Variant, say: &mut dyn FnMut(&str)) -> Resu
         say(&format!("  {}", present.nodes[i].describe()));
     }
     let running = present.running();
-    let made = setup::make_cable(&present, &create, &running, say)?;
-    setup::record_cable(&made.cable, target, &entries)?;
-    if made.restart {
-        let device = made.cable.instance_id();
+    // n + 1: endpoints Windows makes now, so every name the expected one. A make that fails is the answer as it is (a restart
+    // Windows needs among them: exit 7); a migration's cable stays pending until its endpoints are there
+    let rec = setup::recording_of(&entries, label);
+    let (made, r) = steps::make_recorded(&mut Real { present: &present }, &create, Want::Rule(&running), rec, Names::Since(&[]), say);
+    if let Ok(Done::RestartPending { device }) = r {
         say(&format!("  Windows needs a restart to finish installing {device}: its endpoints come after it."));
         return Ok(Outcome::RestartPending { device });
     }
-    // n + 1: endpoints Windows makes now, so every name the expected one
-    let problems = setup::wait_cable_endpoints(&made.cable, target, Names::Since(&[]), say);
-    if let Ok(now) = endpoints::all() {
+    if made.is_some()
+        && let Ok(now) = endpoints::all()
+    {
         for e in endpoints::still_active(&old, &now) {
             say(&format!("  also still active: \"{}\", the cable's old instance's (going)", e.name));
         }
     }
-    if problems.is_empty() { Ok(Outcome::Switched) } else { Err(SetupError::Checks(problems)) }
+    r.map(|_| Outcome::Switched)
 }
 
 #[cfg(test)]

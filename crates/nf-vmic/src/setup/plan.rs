@@ -251,8 +251,12 @@ pub struct Entry {
     pub pending: bool,
     /// A migration's cable: the old driver's nodes (instance IDs) it is made in place of, whose endpoints the endpoint map gives
     /// this cable's ([`super::endpoint_map`]), on a run after their removal too ([`super::store`]'s `Replaces`). Kept once it is
-    /// made, until a run leaves no record pending: that run's map (written first) holds every cable that has them.
+    /// made, until a run leaves no record pending: that run's map (published first) holds every cable that has them.
     pub replaces: Vec<String>,
+    /// Every node `replaces` has named, kept for good (the store's `Replaced`, which its write takes `replaces` into): while
+    /// another record keeps its `replaces`, the cable is still mapped with them ([`mapped`]), so a drop of the records'
+    /// `replaces` that stops part way loses no cable from the migration's map. Read only: a write adds to it, never drops it.
+    pub replaced: Vec<String>,
 }
 
 /// The packages the present cables run, the package rule's input ([`super::package::pick`]): one entry a node with an identity
@@ -667,7 +671,8 @@ impl Target {
     /// Its store entry: `pending` until it is made, with the nodes it replaces (kept once made, until the migration's map is
     /// final: [`Entry::replaces`]).
     pub fn entry(&self, pending: bool) -> Entry {
-        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending, replaces: self.replaces.clone() }
+        let replaces = self.replaces.clone();
+        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending, replaces, replaced: Vec::new() }
     }
 
     /// The node to create (nothing to remove: the old driver's nodes go first).
@@ -708,20 +713,33 @@ pub struct Finish {
     pub replaces: Vec<String>,
 }
 
-/// The cables a migration made whose records keep the nodes they replace ([`Entry::replaces`]: the migration's endpoint map
-/// isn't final yet), present, but those labelled as in `except`. Every migrate or add run maps them again, so the run that
-/// leaves no record pending, and drops the replaced nodes once its map is written, maps the whole migration, whatever its
-/// earlier attempts were (killed, stopped by a restart).
+/// The cables a migration made, present and recorded as made, to map again (but those labelled as in `except`): while any
+/// record keeps the nodes it replaces ([`Entry::replaces`]: the migration's endpoint map isn't final yet), every cable whose
+/// record has them or had them ([`map_old`]). Every migrate or add run maps them again, so the run that leaves no record
+/// pending, and drops the replaced nodes once its map is published, maps the whole migration, whatever its earlier attempts were
+/// (killed, stopped by a restart, a drop that stopped after some records: theirs are in [`Entry::replaced`]). None once no
+/// record keeps them: the map is final.
 pub fn mapped(store: &[Entry], nodes: &[Node], except: &[&Label]) -> Vec<Finish> {
     let mut out = Vec::new();
-    for e in store.iter().filter(|e| !e.pending && !e.replaces.is_empty() && !except.contains(&&e.label)) {
+    for e in store.iter().filter(|e| !e.pending && !except.contains(&&e.label)) {
+        let replaces = map_old(store, e);
+        if replaces.is_empty() {
+            continue;
+        }
         let mut own: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].id() == Some(e.id)).collect();
         own.sort_by_key(|&i| std::cmp::Reverse(nodes[i].cable.as_ref().map_or(0, |c| c.n)));
         if !own.is_empty() {
-            out.push(Finish { label: e.label.clone(), id: e.id, nodes: own, replaces: e.replaces.clone() });
+            out.push(Finish { label: e.label.clone(), id: e.id, nodes: own, replaces });
         }
     }
     out
+}
+
+/// The old nodes the migration's endpoint map gives record `e`'s cable: while any record of `store` keeps its
+/// [`Entry::replaces`] (the map isn't final), `e`'s, with every node its record had ([`Entry::replaced`]); none once the map
+/// is final.
+pub fn map_old(store: &[Entry], e: &Entry) -> Vec<String> {
+    if store.iter().any(|x| !x.replaces.is_empty()) { union(e.replaces.clone(), &e.replaced) } else { Vec::new() }
 }
 
 /// `a` and those of `b` not in it, without case.
@@ -931,7 +949,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn entry(l: &str, id: &str, n: u32, mics: Option<Variant>) -> Entry {
-        Entry { label: label(l), id: cid(id), n, mics, pending: false, replaces: vec![] }
+        Entry { label: label(l), id: cid(id), n, mics, pending: false, replaces: vec![], replaced: vec![] }
     }
 
     /// Two cables present, A (both) and B (low-latency), both in the store.
@@ -1213,7 +1231,8 @@ pub(crate) mod tests {
             n: 1,
             mics: Some(Variant::Both),
             pending: true,
-            replaces
+            replaces,
+            replaced: vec![],
         });
         // Made, its record keeps the old node it replaces (dropped once the migration's map is written)
         assert_eq!((p.add[1].replaces.as_slice(), p.add[1].entry(false).replaces.len()), (&[r"ROOT\MEDIA\0004".to_string()][..], 1));
@@ -1325,6 +1344,18 @@ pub(crate) mod tests {
         // ... also when its cable is gone (removed by the user since): the run drops the names
         let p = migrate(&both[..1], &unsettled, None, None).unwrap();
         assert!(p.mapped.is_empty() && p.add.is_empty(), "{p:?}");
+        // A drop that stopped part way (Astra's review, 2026-11-25): A's Replaces dropped, B's kept. A is still mapped, with
+        // the node its record had (Replaced), so the retry's map holds the whole migration; once no record keeps Replaces,
+        // nothing is mapped (the map is final)
+        let a_dropped = Entry { replaced: vec![r"ROOT\MEDIA\0003".into()], ..entry("A", A_ID, 1, Some(Variant::Both)) };
+        let b_kept = Entry { replaced: vec![r"ROOT\MEDIA\0004".into()], ..unsettled[1].clone() };
+        let p = migrate(&both, &[a_dropped.clone(), b_kept.clone()], None, None).unwrap();
+        let mapped: Vec<(&str, &[String])> = p.mapped.iter().map(|f| (f.label.as_str(), f.replaces.as_slice())).collect();
+        assert_eq!(mapped, [("A", &[r"ROOT\MEDIA\0003".to_string()][..]), ("B", &[r"ROOT\MEDIA\0004".to_string()][..])]);
+        let final_ = [a_dropped.clone(), Entry { replaces: vec![], ..b_kept.clone() }];
+        assert_eq!(migrate(&both, &final_, None, None), Err(PlanError::NothingToMigrate));
+        assert!(mapped_of(&final_, &both).is_empty() && map_old(&final_, &final_[0]).is_empty());
+        assert_eq!(map_old(&[a_dropped.clone(), b_kept], &a_dropped), [r"ROOT\MEDIA\0003"]);
         // Beside a cable to make, a made one keeping its old node is mapped too
         let a_kept = Entry { replaces: vec![r"ROOT\MEDIA\0003".into()], ..entry("A", A_ID, 1, Some(Variant::Both)) };
         let b_to_make = Entry { pending: true, ..unsettled[1].clone() };
@@ -1334,6 +1365,10 @@ pub(crate) mod tests {
         // `add B` on the present B with its record pending: nothing to change, recorded as made
         let p = plan_add(&label("B"), None, None, &store, &both, cid(NEW_ID)).unwrap();
         assert!(matches!(p, AddPlan::Nothing { node: 1, pending: true, .. }), "{p:?}");
+    }
+
+    fn mapped_of(store: &[Entry], nodes: &[Node]) -> Vec<Finish> {
+        mapped(store, nodes, &[])
     }
 
     /// A re-add keeps the identity, and the instance ID (so, we expect, the endpoint ids) only with the microphones it had: other

@@ -111,8 +111,9 @@ $script:CableStore = 'HKLM:\SOFTWARE\ACX-LL-Cable\Cables'
 # The cables a migration hasn't finished: recorded (Pending = 1) and not made, or made and not checked and recorded yet (a run
 # stopped after the old devices went: a failure, a restart Windows needed, a killed tool), or made with the migration's
 # endpoint map not final yet (Replaces, the old devices' instance IDs: dropped by the run that leaves none pending, once its
-# map is written; a map asked for and not written keeps them). While there are any, Install-Driver.ps1 runs the migration
-# again, which makes them, checks and records the ones there, and maps the whole migration.
+# map is published; a map asked for and not published keeps them; Replaced keeps them for good and doesn't count). A cable
+# made stays pending until Windows has made its endpoints. While there are any, Install-Driver.ps1 runs the migration again,
+# which makes them, checks and records the ones there, and maps the whole migration.
 function Get-PendingCables {
     if (-not (Test-Path $CableStore)) { return @() }
     @(Get-ChildItem $CableStore -ErrorAction SilentlyContinue |

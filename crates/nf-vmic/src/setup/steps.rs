@@ -17,15 +17,21 @@
 //!   there) and records it. A later run with the old driver's nodes gone and every cable on the package already disables and
 //!   installs nothing.
 //! - **Its endpoint map is whole at the end.** A cable's record keeps the old nodes it replaces once it is made; every run maps
-//!   each cable that has them, and the run that leaves no record pending drops them once its map is written
-//!   ([`drop_replaces`]), so that run's map holds the whole migration, whatever its earlier attempts were.
+//!   each cable that has them, and the run that leaves no record pending drops them once its map is published
+//!   ([`drop_replaces`]), so that run's map holds the whole migration, whatever its earlier attempts were. A drop that stops
+//!   part way loses nothing: each record keeps them as `Replaced` ([`super::store`]), and while any keeps Replaces every run
+//!   maps the cables of both ([`super::plan::mapped`]).
+//! - **A cable is pending until Windows has made its endpoints.** One made now is recorded as made only once every endpoint of
+//!   its microphones is there; one Windows needs a restart for stays pending, and the run after the restart checks it.
+//! - **A restart Windows needs stops the run** (exit 7): an install's, a node's that needs one to start, or the removal of a
+//!   node that failed to install; nothing more is made before it.
 
-use super::devices::{Bound, DRIVER_WAIT, Disabled, NewNode, judge_install};
+use super::devices::{Bound, DRIVER_WAIT, Disabled, Installed, NewNode, judge_install};
 use super::endpoint_map::{self, Gathered};
 use super::endpoints::{self, ENDPOINTS_WAIT, Endpoint, EndpointCheck, Names};
 use super::package::Candidate;
 use super::plan::{Create, Entry, Finish, MigratePlan, Node, UpdatePlan};
-use super::{Done, Made, Present, SetupError, SystemClock, Want, choose_driver, lacks, make_or_next, service, store};
+use super::{Done, Made, Present, SetupError, SystemClock, Want, choose_driver, entry_of, lacks, make_or_next, service, store};
 use crate::identity::{CableInstance, Label, same_instance};
 use crate::variant::Variant;
 use crate::win_error::WinError;
@@ -58,8 +64,8 @@ pub trait Ops {
     fn endpoints_before(&mut self, also: &[String]) -> Result<Vec<Endpoint>, WinError>;
     /// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints ([`endpoints::wait_for`]).
     fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>);
-    /// A new cable's node on the staged package ([`super::make_or_next`]).
-    fn make(&mut self, create: &Create, published: &str, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError>;
+    /// A new cable's node on the package `want` names ([`super::make_or_next`]).
+    fn make(&mut self, create: &Create, want: Want, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError>;
     /// The store's entry for a cable.
     fn record(&mut self, entry: &Entry) -> Result<(), WinError>;
 }
@@ -135,8 +141,8 @@ impl Ops for Real<'_> {
         endpoints::wait_for(cable, variant, names, ENDPOINTS_WAIT, &mut endpoints::all, &mut SystemClock::start())
     }
 
-    fn make(&mut self, create: &Create, published: &str, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
-        make_or_next(self.present, create, Want::Published(published), say)
+    fn make(&mut self, create: &Create, want: Want, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
+        make_or_next(self.present, create, want, say)
     }
 
     fn record(&mut self, entry: &Entry) -> Result<(), WinError> {
@@ -266,7 +272,7 @@ pub fn unload<O: Ops>(
 
 /// Installs the staged package on each node of `drivers`, enables every node of `disabled` but the old driver's (whatever the
 /// installs did), and checks each: working on the package, its endpoints there and named as `before` had them. The checks that
-/// failed, and a node Windows needs a restart to finish.
+/// failed, and a node Windows needs a restart to finish (its install asked for one, or it shows Code 14 on the package).
 pub fn install_all<O: Ops>(
     ops: &mut O, nodes: &[Node], drivers: &[(usize, O::Driver, Candidate)], disabled: &[usize], before: &[Endpoint],
     say: &mut dyn FnMut(&str),
@@ -304,10 +310,14 @@ pub fn install_all<O: Ops>(
         let now = ops.wait_working(*i);
         say(&format!("  {}: {}", n.instance_id, now.describe()));
         match judge_install(Ok(()), false, &now, candidate) {
-            Ok(_) => {
+            Ok(Installed::Working) => {
                 if let (Some(c), Some(v)) = (&n.cable, n.variant()) {
                     problems.extend(wait_endpoints(ops, c, v, Names::Since(before), say));
                 }
+            }
+            Ok(Installed::Restart) => {
+                say("  Windows needs a restart to finish it: its endpoints come after it");
+                restart.get_or_insert_with(|| n.instance_id.clone());
             }
             Err(failure) => problems.push(format!("{}: {failure}", n.instance_id)),
         }
@@ -352,6 +362,8 @@ enum Finished {
     Checked { cable: CableInstance, variant: Variant, misnamed: Vec<String> },
     /// Left pending: why.
     Pending(Vec<String>),
+    /// Left pending: on the package, but Windows needs a restart to start it (Code 14), so the run stops there (exit 7).
+    Restart(String),
 }
 
 /// What a wait for the endpoints of a cable to finish found (each said): `Ok` with the names that aren't as expected (reported as
@@ -390,8 +402,10 @@ fn check_finish<O: Ops>(
     say(&format!("Checking {name} ({}): an earlier run made it and stopped before recording it", n.instance_id));
     let now = ops.wait_working(*i);
     say(&format!("  {}: {}", n.instance_id, now.describe()));
-    if let Err(failure) = judge_install(Ok(()), false, &now, candidate) {
-        return Finished::Pending(vec![format!("{}: {failure}", n.instance_id)]);
+    match judge_install(Ok(()), false, &now, candidate) {
+        Ok(Installed::Working) => {}
+        Ok(Installed::Restart) => return Finished::Restart(n.instance_id.clone()),
+        Err(failure) => return Finished::Pending(vec![format!("{}: {failure}", n.instance_id)]),
     }
     say(&format!("Waiting for Windows to make {name}'s endpoints (up to {} s)", ENDPOINTS_WAIT.as_secs()));
     let found = ops.wait_endpoints(&cable, variant, Names::Since(before));
@@ -473,49 +487,87 @@ pub fn run_migrate<O: Ops>(
     //    package, or whose endpoints don't come, stays pending; endpoint names that aren't as expected are reported, as for a
     //    cable made now, and don't hold the record back
     let mut unmade = Vec::new();
+    let mut restart = None;
     for f in &plan.finish {
         match check_finish(ops, nodes, f, &drivers, &before, say) {
             Finished::Checked { cable, variant, misnamed } => {
                 // The nodes it replaces stay until the migration's map is final
-                let replaces = f.replaces.clone();
-                let entry = Entry { label: f.label.clone(), id: f.id, n: cable.n, mics: Some(variant), pending: false, replaces };
+                let entry = entry_of(&cable, variant, &f.replaces, false);
                 match ops.record(&entry) {
                     Ok(()) => say(&format!("  {} recorded as made", f.label.friendly_name())),
                     Err(e) => problems.push(format!("{} is made, but the setup's store couldn't record it ({e})", f.label.friendly_name())),
                 }
                 problems.extend(misnamed);
-                gathered.cables.push(endpoint_map::Made::new(cable, variant, &f.replaces));
+                gathered.cables.push(endpoint_map::Made::migration(cable, variant, &f.replaces));
             }
             Finished::Pending(why) => {
                 problems.extend(why);
                 unmade.push(f.label.clone());
             }
+            Finished::Restart(device) => {
+                say("  Windows needs a restart to start it: it stays pending, and the run after the restart checks it");
+                unmade.push(f.label.clone());
+                restart.get_or_insert(device);
+            }
         }
     }
-    // 7. The cables made; one that fails stays pending in the store, and the others are still made
+    if let Some(device) = restart {
+        // Nothing is made before the restart Windows needs
+        let rest: Vec<Label> = unmade.iter().chain(plan.add.iter().map(|t| &t.label)).cloned().collect();
+        mapped_too(nodes, plan, gathered);
+        return restart_due(device, problems, rest, say);
+    }
+    // 7. The cables made; one that fails stays pending in the store, and the others are still made, but for a restart Windows
+    //    needs (the failed node's removal, say): then the run stops there, nothing more made (exit 7)
     for (k, t) in plan.add.iter().enumerate() {
         say(&format!("Adding {} ({})", t.label.friendly_name(), t.variant.describe()));
-        let made = match ops.make(&t.create(), published, say) {
+        let made = match ops.make(&t.create(), Want::Published(published), say) {
             Ok(m) => m,
             Err(e) => {
                 problems.push(format!("{}: {e}", t.label.friendly_name()));
                 unmade.push(t.label.clone());
+                if let Some(device) = e.restart_device() {
+                    say("  Windows needs a restart to finish with it: nothing more is made before then");
+                    let rest: Vec<Label> = unmade.iter().chain(plan.add[k + 1..].iter().map(|t| &t.label)).cloned().collect();
+                    mapped_too(nodes, plan, gathered);
+                    return restart_due(device.to_string(), problems, rest, say);
+                }
                 continue;
             }
         };
-        // Made, and recorded so (its n, the old nodes it replaces kept); pending still if Windows needs a restart to finish it,
-        // so the run after the restart checks it
-        let entry = Entry { n: made.cable.n, ..t.entry(made.restart) };
-        if let Err(e) = ops.record(&entry) {
-            problems.push(format!("{} was made, but the setup's store couldn't record it ({e})", t.label.friendly_name()));
-        }
-        gathered.cables.push(endpoint_map::Made::new(made.cable.clone(), t.variant, &t.replaces));
+        gathered.cables.push(endpoint_map::Made::migration(made.cable.clone(), t.variant, &t.replaces));
+        let not_recorded = |e| format!("{} was made, but the setup's store couldn't record it ({e})", t.label.friendly_name());
         if made.restart {
+            // Pending still, its n recorded, so the run after the restart checks it
+            if let Err(e) = ops.record(&Entry { n: made.cable.n, ..t.entry(true) }) {
+                problems.push(not_recorded(e));
+            }
             let rest: Vec<Label> = unmade.iter().chain(plan.add[k..].iter().map(|t| &t.label)).cloned().collect();
             mapped_too(nodes, plan, gathered);
             return restart_due(made.cable.instance_id(), problems, rest, say);
         }
-        problems.extend(wait_endpoints(ops, &made.cable, t.variant, Names::Since(&before), say));
+        // Recorded as made (its n, the old nodes it replaces kept) only once every endpoint of its microphones is there; else
+        // it stays pending, for the next run's check
+        say(&format!("Waiting for Windows to make {}'s endpoints (up to {} s)", t.label.friendly_name(), ENDPOINTS_WAIT.as_secs()));
+        let found = ops.wait_endpoints(&made.cable, t.variant, Names::Since(&before));
+        match finish_verdict(&made.cable, found, say) {
+            Ok(misnamed) => {
+                if let Err(e) = ops.record(&Entry { n: made.cable.n, ..t.entry(false) }) {
+                    problems.push(not_recorded(e));
+                }
+                problems.extend(misnamed);
+            }
+            Err(why) => {
+                say("  it stays pending in the setup's store: the next run checks it");
+                problems.extend(why);
+                unmade.push(t.label.clone());
+                if made.cable.n != t.n
+                    && let Err(e) = ops.record(&Entry { n: made.cable.n, ..t.entry(true) })
+                {
+                    problems.push(not_recorded(e));
+                }
+            }
+        }
     }
     mapped_too(nodes, plan, gathered);
     // A cable to finish is checked by the installs and again by its own check: each problem once
@@ -534,16 +586,17 @@ fn mapped_too(nodes: &[Node], plan: &MigratePlan, gathered: &mut Gathered) {
     for m in &plan.mapped {
         let n = &nodes[m.nodes[0]];
         if let (Some(c), Some(v)) = (&n.cable, n.variant()) {
-            gathered.cables.push(endpoint_map::Made::new(c.clone(), v, &m.replaces));
+            gathered.cables.push(endpoint_map::Made::migration(c.clone(), v, &m.replaces));
         }
     }
 }
 
-/// The migration's end when Windows needs a restart to finish installing `device`: the cables still `to_make` wait for the
-/// next run (recorded in the store, pending), which it says. A restart and nothing else wrong is [`Done::RestartPending`]; with
-/// other problems, an error that needs the restart first ([`SetupError::needs_restart`]: exit 7).
+/// The migration's end when Windows needs a restart to finish with `device` (an install, a node's start, a failed node's
+/// removal): the cables still `to_make` wait for the next run (recorded in the store, pending), which it says. A restart and
+/// nothing else wrong is [`Done::RestartPending`]; with other problems, an error that needs the restart first
+/// ([`SetupError::needs_restart`]: exit 7).
 fn restart_due(device: String, problems: Vec<String>, to_make: Vec<Label>, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
-    let text = format!("Windows needs a restart to finish installing {device}");
+    let text = format!("Windows needs a restart to finish with {device}");
     if to_make.is_empty() {
         say(&format!("  {text}"));
     } else {
@@ -557,8 +610,10 @@ fn restart_due(device: String, problems: Vec<String>, to_make: Vec<Label>, say: 
 }
 
 /// Once no record in `entries` (the store after the run) is pending, every record's Replaces dropped: the migration is done, and
-/// the run's endpoint map, written before this, holds every cable they name. A write that fails is said; that record keeps them,
-/// and the next migration run maps it again and drops them.
+/// the run's endpoint map, published before this, holds every cable they name. A record at a time: each keeps them as Replaced
+/// ([`super::store::write`]), so a drop that stops part way leaves the next migration run mapping every cable of both (and
+/// dropping the rest). A write that fails is said; that record keeps them, and the next migration run maps it again and drops
+/// them.
 pub fn drop_replaces<O: Ops>(ops: &mut O, entries: &[Entry], say: &mut dyn FnMut(&str)) {
     if entries.iter().any(|e| e.pending) {
         return;
@@ -577,6 +632,67 @@ pub fn drop_replaces<O: Ops>(ops: &mut O, entries: &[Entry], say: &mut dyn FnMut
     }
 }
 
+/// How [`make_recorded`] records the cable it makes: the nodes its record says it replaces (a migration's cable: kept as they
+/// are, until the migration's map is final), and whether its record is still a migration's not finished (pending).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Recording<'a> {
+    pub replaces: &'a [String],
+    pub pending: bool,
+}
+
+/// A cable `add` or the variant switch makes (`create`, on the package `want`), recorded, its endpoints waited for (up to
+/// [`ENDPOINTS_WAIT`], their names judged by `names`). The cable made, if it was, beside the result:
+/// - the make fails: its error as it is, nothing recorded, nothing waited for (a restart Windows needs to finish removing a node
+///   that failed to install among them: exit 7);
+/// - made, and Windows needs a restart to finish it: recorded (a migration's cable still pending, so the run after the restart
+///   checks it), [`Done::RestartPending`] (exit 7), its endpoints unchecked;
+/// - made: a migration's cable (`rec.pending`) is recorded pending first (with its n), then as made only once every endpoint of
+///   its microphones is there ([`finish_verdict`]; else [`SetupError::Unfinished`]: still pending); any other cable is
+///   recorded, then its endpoints are checked ([`SetupError::Checks`]).
+pub fn make_recorded<O: Ops>(
+    ops: &mut O, create: &Create, want: Want, rec: Recording, names: Names, say: &mut dyn FnMut(&str),
+) -> (Option<CableInstance>, Result<Done, SetupError>) {
+    let made = match ops.make(create, want, say) {
+        Ok(m) => m,
+        Err(e) => return (None, Err(e)),
+    };
+    let cable = made.cable.clone();
+    let r = recorded(ops, &made, create.variant, rec, names, say);
+    (Some(cable), r)
+}
+
+/// [`make_recorded`] once the cable is made.
+fn recorded<O: Ops>(
+    ops: &mut O, made: &Made, variant: Variant, rec: Recording, names: Names, say: &mut dyn FnMut(&str),
+) -> Result<Done, SetupError> {
+    let cable = &made.cable;
+    let record = |ops: &mut O, pending| ops.record(&entry_of(cable, variant, rec.replaces, pending)).map_err(SetupError::Store);
+    if made.restart {
+        let device = cable.instance_id();
+        return record(ops, rec.pending).map(|()| Done::RestartPending { device: device.clone() }).map_err(|e| e.and_restart(Some(device)));
+    }
+    if !rec.pending {
+        record(ops, false)?;
+        let problems = wait_endpoints(ops, cable, variant, names, say);
+        return if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) };
+    }
+    // A migration's cable: its n recorded, still pending, so a run that stops during the wait checks the node made now
+    record(ops, true)?;
+    say(&format!("Waiting for Windows to make {}'s endpoints (up to {} s)", cable.label.friendly_name(), ENDPOINTS_WAIT.as_secs()));
+    let found = ops.wait_endpoints(cable, variant, names);
+    match finish_verdict(cable, found, say) {
+        Ok(misnamed) => {
+            record(ops, false)?;
+            say("  recorded as made in the setup's store (its record was a migration's, still pending)");
+            if misnamed.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(misnamed)) }
+        }
+        Err(problems) => {
+            say("  it stays pending in the setup's store: the migration (Install-Driver.ps1) checks it again");
+            Err(SetupError::Unfinished { problems, to_make: vec![cable.label.clone()] })
+        }
+    }
+}
+
 /// "A and B".
 pub fn labels(labels: &[Label]) -> String {
     let names: Vec<String> = labels.iter().map(Label::friendly_name).collect();
@@ -590,6 +706,7 @@ pub fn labels(labels: &[Label]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::*;
@@ -618,7 +735,11 @@ mod tests {
         uninstall_restart: Option<usize>,
         target_fails: Option<&'static str>,
         make_fails: Option<&'static str>,
+        /// This cable's make fails, and Windows needs a restart to finish removing the node that failed (StillPresent).
+        make_fails_restart: Option<&'static str>,
         made_restart: Option<&'static str>,
+        /// This node is on the package after its install or enable, but Windows needs a restart to start it (Code 14).
+        start_restart: Option<usize>,
         /// This cable's endpoints never come.
         endpoints_missing: Option<&'static str>,
         /// This cable's endpoints come with Windows' "2- " numbering in their names.
@@ -711,7 +832,13 @@ mod tests {
         }
 
         fn wait_working(&mut self, i: usize) -> Bound {
-            let health = if self.disabled.contains(&i) { Health::Problem(22) } else { Health::Working };
+            let health = if self.disabled.contains(&i) {
+                Health::Problem(22)
+            } else if self.start_restart == Some(i) {
+                Health::Problem(14)
+            } else {
+                Health::Working
+            };
             let installed_bad = self.install_fails == Some(i);
             Bound {
                 health,
@@ -735,6 +862,7 @@ mod tests {
         }
 
         fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>) {
+            self.log(format!("wait-endpoints {}", cable.label));
             if self.endpoints_missing == Some(cable.label.as_str()) {
                 return (Some(endpoints::check(cable, variant, &[], names)), None);
             }
@@ -752,11 +880,19 @@ mod tests {
             (Some(endpoints::check(cable, variant, &eps, names)), None)
         }
 
-        fn make(&mut self, create: &Create, _: &str, _: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
+        fn make(&mut self, create: &Create, _: Want, _: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
             let l = create.instance.label.as_str();
             self.log(format!("make {l}"));
             if self.make_fails == Some(l) {
                 return Err(SetupError::Windows(failed("SetupDiCallClassInstaller(DIF_REGISTERDEVICE)")));
+            }
+            if self.make_fails_restart == Some(l) {
+                return Err(SetupError::StillPresent {
+                    device: create.instance.instance_id(),
+                    why: "Windows needs a restart to finish removing it".into(),
+                    restart: true,
+                    error: Box::new(SetupError::Windows(failed("DiInstallDevice"))),
+                });
             }
             Ok(Made { cable: create.instance.clone(), restart: self.made_restart == Some(l) })
         }
@@ -922,8 +1058,8 @@ mod tests {
         assert_eq!(gathered.before, Some(vec![]));
         let made: Vec<(&str, Vec<endpoint_map::Old>)> = gathered.cables.iter().map(|m| (m.cable.label.as_str(), m.old.clone())).collect();
         assert_eq!(made, [
-            ("A", vec![endpoint_map::Old::Instance(r"ROOT\MEDIA\0003".into()), endpoint_map::Old::Identity(cid(NEW_A))]),
-            ("B", vec![endpoint_map::Old::Instance(r"ROOT\MEDIA\0004".into()), endpoint_map::Old::Identity(cid(NEW_B))]),
+            ("A", vec![endpoint_map::Old::Instance(r"ROOT\MEDIA\0003".into()), endpoint_map::Old::OtherInstance { id: cid(NEW_A), n: 1 }]),
+            ("B", vec![endpoint_map::Old::Instance(r"ROOT\MEDIA\0004".into()), endpoint_map::Old::OtherInstance { id: cid(NEW_B), n: 1 }]),
         ]);
     }
 
@@ -1069,29 +1205,88 @@ mod tests {
     /// and the store. Every change counts against `budget`; once it is spent, each change fails and does nothing, so the run's
     /// world stays as a kill right after its last change would leave it (the calls after fail without effect). `make` is two
     /// changes, as on Windows: the node registered (present, no driver: Code 28), then installed. `restart_make`: that cable's
-    /// install needs a restart (Code 14 until [`World::next`]).
+    /// install needs a restart (Code 14 until [`World::next`]). The endpoints: each working node's (the old A's three,
+    /// Cable-B.ps1's B's Speakers and Microphone, a cable's variant's), a disabled node's and a removed old node's lingering
+    /// (NOTPRESENT), as Windows keeps them; `late`, a cable whose endpoints don't come in this world (they do in the next).
+    /// `map`: the endpoint map every run publishes, one file across runs (as `Install-Driver.ps1 -EndpointMap <file>` has it);
+    /// its publish is a change.
     struct World {
         nodes: Vec<Node>,
         removed: BTreeSet<usize>,
+        /// Old nodes earlier runs removed: their endpoints linger, NOTPRESENT.
+        lingering: Vec<Node>,
         store: Vec<Entry>,
         budget: usize,
         changes: Vec<String>,
         restart_make: Option<&'static str>,
+        /// This cable's make fails: its node registered, removed again, and Windows needs a restart to finish the removal.
+        make_fails_restart: Option<&'static str>,
+        late: Option<&'static str>,
+        map: Option<PathBuf>,
     }
 
     impl World {
         fn new(nodes: Vec<Node>, store: Vec<Entry>, budget: usize) -> Self {
-            World { nodes, removed: BTreeSet::new(), store, budget, changes: Vec::new(), restart_make: None }
+            World {
+                nodes,
+                removed: BTreeSet::new(),
+                lingering: Vec::new(),
+                store,
+                budget,
+                changes: Vec::new(),
+                restart_make: None,
+                make_fails_restart: None,
+                late: None,
+                map: None,
+            }
         }
 
-        /// The next run's world: what is left present, the store, no budget limit; a node waiting for a restart has had it.
+        /// The next run's world: what is left present, the store, no budget limit; a node waiting for a restart has had it, and
+        /// the endpoints that were late have come. The map's file is the same.
         fn next(&self) -> World {
             let mut nodes: Vec<Node> =
                 self.nodes.iter().enumerate().filter(|(i, _)| !self.removed.contains(i)).map(|(_, n)| n.clone()).collect();
             for n in nodes.iter_mut().filter(|n| n.health == Health::Problem(14)) {
                 n.health = Health::Working;
             }
-            World::new(nodes, self.store.clone(), usize::MAX)
+            let mut next = World::new(nodes, self.store.clone(), usize::MAX);
+            next.lingering = self.lingering.clone();
+            next.lingering.extend(self.removed.iter().map(|&i| self.nodes[i].clone()).filter(|n| n.is_legacy()));
+            next.map = self.map.clone();
+            next
+        }
+
+        /// The endpoints of node `n`, in `state`.
+        fn endpoints_of(n: &Node, state: endpoints::State) -> Vec<Endpoint> {
+            let kinds = match n.model {
+                crate::setup::plan::Model::Cable(v) | crate::setup::plan::Model::Legacy(Legacy::AudioCodec(v)) => {
+                    EndpointKind::of_variant(v)
+                }
+                crate::setup::plan::Model::Legacy(Legacy::CableB) => vec![EndpointKind::Speakers, EndpointKind::Microphone],
+            };
+            let name = |kind: EndpointKind| match &n.cable {
+                Some(c) => endpoints::expected_name(c, kind),
+                None => format!("{} (the old driver's)", kind.name()),
+            };
+            kinds
+                .into_iter()
+                .map(|kind| Endpoint {
+                    id: endpoint_id(&n.instance_id, kind),
+                    name: name(kind),
+                    kind,
+                    state,
+                    instance_id: n.instance_id.to_lowercase(),
+                })
+                .collect()
+        }
+
+        /// The endpoints as a run reads them after it: every working cable's but the late one's.
+        fn after(&self) -> Vec<Endpoint> {
+            let late = |n: &Node| n.cable.as_ref().is_some_and(|c| self.late == Some(c.label.as_str()));
+            (self.nodes.iter().enumerate())
+                .filter(|(i, n)| !self.removed.contains(i) && n.cable.is_some() && n.health == Health::Working && !late(n))
+                .flat_map(|(_, n)| World::endpoints_of(n, endpoints::State::Active))
+                .collect()
         }
 
         fn spend(&mut self, change: String) -> bool {
@@ -1188,18 +1383,42 @@ mod tests {
             service::Unload::Done(Duration::from_millis(500))
         }
 
-        fn endpoints_before(&mut self, _: &[String]) -> Result<Vec<Endpoint>, WinError> {
-            Ok(Vec::new())
+        /// As [`endpoints::before`]: the cables' (a removed one's NOTPRESENT) and those of the nodes `also` names, lingering
+        /// ones too.
+        fn endpoints_before(&mut self, also: &[String]) -> Result<Vec<Endpoint>, WinError> {
+            let wanted = |n: &Node| n.cable.is_some() || also.iter().any(|a| same_instance(a, &n.instance_id));
+            let mut out = Vec::new();
+            for (i, n) in self.nodes.iter().enumerate().filter(|(_, n)| wanted(n)) {
+                if self.removed.contains(&i) || n.health == Health::Problem(22) {
+                    out.extend(World::endpoints_of(n, endpoints::State::NotPresent));
+                } else if n.health == Health::Working {
+                    out.extend(World::endpoints_of(n, endpoints::State::Active));
+                }
+            }
+            for n in self.lingering.iter().filter(|n| wanted(n)) {
+                out.extend(World::endpoints_of(n, endpoints::State::NotPresent));
+            }
+            Ok(out)
         }
 
         fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>) {
-            Fake::default().wait_endpoints(cable, variant, names)
+            let endpoints_missing = self.late.filter(|l| *l == cable.label.as_str());
+            Fake { endpoints_missing, ..Fake::default() }.wait_endpoints(cable, variant, names)
         }
 
-        fn make(&mut self, create: &Create, _: &str, _: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
+        fn make(&mut self, create: &Create, _: Want, _: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
             let id = create.instance.instance_id();
             if !self.spend(format!("register {id}")) {
                 return Err(SetupError::Windows(World::killed()));
+            }
+            if self.make_fails_restart == Some(create.instance.label.as_str()) {
+                // Registered, its install failed, removed again; Windows finishes the removal at the restart
+                return Err(SetupError::StillPresent {
+                    device: id,
+                    why: "Windows needs a restart to finish removing it".into(),
+                    restart: true,
+                    error: Box::new(SetupError::Windows(failed("DiInstallDevice"))),
+                });
             }
             self.nodes.push(Node {
                 instance_id: id.clone(),
@@ -1233,9 +1452,13 @@ mod tests {
             if !self.spend(format!("record {} {what}", entry.label)) {
                 return Err(World::killed());
             }
+            // As store::write: Replaced takes every node Replaces names, and keeps them
+            let mut entry = entry.clone();
+            let kept = self.store.iter().find(|e| e.label == entry.label).map(|e| e.replaced.clone()).unwrap_or_default();
+            entry.replaced = store::replaced_after(&kept, &entry).unwrap_or(kept);
             match self.store.iter_mut().find(|e| e.label == entry.label) {
-                Some(e) => *e = entry.clone(),
-                None => self.store.push(entry.clone()),
+                Some(e) => *e = entry,
+                None => self.store.push(entry),
             }
             Ok(())
         }
@@ -1244,9 +1467,13 @@ mod tests {
     const NEW_A2: &str = "a2a2a2a2-0000-4000-8000-0000000000a2";
     const NEW_B2: &str = "b2b2b2b2-0000-4000-8000-0000000000b2";
 
-    /// One run on `world` (new identities `ids` if the store has none), as `migrate` runs it: the sequence, then (its map
-    /// written) the old nodes' names dropped once nothing is pending; `None` if there is nothing to migrate.
+    /// One run on `world` (new identities `ids` if the store has none), as `migrate` runs it: the map's start check, the
+    /// sequence, the map published (`world.map`; a change: a kill before it leaves the file as it was), then (published, or no
+    /// map asked for) the old nodes' names dropped once nothing is pending; `None` if there is nothing to migrate (the file
+    /// untouched).
     fn run_mapped(world: &mut World, ids: [&str; 2]) -> Option<(Result<Done, SetupError>, Gathered)> {
+        let map = world.map.clone();
+        endpoint_map::start(map.as_deref()).unwrap();
         let nodes = world.nodes.clone();
         let plan = match plan_migrate(&nodes, &world.store, None, None, [cid(ids[0]), cid(ids[1])]) {
             Ok(p) => p,
@@ -1255,8 +1482,18 @@ mod tests {
         };
         let mut gathered = Gathered::default();
         let r = run_migrate(world, &nodes, &plan, PUBLISHED, &mut gathered, &mut |_: &str| {});
-        let store = world.store.clone();
-        drop_replaces(world, &store, &mut |_: &str| {});
+        let (r, mapped) = match &map {
+            None => (r, true),
+            Some(_) if !world.spend("publish map".into()) => (r, false),
+            Some(path) => {
+                let after = world.after();
+                endpoint_map::finish(Some(path), "migrate", gathered.clone(), r, &mut || Ok(after.clone()), &mut |_: &str| {})
+            }
+        };
+        if mapped {
+            let store = world.store.clone();
+            drop_replaces(world, &store, &mut |_: &str| {});
+        }
         Some((r, gathered))
     }
 
@@ -1294,11 +1531,74 @@ mod tests {
         }
     }
 
+    /// An endpoint's MMDevice id in the worlds: its node's instance ID and its role.
+    fn endpoint_id(instance: &str, kind: EndpointKind) -> String {
+        format!("{{{instance}}}.{kind:?}")
+    }
+
+    /// A cable's rows in an endpoint map as a reader takes them: role, old id, new id, match.
+    type Rows = Vec<(String, Option<String>, Option<String>, String)>;
+
+    /// A cable in an endpoint map as a reader takes it: its label, the old nodes it replaces, its rows.
+    type MapCable = (String, Vec<String>, Rows);
+
+    /// What a reader finds in the endpoint map's file, as s0a.sh's map.ps1 reads it: `None` if there is no file; else its
+    /// `result`, and each cable (by label) with the old nodes it replaces and its rows. The file is always a whole map.
+    fn read_map(path: &Path) -> Option<(String, Vec<MapCable>)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a whole map ({e}): {text}"));
+        assert_eq!(
+            (v["format"].as_str(), v["version"].as_u64(), v["command"].as_str()),
+            (Some(endpoint_map::FORMAT), Some(1), Some("migrate"))
+        );
+        let text_of = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+        let id = |side: &serde_json::Value| side.get("id").map(text_of);
+        let mut cables: Vec<MapCable> = (v["cables"].as_array().unwrap().iter())
+            .map(|c| {
+                let replaces = c["replaces"].as_array().unwrap().iter().map(text_of).collect();
+                let rows = (c["endpoints"].as_array().unwrap().iter())
+                    .map(|p| (text_of(&p["role"]), id(&p["old"]), id(&p["new"]), text_of(&p["match"])))
+                    .collect();
+                (text_of(&c["label"]), replaces, rows)
+            })
+            .collect();
+        cables.sort();
+        Some((text_of(&v["result"]), cables))
+    }
+
+    /// The whole migration's map for the cables A and B of `w`, as a reader should find it (the owner's decision with Astra,
+    /// 2026-11-25): A's three endpoints moved from the old A's; B's Speakers moved from Cable-B.ps1's, and its one microphone to
+    /// B's low-latency Microphone (so an app's saved choice keeps working), B's Call Microphone a newly added endpoint.
+    fn whole_map_rows(w: &World) -> Vec<MapCable> {
+        let inst = |l: &str| w.nodes.iter().find(|n| n.cable.as_ref().is_some_and(|c| c.label.as_str() == l)).unwrap().instance_id.clone();
+        let (a, b, old_a, old_b) = (inst("A"), inst("B"), r"ROOT\MEDIA\0003", r"ROOT\MEDIA\0004");
+        let id = |instance: &str, kind| Some(endpoint_id(instance, kind));
+        let row = |kind: EndpointKind, old, new, m: &str| (kind.name().to_string(), old, new, m.to_string());
+        let (spk, mic, call) = (EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone);
+        vec![
+            ("A".into(), vec![old_a.into()], vec![
+                row(spk, id(old_a, spk), id(&a, spk), "moved"),
+                row(mic, id(old_a, mic), id(&a, mic), "moved"),
+                row(call, id(old_a, call), id(&a, call), "moved"),
+            ]),
+            ("B".into(), vec![old_b.into()], vec![
+                row(spk, id(old_b, spk), id(&b, spk), "moved"),
+                row(mic, id(old_b, mic), id(&b, mic), "moved"),
+                row(call, None, id(&b, call), "added"),
+            ]),
+        ]
+    }
+
     /// Astra's review (2026-11-25): a migration stopped right after any change it makes (a killed tool, a crash) is finished by
     /// the next run, which never meets the stuck state the review found (a record pending that no plan acts on). Today's box
-    /// (the old A and Cable-B.ps1's B), and the same with a cable C on an older package.
+    /// (the old A and Cable-B.ps1's B), and the same with a cable C on an older package. Each run publishes its endpoint map to
+    /// one file (Install-Driver.ps1 -EndpointMap): at every step boundary, the publish and each record's drop of the old nodes'
+    /// names among them, a reader finds no map or the whole migration's after the stopped run, the whole migration's after the
+    /// retry, and the same after a third run (nothing to do: the file untouched).
     #[test]
     fn a_migration_stopped_after_any_change_is_finished_by_the_next_run() {
+        let dir = endpoint_map::tests::scratch("boundaries");
+        let map = dir.join("endpoint-map.json");
         let mut c = node("C", "cccccccc-0000-4000-8000-00000000000c", 1, Variant::Call);
         c.running = Some(crate::setup::package::tests::running("oem12.inf", "3.27.41.511"));
         for with_c in [false, true] {
@@ -1306,43 +1606,122 @@ mod tests {
             if with_c {
                 start.insert(0, c.clone());
             }
-            let mut whole = World::new(start.clone(), vec![], usize::MAX);
+            let world = |budget| World { map: Some(map.clone()), ..World::new(start.clone(), vec![], budget) };
+            let _ = std::fs::remove_file(&map);
+            let mut whole = world(usize::MAX);
             assert_eq!(run_on(&mut whole, [NEW_A, NEW_B]), Some(Ok(Done::Changed)));
             assert_migrated(&whole.next(), with_c, "one run");
+            assert_eq!(read_map(&map), Some(("done".into(), whole_map_rows(&whole))), "one run");
             // The step boundaries: each change below is one place a run can stop
             let kinds: Vec<&str> = whole.changes.iter().map(|c| c.split(' ').next().unwrap()).collect();
-            // The last two: the old nodes' names dropped from A's and B's records, once the map is written
+            // The last three: the map published, then the old nodes' names dropped from A's and B's records
             #[rustfmt::skip]
             let expected: &[&str] = if with_c {
                 &["record", "record", "disable", "disable", "disable", "uninstall", "uninstall", "clear", "install", "rename", "clear",
-                  "enable", "register", "install-new", "record", "register", "install-new", "record", "record", "record"]
+                  "enable", "register", "install-new", "record", "register", "install-new", "record", "publish", "record", "record"]
             } else {
                 &["record", "record", "disable", "disable", "uninstall", "uninstall", "register", "install-new", "record", "register",
-                  "install-new", "record", "record", "record"]
+                  "install-new", "record", "publish", "record", "record"]
             };
             assert_eq!(kinds, expected, "{:?}", whole.changes);
+            let published_at = kinds.iter().position(|k| *k == "publish").unwrap();
             for k in 0..whole.changes.len() {
                 let why = format!("stopped after {} (change {k}, C {with_c})", k.checked_sub(1).map_or("nothing", |j| &whole.changes[j]));
-                let mut first = World::new(start.clone(), vec![], k);
-                let (first_r, first_map) = run_mapped(&mut first, [NEW_A, NEW_B]).unwrap();
+                let _ = std::fs::remove_file(&map);
+                let mut first = world(k);
+                let (_, first_map) = run_mapped(&mut first, [NEW_A, NEW_B]).unwrap();
                 assert_eq!(first.changes, whole.changes[..k], "{why}");
+                // What a reader finds after the stopped run: no map until the run published one, then the whole migration's
+                let found = read_map(&map);
+                if k > published_at {
+                    assert_eq!(found, Some(("done".into(), whole_map_rows(&first))), "{why}");
+                    assert_eq!(mapped_of(&first_map), whole_map(), "{why}");
+                } else {
+                    assert_eq!(found, None, "{why}: no map before the run published one");
+                }
                 let mut next = first.next();
                 let (r, gathered) = run_mapped(&mut next, [NEW_A2, NEW_B2]).unwrap_or_else(|| panic!("{why}: nothing to do"));
                 assert_eq!(r, Ok(Done::Changed), "{why}: {:?}", next.changes);
-                // The run that finishes the sequence maps the whole migration, the cables earlier runs made too (Astra's review): the
-                // first, if only the drop after its map was cut short, else the next
-                let finisher = if first_r == Ok(Done::Changed) { &first_map } else { &gathered };
-                assert_eq!(mapped_of(finisher), whole_map(), "{why}");
+                // The retry maps the whole migration, the cables earlier runs made and recorded too, whether or not their records
+                // still keep the old nodes' names (a drop cut short: A's dropped, B's kept), and publishes it whole
+                assert_eq!(mapped_of(&gathered), whole_map(), "{why}");
                 let done = next.next();
                 assert_migrated(&done, with_c, &why);
+                assert_eq!(read_map(&map), Some(("done".into(), whole_map_rows(&done))), "{why}: after the retry");
+                assert!(!dir.join("endpoint-map.json.tmp").exists(), "{why}");
+                let text = std::fs::read_to_string(&map).unwrap();
                 let mut again = done.next();
                 assert!(run_on(&mut again, [NEW_A2, NEW_B2]).is_none(), "{why}: a third run has nothing to do");
+                assert_eq!(std::fs::read_to_string(&map).unwrap(), text, "{why}: the whole map stays");
                 // A cable recorded before the stop keeps the identity it was recorded with
                 for e in first.store.iter() {
                     assert!(done.store.iter().any(|d| d.label == e.label && d.id == e.id), "{why}: {} changed identity", e.label);
                 }
             }
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Astra's review (2026-11-25): a newly made cable stays pending while an expected endpoint is missing. B made, Windows not
+    /// making its endpoints within the wait: its record stays pending (the run exits 2, the map says so), `list` says the
+    /// migration hasn't finished it, and the next run checks it once they are there and finishes the migration. After a restart
+    /// too: a cable made by a run that needs one stays pending through the run after it while its endpoints are late.
+    #[test]
+    fn a_cable_stays_pending_until_its_endpoints_are_there() {
+        let dir = endpoint_map::tests::scratch("late");
+        let map = dir.join("endpoint-map.json");
+        let start = vec![legacy(r"ROOT\MEDIA\0003", Legacy::AudioCodec(Variant::Both)), legacy(r"ROOT\MEDIA\0004", Legacy::CableB)];
+        let mut first = World { map: Some(map.clone()), late: Some("B"), ..World::new(start.clone(), vec![], usize::MAX) };
+        let (r, _) = run_mapped(&mut first, [NEW_A, NEW_B]).unwrap();
+        let Err(e @ SetupError::Unfinished { to_make, .. }) = &r else { panic!("{r:?}") };
+        assert_eq!((to_make.as_slice(), e.needs_restart()), (&[label("B")][..], false), "exit 2");
+        let b = first.store.iter().find(|e| e.label.as_str() == "B").unwrap();
+        assert!(b.pending && b.replaces.len() == 1, "{b:?}");
+        assert!(!first.changes.iter().any(|c| c == "record B made"), "{:?}", first.changes);
+        // The map of that run: A whole; B's old endpoints have no new one yet
+        let (result, cables) = read_map(&map).unwrap();
+        assert_eq!(result, "error");
+        assert_eq!(cables[0], whole_map_rows(&first)[0]);
+        assert!(cables[1].2.iter().all(|(_, old, _, m)| old.is_some() && m == "gone"), "{:?}", cables[1]);
+        // How pending shows
+        let nodes = first.next().nodes;
+        let report =
+            crate::setup::Report { nodes, store: store::Store { entries: first.store.clone(), problems: vec![] }, endpoints: Ok(vec![]) };
+        assert!(crate::setup::format_list(&report).contains("note: the migration hasn't finished it (its record is pending)"));
+        // The next run: B checked in place, recorded, the whole map published
+        let mut next = first.next();
+        assert_eq!(run_on(&mut next, [NEW_A2, NEW_B2]), Some(Ok(Done::Changed)));
+        assert!(!next.changes.iter().any(|c| c.starts_with("register")), "B isn't made again: {:?}", next.changes);
+        assert_migrated(&next.next(), false, "B's endpoints late");
+        assert_eq!(read_map(&map), Some(("done".into(), whole_map_rows(&next))));
+        // Made by a run that needs a restart, its endpoints still late after the restart: pending until they come
+        let mut first = World { map: Some(map.clone()), restart_make: Some("A"), ..World::new(start, vec![], usize::MAX) };
+        assert!(matches!(run_on(&mut first, [NEW_A, NEW_B]), Some(Ok(Done::RestartPending { .. }))));
+        let mut after_restart = World { late: Some("A"), ..first.next() };
+        let r = run_on(&mut after_restart, [NEW_A2, NEW_B2]).unwrap();
+        assert!(matches!(&r, Err(SetupError::Unfinished { to_make, .. }) if to_make == &[label("A")]), "{r:?}");
+        assert!(after_restart.store.iter().any(|e| e.label.as_str() == "A" && e.pending), "{:?}", after_restart.store);
+        let mut last = after_restart.next();
+        assert_eq!(run_on(&mut last, [NEW_A2, NEW_B2]), Some(Ok(Done::Changed)));
+        assert_migrated(&last.next(), false, "A's endpoints late after the restart");
+        assert_eq!(read_map(&map), Some(("done".into(), whole_map_rows(&last))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Astra's review (2026-11-25): making A failed and Windows needs a restart to finish removing the failed node. The run
+    /// keeps the restart (exit 7) and stops before B; after the restart the next run makes both.
+    #[test]
+    fn a_restart_to_remove_a_failed_cable_stops_the_migration_before_the_next() {
+        let start = vec![legacy(r"ROOT\MEDIA\0003", Legacy::AudioCodec(Variant::Both)), legacy(r"ROOT\MEDIA\0004", Legacy::CableB)];
+        let mut first = World { make_fails_restart: Some("A"), ..World::new(start, vec![], usize::MAX) };
+        let r = run_on(&mut first, [NEW_A, NEW_B]).unwrap();
+        let Err(e) = &r else { panic!("{r:?}") };
+        assert!(e.needs_restart(), "exit 7: {e}");
+        assert!(!first.changes.iter().any(|c| c.contains("ACXLLCABLE_B")), "B never attempted: {:?}", first.changes);
+        assert!(first.store.iter().all(|e| e.pending), "A and B pending for the run after the restart: {:?}", first.store);
+        let mut next = first.next();
+        assert_eq!(run_on(&mut next, [NEW_A2, NEW_B2]), Some(Ok(Done::Changed)));
+        assert_migrated(&next.next(), false, "after the restart");
     }
 
     /// The case the review found, and the one before it: stopped right after B was made (and before its record), the next run
@@ -1444,6 +1823,130 @@ mod tests {
         let Err(SetupError::Unfinished { problems, .. }) = &r else { panic!("{r:?}") };
         assert!(problems[0].contains("identity is on 2 nodes") && problems[0].contains("acx-ll-cable add B"), "{problems:?}");
         assert!(fake.records.is_empty());
+    }
+
+    /// Astra's review (2026-11-25): making A fails and Windows needs a restart to finish removing the node that failed. The
+    /// migration keeps the restart (exit 7) and stops before B, which is never attempted; A and B stay pending, and the error
+    /// says both and the restart.
+    #[test]
+    fn a_restart_after_a_failed_make_is_exit_7_and_stops_before_b() {
+        let nodes = todays_box();
+        let mut fake = Fake { make_fails_restart: Some("A"), ..Fake::default() };
+        let (r, said, gathered) = migrate_gathering(&mut fake, &nodes, &[]);
+        let Err(e) = &r else { panic!("{r:?}") };
+        assert!(e.needs_restart(), "exit 7: {e:?}");
+        let SetupError::AndRestart { device, error } = e else { panic!("{e:?}") };
+        assert_eq!(device, &format!(r"ROOT\MEDIA\ACXLLCABLE_A_{}_1", NEW_A.to_uppercase()), "the failed node's");
+        let SetupError::Unfinished { problems, to_make } = &**error else { panic!("{error:?}") };
+        assert_eq!(to_make, &[label("A"), label("B")]);
+        assert!(problems[0].starts_with("ACX-LL-Cable A: ") && problems[0].contains("isn't confirmed gone"), "{problems:?}");
+        assert_eq!(fake.only(&["make"]), ["make A"], "B never attempted");
+        assert!(!fake.calls.iter().any(|c| c.ends_with(" B") && !c.starts_with("check") && !c.starts_with("record")), "{:?}", fake.calls);
+        assert!(fake.records.iter().all(|e| e.pending), "nothing recorded as made: {:?}", fake.records);
+        assert!(fake.disabled.is_empty());
+        assert!(said.iter().any(|s| s.contains("nothing more is made before then")), "{said:?}");
+        let text = e.to_string();
+        assert!(text.contains("ACX-LL-Cable A and ACX-LL-Cable B are recorded in the setup's store, pending"), "{text}");
+        assert!(text.contains("Windows needs a restart to finish with"), "{text}");
+        assert!(gathered.cables.is_empty(), "nothing made to map");
+        // B's make failing that way after A was made: A recorded, the restart kept
+        let mut fake = Fake { make_fails_restart: Some("B"), ..Fake::default() };
+        let (r, _) = migrate(&mut fake, &nodes, &[]);
+        assert!(r.as_ref().is_err_and(SetupError::needs_restart), "{r:?}");
+        assert_eq!(fake.only(&["make", "record"]), ["record A pending", "record B pending", "make A", "record A", "make B"]);
+        // An error without a restart still goes on to the next cable (exit 2)
+        let mut fake = Fake { make_fails: Some("A"), ..Fake::default() };
+        let (r, _) = migrate(&mut fake, &nodes, &[]);
+        assert!(r.as_ref().is_err_and(|e| !e.needs_restart()) && fake.only(&["make"]) == ["make A", "make B"], "{r:?}");
+    }
+
+    /// A node on the package that Windows needs a restart to start (Code 14) after an install or an enable is a restart (exit
+    /// 7), not a check that failed: `update` says so, and the migration stops before it makes or checks a cable.
+    #[test]
+    fn a_node_that_needs_a_restart_to_start_is_a_restart() {
+        let nodes = three();
+        let mut fake = Fake { start_restart: Some(1), ..Fake::default() };
+        let (r, _) = update(&mut fake, &nodes);
+        assert_eq!(r, Ok(Done::RestartPending { device: nodes[1].instance_id.clone() }));
+        assert!(!fake.calls.iter().any(|c| c == "wait-endpoints B"), "its endpoints come after the restart: {:?}", fake.calls);
+        // The migration: C needs the restart after its install, so A and B wait for it, pending
+        let mut fake = Fake { start_restart: Some(2), ..Fake::default() };
+        let (r, _) = migrate(&mut fake, &todays_box(), &[]);
+        assert_eq!(r, Ok(Done::RestartPending { device: todays_box()[2].instance_id.clone() }));
+        assert!(fake.only(&["make"]).is_empty() && fake.records.iter().all(|e| e.pending));
+        // A cable an earlier run made and didn't record, Code 14 on the package: pending, nothing made before the restart
+        let published = World::published();
+        let mut b = node("B", B_ID, 1, Variant::Both);
+        b.running = Some(published);
+        let pending = |l: &str, id: &str| Entry { pending: true, ..crate::setup::plan::tests::entry(l, id, 1, Some(Variant::Both)) };
+        let store = vec![pending("A", NEW_A), pending("B", B_ID)];
+        let mut fake = Fake { start_restart: Some(0), ..Fake::default() };
+        let (r, said) = migrate(&mut fake, &[b.clone()], &store);
+        assert_eq!(r, Ok(Done::RestartPending { device: b.instance_id.clone() }));
+        assert!(fake.only(&["make", "disable", "install"]).is_empty(), "{:?}", fake.calls);
+        assert!(fake.only(&["record"]).iter().all(|c| c.ends_with("pending")), "{:?}", fake.calls);
+        assert!(said.iter().any(|s| s.contains("to finish ACX-LL-Cable B and ACX-LL-Cable A, recorded")), "{said:?}");
+    }
+
+    fn a_create(n: u32) -> Create {
+        Create {
+            instance: CableInstance { label: label("A"), id: cid(A_ID), n },
+            variant: Variant::Both,
+            remove: vec![],
+            identity: crate::setup::plan::Identity::Stored,
+            same_instance: true,
+        }
+    }
+
+    /// `add`'s and the variant switch's make ([`make_recorded`]), audited as the migration is (Astra's review, 2026-11-25): a
+    /// make that fails with a restart Windows needs is that error (exit 7), nothing recorded or waited for; a cable made that
+    /// needs one is recorded (a migration's still pending) and is a restart; a migration's cable is recorded as made only once
+    /// its endpoints are there, else left pending (exit 2); any other cable is recorded, then checked.
+    #[test]
+    fn add_and_the_variant_switch_keep_a_restart_and_a_pending_record() {
+        let run = |fake: &mut Fake, rec: Recording| {
+            let mut said = Vec::new();
+            let r = make_recorded(fake, &a_create(2), Want::Published(PUBLISHED), rec, Names::Since(&[]), &mut |s: &str| {
+                said.push(s.to_string())
+            });
+            (r, said)
+        };
+        let replaces = [r"ROOT\MEDIA\0003".to_string()];
+        let migrations = Recording { replaces: &replaces, pending: true };
+        for rec in [Recording::default(), migrations] {
+            // The make fails, Windows needing a restart to finish removing the failed node: exit 7, nothing else
+            let mut fake = Fake { make_fails_restart: Some("A"), ..Fake::default() };
+            let ((made, r), _) = run(&mut fake, rec);
+            assert!(made.is_none() && r.as_ref().is_err_and(SetupError::needs_restart), "{r:?}");
+            assert_eq!(fake.calls, ["make A"], "nothing recorded or waited for");
+            // Made, Windows needing a restart to finish it: recorded (pending still, if it was), a restart, no wait
+            let mut fake = Fake { made_restart: Some("A"), ..Fake::default() };
+            let ((made, r), _) = run(&mut fake, rec);
+            assert_eq!(made.map(|c| c.n), Some(2));
+            assert!(matches!(r, Ok(Done::RestartPending { .. })), "{r:?}");
+            assert_eq!(fake.only(&["record", "wait-endpoints"]), [if rec.pending { "record A pending" } else { "record A" }]);
+            assert_eq!(fake.records[0].replaces, rec.replaces, "the nodes it replaces kept as they are");
+            // Made, its endpoints not there: a migration's stays pending (exit 2); another is recorded, its check failed
+            let mut fake = Fake { endpoints_missing: Some("A"), ..Fake::default() };
+            let ((_, r), _) = run(&mut fake, rec);
+            if rec.pending {
+                assert!(matches!(&r, Err(SetupError::Unfinished { to_make, .. }) if to_make == &[label("A")]), "{r:?}");
+                assert_eq!(fake.only(&["record", "wait-endpoints"]), ["record A pending", "wait-endpoints A"]);
+                assert_eq!(fake.records[0].n, 2, "its n recorded");
+            } else {
+                assert!(matches!(&r, Err(SetupError::Checks(_))), "{r:?}");
+                assert_eq!(fake.only(&["record", "wait-endpoints"]), ["record A", "wait-endpoints A"]);
+            }
+            assert!(!r.unwrap_err().needs_restart());
+            // Made, its endpoints there: recorded as made
+            let mut fake = Fake::default();
+            let ((_, r), _) = run(&mut fake, rec);
+            assert_eq!(r, Ok(Done::Changed));
+            let recorded =
+                if rec.pending { vec!["record A pending", "wait-endpoints A", "record A"] } else { vec!["record A", "wait-endpoints A"] };
+            assert_eq!(fake.only(&["record", "wait-endpoints"]), recorded);
+            assert!(fake.records.last().is_some_and(|e| !e.pending && e.n == 2));
+        }
     }
 
     #[test]
