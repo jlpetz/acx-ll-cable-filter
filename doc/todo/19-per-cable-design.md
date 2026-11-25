@@ -922,6 +922,18 @@ owner agrees.
   others live, under Verifier (S0a).
 
 ### Open questions
+**Astra's answers (2026-11-25, forwarded by the owner; the working plan, the owner's to confirm):** 1, A's counters reset
+when A itself restarts, and B removed, restarted or updated alone leaves A's running. 2, a re-add keeps the logical
+identity and aims to keep the Windows endpoint IDs on an ordinary same-variant re-add, checked in S0a by default (the
+active endpoint IDs compared, a saved selection opening the intended microphone). 3, both microphones by default on every
+cable, with a one-mic option. 4, aliases (A, B, D...) in the tools and GUI only, over the stable identity: no kernel names.
+5, devices made outside the tool adopted only explicitly (shown, then adopted at the user's choice). Also: treat the first
+migration as a device change, recording the old-to-new endpoint mapping and remapping our own saved settings where the
+match is unambiguous; today's app opens the old control path, which the new driver removes, so a direct-output app test
+needs the branch's app and broker. For release (TODO 23): deleting one cable's control device while A's lives departs
+from Learn's documented order; confirm the lifetime arrangement or use the fallback of one shared control device that
+routes by cable id.
+
 1. **"A's continue."** We read it as: A's counters run on while other cables are removed and re-added, and A's own
    restart is a new binding like any cable's, with the GUI joining the history. If you meant A's counters survive A's own
    disable, update or variant switch, that needs state kept outside A's device (a global or a registry carry-over), which

@@ -27,6 +27,11 @@ Not for us: NDIS/WiFi, VM switch, port/miniport checking; IRP logging is a diagn
 - CodeQL with Microsoft's Windows driver queries (what driver certification runs); ApiValidator on for release builds
   (`Build-Driver.ps1` turns it off today); InfVerif (already run by every build).
 - Physical Windows 11 machines (the owner's).
+- The per-cable driver's control devices (TODO 19, Astra's review, 2026-11-25): removing one cable deletes its KMDF
+  control device while other cables' devices live, which departs from Learn's documented deletion order ("Using Control
+  Device Objects"). A pass of the removal runs under Verifier shows this build's behaviour, not that it is supported:
+  before release, confirm the lifetime arrangement (WDF's source, or Microsoft) or move to the design's fallback, one
+  shared control device routing requests by cable id (`19-per-cable-design.md`).
 
 ## Dev-box rules that carry over
 - Commit and `sync` before every install; never install over a build with a removal bug while Verifier is on.
