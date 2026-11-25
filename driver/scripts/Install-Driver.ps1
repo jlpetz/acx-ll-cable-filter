@@ -13,7 +13,8 @@
            then A and B are recorded in the setup's store, every device of ours is disabled until the old image unloads, the
            old devices are removed, and A (its variant, or -Variant if given) and B (if the old B was there; -CableBMics) are
            made on the new package. A run that stops part way (a failure, a restart Windows needs) is finished by running this
-           again;
+           again: a cable it made and didn't record is checked and recorded, and the run that finishes writes the whole
+           migration's endpoint map (-EndpointMap);
          - cables present: acx-ll-cable update, which moves every cable to the package together (each stops for a few
            seconds) and puts every cable back if the old image doesn't unload (an app holds a cable's control device). With
            -Variant, cable A is then switched to it (acx-ll-cable variant A), as -Variant switched the device before cables;
@@ -25,9 +26,9 @@
     add of A) writes which new endpoint takes each old one's place there, as JSON (acx-ll-cable's --endpoint-map); an update
     keeps the endpoints and writes none.
 
-    Exit codes: 0 done; 7 Windows wants a restart to finish (stop there: restart, then run this again, which finishes what is
-    left); 2 the setup tool's error (its steps above say what changed); 1 this script's own check (not elevated, test signing,
-    no package, no tool).
+    Exit codes: 0 done; 7 Windows wants a restart to finish, with or without other errors beside it (stop there: restart, then
+    run this again, which finishes what is left and says what is still wrong); 2 the setup tool's error (its steps above say
+    what changed); 1 this script's own check (not elevated, test signing, no package, no tool).
 
 .EXAMPLE
     .\Install-Driver.ps1
@@ -73,7 +74,7 @@ if ($EndpointMap) { $map = @('--endpoint-map', $EndpointMap) }
 $pending = @(Get-PendingCables)
 $switchA = $false
 if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
-    if ($pending.Count -gt 0) { Write-Note "an earlier migration left these cables to make or record: $($pending -join ', ')" }
+    if ($pending.Count -gt 0) { Write-Note "an earlier migration left these cables to make, record or map: $($pending -join ', ')" }
     Write-Step 'Migrate the old driver''s devices to cables (acx-ll-cable migrate)'
     $arguments = @('migrate', $package)
     if ($PSBoundParameters.ContainsKey('Variant')) { $arguments += @('--a-mics', $Variant) }

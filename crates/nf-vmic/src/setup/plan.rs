@@ -247,10 +247,11 @@ pub struct Entry {
     pub n: u32,
     /// The microphones it had last.
     pub mics: Option<Variant>,
-    /// The migration's, not made yet ([`super::store`]'s `Pending`).
+    /// The migration's, not finished yet: not made, or made and not checked and recorded ([`super::store`]'s `Pending`).
     pub pending: bool,
-    /// While pending: the old driver's nodes (instance IDs) the migration makes it in place of, whose endpoints the endpoint map
-    /// gives this cable's ([`super::endpoint_map`]), on a run after their removal too ([`super::store`]'s `Replaces`).
+    /// A migration's cable: the old driver's nodes (instance IDs) it is made in place of, whose endpoints the endpoint map gives
+    /// this cable's ([`super::endpoint_map`]), on a run after their removal too ([`super::store`]'s `Replaces`). Kept once it is
+    /// made, until a run leaves no record pending: that run's map (written first) holds every cable that has them.
     pub replaces: Vec<String>,
 }
 
@@ -663,10 +664,10 @@ impl Target {
         CableInstance { label: self.label.clone(), id: self.id, n: self.n }
     }
 
-    /// Its store entry: `pending` (with the nodes it replaces) until it is made.
+    /// Its store entry: `pending` until it is made, with the nodes it replaces (kept once made, until the migration's map is
+    /// final: [`Entry::replaces`]).
     pub fn entry(&self, pending: bool) -> Entry {
-        let replaces = if pending { self.replaces.clone() } else { Vec::new() };
-        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending, replaces }
+        Entry { label: self.label.clone(), id: self.id, n: self.n, mics: Some(self.variant), pending, replaces: self.replaces.clone() }
     }
 
     /// The node to create (nothing to remove: the old driver's nodes go first).
@@ -691,9 +692,12 @@ pub struct MigratePlan {
     /// The cables an earlier run made and stopped before recording as made: present, their records still pending. Each is
     /// checked (its identity on one node, working on the package, its endpoints there), then recorded as made.
     pub finish: Vec<Finish>,
+    /// The cables an earlier run made and recorded, their records keeping the nodes they replace ([`mapped`]): in this run's
+    /// endpoint map again, nothing else done to them.
+    pub mapped: Vec<Finish>,
 }
 
-/// A cable to finish ([`MigratePlan::finish`]).
+/// A cable to finish ([`MigratePlan::finish`]), or to map ([`MigratePlan::mapped`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finish {
     pub label: Label,
@@ -704,8 +708,24 @@ pub struct Finish {
     pub replaces: Vec<String>,
 }
 
+/// The cables a migration made whose records keep the nodes they replace ([`Entry::replaces`]: the migration's endpoint map
+/// isn't final yet), present, but those labelled as in `except`. Every migrate or add run maps them again, so the run that
+/// leaves no record pending, and drops the replaced nodes once its map is written, maps the whole migration, whatever its
+/// earlier attempts were (killed, stopped by a restart).
+pub fn mapped(store: &[Entry], nodes: &[Node], except: &[&Label]) -> Vec<Finish> {
+    let mut out = Vec::new();
+    for e in store.iter().filter(|e| !e.pending && !e.replaces.is_empty() && !except.contains(&&e.label)) {
+        let mut own: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].id() == Some(e.id)).collect();
+        own.sort_by_key(|&i| std::cmp::Reverse(nodes[i].cable.as_ref().map_or(0, |c| c.n)));
+        if !own.is_empty() {
+            out.push(Finish { label: e.label.clone(), id: e.id, nodes: own, replaces: e.replaces.clone() });
+        }
+    }
+    out
+}
+
 /// `a` and those of `b` not in it, without case.
-fn union(mut a: Vec<String>, b: &[String]) -> Vec<String> {
+pub(crate) fn union(mut a: Vec<String>, b: &[String]) -> Vec<String> {
     for s in b {
         if !a.iter().any(|x| same_instance(x, s)) {
             a.push(s.clone());
@@ -775,7 +795,12 @@ pub fn plan_migrate(
             want(&mut add, &mut finish, e.label.clone(), e.mics.unwrap_or(Variant::Both), e.id, e.replaces.clone())?;
         }
     }
-    if legacy.is_empty() && add.is_empty() && finish.is_empty() {
+    let labels: Vec<&Label> = add.iter().map(|t| &t.label).chain(finish.iter().map(|f| &f.label)).collect();
+    let mapped = mapped(store, nodes, &labels);
+    // Records that keep the nodes they replace: the run maps them and drops those (an earlier run's map wasn't written, or the
+    // drop didn't finish), even if none of their cables is present
+    let unsettled = store.iter().any(|e| !e.replaces.is_empty());
+    if legacy.is_empty() && add.is_empty() && finish.is_empty() && !unsettled {
         return Err(PlanError::NothingToMigrate);
     }
     let mut update = unload_and_install(nodes, |n| !n.is_legacy());
@@ -789,7 +814,7 @@ pub fn plan_migrate(
     }
     update.disable.sort_unstable();
     update.reenable.sort_unstable();
-    Ok(MigratePlan { legacy, update, add, finish })
+    Ok(MigratePlan { legacy, update, add, finish, mapped })
 }
 
 /// `list`'s view (pure): the present cables by identity, the remembered absent ones, and what isn't a working cable.
@@ -1190,7 +1215,8 @@ pub(crate) mod tests {
             pending: true,
             replaces
         });
-        assert_eq!((p.add[1].replaces.as_slice(), p.add[1].entry(false).replaces.len()), (&[r"ROOT\MEDIA\0004".to_string()][..], 0));
+        // Made, its record keeps the old node it replaces (dropped once the migration's map is written)
+        assert_eq!((p.add[1].replaces.as_slice(), p.add[1].entry(false).replaces.len()), (&[r"ROOT\MEDIA\0004".to_string()][..], 1));
         assert_eq!(p.add[1].create().instance.instance_id(), format!(r"ROOT\MEDIA\ACXLLCABLE_B_{}_1", NEW_B.to_uppercase()));
         // Install-Driver's -Variant for A, and -CableBMics for B
         let p = migrate(&nodes, &[], Some(Variant::Call), Some(Variant::LowLatency)).unwrap();
@@ -1287,9 +1313,24 @@ pub(crate) mod tests {
         let mut dup = both.to_vec();
         dup.push(node("B", B_ID, 2, Variant::Both));
         assert_eq!(migrate(&dup, &store, None, None).unwrap().finish[0].nodes, [2, 1]);
-        // Recorded since: nothing to do
-        let done = vec![a_made, Entry { pending: false, replaces: vec![], ..b_pending }];
+        // Recorded since, the old nodes' names dropped: nothing to do
+        let done = vec![a_made.clone(), Entry { pending: false, replaces: vec![], ..b_pending.clone() }];
         assert_eq!(migrate(&both, &done, None, None), Err(PlanError::NothingToMigrate));
+        // Recorded, and its record still keeps the old node (a run that stopped before its map was written, or before the drop):
+        // mapped again, and nothing else
+        let unsettled = vec![a_made, Entry { pending: false, ..b_pending }];
+        let p = migrate(&both, &unsettled, None, None).unwrap();
+        assert!(p.legacy.is_empty() && p.add.is_empty() && p.finish.is_empty(), "{p:?}");
+        assert_eq!(p.mapped, [Finish { label: label("B"), id: cid(B_ID), nodes: vec![1], replaces: vec![r"ROOT\MEDIA\0004".into()] }]);
+        // ... also when its cable is gone (removed by the user since): the run drops the names
+        let p = migrate(&both[..1], &unsettled, None, None).unwrap();
+        assert!(p.mapped.is_empty() && p.add.is_empty(), "{p:?}");
+        // Beside a cable to make, a made one keeping its old node is mapped too
+        let a_kept = Entry { replaces: vec![r"ROOT\MEDIA\0003".into()], ..entry("A", A_ID, 1, Some(Variant::Both)) };
+        let b_to_make = Entry { pending: true, ..unsettled[1].clone() };
+        let p = migrate(&both[..1], &[a_kept, b_to_make], None, None).unwrap();
+        assert_eq!((p.mapped.len(), p.mapped[0].label.as_str()), (1, "A"));
+        assert_eq!(targets(&p), [("B", Variant::Both, 1, false)]);
         // `add B` on the present B with its record pending: nothing to change, recorded as made
         let p = plan_add(&label("B"), None, None, &store, &both, cid(NEW_ID)).unwrap();
         assert!(matches!(p, AddPlan::Nothing { node: 1, pending: true, .. }), "{p:?}");

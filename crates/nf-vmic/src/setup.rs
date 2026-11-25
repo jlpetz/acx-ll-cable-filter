@@ -9,7 +9,8 @@
 //!   (same identity, same instance ID), D1's start count cleared. Absent: made with the identity and n the store has, or new
 //!   ones. The node is created with its fixed instance ID, `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`, its hardware ID and
 //!   friendly name set before registration; the package is the one the cables run ([`package::pick`]). `add` never restarts
-//!   another cable.
+//!   another cable. A migration's cable whose record is still pending is recorded as made only once its endpoints are there,
+//!   as the migration's own check has it.
 //! - [`remove`]: a cable's nodes (by identity), or every node of ours (`--all`); the store keeps the identity unless forgotten.
 //! - [`update`]: every node of ours to a package folder's driver. Every cable runs one service and one image, which reloads
 //!   only once no device and no control-device handle holds it, so the update disables every node (politely, without
@@ -19,7 +20,10 @@
 //! - [`migrate`]: from the old driver's devices (`ROOT\AudioCodec*`, A; `ROOT\NoiseFilterCableB`, the B Cable-B.ps1 made) to
 //!   cables: the package checked for every cable to make, A and B recorded in the store (pending), then as `update` to unload
 //!   the old image, the old nodes removed and A and B made on the package given. A run that stops part way is finished by
-//!   the next, one that stopped between making a cable and recording it included.
+//!   the next, one that stopped between making a cable and recording it included, or needed a restart to finish one.
+//!
+//! Exit 7 ([`SetupError::needs_restart`], [`Done::RestartPending`]): Windows needs a restart to finish, other problems beside it
+//! or not.
 //!
 //! `migrate` and `add` take `--endpoint-map <file>`: which new endpoint takes each old one's place ([`endpoint_map`]).
 //!
@@ -129,11 +133,19 @@ pub enum SetupError {
     RestartFirst {
         device: String,
     },
-    /// A re-opened node (`device`) couldn't be installed (`error`), and isn't confirmed gone (`why`), so no other instance of its
-    /// cable was made: two nodes with one identity would want one control device's name.
+    /// A re-opened node (`device`) couldn't be installed (`error`), and isn't confirmed gone (`why`; `restart`: Windows finishes
+    /// its removal at the next restart), so no other instance of its cable was made: two nodes with one identity would want one
+    /// control device's name.
     StillPresent {
         device: String,
         why: String,
+        restart: bool,
+        error: Box<SetupError>,
+    },
+    /// `error` went wrong, and Windows needs a restart to finish with `device` too: the restart comes first (exit 7), and the
+    /// run after it says what is still wrong.
+    AndRestart {
+        device: String,
         error: Box<SetupError>,
     },
     /// The endpoint map ([`endpoint_map`]) couldn't be started, made or written.
@@ -179,8 +191,32 @@ pub struct NotInstalled {
     /// The package it was given, described.
     pub chosen: String,
     pub failure: InstallFailure,
-    /// How removing it again went; `None`: a node repaired in place, left as it is.
-    pub removed: Option<Result<(), WinError>>,
+    /// How removing it again went (`Ok(true)`: Windows needs a restart to finish); `None`: a node repaired in place, left as it
+    /// is.
+    pub removed: Option<Result<bool, WinError>>,
+}
+
+impl SetupError {
+    /// Whether Windows needs a restart to finish what the action did (exit 7: restart, then run it again), whatever else went
+    /// wrong beside it: a removal Windows finishes at the next restart (before anything was made, in the migration's removal of
+    /// an old node, or of a re-opened node), an install that needs one alongside other problems.
+    pub fn needs_restart(&self) -> bool {
+        match self {
+            SetupError::RestartFirst { .. } | SetupError::AndRestart { .. } => true,
+            SetupError::StillPresent { restart, .. } => *restart,
+            SetupError::Stopped { error, .. } => error.needs_restart(),
+            SetupError::Install(not) => matches!(not.removed, Some(Ok(true))),
+            _ => false,
+        }
+    }
+
+    /// `self`, and Windows needs a restart to finish with `device` (`None`: only `self`).
+    pub fn and_restart(self, device: Option<String>) -> SetupError {
+        match device {
+            Some(device) if !self.needs_restart() => SetupError::AndRestart { device, error: Box::new(self) },
+            _ => self,
+        }
+    }
 }
 
 impl From<LockError> for SetupError {
@@ -249,11 +285,23 @@ impl fmt::Display for SetupError {
             SetupError::RestartFirst { device } => {
                 write!(f, "Windows will finish removing {device} when it restarts: restart Windows, then run this again")
             }
-            SetupError::StillPresent { device, why, error } => write!(
+            SetupError::StillPresent { device, why, restart: true, error } => write!(
+                f,
+                "{}. {device} isn't confirmed gone ({why}), so no other instance of its cable was made (two devices with one \
+                 identity would share its control device's name): restart Windows, then run this again.",
+                error.to_string().trim_end_matches('.')
+            ),
+            SetupError::StillPresent { device, why, restart: false, error } => write!(
                 f,
                 "{}. {device} isn't confirmed gone ({why}), so no other instance of its cable was made (two devices with one \
                  identity would share its control device's name). `acx-ll-cable list` shows it: remove it (`acx-ll-cable remove \
                  <label>`), restart Windows if that says so, then run this again.",
+                error.to_string().trim_end_matches('.')
+            ),
+            SetupError::AndRestart { device, error } => write!(
+                f,
+                "{}. Windows needs a restart to finish with {device} as well: restart Windows, then run this again, which says \
+                 what is still wrong.",
                 error.to_string().trim_end_matches('.')
             ),
             SetupError::EndpointMap(why) => write!(f, "the endpoint map: {why}"),
@@ -262,7 +310,12 @@ impl fmt::Display for SetupError {
                 write!(f, "{device} isn't working on the chosen driver ({chosen}): {failure}.")?;
                 match removed {
                     None => write!(f, " It is left as it is: `acx-ll-cable list` shows it."),
-                    Some(Ok(())) => write!(f, " It was removed again: run this again, or see what's there with `acx-ll-cable list`."),
+                    Some(Ok(false)) => write!(f, " It was removed again: run this again, or see what's there with `acx-ll-cable list`."),
+                    Some(Ok(true)) => write!(
+                        f,
+                        " It was removed again, but Windows needs a restart to finish removing it: restart Windows, then run this \
+                         again."
+                    ),
                     Some(Err(e)) => write!(
                         f,
                         " Removing it again failed too ({e}): remove it in Device Manager, or with pnputil /remove-device {device}."
@@ -441,6 +494,7 @@ pub struct Made {
 
 /// Why [`make`] stopped: on a re-opened element (a removed node's key), which it removed again (the caller may try n + 1), or
 /// otherwise.
+#[derive(Debug)]
 enum MakeError {
     Reopened(SetupError),
     Other(SetupError),
@@ -494,12 +548,11 @@ fn make(present: &Present, create: &Create, want: Want, say: &mut dyn FnMut(&str
         Err(failure) => {
             say(&format!("Removing {id} again: {failure}"));
             let removed = node.set.uninstall(&node.data);
-            let shown = removed.as_ref().map(drop).map_err(Clone::clone);
             let e = SetupError::Install(Box::new(NotInstalled {
                 device: id.clone(),
                 chosen: candidate.describe(),
                 failure,
-                removed: Some(shown),
+                removed: Some(removed.clone()),
             }));
             // A re-opened element that installed but never worked (what DiUninstallDevice left of a removed node, say): n + 1
             // can be tried once it's gone
@@ -523,7 +576,7 @@ fn after_removal(device: &str, removed: Result<bool, WinError>, error: SetupErro
         Ok(true) => {
             say("  removed, but Windows needs a restart to finish");
             let why = "Windows needs a restart to finish removing it".into();
-            MakeError::Other(SetupError::StillPresent { device: device.into(), why, error: Box::new(error) })
+            MakeError::Other(SetupError::StillPresent { device: device.into(), why, restart: true, error: Box::new(error) })
         }
         Err(e) => {
             say(&format!("  not removed: {e}"));
@@ -533,6 +586,7 @@ fn after_removal(device: &str, removed: Result<bool, WinError>, error: SetupErro
                 error => MakeError::Other(SetupError::StillPresent {
                     device: device.into(),
                     why: format!("removing it again failed: {e}"),
+                    restart: false,
                     error: Box::new(error),
                 }),
             }
@@ -556,19 +610,30 @@ fn identity_gone(id: CableId, present: &Result<Vec<crate::cables::PresentCable>,
 /// the install, or took it and never worked (the design's fallback: the endpoints are new then). Only once no node with the
 /// cable's identity is left in the device tree: two would want one control device's name.
 fn make_or_next(present: &Present, create: &Create, want: Want, say: &mut dyn FnMut(&str)) -> Result<Made, SetupError> {
-    match make(present, create, want, say) {
+    make_or_next_with(create, &mut |c: &Create, say: &mut dyn FnMut(&str)| make(present, c, want, say), &mut crate::cables::present, say)
+}
+
+/// One make: [`make`]'s, or a test's.
+type MakeOne<'a> = dyn FnMut(&Create, &mut dyn FnMut(&str)) -> Result<Made, MakeError> + 'a;
+
+/// [`make_or_next`] over its seams: `make` ([`make`]) and `listed`, the cables in the device tree ([`crate::cables::present`]).
+fn make_or_next_with(
+    create: &Create, make: &mut MakeOne, listed: &mut dyn FnMut() -> Result<Vec<crate::cables::PresentCable>, WinError>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, SetupError> {
+    match make(create, say) {
         Ok(m) => Ok(m),
         Err(MakeError::Other(e)) => Err(e),
         Err(MakeError::Reopened(e)) => {
             let Some(next) = create.instance.next() else { return Err(e) };
-            if let Err(why) = identity_gone(create.instance.id, &crate::cables::present()) {
+            if let Err(why) = identity_gone(create.instance.id, &listed()) {
                 say(&format!("  not making {} instead: {why}", next.instance_id()));
-                return Err(SetupError::StillPresent { device: create.instance.instance_id(), why, error: Box::new(e) });
+                return Err(SetupError::StillPresent { device: create.instance.instance_id(), why, restart: false, error: Box::new(e) });
             }
             say(&format!("  the re-opened node couldn't be installed ({e}): making {} instead, with new endpoints", next.instance_id()));
             // The old nodes are gone already, if there were any
             let again = Create { instance: next, remove: Vec::new(), same_instance: false, ..create.clone() };
-            make(present, &again, want, say).map_err(|e| match e {
+            make(&again, say).map_err(|e| match e {
                 MakeError::Reopened(e) | MakeError::Other(e) => e,
             })
         }
@@ -592,10 +657,16 @@ fn endpoints_before(also: &[String], say: &mut dyn FnMut(&str)) -> Option<Vec<En
         .ok()
 }
 
-/// The store's record of a cable as made.
-fn record(cable: &CableInstance, variant: Variant) -> Result<(), SetupError> {
-    let entry = Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant), pending: false, replaces: Vec::new() };
+/// The store's record of a cable as made (`pending`: a migration's, made by a run that ends needing a restart, so the run after
+/// it checks it); `replaces`, its record's (a migration's cable: kept until the migration's map is final, [`Entry::replaces`]).
+fn record(cable: &CableInstance, variant: Variant, replaces: &[String], pending: bool) -> Result<(), SetupError> {
+    let entry = Entry { label: cable.label.clone(), id: cable.id, n: cable.n, mics: Some(variant), pending, replaces: replaces.to_vec() };
     store::write(&entry).map_err(SetupError::Store)
+}
+
+/// The nodes `label`'s record says the cable replaces (a migration's: [`Entry::replaces`]), kept by every record of it.
+fn replaces_of(store: &[Entry], label: &Label) -> Vec<String> {
+    store.iter().find(|e| &e.label == label).map(|e| e.replaces.clone()).unwrap_or_default()
 }
 
 /// A cable's node made on the package the cables run (the variant switch's step 4, [`crate::variant::switch`]): `create`'s
@@ -606,9 +677,23 @@ pub fn make_cable(
     make_or_next(present, create, Want::Rule(running), say)
 }
 
-/// The store's record of a cable as made.
-pub fn record_cable(cable: &CableInstance, variant: Variant) -> Result<(), SetupError> {
-    record(cable, variant)
+/// The store's record of a cable as made; the nodes its record in `store` says it replaces are kept (a migration's cable, its
+/// map not final yet).
+pub fn record_cable(cable: &CableInstance, variant: Variant, store: &[Entry]) -> Result<(), SetupError> {
+    record(cable, variant, &replaces_of(store, &cable.label), false)
+}
+
+/// After a migrate or add run and its endpoint map (`map`): once no record is pending, every record's Replaces dropped
+/// ([`steps::drop_replaces`]), unless a map was asked for and isn't there (it wasn't written: the next migration run writes it,
+/// with every cable that has them).
+fn settle(present: &Present, map: Option<&Path>, say: &mut dyn FnMut(&str)) {
+    if map.is_some_and(|p| !p.is_file()) {
+        return;
+    }
+    match store::read() {
+        Ok(s) => steps::drop_replaces(&mut Real { present }, &s.entries, say),
+        Err(e) => say(&format!("  warning: the setup's store couldn't be read again to drop the old devices' names ({e})")),
+    }
 }
 
 /// Up to [`ENDPOINTS_WAIT`] for a cable's endpoints, each said, their names judged by `names`; the checks that failed.
@@ -625,22 +710,57 @@ pub fn add(
     let present = Present::read()?;
     let entries = read_store(say)?;
     let plan = plan::plan_add(label, mics, adopt, &entries, &present.nodes, new_identity()?)?;
+    // The cables a migration made whose map isn't final (their records keep the nodes they replace), this one too: in this
+    // run's map, as a migration run's, since this run may be the one that drops those nodes (`settle`)
+    let mapped: Vec<endpoint_map::Made> =
+        plan::mapped(&entries, &present.nodes, &[]).iter().filter_map(|f| mapped_cable(&present.nodes, f)).collect();
     let mut gathered = Gathered::default();
-    let r = add_planned(&present, label, plan, &mut gathered, say);
-    endpoint_map::finish(map, "add", gathered, r, &mut endpoints::all, say)
+    let ours = Ours { label, record: &replaces_of(&entries, label), pending: entries.iter().any(|e| &e.label == label && e.pending) };
+    let r = add_planned(&present, &ours, plan, &mapped, &mut gathered, say);
+    // The cable this run made, finished or repaired is in the map as it is now; the others (and this one, if nothing was done
+    // to it) as their nodes are
+    for m in mapped {
+        if !gathered.cables.iter().any(|g| g.cable.id == m.cable.id) {
+            gathered.cables.push(m);
+        }
+    }
+    let r = endpoint_map::finish(map, "add", gathered, r, &mut endpoints::all, say);
+    settle(&present, map, say);
+    r
 }
 
-/// `add` with its plan made; `gathered` takes the endpoints before and the cable made or repaired, for the endpoint map.
+/// A cable a migration made and recorded, as its newest node has it, for the endpoint map ([`plan::mapped`]).
+fn mapped_cable(nodes: &[Node], f: &plan::Finish) -> Option<endpoint_map::Made> {
+    let n = &nodes[*f.nodes.first()?];
+    Some(endpoint_map::Made::new(n.cable.clone()?, n.variant()?, &f.replaces))
+}
+
+/// The cable `add` acts on: its label, the nodes its record says it replaces (a migration's cable), and whether its record is
+/// still the migration's (pending).
+struct Ours<'a> {
+    label: &'a Label,
+    record: &'a [String],
+    pending: bool,
+}
+
+/// `add` with its plan made; `mapped`, the cables a migration made whose map isn't final (their old nodes' endpoints are read
+/// too); `gathered` takes the endpoints before and the cable made, finished or repaired, for the endpoint map.
 fn add_planned(
-    present: &Present, label: &Label, plan: AddPlan, gathered: &mut Gathered, say: &mut dyn FnMut(&str),
+    present: &Present, ours: &Ours, plan: AddPlan, mapped: &[endpoint_map::Made], gathered: &mut Gathered, say: &mut dyn FnMut(&str),
 ) -> Result<Done, SetupError> {
+    let label = ours.label;
     // Before anything changes: the names a re-added or repaired cable's endpoints keep (the user's renames among them), and the
-    // endpoints of an adopted node
-    let replaced: Vec<String> = match &plan {
+    // endpoints of the nodes the cable takes the place of (an adopted node; a migration's cable: the old driver's, which its
+    // record names) and of the other cables to map
+    let adopted: Vec<String> = match &plan {
         AddPlan::Create(c) => c.remove.iter().map(|&i| present.nodes[i].instance_id.clone()).collect(),
         _ => Vec::new(),
     };
-    gathered.before = if matches!(plan, AddPlan::Nothing { .. }) { Some(Vec::new()) } else { endpoints_before(&replaced, say) };
+    let replaced = plan::union(adopted, ours.record);
+    let theirs: Vec<String> = mapped.iter().flat_map(|m| m.replaces()).cloned().collect();
+    let also = plan::union(replaced.clone(), &theirs);
+    let quiet = matches!(plan, AddPlan::Nothing { pending: false, .. }) && mapped.is_empty();
+    gathered.before = if quiet { Some(Vec::new()) } else { endpoints_before(&also, say) };
     let before = gathered.before.clone().unwrap_or_default();
     match plan {
         AddPlan::Nothing { node, prune, mics_differ, identity, pending } => {
@@ -655,20 +775,31 @@ fn add_planned(
                 ));
             }
             uninstall_nodes(present, &prune, say)?;
-            if (identity == Identity::FromNode || pending)
-                && let (Some(c), Some(v)) = (&n.cable, n.variant())
-            {
-                record(c, v)?;
-                say(if pending {
-                    "  recorded as made in the setup's store (its record was a migration's, still pending: the run that made it \
-                     stopped before recording it)"
-                } else {
-                    "  recorded in the setup's store"
-                });
+            let (Some(c), Some(v)) = (&n.cable, n.variant()) else { unreachable!("plan_add keeps cables only") };
+            if pending {
+                // A migration's cable that a run made and stopped before recording: checked as the migration checks one, then
+                // recorded as made
+                say("  its record is still a migration's (the run that made it stopped before recording it)");
+                let misnamed = finish_pending(c, v, &before, ours.record, say)?;
+                gathered.cables.push(endpoint_map::Made::new(c.clone(), v, &replaced));
+                return if misnamed.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(misnamed)) };
             }
-            Ok(if prune.is_empty() { Done::Nothing } else { Done::Changed })
+            let recorded = identity == Identity::FromNode;
+            if recorded {
+                record(c, v, &[], false)?;
+                say("  recorded in the setup's store");
+            }
+            Ok(if prune.is_empty() && !recorded { Done::Nothing } else { Done::Changed })
         }
-        AddPlan::Repair { node, prune, mics_differ, .. } => repair(present, node, &prune, mics_differ, &before, gathered, say),
+        AddPlan::Repair { node, prune, mics_differ, .. } => {
+            let n = &present.nodes[node];
+            say(&format!("{} is present but not healthy: {}", label.friendly_name(), n.describe()));
+            say("  repairing it in place: its identity and instance ID stay");
+            if let (Some(m), Some(v)) = (mics_differ, n.variant()) {
+                say(&format!("  it keeps {}; `acx-ll-cable variant {label} {}` switches", v.describe(), m.arg()));
+            }
+            repair(present, ours, node, &prune, (&before, &replaced), gathered, say)
+        }
         AddPlan::Create(create) => {
             say(&match create.identity {
                 Identity::New => format!("Adding {} with a new identity", label.friendly_name()),
@@ -677,7 +808,8 @@ fn add_planned(
             });
             let running = present.running();
             let made = make_or_next(present, &create, Want::Rule(&running), say)?;
-            record(&made.cable, create.variant)?;
+            // A migration's cable made by a run that needs a restart stays pending: the run after the restart checks it
+            record(&made.cable, create.variant, ours.record, ours.pending && made.restart)?;
             gathered.cables.push(endpoint_map::Made::new(made.cable.clone(), create.variant, &replaced));
             if made.restart {
                 return Ok(Done::RestartPending { device: made.cable.instance_id() });
@@ -689,19 +821,15 @@ fn add_planned(
     }
 }
 
-/// A present but unhealthy cable's node given the package again in place (`add`'s repair); `before`, its endpoints before;
-/// `gathered` takes it once it works, for the endpoint map.
+/// A present but unhealthy cable's node given the package again in place (`add`'s repair); `before`, the endpoints before, and
+/// `replaced`, the nodes it takes the place of; `gathered` takes it once it works, for the endpoint map. A migration's cable
+/// (its record pending) is recorded as made only once its endpoints are there, as the migration's own check has it.
 fn repair(
-    present: &Present, node: usize, prune: &[usize], mics_differ: Option<Variant>, before: &[Endpoint], gathered: &mut Gathered,
+    present: &Present, ours: &Ours, node: usize, prune: &[usize], (before, replaced): (&[Endpoint], &[String]), gathered: &mut Gathered,
     say: &mut dyn FnMut(&str),
 ) -> Result<Done, SetupError> {
     let n = &present.nodes[node];
     let (Some(cable), Some(variant)) = (n.cable.clone(), n.variant()) else { unreachable!("plan_add repairs cables only") };
-    say(&format!("{} is present but not healthy: {}", cable.label.friendly_name(), n.describe()));
-    say("  repairing it in place: its identity and instance ID stay");
-    if let Some(m) = mics_differ {
-        say(&format!("  it keeps {}; `acx-ll-cable variant {} {}` switches", variant.describe(), cable.label, m.arg()));
-    }
     let mut data = present.data[node];
     let drivers = present.set.compatible(&mut data)?;
     let others: Vec<(String, Running)> =
@@ -731,10 +859,30 @@ fn repair(
         }
     }
     rename(&present.set, &mut data, &cable, say);
-    record(&cable, variant)?;
-    gathered.cables.push(endpoint_map::Made::new(cable.clone(), variant, &[]));
-    let problems = wait_endpoints(&cable, variant, Names::Since(before), say);
+    let problems = if ours.pending {
+        finish_pending(&cable, variant, before, ours.record, say)?
+    } else {
+        record(&cable, variant, ours.record, false)?;
+        wait_endpoints(&cable, variant, Names::Since(before), say)
+    };
+    gathered.cables.push(endpoint_map::Made::new(cable, variant, replaced));
     if problems.is_empty() { Ok(Done::Changed) } else { Err(SetupError::Checks(problems)) }
+}
+
+/// A migration's cable (its record pending) that works, as `add` finds it or leaves it: up to [`ENDPOINTS_WAIT`] for every
+/// endpoint of its microphones, as the migration's own check has it ([`steps::finish_verdict`]), then recorded as made, the
+/// nodes it replaces kept (`replaces`); the endpoint names that aren't as expected. Its endpoints not there: left pending
+/// ([`SetupError::Unfinished`]).
+fn finish_pending(
+    cable: &CableInstance, variant: Variant, before: &[Endpoint], replaces: &[String], say: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, SetupError> {
+    say(&format!("Waiting for Windows to make {}'s endpoints (up to {} s)", cable.label.friendly_name(), ENDPOINTS_WAIT.as_secs()));
+    let found = endpoints::wait_for(cable, variant, Names::Since(before), ENDPOINTS_WAIT, &mut endpoints::all, &mut SystemClock::start());
+    let misnamed = steps::finish_verdict(cable, found, say)
+        .map_err(|problems| SetupError::Unfinished { problems, to_make: vec![cable.label.clone()] })?;
+    record(cable, variant, replaces, false)?;
+    say("  recorded as made in the setup's store (its record was a migration's, still pending)");
+    Ok(misnamed)
 }
 
 /// `remove <label> [--forget]`, `remove --all [--forget]`.
@@ -749,19 +897,22 @@ pub fn remove(target: &RemoveTarget, forget: bool, say: &mut dyn FnMut(&str)) ->
             RemoveTarget::All => "no device of ours is present: nothing to remove".into(),
         });
     }
+    // A removal Windows finishes at the next restart is said with any error after it (exit 7 all the same)
     let mut restart = None;
     for &i in &plan.remove {
         let n = &present.nodes[i];
         say(&format!("Removing {} (DiUninstallDevice)", n.describe()));
-        if present.set.uninstall(&present.data[i])? {
-            say("  removed, but Windows needs a restart to finish");
-            restart = Some(n.instance_id.clone());
-        } else {
-            say("  removed");
+        match present.set.uninstall(&present.data[i]) {
+            Ok(true) => {
+                say("  removed, but Windows needs a restart to finish");
+                restart = Some(n.instance_id.clone());
+            }
+            Ok(false) => say("  removed"),
+            Err(e) => return Err(SetupError::Windows(e).and_restart(restart)),
         }
     }
     for label in &plan.forget {
-        store::forget(label).map_err(SetupError::Store)?;
+        store::forget(label).map_err(|e| SetupError::Store(e).and_restart(restart.clone()))?;
         say(&format!("Forgot {label}'s identity: an `add {label}` now makes a new cable, with new endpoints"));
     }
     if let RemoveTarget::Label(l) = target
@@ -842,10 +993,15 @@ pub fn migrate(
         let from = if t.new { "a new identity" } else { "its identity from the setup's store" };
         say(&format!("To make: {} ({}), with {from}", t.label.friendly_name(), t.variant.describe()));
     }
+    for m in &plan.mapped {
+        say(&format!("To map again: {}, made by an earlier run (the old devices it replaces are recorded)", m.label.friendly_name()));
+    }
     let published = stage_package(folder, say)?;
     let mut gathered = Gathered::default();
     let r = steps::run_migrate(&mut Real { present: &present }, &present.nodes, &plan, &published, &mut gathered, say);
-    endpoint_map::finish(map, "migrate", gathered, r, &mut endpoints::all, say)
+    let r = endpoint_map::finish(map, "migrate", gathered, r, &mut endpoints::all, say);
+    settle(&present, map, say);
+    r
 }
 
 /// What `list` reads (any user, no lock): the nodes, the store, and the endpoints (or why they couldn't be read).
@@ -1022,11 +1178,122 @@ pub(crate) mod tests {
         let e = SetupError::StillPresent {
             device: r"ROOT\MEDIA\ACXLLCABLE_B_X_1".into(),
             why: "Windows needs a restart to finish removing it".into(),
+            restart: true,
             error: Box::new(SetupError::Windows(WinError { call: "DiInstallDevice", code: 5 })),
         };
         let text = e.to_string();
         assert!(text.starts_with("DiInstallDevice failed"), "{text}");
         assert!(text.contains(r"ROOT\MEDIA\ACXLLCABLE_B_X_1 isn't confirmed gone (Windows needs a restart"), "{text}");
+        assert!(text.ends_with("restart Windows, then run this again."), "{text}");
+    }
+
+    fn b_create(n: u32) -> Create {
+        Create {
+            instance: CableInstance { label: "B".parse().unwrap(), id: B_ID.parse().unwrap(), n },
+            variant: Variant::Both,
+            remove: vec![3],
+            identity: Identity::Stored,
+            same_instance: true,
+        }
+    }
+
+    fn not_installed(removed: Option<Result<bool, WinError>>) -> SetupError {
+        let now = Bound { health: Health::Problem(10), inf: None, driver_version: None };
+        SetupError::Install(Box::new(NotInstalled {
+            device: r"ROOT\MEDIA\ACXLLCABLE_B_X_1".into(),
+            chosen: "oem20.inf".into(),
+            failure: InstallFailure::NotWorking { now },
+            removed,
+        }))
+    }
+
+    /// Astra's review (2026-11-25): a re-opened node that couldn't be installed allows n + 1 only once DiUninstallDevice removed
+    /// it without needing a restart; a restart it needs, or a removal that failed, stops there (exit 7 for the restart).
+    #[test]
+    fn a_re_opened_node_allows_the_next_instance_only_once_removed() {
+        let error = || SetupError::Windows(WinError { call: "DiInstallDevice", code: 5 });
+        let quiet = &mut |_: &str| {};
+        assert!(matches!(after_removal("X", Ok(false), error(), quiet), MakeError::Reopened(SetupError::Windows(_))));
+        let MakeError::Other(e) = after_removal("X", Ok(true), error(), quiet) else { panic!("a restart it needs isn't gone") };
+        assert!(matches!(&e, SetupError::StillPresent { restart: true, error, .. } if matches!(**error, SetupError::Windows(_))), "{e:?}");
+        assert!(e.needs_restart());
+        let failed = WinError { call: "DiUninstallDevice", code: 5 };
+        let MakeError::Other(e) = after_removal("X", Err(failed.clone()), error(), quiet) else { panic!("not removed isn't gone") };
+        assert!(matches!(&e, SetupError::StillPresent { restart: false, why, .. } if why.starts_with("removing it again failed")), "{e:?}");
+        assert!(!e.needs_restart());
+        // An install that never worked says the removal itself, so it is kept as it is
+        let e = not_installed(Some(Err(failed.clone())));
+        assert!(matches!(after_removal("X", Err(failed), e.clone(), quiet), MakeError::Other(k) if k == e));
+        assert!(matches!(after_removal("X", Ok(false), e.clone(), quiet), MakeError::Reopened(k) if k == e));
+    }
+
+    /// `make_or_next` tries n + 1 after a re-opened node's failure only while no node with the cable's identity is listed (or the
+    /// list doesn't read): two would want one control device's name. A failure that isn't a re-opened node's is the answer.
+    #[test]
+    fn the_next_instance_is_refused_while_the_identity_is_listed() {
+        let listed_b = |n: u32| crate::cables::PresentCable {
+            instance_id: b_create(n).instance.instance_id(),
+            cable: b_create(n).instance,
+            health: Health::Problem(28),
+        };
+        let reopened =
+            || MakeError::Reopened(SetupError::Windows(WinError { call: "SetupDiCallClassInstaller(DIF_REGISTERDEVICE)", code: 5 }));
+        let run = |first: fn() -> MakeError, listed: Result<Vec<crate::cables::PresentCable>, WinError>| {
+            let mut made: Vec<Create> = Vec::new();
+            let mut said = Vec::new();
+            let mut first = Some(first);
+            let r = make_or_next_with(
+                &b_create(4),
+                &mut |c: &Create, _: &mut dyn FnMut(&str)| {
+                    made.push(c.clone());
+                    match first.take() {
+                        Some(f) => Err(f()),
+                        None => Ok(Made { cable: c.instance.clone(), restart: false }),
+                    }
+                },
+                &mut || listed.clone(),
+                &mut |s: &str| said.push(s.to_string()),
+            );
+            (r, made, said)
+        };
+        // Still listed (Windows hasn't finished removing it, or it came back): nothing more is made
+        let (r, made, said) = run(reopened, Ok(vec![listed_b(4)]));
+        assert!(
+            matches!(&r, Err(SetupError::StillPresent { restart: false, why, .. }) if why.contains("still in the device tree")),
+            "{r:?}"
+        );
+        assert_eq!(made.len(), 1, "n + 1 not tried");
+        assert!(said.iter().any(|s| s.contains("not making") && s.contains("_5")), "{said:?}");
+        // The device tree unread: counted as there
+        let (r, made, _) = run(reopened, Err(WinError { call: "CM_Get_Device_ID_ListW", code: 5 }));
+        assert!(matches!(r, Err(SetupError::StillPresent { .. })) && made.len() == 1, "{r:?}");
+        // Gone: n + 1, new endpoints, nothing more to remove
+        let (r, made, _) = run(reopened, Ok(vec![]));
+        assert_eq!(r.map(|m| m.cable.n), Ok(5));
+        assert_eq!((made[1].instance.n, made[1].same_instance, made[1].remove.as_slice()), (5, false, &[][..]));
+        // Not a re-opened node's failure: no n + 1
+        let (r, made, _) = run(|| MakeError::Other(SetupError::RestartFirst { device: "X".into() }), Ok(vec![]));
+        assert!(matches!(r, Err(SetupError::RestartFirst { .. })) && made.len() == 1, "{r:?}");
+    }
+
+    /// Exit 7 (Astra's review, 2026-11-25): every result that needs a restart to finish, with other problems beside it or not.
+    #[test]
+    fn a_restart_windows_needs_is_found_in_every_error() {
+        let restart = SetupError::RestartFirst { device: r"ROOT\MEDIA\0003".into() };
+        let checks = SetupError::Checks(vec!["x".into()]);
+        assert!(restart.needs_restart() && !checks.needs_restart());
+        let stopped = |error| SetupError::Stopped { error: Box::new(error), unrestored: vec![], to_make: vec![] };
+        assert!(stopped(restart.clone()).needs_restart(), "the migration's removal of an old node");
+        assert!(!stopped(SetupError::Windows(WinError { call: "DiUninstallDevice", code: 5 })).needs_restart());
+        assert!(not_installed(Some(Ok(true))).needs_restart(), "removed again, Windows to finish it");
+        assert!(!not_installed(Some(Ok(false))).needs_restart() && !not_installed(None).needs_restart());
+        assert!(not_installed(Some(Ok(true))).to_string().ends_with("restart Windows, then run this again."));
+        let both = checks.clone().and_restart(Some("ROOT\\MEDIA\\ACXLLCABLE_A_X_1".into()));
+        assert!(both.needs_restart());
+        let text = both.to_string();
+        assert!(text.starts_with("done, but: x. Windows needs a restart to finish with ROOT\\MEDIA\\ACXLLCABLE_A_X_1 as well"), "{text}");
+        assert_eq!(checks.clone().and_restart(None), checks, "no restart: as it was");
+        assert_eq!(restart.clone().and_restart(Some("Y".into())), restart, "said once");
     }
 
     #[test]

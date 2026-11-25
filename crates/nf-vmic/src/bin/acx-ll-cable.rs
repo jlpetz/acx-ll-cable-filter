@@ -3,8 +3,9 @@
 //! the rest needs an elevated administrator (the setup's lock refuses anyone else before anything is read).
 //!
 //! Exit codes: 0 done (or nothing to do), 1 usage, 2 an error (the message says what changed, if anything), 7 Windows needs a
-//! restart to finish (stop there: restart, then run it again). `migrate` and `add` take `--endpoint-map <file>`: the old
-//! endpoints' new ones, as JSON (`nf_vmic::setup::endpoint_map`).
+//! restart to finish, with or without other problems beside it (stop there: restart, then run it again, which says what is still
+//! wrong). `migrate` and `add` take `--endpoint-map <file>`: the old endpoints' new ones, as JSON
+//! (`nf_vmic::setup::endpoint_map`).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::path::PathBuf;
@@ -40,9 +41,11 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
       both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
   --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
-      names), as JSON: deleted at the start, written at the end once the endpoints before the run were read.
+      names), as JSON: deleted at the start, written at the end once the endpoints before the run were read. The run that
+      finishes the migration maps all of it, whatever runs came before.
 
-Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish (stop there: restart, then run this again).";
+Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish, other errors beside it or not (stop there:
+restart, then run this again, which says what is still wrong).";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,25 +149,33 @@ fn say(line: &str) {
     println!("{line}");
 }
 
-fn exit_of(r: Result<Done, SetupError>) -> ExitCode {
+/// The exit code of an action's result (the module's docs): 7 whenever Windows needs a restart to finish, other problems beside
+/// it or not (they are said; the run after the restart says what is still wrong), so a caller can stop there.
+fn code_of(r: &Result<Done, SetupError>) -> u8 {
     match r {
-        Ok(Done::Nothing) => {
-            say("Nothing to do.");
-            ExitCode::SUCCESS
-        }
-        Ok(Done::Changed) => {
-            say("Done.");
-            ExitCode::SUCCESS
-        }
+        Ok(Done::Nothing | Done::Changed) => 0,
+        Ok(Done::RestartPending { .. }) => 7,
+        Err(e) if e.needs_restart() => 7,
+        Err(_) => 2,
+    }
+}
+
+fn exit_of(r: Result<Done, SetupError>) -> ExitCode {
+    let code = code_of(&r);
+    match r {
+        Ok(Done::Nothing) => say("Nothing to do."),
+        Ok(Done::Changed) => say("Done."),
         Ok(Done::RestartPending { device }) => {
-            say(&format!("Windows needs a restart to finish with {device}: restart, then run `acx-ll-cable list`."));
-            ExitCode::from(7)
+            say(&format!("Windows needs a restart to finish with {device}: restart, then run `acx-ll-cable list`."))
         }
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::from(2)
+            if code == 7 {
+                say("Windows needs a restart to finish: restart, then run this again.");
+            }
         }
     }
+    ExitCode::from(code)
 }
 
 fn main() -> ExitCode {
@@ -248,6 +259,26 @@ mod tests {
                 map: Some("m.json".into())
             })
         );
+    }
+
+    /// The exit codes a harness stops on (Astra's review, 2026-11-25): 7 for every result that needs a restart, the migration's
+    /// removal of an old node among them, with other problems beside it too.
+    #[test]
+    fn a_restart_windows_needs_is_exit_7() {
+        use nf_vmic::win_error::WinError;
+        let restart_first = || SetupError::RestartFirst { device: r"ROOT\MEDIA\0003".into() };
+        let stopped = |error| Err(SetupError::Stopped { error: Box::new(error), unrestored: vec![], to_make: vec![l("A"), l("B")] });
+        assert_eq!(code_of(&Ok(Done::Nothing)), 0);
+        assert_eq!(code_of(&Ok(Done::Changed)), 0);
+        assert_eq!(code_of(&Ok(Done::RestartPending { device: "X".into() })), 7);
+        assert_eq!(code_of(&Err(restart_first())), 7);
+        assert_eq!(code_of(&stopped(restart_first())), 7, "the old node's removal Windows finishes at the next restart");
+        assert_eq!(code_of(&stopped(SetupError::Windows(WinError { call: "DiUninstallDevice", code: 5 }))), 2);
+        let with_problems = SetupError::Unfinished { problems: vec!["x".into()], to_make: vec![l("B")] }.and_restart(Some("Y".into()));
+        assert_eq!(code_of(&Err(with_problems)), 7, "a restart with other problems");
+        assert_eq!(code_of(&Err(SetupError::Checks(vec!["x".into()]))), 2);
+        let still = SetupError::StillPresent { device: "X".into(), why: "w".into(), restart: true, error: Box::new(restart_first()) };
+        assert_eq!(code_of(&Err(still)), 7);
     }
 
     #[test]

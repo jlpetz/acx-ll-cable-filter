@@ -5,7 +5,8 @@
 //!
 //! **Old and new.** A cable's old endpoints are those in the look before the run (NOTPRESENT ones too) on the nodes it replaces:
 //! the old driver's nodes the migration makes it in place of (`ROOT\MEDIA\0003` for A, Cable-B.ps1's for B; recorded in the
-//! store while pending, so a run after their removal still finds their lingering endpoints), a node `add --adopt` re-creates,
+//! store until the migration's map is final, so a run after their removal still finds their lingering endpoints), a node `add
+//! --adopt` re-creates,
 //! and every earlier instance of its identity (a re-add's, a repair's: the same node). Its new endpoints are those on its
 //! instance after the run. Each old endpoint is matched to the new one of the same role (Speakers, render; Microphone and Call
 //! Microphone, capture): the old driver's circuits have the cable's reference strings (Speaker0, Microphone0, Microphone1).
@@ -20,6 +21,13 @@
 //!
 //! The file is replaced at the start of the run (deleted, so a file there afterwards is this run's) and written at its end once
 //! the run has read the endpoints before it; a run that stops earlier (its error says why, nothing was changed) leaves none.
+//!
+//! **Across runs.** A migration's cable keeps the old nodes it replaces in its store record (`Replaces`) once it is made, and
+//! every migrate or add run maps each present cable whose record has them, so the map of the run that leaves no record pending
+//! holds the whole migration, whatever its earlier attempts did (killed, stopped by a restart: a cable made by a run that needs
+//! one stays pending, and the run after the restart checks and maps it). That run drops them once its map is written; a map
+//! asked for and not written keeps them, so the next migration run maps them again. An earlier attempt's map holds what that
+//! attempt saw (`result` says how it ended).
 
 use std::path::Path;
 
@@ -68,6 +76,14 @@ impl Made {
         let mut old: Vec<Old> = replaces.iter().cloned().map(Old::Instance).collect();
         old.push(Old::Identity(cable.id));
         Self { cable, variant, old }
+    }
+
+    /// The other nodes it takes the place of (instance IDs).
+    pub fn replaces(&self) -> impl Iterator<Item = &String> {
+        self.old.iter().filter_map(|o| match o {
+            Old::Instance(id) => Some(id),
+            Old::Identity(_) => None,
+        })
     }
 }
 
@@ -198,14 +214,7 @@ pub fn map_cable(made: &Made, before: &[Endpoint], after: &[Endpoint]) -> CableM
             pairs.push(role(None, Some(side(n)), Match::Added));
         }
     }
-    let replaces = made
-        .old
-        .iter()
-        .filter_map(|o| match o {
-            Old::Instance(id) => Some(id.clone()),
-            Old::Identity(_) => None,
-        })
-        .collect();
+    let replaces = made.replaces().cloned().collect();
     CableMap {
         label: made.cable.label.to_string(),
         id: made.cable.id.to_string(),
@@ -224,6 +233,7 @@ pub fn map(
         Ok(Done::Changed) => "done",
         Ok(Done::Nothing) => "nothing",
         Ok(Done::RestartPending { .. }) => "restart",
+        Err(e) if e.needs_restart() => "restart",
         Err(_) => "error",
     };
     let cables = cables.iter().map(|m| map_cable(m, before, after)).collect();
@@ -409,6 +419,8 @@ mod tests {
         assert_eq!(r(Ok(Done::Nothing)), "nothing");
         assert_eq!(r(Ok(Done::RestartPending { device: "X".into() })), "restart");
         assert_eq!(r(Err(SetupError::Checks(vec![]))), "error");
+        // An error that needs a restart first (exit 7): a restart, as the exit code says
+        assert_eq!(r(Err(SetupError::Checks(vec![]).and_restart(Some("X".into())))), "restart");
     }
 
     /// The file: deleted at the start, written at the end; a map that can't be made fails a run that was done, and only says so

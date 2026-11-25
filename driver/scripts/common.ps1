@@ -84,13 +84,14 @@ function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
 }
 
 # The scripts' exit codes (TODO 19; Install-Driver.ps1, Cable.ps1, Uninstall-Driver.ps1): 0 done; 7 Windows wants a restart to
-# finish (a caller stops there: restart, then run the script again, which finishes what is left); 2 the setup tool's error
-# (its steps say what changed); 1 the tool's usage error, or the script's own check (not elevated, test signing, no package,
-# no tool: a thrown error). pnputil's own "restart required" (ERROR_SUCCESS_REBOOT_REQUIRED) is 7 too.
+# finish, with or without other errors beside it (a caller stops there: restart, then run the script again, which finishes what
+# is left and says what is still wrong); 2 the setup tool's error (its steps say what changed); 1 the tool's usage error, or the
+# script's own check (not elevated, test signing, no package, no tool: a thrown error). pnputil's own "restart required"
+# (ERROR_SUCCESS_REBOOT_REQUIRED) is 7 too.
 $script:RebootRequired = 3010
 
 # Ends the script with the setup tool's exit code `$Code` unless it is 0, saying so (`$What`: the step), after `$Then` (the
-# status, say) if given.
+# status, say) if given. The code survives whatever `$Then` does: an error in it is only said.
 function Exit-ForToolCode([int]$Code, [string]$What, [scriptblock]$Then) {
     if ($Code -eq 0) { return }
     if ($Code -eq 7) {
@@ -98,20 +99,27 @@ function Exit-ForToolCode([int]$Code, [string]$What, [scriptblock]$Then) {
     } else {
         Write-Host "   the setup tool failed at $($What) (exit $Code): its steps are above" -ForegroundColor Red
     }
-    if ($Then) { & $Then }
+    if ($Then) {
+        try { & $Then } catch { Write-Note "the status couldn't be shown: $($_.Exception.Message)" }
+    }
     exit $Code
 }
 
 # The setup tool's store of cable identities (crates\nf-vmic\src\setup\store.rs), read-only here.
 $script:CableStore = 'HKLM:\SOFTWARE\ACX-LL-Cable\Cables'
 
-# The cables a migration recorded (Pending = 1) and hasn't made, or made and hasn't recorded as made yet: a run stopped after
-# the old devices went, by a failure, a restart Windows needed or a killed tool. While there are any, Install-Driver.ps1 runs
-# the migration again, which makes them, or checks and records the ones there.
+# The cables a migration hasn't finished: recorded (Pending = 1) and not made, or made and not checked and recorded yet (a run
+# stopped after the old devices went: a failure, a restart Windows needed, a killed tool), or made with the migration's
+# endpoint map not final yet (Replaces, the old devices' instance IDs: dropped by the run that leaves none pending, once its
+# map is written; a map asked for and not written keeps them). While there are any, Install-Driver.ps1 runs the migration
+# again, which makes them, checks and records the ones there, and maps the whole migration.
 function Get-PendingCables {
     if (-not (Test-Path $CableStore)) { return @() }
     @(Get-ChildItem $CableStore -ErrorAction SilentlyContinue |
-        Where-Object { (Get-ItemProperty -Path $_.PSPath -Name Pending -ErrorAction SilentlyContinue).Pending -eq 1 } |
+        Where-Object {
+            $pending = (Get-ItemProperty -Path $_.PSPath -Name Pending -ErrorAction SilentlyContinue).Pending
+            ($pending -eq 1) -or (@($_.GetValueNames()) -contains 'Replaces')
+        } |
         ForEach-Object { $_.PSChildName })
 }
 

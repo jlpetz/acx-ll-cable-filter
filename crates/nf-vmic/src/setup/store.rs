@@ -1,11 +1,14 @@
 //! The setup's store (TODO 19, the per-cable design, section 4): `HKLM\SOFTWARE\ACX-LL-Cable\Cables\<label>`, with `Id` (the
 //! identity's 36 lower-case characters, REG_SZ), `N` (the instance number its node had last, REG_DWORD) and `Mics` (`both`,
 //! `call` or `low-latency`, REG_SZ). `add` reuses a label's identity and n, `remove` keeps them, `remove --forget` drops them.
-//! `Pending` (REG_DWORD 1, ours) marks a cable the migration is to make and hasn't yet: written before the old devices go, so
-//! a run that stops after their removal is finished by the next (Install-Driver.ps1 runs the migration while one is pending);
-//! cleared when the cable is made. `Replaces` (REG_MULTI_SZ, ours) goes with it: the instance IDs of the old driver's nodes the
-//! migration makes the cable in place of, so a run after their removal still finds their endpoints for the endpoint map. The
-//! key takes HKLM\SOFTWARE's permissions: any user reads it, administrators write it.
+//! `Pending` (REG_DWORD 1, ours) marks a cable the migration is to make and hasn't finished: written before the old devices go,
+//! so a run that stops after their removal is finished by the next; cleared when the cable is made and checked (one made by a
+//! run that ends needing a restart stays pending, so the run after the restart checks it). `Replaces` (REG_MULTI_SZ, ours) goes
+//! with it: the instance IDs of the old driver's nodes the migration makes the cable in place of, so a run after their removal
+//! still finds their endpoints for the endpoint map. It stays once the cable is made, until a migrate or add run leaves no
+//! record pending: that run writes its endpoint map first (every cable with Replaces is in it), then drops them all. While a
+//! record has either, Install-Driver.ps1 runs the migration. The key takes HKLM\SOFTWARE's permissions: any user reads it,
+//! administrators write it.
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
@@ -25,7 +28,7 @@ use crate::win_error::WinError;
 pub const KEY: &str = r"SOFTWARE\ACX-LL-Cable\Cables";
 /// The value marking a cable the migration hasn't made yet.
 pub const PENDING: &str = "Pending";
-/// The old driver's nodes a pending cable is made in place of.
+/// The old driver's nodes a migration's cable is made in place of.
 pub const REPLACES: &str = "Replaces";
 
 /// What the store holds: the entries that read, and what was wrong with those that didn't (left alone, and reported).
@@ -143,9 +146,7 @@ pub fn read() -> Result<Store, WinError> {
         let pending = dword_value(&key, PENDING)?;
         match entry_of(&label, id.as_deref(), n, mics.as_deref(), pending) {
             Ok(mut e) => {
-                if e.pending {
-                    e.replaces = strings_value(&key, REPLACES)?;
-                }
+                e.replaces = strings_value(&key, REPLACES)?;
                 store.entries.push(e)
             }
             Err(why) => store.problems.push(why),
@@ -186,18 +187,21 @@ pub fn write(e: &Entry) -> Result<(), WinError> {
     if let Some(m) = e.mics {
         set("Mics", REG_SZ, &sz(m.arg()))?;
     }
-    // Pending last when set, first when cleared: a Pending entry always has its Replaces
-    if e.pending {
+    let replaces = || {
         if e.replaces.is_empty() {
-            delete_value(&key, REPLACES, "RegDeleteKeyValueW(Replaces)")?;
+            delete_value(&key, REPLACES, "RegDeleteKeyValueW(Replaces)")
         } else {
             let replaces: Vec<&str> = e.replaces.iter().map(String::as_str).collect();
-            set(REPLACES, REG_MULTI_SZ, &multi_sz_bytes(&replaces))?;
+            set(REPLACES, REG_MULTI_SZ, &multi_sz_bytes(&replaces))
         }
+    };
+    // Pending last when set, first when cleared: a Pending entry always has its Replaces
+    if e.pending {
+        replaces()?;
         set(PENDING, REG_DWORD, &1u32.to_le_bytes())
     } else {
         delete_value(&key, PENDING, "RegDeleteKeyValueW(Pending)")?;
-        delete_value(&key, REPLACES, "RegDeleteKeyValueW(Replaces)")
+        replaces()
     }
 }
 

@@ -301,7 +301,7 @@ pub fn switch(label: &Label, target: Variant, say: &mut dyn FnMut(&str)) -> Resu
     }
     let running = present.running();
     let made = setup::make_cable(&present, &create, &running, say)?;
-    setup::record_cable(&made.cable, target)?;
+    setup::record_cable(&made.cable, target, &entries)?;
     if made.restart {
         let device = made.cable.instance_id();
         say(&format!("  Windows needs a restart to finish installing {device}: its endpoints come after it."));

@@ -184,7 +184,9 @@ fn switch(target: Variant, report: Option<&str>) -> Result<(), Failure> {
             if report.is_some() {
                 step(&format!("error: {message}"));
             }
-            Err(Failure::error(message))
+            // Windows needs a restart to finish (a removal it finishes then, say): exit 7, as the setup tool's (Astra's review,
+            // 2026-11-25)
+            Err(if e.needs_restart() { Failure::restart_pending(message) } else { Failure::error(message) })
         }
     }
 }

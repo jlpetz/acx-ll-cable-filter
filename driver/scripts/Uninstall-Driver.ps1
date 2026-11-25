@@ -8,9 +8,9 @@
     and the per-cable driver's share the name). -KeepIdentities keeps the setup's store, so cables added again keep their
     identities and endpoints. -BuildTool builds the setup tool first.
 
-    Exit codes: 0 done; 7 Windows wants a restart to finish (a device's removal, or a package's deletion: stop there,
-    restart, then run this again); 2 the setup tool's error, or a package pnputil couldn't delete; 1 this script's own check
-    (not elevated, no tool).
+    Exit codes: 0 done; 7 Windows wants a restart to finish (a device's removal, or a package's deletion, with or without
+    other errors beside it: stop there, restart, then run this again); 2 the setup tool's error, or a package pnputil couldn't
+    delete; 1 this script's own check (not elevated, no tool).
 
 .EXAMPLE
     .\Uninstall-Driver.ps1
@@ -43,10 +43,11 @@ foreach ($d in $published) {
 }
 if ($failed.Count -gt 0) {
     Write-Host "   not deleted: $($failed -join ', '): run this again, or pnputil /delete-driver <oemNN.inf> /uninstall /force" -ForegroundColor Red
-    exit 2
 }
+# A restart Windows wants comes first, whatever else failed: the run after it says what is still there
 if ($restart.Count -gt 0) {
     Write-Note "Windows wants a restart to finish deleting $($restart -join ', '): restart, then run this again. Exit 7."
     exit 7
 }
+if ($failed.Count -gt 0) { exit 2 }
 exit 0

@@ -15,9 +15,9 @@
     error, so no run rebuilds anything unasked. add -EndpointMap <file>: which new endpoint takes each old one's place (a
     re-added or repaired cable's, an adopted device's), as JSON (acx-ll-cable's --endpoint-map).
 
-    Exit codes: 0 done (or nothing to do); 7 Windows wants a restart to finish (stop there: restart, then run this again);
-    2 the setup tool's error (its steps above say what changed); 1 a usage error or this script's own check (not elevated,
-    no tool).
+    Exit codes: 0 done (or nothing to do); 7 Windows wants a restart to finish, with or without other errors beside it (stop
+    there: restart, then run this again); 2 the setup tool's error (its steps above say what changed); 1 a usage error or this
+    script's own check (not elevated, no tool).
 
 .EXAMPLE
     .\Cable.ps1 list
