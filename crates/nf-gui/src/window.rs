@@ -602,7 +602,13 @@ impl Window {
     fn devices_listed(&mut self, result: Result<Vec<DeviceInfo>, EngineError>) {
         self.refreshing = false;
         match result {
-            Ok(list) => self.devices = Some(list),
+            Ok(list) => {
+                if self.settings.bind_cable_endpoints(&list) {
+                    self.engine.apply(&self.settings.engine);
+                    self.persist();
+                }
+                self.devices = Some(list);
+            }
             Err(e) => {
                 self.notice = Some(Notice::new(InfoBarSeverity::Error, "Couldn't list the audio devices", e.0));
                 // Unlock the pickers anyway: the stored devices show as missing
@@ -1505,6 +1511,7 @@ mod tests {
     fn choices_follow_the_settings() {
         let list = vec![nf_engine::DeviceInfo {
             id: "cable-in".to_owned(),
+            cable_selection: None,
             name: "CABLE Input".to_owned(),
             flow: nf_engine::Flow::Render,
             is_default: false,

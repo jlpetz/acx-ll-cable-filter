@@ -26,7 +26,8 @@ pub struct EffectConfig {
     pub worker_blocks: u8,
 }
 
-/// Endpoint ids (WASAPI device ids). `None` = the system default for that role.
+/// Device choices. Our cables can be saved by `acx-ll-cable:<cable id>/<role>` across reinstalls. Other choices, and files
+/// from older releases, use the Windows endpoint ID.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceSelection {

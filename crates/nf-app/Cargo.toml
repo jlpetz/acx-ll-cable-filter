@@ -44,6 +44,7 @@ hound.workspace = true
 log.workspace = true
 # `--config FILE`: the window's settings.json, or a bare EngineConfig.
 serde_json.workspace = true
+serde.workspace = true
 # The console (attach, allocate, Ctrl+C), standard-handle checks, the log's local time, the crash
 # message box, the named mutexes (log rotation, one window), the window hand-over, the interactive
 # user's account (setup-large-pages), the launcher's child process, and `mic variant`'s report pipe (System_Pipes, and System_IO

@@ -55,7 +55,7 @@ pub(crate) fn choices(devices: &[DeviceInfo], picker: Picker<'_>, selected: Opti
     let listed: Vec<&DeviceInfo> = devices
         .iter()
         .filter(|d| d.flow == picker.flow)
-        .filter(|d| picker.exclude != Some(d.id.as_str()) || selected == Some(d.id.as_str()))
+        .filter(|d| !picker.exclude.is_some_and(|s| d.matches_selection(s)) || selected.is_some_and(|s| d.matches_selection(s)))
         .collect();
     let mut labels = Vec::with_capacity(listed.len() + 2);
     let mut ids = Vec::with_capacity(listed.len() + 2);
@@ -72,12 +72,12 @@ pub(crate) fn choices(devices: &[DeviceInfo], picker: Picker<'_>, selected: Opti
         // Two endpoints can share a friendly name (two identical USB mics): number the later ones.
         let same = listed.iter().take(i).filter(|e| e.name == d.name).count();
         labels.push(if same == 0 { d.name.clone() } else { format!("{} #{}", d.name, same + 1) });
-        ids.push(Some(d.id.clone()));
+        ids.push(Some(d.selection().to_owned()));
     }
     let selected = match selected {
         None => picker.default_label.map(|_| 0),
-        Some(id) => match ids.iter().position(|x| x.as_deref() == Some(id)) {
-            Some(i) => Some(i),
+        Some(id) => match listed.iter().position(|d| d.matches_selection(id)) {
+            Some(i) => Some(i + usize::from(picker.default_label.is_some())),
             None => {
                 labels.push(format!("(missing) {id}"));
                 ids.push(Some(id.to_owned()));
@@ -97,6 +97,7 @@ mod tests {
     fn device(id: &str, name: &str, flow: Flow, is_default: bool) -> DeviceInfo {
         DeviceInfo {
             id: id.to_owned(),
+            cable_selection: None,
             name: name.to_owned(),
             flow,
             is_default,
@@ -153,6 +154,30 @@ mod tests {
         let c = choices(&devices(), Picker::reference(Some("cable-in")), Some("cable-in"));
         assert_eq!(c.selected, Some(2));
         assert_eq!(c.labels[2], "CABLE Input (VB-Audio Virtual Cable)");
+    }
+
+    #[test]
+    fn cable_selections_follow_the_role_across_endpoint_replacement() {
+        let mut endpoint = device("old", "Studio", Flow::Render, false);
+        let key = nf_engine::cable_endpoint_selection(nf_vmic::identity::CableId(17), nf_vmic::cables::EndpointKind::Speakers);
+        endpoint.cable_selection = Some(key.clone());
+        let mut settings = crate::settings::Settings::default();
+        settings.engine.devices.output = Some("old".into());
+        settings.ui.test_probe = Some("old".into());
+        settings.ui.test_capture = Some("another".into());
+        assert!(settings.bind_cable_endpoints(std::slice::from_ref(&endpoint)));
+        assert_eq!(settings.engine.devices.output.as_ref(), Some(&key));
+        assert_eq!(settings.ui.test_probe.as_ref(), Some(&key));
+        assert_eq!(settings.ui.test_capture.as_deref(), Some("another"));
+        assert!(!settings.bind_cable_endpoints(std::slice::from_ref(&endpoint)));
+        endpoint.id = "replacement".into();
+        endpoint.name = "Renamed studio".into();
+        let list = [endpoint];
+        let c = choices(&list, Picker::OUTPUT, Some(&key));
+        assert_eq!(c.selected, Some(0));
+        assert_eq!(c.labels, ["Renamed studio"]);
+        assert_eq!(c.ids, [Some(key.clone())]);
+        assert_eq!(choices(&list, Picker::reference(Some(&key)), None).ids, [None]);
     }
 
     #[test]

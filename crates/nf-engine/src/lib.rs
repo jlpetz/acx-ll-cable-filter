@@ -61,3 +61,4 @@ mod test_alloc;
 mod timing;
 
 pub use api::*;
+pub use devices::cable_endpoint_selection;

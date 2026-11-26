@@ -359,6 +359,10 @@ impl Inner {
         let d = lock(&self.desired);
         let running = d.running.as_ref()?;
         let st = lock(&self.status);
+        // A returned cable can have a different Windows ID. Probe its saved role both after a loss and if it was absent at start.
+        if d.aec_built && st.reference_id.is_none() && crate::devices::is_cable_selection(running.devices.reference.as_deref()) {
+            return Some(running.devices.reference.clone());
+        }
         st.reference_lost.then(|| st.lost_reference_id.clone().or_else(|| running.devices.reference.clone()))
     }
 
@@ -957,8 +961,14 @@ fn start_locked(inner: &Arc<Inner>, run: &mut RunState, config: &EngineConfig) -
     let (flight_port, flight_end) = flight::run_channel(inner);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::channel();
+    // Keep the desired config durable for every retry. Only the audio worker gets this run's concrete endpoint IDs.
+    let mut opened_config = config.clone();
+    let devices = &mut opened_config.devices;
+    let output = devices.output.as_mut().filter(|_| config.io.output_backend == nf_core::config::OutputBackend::Wasapi);
+    let reference = devices.reference.as_mut().filter(|_| config.processing.aec_enabled);
+    crate::devices::resolve_selections([devices.mic.as_mut(), output, reference].into_iter().flatten());
     let args = AudioArgs {
-        config: config.clone(),
+        config: opened_config,
         effect_stage,
         telemetry: inner.telemetry.clone(),
         controls: inner.controls.clone(),
@@ -1375,7 +1385,9 @@ fn control_main(weak: Weak<Inner>, rx: Receiver<Ctl>, tx: Sender<Ctl>) {
 /// Whether a loopback stream opens on the reference now (it's released at once). On the control
 /// thread, which has COM and its own enumerator.
 fn loopback_opens(en: &DeviceEnumerator, id: Option<&str>) -> bool {
-    resolve(en, id, Direction::Render, StreamRole::Reference).is_ok_and(|d| CaptureStream::open_loopback(&d).is_ok())
+    let mut selected = id.map(str::to_owned);
+    crate::devices::resolve_selections(&mut selected);
+    resolve(en, selected.as_deref(), Direction::Render, StreamRole::Reference).is_ok_and(|d| CaptureStream::open_loopback(&d).is_ok())
 }
 
 /// Forwards every endpoint notification to the control thread. The callbacks run on a Windows
@@ -1886,6 +1898,19 @@ mod tests {
         d.running = Some(c.clone());
         d.aec_built = c.processing.aec_enabled;
         inner.telemetry.set_state(EngineState::Running);
+    }
+
+    #[test]
+    fn a_missing_cable_reference_is_retried_by_role_even_when_its_windows_id_changes() {
+        let selection = crate::cable_endpoint_selection(nf_vmic::identity::CableId(5), nf_vmic::cables::EndpointKind::Speakers);
+        let config = cfg(None, Some("output"), Some(&selection), true);
+        let inner = Inner::new();
+        fake_run(&inner, &config, &Arc::new(AudioShared::default()));
+        assert_eq!(inner.lost_reference(), Some(Some(selection.clone())), "unavailable at first start");
+        lock(&inner.status).reference_id = Some("old Windows ID".into());
+        assert_eq!(inner.lost_reference(), None);
+        inner.device_event_wants_restart(&DevEvent::Removed("old Windows ID".into()));
+        assert_eq!(inner.lost_reference(), Some(Some(selection)), "removed while running");
     }
 
     /// wasapi/A: a fault that ends the run (with no device event to follow) stops it, arms the

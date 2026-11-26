@@ -19,6 +19,10 @@ pub enum Command {
     Help,
     Version,
     Devices,
+    RemapDevices {
+        map: PathBuf,
+        config: Option<PathBuf>,
+    },
     /// `devices --check`: a short passive run on the chosen devices, then a health report per stream (TODO 21).
     DeviceCheck(CheckArgs),
     Run(RunArgs),
@@ -309,6 +313,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "help" => return Ok(Command::Help),
         "--version" | "-V" | "version" => Command::Version,
         "devices" => return parse_devices(&mut p),
+        "remap-devices" => return parse_remap(&mut p),
         "run" => return parse_run(&mut p).map(Command::Run),
         "latency" => return parse_latency(&mut p).map(Command::Latency),
         "quality" => return parse_quality(&mut p).map(Command::Quality),
@@ -322,6 +327,20 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     };
     p.finish()?;
     Ok(command)
+}
+
+fn parse_remap(p: &mut Parser<'_>) -> Result<Command, UsageError> {
+    let mut map = None;
+    let mut config = None;
+    while let Some(arg) = p.next() {
+        match arg {
+            Arg::Positional(path) if map.is_none() => map = Some(PathBuf::from(path)),
+            Arg::Positional(_) => return Err(usage("remap-devices takes one endpoint map")),
+            Arg::Flag("--config", value) => config = Some(PathBuf::from(p.value("--config", value)?)),
+            Arg::Flag(f, _) => return Err(p.unknown(f)),
+        }
+    }
+    Ok(Command::RemapDevices { map: map.ok_or_else(|| usage("remap-devices needs the setup tool's endpoint map JSON"))?, config })
 }
 
 /// One argument: an option (with its `=value`, if written that way) or a positional.
@@ -978,6 +997,9 @@ pub fn help_text() -> String {
 Usage:
   noise-filter [gui]             Open the settings window (the default)
   noise-filter devices           List the recording and playback devices
+  noise-filter remap-devices MAP [--config FILE]
+                                 Close the window, then apply the setup tool's --endpoint-map JSON
+                                 to your saved cable choices (defaults to your window's settings).
   noise-filter devices --check [--seconds N] [--flight DIR] [--flight-audio] [OPTIONS]
                                  Run the filter quietly for N s (default {check_s}, {check_lo}-{check_hi}) and say
                                  how each stream delivers: steady, in bursts or late, its drift and
@@ -1231,6 +1253,17 @@ mod tests {
             assert!(help.contains(command), "{command}");
         }
         assert!(help.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn remap_devices_takes_the_setup_map_and_an_optional_settings_file() {
+        assert_eq!(p(&["remap-devices", "migration.json"]), Ok(Command::RemapDevices { map: "migration.json".into(), config: None }));
+        assert_eq!(
+            p(&["remap-devices", "--config=settings.json", "migration.json"]),
+            Ok(Command::RemapDevices { map: "migration.json".into(), config: Some("settings.json".into()) })
+        );
+        assert!(p(&["remap-devices"]).is_err());
+        assert!(p(&["remap-devices", "first", "second"]).is_err());
     }
 
     #[test]

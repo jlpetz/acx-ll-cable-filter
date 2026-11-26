@@ -137,8 +137,9 @@ fn engine_args(args: &QualityArgs) -> EngineArgs {
 /// The devices must make a loop through the filter: the probe isn't its output, the capture isn't its mic, the far end is
 /// neither the probe nor the output, and echo cancellation doesn't take the probe (the scene itself) as its reference.
 fn check_devices(cfg: &EngineConfig, devices: &[DeviceInfo], probe: &str, capture: &str, far: Option<&str>) -> Result<(), String> {
-    let mic = cfg.devices.mic.as_deref();
-    let output = (cfg.io.output_backend == nf_engine::OutputBackend::Wasapi).then_some(cfg.devices.output.as_deref()).flatten();
+    let current_id = |id| devices.iter().find(|d| d.matches_selection(id)).map_or(id, |d| d.id.as_str());
+    let mic = cfg.devices.mic.as_deref().map(current_id);
+    let output = cfg.devices.output.as_deref().filter(|_| cfg.io.output_backend == nf_engine::OutputBackend::Wasapi).map(current_id);
     if output == Some(probe) {
         return Err("--probe is the filter's own output: play into the cable its mic records instead (e.g. \"CABLE-A Input\")".into());
     }
@@ -157,7 +158,7 @@ fn check_devices(cfg: &EngineConfig, devices: &[DeviceInfo], probe: &str, captur
         let default_playback = devices.iter().find(|d| d.flow == Flow::Render && d.is_default).map(|d| d.id.as_str());
         let fix = "it would take the scene itself as the far end and cancel it. Give the far end's speakers as --reference, or turn \
                    echo cancellation off (--no-aec)";
-        match cfg.devices.reference.as_deref() {
+        match cfg.devices.reference.as_deref().map(current_id) {
             Some(r) if r == probe => return Err(format!("Echo cancellation's reference is --probe: {fix}")),
             None if default_playback == Some(probe) => {
                 return Err(format!("Echo cancellation takes its reference from the default playback device, which is --probe: {fix}"));
@@ -970,6 +971,7 @@ mod tests {
     fn device(id: &str, name: &str, flow: Flow, is_default: bool) -> DeviceInfo {
         DeviceInfo {
             id: id.into(),
+            cable_selection: None,
             name: name.into(),
             flow,
             is_default,

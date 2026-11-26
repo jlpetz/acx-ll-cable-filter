@@ -90,7 +90,7 @@ impl IoOptions {
 /// case), else the first name containing it. `what` names the option for the error.
 pub fn resolve_device(devices: &[DeviceInfo], query: &str, flow: Flow, what: &str) -> Result<String, String> {
     let kind = |f: Flow| if f == Flow::Capture { "recording" } else { "playback" };
-    if let Some(d) = devices.iter().find(|d| d.id == query) {
+    if let Some(d) = devices.iter().find(|d| d.matches_selection(query)) {
         return if d.flow == flow {
             Ok(d.id.clone())
         } else {
@@ -127,7 +127,13 @@ pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Ve
     if args.mic.is_some() || args.output.is_some() || args.reference.is_some() {
         let devices = list_devices().map_err(|e| Failure::error(format!("Couldn't list the audio devices: {e}")))?;
         let resolve = |q: &Option<String>, flow, what| -> Result<Option<String>, Failure> {
-            q.as_deref().map(|q| resolve_device(&devices, q, flow, what).map_err(Failure::error)).transpose()
+            q.as_deref()
+                .map(|q| {
+                    let id = resolve_device(&devices, q, flow, what).map_err(Failure::error)?;
+                    // An explicitly supplied durable selection should survive a re-add while this CLI run is retrying.
+                    Ok(if devices.iter().any(|d| d.cable_selection.as_deref() == Some(q)) { q.to_owned() } else { id })
+                })
+                .transpose()
         };
         if let Some(id) = resolve(&args.mic, Flow::Capture, "--mic")? {
             cfg.devices.mic = Some(id);
@@ -156,6 +162,7 @@ mod tests {
     fn dev(id: &str, name: &str, flow: Flow) -> DeviceInfo {
         DeviceInfo {
             id: id.into(),
+            cable_selection: None,
             name: name.into(),
             flow,
             is_default: false,

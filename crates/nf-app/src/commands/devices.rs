@@ -49,6 +49,7 @@ mod tests {
         let list = vec![
             DeviceInfo {
                 id: "{0.0.1.00000000}.{mic}".into(),
+                cable_selection: None,
                 name: "Microphone (USB)".into(),
                 flow: Flow::Capture,
                 is_default: true,
@@ -58,6 +59,7 @@ mod tests {
             },
             DeviceInfo {
                 id: "{0.0.0.00000000}.{cable}".into(),
+                cable_selection: None,
                 name: "CABLE Input".into(),
                 flow: Flow::Render,
                 is_default: false,

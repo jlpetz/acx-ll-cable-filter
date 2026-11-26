@@ -68,9 +68,9 @@ other's, and its counters start at zero with each binding (AddDevice). Only the 
 friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
 circuit's component ID is the identity XOR the sample's constant.
 
-**A cable's endpoints, by role (the app's contract, `nf_vmic::roles`).** Windows' endpoint ids belong to one installation
-of a cable's device: a cable removed and added again gets new ones (the first install's trial, 2026-11-26: Windows keeps the
-old ones as not present and never reuses them; accepted by the owner), while a disable and enable keeps them. So an app saves
+**A cable's endpoints, by role (the app's contract, `nf_vmic::roles`).** Windows' endpoint IDs belong to one installation
+of a cable's device. In the first install trial, removing and adding B again gave it three new IDs. Its old records were
+still present immediately afterwards. Disabling and enabling B preserved all three IDs. An app saves
 a cable's id with the endpoint's role ("B's Call Microphone": the `CableId` and an `EndpointKind`, Speakers, Microphone or
 Call Microphone), never the endpoint's id or name, and resolves the current id each time it opens one:
 `nf_vmic::roles::resolve(id, role)`, or `Snapshot::read()` then `snapshot.resolve(id, role)` for many. It matches endpoints by
@@ -200,12 +200,17 @@ are the same (cable, role, old and new ids, `match`); an old endpoint's `state` 
 removal finds them `notpresent`). A map asked for and not published keeps them, and the next `Install-Driver.ps1` runs the
 migration again to publish it.
 
+The settings window saves an ACX-LL-Cable device choice by cable ID and role. To recover choices that still refer to
+old Windows endpoint IDs after a migration, close the window and run `noise-filter-cli remap-devices <map.json>` as
+the user who owns the settings. Use the map from the completed `migrate` or `add` command. `--config <file>` selects
+a particular settings file. The command reports any ambiguous choices and leaves them available for manual selection.
+
 **Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker
 always, take the cable labelled A, else the only cable. Each mode records or plays that cable's own endpoints, found by the
 instance ID in their KS filter's path. `\\.\NoiseFilterVmic` is gone: a tool that opens it gets ERROR_FILE_NOT_FOUND. The
-control device admits SYSTEM and Administrators only, so the tools run elevated. The box's installed package (the old one:
-"AudioCodec Device" and "Noise Filter Cable B") stays until the owner's go for S0a, which migrates both.
+control device admits SYSTEM and Administrators only, so the audio tools run elevated. The dev box migrated both cables
+in the first install trial on 2026-11-26.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
 on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with

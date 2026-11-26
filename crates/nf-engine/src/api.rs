@@ -27,8 +27,10 @@ pub enum Flow {
 /// One active audio endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// WASAPI endpoint id (stable across reboots); what [`DeviceSelection`] stores.
+    /// WASAPI endpoint ID for this installation.
     pub id: String,
+    /// For our cable endpoints, the cable identity and role to save across reinstalls.
+    pub cable_selection: Option<String>,
     /// Friendly name, e.g. "CABLE Input (VB-Audio Virtual Cable)".
     pub name: String,
     pub flow: Flow,
@@ -39,6 +41,17 @@ pub struct DeviceInfo {
     /// The shared-mode mix format's rate and channel count.
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+impl DeviceInfo {
+    /// The selection to save. Ordinary endpoint IDs from existing files or the command line still match this device.
+    pub fn selection(&self) -> &str {
+        self.cable_selection.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn matches_selection(&self, selected: &str) -> bool {
+        self.id == selected || self.selection() == selected
+    }
 }
 
 /// An engine error, already worded for the user.

@@ -9,6 +9,7 @@ mod latency;
 mod mic;
 mod process;
 mod quality;
+mod remap;
 mod run;
 mod setup;
 
@@ -27,6 +28,7 @@ pub fn run_cli(command: &Command) -> Result<(), Failure> {
             Ok(())
         }
         Command::Devices => devices::devices(),
+        Command::RemapDevices { map, config } => remap::run(map, config.as_deref()),
         Command::DeviceCheck(args) => check::check(args),
         Command::Run(args) => run::run(args),
         Command::Latency(args) => latency::latency(args),

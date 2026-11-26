@@ -119,10 +119,11 @@ fn failed(msg: impl Into<String>) -> TestError {
 
 /// Starts the test, its capture at `capture_period_frames` (IAudioClient3, shared: `CaptureStream::open_events_at`), or at the
 /// endpoint's default period for 0.
-pub(crate) fn start(inner: &Arc<Inner>, request: LatencyTestRequest, capture_period_frames: u32) -> Result<LatencyTest, EngineError> {
+pub(crate) fn start(inner: &Arc<Inner>, mut request: LatencyTestRequest, capture_period_frames: u32) -> Result<LatencyTest, EngineError> {
     if inner.telemetry.state() != EngineState::Running {
         return Err(EngineError("Start the filter first: the latency test measures the running engine.".into()));
     }
+    crate::devices::resolve_selections([&mut request.probe_device, &mut request.capture_device]);
     let mic_id = lock(&inner.status).mic_id.clone();
     validate_request(&request, mic_id.as_deref()).map_err(EngineError)?;
     if !claim_test(inner) {

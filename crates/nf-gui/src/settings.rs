@@ -255,6 +255,21 @@ impl Default for UiSettings {
 }
 
 impl Settings {
+    /// Upgrade still-active Windows IDs from an older settings file as soon as the device picker has its inventory.
+    pub(crate) fn bind_cable_endpoints(&mut self, list: &[nf_engine::DeviceInfo]) -> bool {
+        let d = &mut self.engine.devices;
+        let mut changed = false;
+        for selected in
+            [&mut d.mic, &mut d.output, &mut d.reference, &mut self.ui.test_probe, &mut self.ui.test_capture].into_iter().flatten()
+        {
+            if let Some(binding) = list.iter().find(|d| d.id == *selected).and_then(|d| d.cable_selection.as_ref()) {
+                selected.clone_from(binding);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Clamps every value to its control's range, so no builder can assert on it and no slider snaps
     /// on first show. Blank device ids become `None` (the default, or not chosen).
     pub fn sanitize(&mut self) {
