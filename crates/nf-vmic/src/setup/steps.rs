@@ -58,7 +58,7 @@ pub trait Ops {
     fn enable(&mut self, i: usize) -> Result<(), WinError>;
     /// `disable` and `enable`'s persistent, global change (DIF_PROPERTYCHANGE: [`super::devices::DeviceSet::change_state`]);
     /// whether Windows needs a restart to finish it.
-    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError>;
+    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, SetupError>;
     /// Node `i`'s state now, without waiting.
     fn bound(&mut self, i: usize) -> Bound;
     /// Node `i`'s ConfigFlags now (SPDRP_CONFIGFLAGS), if they read: CONFIGFLAG_DISABLED marks a persistent disable, done or
@@ -123,8 +123,8 @@ impl Ops for Real<'_> {
         self.present.set.enable(&self.present.data[i])
     }
 
-    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
-        self.present.set.change_state(&self.present.data[i], enable)
+    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, SetupError> {
+        self.present.set.change_state(&self.present.data[i], &self.present.nodes[i].instance_id, enable)
     }
 
     fn bound(&mut self, i: usize) -> Bound {
@@ -389,9 +389,10 @@ pub fn reinstall<O: Ops>(
     if n.health == Health::Problem(PROBLEM_DISABLED) || ops.bound(i).health == Health::Problem(PROBLEM_DISABLED) {
         clear_count(ops, nodes, i, say);
         say("  enabling it");
-        let enabled = if n.disabled_by_user() { ops.change_state(i, true).map(|r| restart |= r) } else { ops.enable(i) };
+        let enabled =
+            if n.disabled_by_user() { ops.change_state(i, true).map(|r| restart |= r) } else { ops.enable(i).map_err(SetupError::from) };
         if let Err(e) = enabled {
-            return Err(SetupError::Windows(e).and_restart(restart.then(|| n.instance_id.clone())));
+            return Err(e.and_restart(restart.then(|| n.instance_id.clone())));
         }
     }
     let now = if restart { ops.bound(i) } else { ops.wait_working(i) };
@@ -459,7 +460,7 @@ pub fn run_disable<O: Ops>(ops: &mut O, nodes: &[Node], plan: &StatePlan, say: &
                     problems.push(format!("{} isn't disabled after the disable: {}", n.instance_id, now.health.describe()));
                 }
             }
-            Err(e) => return Err(SetupError::Windows(e).and_restart(restart)),
+            Err(e) => return Err(e.and_restart(restart)),
         }
         if flagged(ops, i, say) == Some(false) {
             problems.push(format!(
@@ -517,7 +518,7 @@ pub fn run_enable<O: Ops>(ops: &mut O, nodes: &[Node], plan: &StatePlan, say: &m
         });
         let finish = match ops.change_state(i, true) {
             Ok(r) => r,
-            Err(e) => return Err(SetupError::Windows(e).and_restart(restart)),
+            Err(e) => return Err(e.and_restart(restart)),
         };
         if flagged(ops, i, say) == Some(true) {
             problems.push(format!(
@@ -540,7 +541,8 @@ pub fn run_enable<O: Ops>(ops: &mut O, nodes: &[Node], plan: &StatePlan, say: &m
                 } else {
                     format!("Waiting for Windows to bring back {name}'s endpoints (up to {} s)", ENDPOINTS_WAIT.as_secs())
                 });
-                let found = ops.wait_endpoints(cable, variant, Names::Since(before.as_deref().unwrap_or_default()));
+                let names = before.as_deref().map_or(Names::Any, Names::Since);
+                let found = ops.wait_endpoints(cable, variant, names);
                 if let (Some(before), Some(check)) = (&before, &found.0) {
                     problems.extend(new_ids(cable, before, check));
                 }
@@ -993,6 +995,8 @@ mod tests {
         endpoints_missing: Option<&'static str>,
         /// This cable's endpoints come with Windows' "2- " numbering in their names.
         endpoints_numbered: Option<&'static str>,
+        /// This cable's endpoints retain a user-assigned name.
+        endpoints_renamed: Option<&'static str>,
         records: Vec<Entry>,
         /// CM_Enable_DevNode fails on this node.
         enable_fails: Option<usize>,
@@ -1007,6 +1011,7 @@ mod tests {
         enable_broken: Option<usize>,
         /// The endpoints before the run (endpoints_before's look).
         before: Vec<Endpoint>,
+        before_fails: bool,
         /// The nodes disabled persistently (CONFIGFLAG_DISABLED), by the persistent change.
         persistent: BTreeSet<usize>,
     }
@@ -1070,10 +1075,10 @@ mod tests {
             Ok(())
         }
 
-        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
+        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, SetupError> {
             self.log(format!("{} {i}", if enable { "state-on" } else { "state-off" }));
             if self.state_fails == Some(i) {
-                return Err(failed("SetupDiCallClassInstaller(DIF_PROPERTYCHANGE)"));
+                return Err(failed("SetupDiCallClassInstaller(DIF_PROPERTYCHANGE)").into());
             }
             if self.flags_stuck != Some(i) {
                 if enable {
@@ -1159,7 +1164,7 @@ mod tests {
 
         fn endpoints_before(&mut self, also: &[String]) -> Result<Vec<Endpoint>, WinError> {
             self.log(format!("endpoints {}", also.join(" ")));
-            Ok(self.before.clone())
+            if self.before_fails { Err(failed("EnumAudioEndpoints")) } else { Ok(self.before.clone()) }
         }
 
         fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>) {
@@ -1172,7 +1177,13 @@ mod tests {
                 .into_iter()
                 .map(|kind| Endpoint {
                     id: format!("{}.{kind:?}", cable.instance_id()),
-                    name: if numbered { format!("{} (2- ACX-LL-Cable)", kind.name()) } else { endpoints::expected_name(cable, kind) },
+                    name: if numbered {
+                        format!("{} (2- ACX-LL-Cable)", kind.name())
+                    } else if self.endpoints_renamed == Some(cable.label.as_str()) {
+                        format!("Studio {}", kind.name())
+                    } else {
+                        endpoints::expected_name(cable, kind)
+                    },
                     kind,
                     state: endpoints::State::Active,
                     instance_id: cable.instance_id().to_lowercase(),
@@ -1672,9 +1683,9 @@ mod tests {
         }
 
         /// As a disable or enable that persists (the migration never makes one).
-        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
+        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, SetupError> {
             if !self.spend(format!("state {} {}", if enable { "on" } else { "off" }, self.nodes[i].instance_id)) {
-                return Err(World::killed());
+                return Err(World::killed().into());
             }
             let n = &mut self.nodes[i];
             n.health = if !enable {
@@ -2477,6 +2488,12 @@ mod tests {
         assert!(fake.disabled.is_empty() && !fake.persistent.contains(&1));
         assert!(said.iter().any(|s| s.starts_with("Enabling") && s.ends_with("in every hardware profile, then in this one)")), "{said:?}");
         assert_eq!(said.last().unwrap(), "ACX-LL-Cable B is on, across restarts too, its endpoints the ones it had");
+        // Windows couldn't supply the pre-enable snapshot. Previously renamed endpoints still count when they return, but
+        // without comparing their IDs we cannot claim to have verified identity.
+        let (r, said) = enable(&mut off(Fake { before_fails: true, endpoints_renamed: Some("B"), ..Fake::default() }), &nodes);
+        assert_eq!(r, Ok(Done::Changed), "{said:?}");
+        assert!(said.iter().any(|line| line.contains("their ids aren't compared")));
+        assert_eq!(said.last().unwrap(), "ACX-LL-Cable B is on, across restarts too");
         // CONFIGFLAG_DISABLED left set: a failed check (a restart would disable it again), the endpoints checked too
         let (r, _) = enable(&mut off(Fake { flags_stuck: Some(1), ..Fake::default() }), &nodes);
         assert_eq!(

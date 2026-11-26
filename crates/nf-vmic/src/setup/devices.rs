@@ -69,6 +69,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::{BOOL, HSTRING, Owned, PCWSTR, w};
 
+use super::SetupError;
 use super::package::{Candidate, Running, runs};
 use super::plan::{Health, Model, Node};
 use crate::identity::{CableInstance, PRODUCT};
@@ -398,12 +399,8 @@ impl DeviceSet {
     /// disabled for the profile only (devcon's own disable) comes back too. Whether Windows needs a restart to finish it
     /// (DI_NEEDRESTART or DI_NEEDREBOOT in the element's install parameters after either call, SetupDiCallClassInstaller's
     /// documented signal: a device it couldn't change now). Elevated only.
-    pub fn change_state(&self, data: &SP_DEVINFO_DATA, enable: bool) -> Result<bool, WinError> {
-        let restart = self.property_change(data, enable, DICS_FLAG_GLOBAL)?;
-        if !enable {
-            return Ok(restart);
-        }
-        Ok(self.property_change(data, true, DICS_FLAG_CONFIGSPECIFIC)? || restart)
+    pub fn change_state(&self, data: &SP_DEVINFO_DATA, instance_id: &str, enable: bool) -> Result<bool, SetupError> {
+        change_scopes(instance_id, enable, |scope| self.property_change(data, enable, scope))
     }
 
     /// SPDRP_CONFIGFLAGS now, if it reads: CONFIGFLAG_DISABLED marks a disable in every hardware profile, done or waiting for
@@ -729,6 +726,20 @@ pub fn parse_multi_sz(s: &[u16]) -> Vec<String> {
     s.split(|&c| c == 0).take_while(|part| !part.is_empty()).map(String::from_utf16_lossy).collect()
 }
 
+/// Disable globally, or enable globally and in the current profile. Once Windows requests a restart, report it even if the
+/// second scope fails. Callers use that information to stop before proceeding with another install operation.
+fn change_scopes(
+    instance_id: &str, enable: bool, mut change: impl FnMut(SETUP_DI_PROPERTY_CHANGE_SCOPE) -> Result<bool, WinError>,
+) -> Result<bool, SetupError> {
+    let global_restart = change(DICS_FLAG_GLOBAL)?;
+    if !enable {
+        return Ok(global_restart);
+    }
+    let profile_restart = change(DICS_FLAG_CONFIGSPECIFIC)
+        .map_err(|error| SetupError::Windows(error).and_restart(global_restart.then(|| instance_id.to_owned())))?;
+    Ok(global_restart || profile_restart)
+}
+
 /// A REG_MULTI_SZ's bytes: each string NUL-terminated, then one more NUL.
 pub fn multi_sz_bytes(strings: &[&str]) -> Vec<u8> {
     let mut units: Vec<u16> = Vec::new();
@@ -751,6 +762,26 @@ mod tests {
     use crate::setup::package::tests::{V1, candidate};
 
     // Nothing here touches a device or the driver store: the formats, the install's judgement, and the repo's INF.
+
+    #[test]
+    fn enabling_keeps_a_restart_requested_by_either_scope_on_success_or_failure() {
+        let id = r"ROOT\MEDIA\test";
+        let failed = WinError { call: "current-profile enable", code: 5 };
+        for global_restart in [false, true] {
+            for profile in [Ok(false), Ok(true), Err(failed.clone())] {
+                let mut scopes = Vec::new();
+                let result = change_scopes(id, true, |scope| {
+                    scopes.push(scope);
+                    if scope == DICS_FLAG_GLOBAL { Ok(global_restart) } else { profile.clone() }
+                });
+                assert_eq!(scopes, [DICS_FLAG_GLOBAL, DICS_FLAG_CONFIGSPECIFIC]);
+                match profile {
+                    Ok(profile_restart) => assert_eq!(result, Ok(global_restart || profile_restart)),
+                    Err(error) => assert_eq!(result, Err(SetupError::Windows(error).and_restart(global_restart.then(|| id.to_owned())))),
+                }
+            }
+        }
+    }
 
     #[test]
     fn multi_sz_round_trips() {
