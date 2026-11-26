@@ -80,6 +80,7 @@ impl ChainItem {
                     use_vad: false,
                 },
                 high_band: nf_core::config::HighBand::Model,
+                gate_position: nf_core::config::GatePosition::AfterNoise,
             },
             budget: None,
             output: OutputFacts {

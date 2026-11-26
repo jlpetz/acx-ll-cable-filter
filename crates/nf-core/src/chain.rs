@@ -1,4 +1,5 @@
 //! The processing chain: input meter → echo cancel → noise stage → optional post effect → output meter.
+//! [`Chain::with_noise_model`] places one independent gate at a configurable boundary in this chain.
 //!
 //! Each built-in stage sits in a slot that is off (bypassed: a copy, no stage CPU, no delay, TODO #15), on,
 //! in measurement passthrough (a delay line of the stage's latency stands in for it, so the measured
@@ -45,10 +46,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-use crate::controls::ChainControls;
+use crate::config::{GateMode, GatePosition};
+use crate::controls::{ChainControls, GateParams};
 use crate::dsp::delay::DelayLine;
 use crate::dsp::fade::{crossfade_into, dip_splice_into};
+use crate::dsp::gate::Gate;
 use crate::dsp::meter::{Meter, MeterReading, mean_square};
+use crate::dsp::noise_post::reduction_db;
+use crate::noise::NoiseStage;
 use crate::stage::{Activation, AecStats, ProcessIo, Stage, StageError, StageReport, StageRole, check_host_profile};
 use crate::{BLOCK, Block};
 
@@ -68,6 +73,8 @@ pub struct ChainReport {
     pub output: Option<MeterReading>,
     /// From the noise stage this block, if it ran.
     pub noise: Option<StageReport>,
+    /// The gate alone, at its selected point. When it and the noise model are adjacent, `noise` includes their combined reduction.
+    pub gate_reduction_db: Option<f32>,
     /// Timer ticks spent in the AEC stage and in the noise stage (from the caller's clock; 0 if not run).
     pub aec_ticks: u64,
     pub noise_ticks: u64,
@@ -188,6 +195,9 @@ pub struct Chain {
     controls: Arc<ChainControls>,
     aec: Option<Slot>,
     noise: Option<Slot>,
+    gate: Option<Gate>,
+    gate_has_history: bool,
+    gate_position: GatePosition,
     /// An activated post effect. Its host maintains the same stream delay during bypass and measurement passthrough.
     effect: Option<Box<dyn Stage>>,
     effect_latency: u32,
@@ -210,6 +220,9 @@ impl Chain {
             controls,
             aec: aec.map(|s| Slot::new(s, StageRole::EchoCancel)),
             noise: noise.map(|s| Slot::new(s, StageRole::Noise)),
+            gate: None,
+            gate_has_history: false,
+            gate_position: GatePosition::default(),
             effect: None,
             effect_latency: 0,
             effect_inputs: 0,
@@ -221,6 +234,15 @@ impl Chain {
             started: false,
             was_passthrough: false,
         }
+    }
+
+    /// App composition. Move the noise stage's gate out so it can run independently or move between stages.
+    /// External callers constructing a standalone noise stage keep its original gate and parameter contract.
+    pub fn with_noise_model(controls: Arc<ChainControls>, aec: Option<Box<dyn Stage>>, mut noise: Option<Box<NoiseStage>>) -> Self {
+        let gate = noise.as_mut().and_then(|s| s.take_gate()).unwrap_or_default();
+        let mut chain = Self::new(controls, aec, noise.map(|s| s as Box<dyn Stage>));
+        chain.gate = Some(gate);
+        chain
     }
 
     /// Checks each stage against the host profile and its slot, activates it at the app's format ([`Activation::HOST`]) on
@@ -323,8 +345,46 @@ impl Chain {
             report.input = Some(self.input_meter.measure(mic));
         }
 
-        // AEC: mic (+ reference) -> a
+        let mut position = self.controls.gate_position();
+        let mut params = self.controls.noise.gate.load();
+        if position != self.gate_position && !passthrough && self.gate.as_ref().is_some_and(Gate::releasing_to_unity) {
+            // Release attenuation at the old location (5 ms); move at unity on the next block. The new location then
+            // acquires its own level and follows the user's attack/release settings. No two gates ever process one block.
+            position = self.gate_position;
+            params.mode = GateMode::Off;
+        }
+        let warm_gate = want_noise && self.noise.is_some();
+        let mut gate = self.gate.as_mut().and_then(|g| {
+            if self.gate_has_history && (test_starts || self.gate_position != position) {
+                g.reset();
+                self.gate_has_history = false;
+            }
+            if passthrough {
+                None
+            } else if warm_gate || params.mode != GateMode::Off || g.releasing_to_unity() {
+                self.gate_has_history = true;
+                Some(g)
+            } else {
+                // Cable/gate bypass does no detector work. Re-acquire from current levels if this route enables Auto later.
+                if self.gate_has_history {
+                    g.reset();
+                    self.gate_has_history = false;
+                }
+                None
+            }
+        });
+        self.gate_position = position;
+        // AEC: mic (+ reference) -> a. Before-AEC gating needs its own mutable copy of the caller's input.
         let t0 = now();
+        let mic = if position == GatePosition::BeforeAec
+            && let Some(g) = gate.as_deref_mut()
+        {
+            *self.b = *mic;
+            report.gate_reduction_db = apply_gate(g, &params, &mut self.b, f32::NAN);
+            &*self.b
+        } else {
+            mic
+        };
         match self.aec.as_mut() {
             Some(slot) => run_slot(slot, Want::new(want_aec, passthrough), test_starts, mic, reference, &mut self.a, &mut self.c),
             None => *self.a = *mic,
@@ -334,9 +394,18 @@ impl Chain {
             report.aec_ticks = t1.wrapping_sub(t0);
         }
 
+        if position == GatePosition::BeforeNoise
+            && let Some(g) = gate.as_deref_mut()
+        {
+            report.gate_reduction_db = apply_gate(g, &params, &mut self.a, f32::NAN);
+        }
         // Noise: a (+ the reference, if it takes one) -> b
+        let mut aligned_dry = false;
         match self.noise.as_mut() {
             Some(slot) => {
+                // In steady On, run_slot leaves the noise slot's latency-aligned dry input in c. During a splice the two
+                // paths can correspond to different input times, so a combined reduction would have no single denominator.
+                aligned_dry = slot.mode == Mode::On && want_noise && !passthrough;
                 run_slot(slot, Want::new(want_noise, passthrough), test_starts, &self.a, reference, &mut self.b, &mut self.c);
                 if want_noise && !passthrough {
                     report.noise = Some(StageReport::read(&*slot.stage));
@@ -344,8 +413,23 @@ impl Chain {
             }
             None => *self.b = *self.a,
         }
+        let vad = if aligned_dry { report.noise.map_or(f32::NAN, |n| n.speech_probability) } else { f32::NAN };
+        // With no external effect the two downstream positions are the same audio boundary.
+        let adjacent = position == GatePosition::AfterNoise || (position == GatePosition::AfterEffect && self.effect.is_none());
+        if adjacent && let Some(g) = gate.as_deref_mut() {
+            report.gate_reduction_db = apply_gate(g, &params, &mut self.b, vad);
+            if report.gate_reduction_db.is_some()
+                && let Some(noise) = &mut report.noise
+            {
+                noise.gain_reduction_db = if aligned_dry && noise.gain_reduction_db.is_finite() {
+                    reduction_db(mean_square(&self.c), mean_square(&self.b))
+                } else {
+                    f32::NAN
+                };
+            }
+        }
         let t2 = now();
-        if want_noise && self.noise.is_some() {
+        if (want_noise && self.noise.is_some()) || (gate.is_some() && (position == GatePosition::BeforeNoise || adjacent)) {
             report.noise_ticks = t2.wrapping_sub(t1);
         }
 
@@ -355,11 +439,24 @@ impl Chain {
         } else {
             *out = *self.b;
         }
+        if position == GatePosition::AfterEffect
+            && !adjacent
+            && let Some(g) = gate
+        {
+            report.gate_reduction_db = apply_gate(g, &params, out, f32::NAN);
+        }
         if meters {
             report.output = Some(self.output_meter.measure(out));
         }
         report
     }
+}
+
+fn apply_gate(gate: &mut Gate, params: &GateParams, block: &mut Block, vad: f32) -> Option<f32> {
+    let metered = params.mode != GateMode::Off || gate.releasing_to_unity();
+    let before = mean_square(block);
+    gate.process_with_power(block, params, vad, before);
+    metered.then(|| reduction_db(before, mean_square(block)))
 }
 
 /// Resets the stage and runs it once on last block's input (into `discard`), so its next output is
@@ -494,7 +591,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::config::ProcessingConfig;
+    use crate::config::{GateConfig, ProcessingConfig};
     use crate::dsp::fade::SPLICE_FADE;
     use crate::stage::{
         AecTelemetry, AudioPorts, GainAdjustmentMetering, MONO_IN_OUT, MONO_WITH_REFERENCE, SpeechProbability, StageDescriptor, Text,
@@ -663,6 +760,145 @@ mod tests {
         assert_eq!(seen.lock().unwrap().as_slice(), &[(0.25, Some(0.125))]);
         assert_eq!(report.output.unwrap().peak, 0.25);
         assert_eq!(out, [0.25; BLOCK]);
+    }
+
+    fn gate_config(position: GatePosition) -> ProcessingConfig {
+        ProcessingConfig {
+            gate_position: position,
+            gate: GateConfig {
+                mode: GateMode::Static,
+                threshold_db: -10.0,
+                range_db: -20.0,
+                release_ms: 0.0,
+                hold_ms: 0.0,
+                ..GateConfig::default()
+            },
+            floor_db: -120.0,
+            ..ProcessingConfig::default()
+        }
+    }
+
+    #[test]
+    fn gate_only_needs_no_model_dither_or_delay_and_passthrough_is_exact() {
+        for position in [GatePosition::BeforeAec, GatePosition::BeforeNoise, GatePosition::AfterNoise, GatePosition::AfterEffect] {
+            let mut cfg = gate_config(position);
+            cfg.noise_enabled = false;
+            let c = Arc::new(ChainControls::new(&cfg));
+            let mut chain = Chain::with_noise_model(c.clone(), None, None);
+            chain.activate().unwrap();
+            let mut out = [0.0; BLOCK];
+            let mic: Block = std::array::from_fn(|i| 0.002 * (i as f32 * 0.05).sin());
+            assert_eq!(chain.latency(), 0);
+            assert!(!chain.runs_a_stage());
+            let r = chain.process(&mic, &[0.0; BLOCK], &mut out);
+            assert_eq!(out, mic.map(|s| s * 0.1), "{position:?}");
+            assert!(r.noise.is_none() && (r.gate_reduction_db.unwrap() + 20.0).abs() < 0.001);
+            chain.process(&[0.0; BLOCK], &[0.0; BLOCK], &mut out);
+            assert_eq!(out.map(f32::to_bits), [0; BLOCK]);
+            c.passthrough.store(true, Relaxed);
+            let r = chain.process(&mic, &[0.0; BLOCK], &mut out);
+            assert_eq!(out.map(f32::to_bits), mic.map(f32::to_bits));
+            assert!(r.noise.is_none() && r.gate_reduction_db.is_none());
+        }
+    }
+
+    #[test]
+    fn auto_uses_the_warm_model_floor_but_reacquires_after_complete_bypass() {
+        let mut cfg = gate_config(GatePosition::AfterNoise);
+        cfg.gate.mode = GateMode::Off;
+        let c = Arc::new(ChainControls::new(&cfg));
+        let model = crate::noise::DelayModel::new(BLOCK, BLOCK as u32);
+        let noise = NoiseStage::new(c.clone(), Box::new(model)).unwrap();
+        let mut chain = Chain::with_noise_model(c.clone(), None, Some(Box::new(noise)));
+        chain.activate().unwrap();
+        let mut out = [0.0; BLOCK];
+        let input = [0.01; BLOCK];
+        for _ in 0..300 {
+            chain.process(&input, &[0.0; BLOCK], &mut out);
+        }
+        cfg.gate.mode = GateMode::Auto;
+        c.apply(&cfg);
+        chain.process(&input, &[0.0; BLOCK], &mut out);
+        assert!(out[BLOCK - 1] < 0.002, "Auto already knows this stationary background");
+        cfg.noise_enabled = false;
+        cfg.gate.mode = GateMode::Off;
+        c.apply(&cfg);
+        for _ in 0..5 {
+            chain.process(&input, &[0.0; BLOCK], &mut out);
+        }
+        cfg.gate.mode = GateMode::Auto;
+        c.apply(&cfg);
+        chain.process(&input, &[0.0; BLOCK], &mut out);
+        assert_eq!(out, input, "Auto starts afresh after bypass");
+    }
+
+    #[test]
+    fn gate_position_selects_the_audio_boundary_and_vad_requires_adjacent_model_output() {
+        for position in [GatePosition::BeforeAec, GatePosition::BeforeNoise, GatePosition::AfterNoise, GatePosition::AfterEffect] {
+            let mut cfg = gate_config(position);
+            cfg.aec_enabled = true;
+            cfg.gate.use_vad = true;
+            let c = Arc::new(ChainControls::new(&cfg));
+            let aec = Wired::new(&[features::ECHO_CANCEL], MONO_WITH_REFERENCE.clone(), false);
+            let aec_seen = aec.seen.clone();
+            let effect = Wired::new(&[], MONO_IN_OUT.clone(), false);
+            let effect_seen = effect.seen.clone();
+            let noise = crate::noise::DelayModel::new(BLOCK, BLOCK as u32).with_vad();
+            let noise = NoiseStage::new(c.clone(), Box::new(noise)).unwrap();
+            let mut chain = Chain::with_noise_model(c, Some(Box::new(aec)), Some(Box::new(noise)));
+            chain.activate().unwrap();
+            chain.attach_effect(Box::new(effect)).unwrap();
+            let mut mic = [0.01; BLOCK];
+            mic[1] = 0.75; // The model sees speech on the ungated mic, while the gate's RMS detector stays well below threshold.
+            let mut out = [0.0; BLOCK];
+            let report = chain.process(&mic, &[0.5; BLOCK], &mut out);
+            let opens = position == GatePosition::AfterNoise;
+            let gain = if opens { 1.0 } else { 0.1 };
+            assert_eq!(out, mic.map(|x| x * gain), "{position:?}: once, at the right side of the model");
+            let vad = report.noise.unwrap().speech_probability;
+            assert_eq!(vad, if matches!(position, GatePosition::BeforeAec | GatePosition::BeforeNoise) { 0.075 } else { 0.75 });
+            assert_eq!(aec_seen.lock().unwrap()[0], (if position == GatePosition::BeforeAec { mic[0] * 0.1 } else { mic[0] }, Some(0.5)));
+            assert_eq!(effect_seen.lock().unwrap()[0].0, if position == GatePosition::AfterEffect { mic[0] } else { mic[0] * gain });
+        }
+    }
+
+    #[test]
+    fn combined_reduction_measures_the_whole_ramp_against_the_aligned_dry_block_and_noise_bypass_keeps_the_gate() {
+        let mut cfg = gate_config(GatePosition::AfterNoise);
+        cfg.gate.release_ms = 200.0;
+        let c = Arc::new(ChainControls::new(&cfg));
+        let noise = crate::noise::DelayModel::new(BLOCK, (2 * BLOCK) as u32);
+        let noise = NoiseStage::new(c.clone(), Box::new(noise)).unwrap();
+        let mut chain = Chain::with_noise_model(c.clone(), None, Some(Box::new(noise)));
+        chain.activate().unwrap();
+        let mut out = [0.0; BLOCK];
+        let quiet = [0.01; BLOCK];
+        chain.process(&quiet, &[0.0; BLOCK], &mut out);
+        for i in 0..25 {
+            let next = if i % 2 == 0 { [0.02; BLOCK] } else { quiet };
+            let dry = if i % 2 == 0 { quiet } else { [0.02; BLOCK] };
+            let r = chain.process(&next, &[0.0; BLOCK], &mut out);
+            let measured = reduction_db(mean_square(&dry), mean_square(&out));
+            assert!((r.noise.unwrap().gain_reduction_db - measured).abs() < 0.001);
+            assert!((r.gate_reduction_db.unwrap() - measured).abs() < 0.001);
+        }
+        c.noise.enabled.store(false, Relaxed);
+        for _ in 0..3 {
+            let r = chain.process(&quiet, &[0.0; BLOCK], &mut out);
+            assert!(r.noise.is_none() && (r.gate_reduction_db.unwrap() + 20.0).abs() < 0.001);
+        }
+        for _ in 0..3 {
+            chain.process(&[0.001; BLOCK], &[0.0; BLOCK], &mut out);
+        }
+        assert_eq!(chain.latency(), 0, "the bypass has finished draining");
+        // Relocating a closed gate releases the old position to unity before the new gate attacks/releases.
+        cfg.noise_enabled = false;
+        cfg.gate_position = GatePosition::BeforeAec;
+        c.apply(&cfg);
+        chain.process(&quiet, &[0.0; BLOCK], &mut out);
+        assert!(out[0] < 0.002 && out[BLOCK - 1] == quiet[0]);
+        chain.process(&quiet, &[0.0; BLOCK], &mut out);
+        assert!(out[0] > 0.009 && out[BLOCK - 1] < out[0]);
     }
 
     #[test]

@@ -102,8 +102,8 @@ pub struct Built {
 /// it (the same blocks behind as on the engine's worker, so the same output), and AEC3's stage dithering its reference at
 /// `aec_dither` ([`nf_stages::AEC3_REFERENCE_DITHER`] is the app's; 0 for the matrix's "bare" policy). Without AEC3 or a noise
 /// stage running it is the engine's own (`nf_engine::models::build_chain`: RNNoise's stage in the noise slot, off). Otherwise
-/// it is what `nf_stages::build_chain_with` (the constructor `models.rs` calls) builds, written out so AEC3's dither can be
-/// set: `Chain::new` with the AEC3 stage and the noise stage `models.rs` builds (its model wrapped in [`Timed`]), then
+/// it is what `nf_stages::build_model_chain` builds, written out so AEC3's dither can be set: `Chain::with_noise_model` with
+/// the AEC3 stage and the noise stage `models.rs` builds (its model wrapped in [`Timed`]), then
 /// `activate`. `the_timed_chains_are_the_engine_s` checks the output is the engine's bit for bit at the app's dither.
 pub fn build(kind: &ChainKind, cfg: &ProcessingConfig, aec_dither: f32) -> Result<Built, String> {
     let controls = Arc::new(ChainControls::new(cfg));
@@ -112,7 +112,7 @@ pub fn build(kind: &ChainKind, cfg: &ProcessingConfig, aec_dither: f32) -> Resul
         return Ok(Built { chain: b.chain, model_ns: None });
     }
     let ns = Arc::new(AtomicU64::new(0));
-    let noise: Box<dyn Stage> = match kind.model {
+    let noise = match kind.model {
         // The noise filter off: the engine's noise slot (`models.rs`' `noise_stage` for the default model), off.
         None => Box::new(nf_stages::rnnoise_stage(controls.clone()).map_err(|e| e.0)?),
         Some(Model::Rnnoise) => {
@@ -125,7 +125,7 @@ pub fn build(kind: &ChainKind, cfg: &ProcessingConfig, aec_dither: f32) -> Resul
     } else {
         None
     };
-    let mut chain = Chain::new(controls, aec, Some(noise));
+    let mut chain = Chain::with_noise_model(controls, aec, Some(noise));
     chain.activate().map_err(|e| e.0)?;
     Ok(Built { chain, model_ns: kind.model.map(|_| ns) })
 }

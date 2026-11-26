@@ -50,6 +50,8 @@ pub fn run(engine: Arc<Engine>, settings_path: PathBuf) -> Result<(), String> {
         settings::Saver::spawn(settings_path, settings::SAVE_DEBOUNCE)
     };
     let start = window::Start {
+        #[cfg(test)]
+        isolated: false,
         engine: SharedEngine(Arc::clone(&engine)),
         settings: loaded.settings,
         warning: loaded.warning,

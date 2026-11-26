@@ -329,10 +329,7 @@ impl Pack {
     /// Loads the pack in `dir`: its manifest through the checks every pack takes and `kind`'s (a noise model's, or a quality
     /// metric's: `crate::metric`), then `which` of its files read and hashed.
     pub(crate) fn load_kind(dir: &Path, which: Verify, kind: fn(&Manifest) -> Result<(), String>) -> Result<Pack, PackError> {
-        let raw = read_capped(&dir.join("manifest.json"), MAX_MANIFEST)?;
-        let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| PackError(format!("{}: manifest.json: {e}", dir.display())))?;
-        let folder = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        check_files(&manifest, folder).and_then(|()| kind(&manifest)).map_err(|e| PackError(format!("pack {}: {e}", dir.display())))?;
+        let manifest = read_manifest(dir, kind)?;
         let mut model_bytes = None;
         for f in manifest.files.iter().filter(|f| which == Verify::All || f.role != "conformance") {
             let path = safe_parts(&f.path)?.iter().fold(dir.to_path_buf(), |p, part| p.join(part));
@@ -384,6 +381,39 @@ impl Pack {
     }
 }
 
+fn read_manifest(dir: &Path, kind: fn(&Manifest) -> Result<(), String>) -> Result<Manifest, PackError> {
+    let raw = read_capped(&dir.join("manifest.json"), MAX_MANIFEST)?;
+    let manifest = serde_json::from_slice(&raw).map_err(|e| PackError(format!("{}: manifest.json: {e}", dir.display())))?;
+    let folder = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    check_files(&manifest, folder).and_then(|()| kind(&manifest)).map_err(|e| PackError(format!("pack {}: {e}", dir.display())))?;
+    Ok(manifest)
+}
+
+/// Installed noise pack IDs and display names, sorted by ID. Discovery checks the manifest and the runtime files' sizes.
+/// The normal loader verifies the contents when a model is used.
+pub fn noise_pack_names(root: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut names: Vec<_> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let dir = entry.path();
+            let manifest = read_manifest(&dir, check_noise).ok()?;
+            for f in manifest.files.iter().filter(|f| f.role != "conformance") {
+                if regular_file_size(&dir.join(&f.path)).ok()? != f.size? {
+                    return None;
+                }
+            }
+            let name = if manifest.name.trim().is_empty() { manifest.id.clone() } else { manifest.name };
+            Some((manifest.id, name))
+        })
+        .collect();
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    names
+}
+
 /// `models_dir()/<id>`, if it holds a manifest; else how to fetch it.
 pub(crate) fn installed_dir(id: &str) -> Result<PathBuf, PackError> {
     if !is_pack_id(id) {
@@ -397,19 +427,19 @@ pub(crate) fn installed_dir(id: &str) -> Result<PathBuf, PackError> {
     Ok(dir)
 }
 
-/// Reads `path` if it is a regular file (not a link) of at most `cap` bytes.
-fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, PackError> {
+fn regular_file_size(path: &Path) -> Result<u64, PackError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| PackError(format!("{}: {e}", path.display())))?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Err(PackError(format!("{} isn't a regular file", path.display())));
     }
-    if meta.len() > cap.min(MAX_FILE) {
-        return Err(PackError(format!(
-            "{} is {} bytes, more than the {} the manifest allows",
-            path.display(),
-            meta.len(),
-            cap.min(MAX_FILE)
-        )));
+    Ok(meta.len())
+}
+
+/// Reads `path` if it is a regular file (not a link) of at most `cap` bytes.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, PackError> {
+    let size = regular_file_size(path)?;
+    if size > cap.min(MAX_FILE) {
+        return Err(PackError(format!("{} is {size} bytes, more than the {} the manifest allows", path.display(), cap.min(MAX_FILE))));
     }
     std::fs::read(path).map_err(|e| PackError(format!("{}: {e}", path.display())))
 }

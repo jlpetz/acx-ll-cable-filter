@@ -13,6 +13,7 @@
 //!   of changes), through a temporary file that's flushed to the disk and then renamed, so neither a
 //!   crash mid-write nor a power loss after it can truncate or zero it.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nf_engine::{EngineConfig, IoConfig, LatencyMode};
+use nf_engine::{EffectConfig, EngineConfig, GateConfig, GateMode, GatePosition, HighBand, IoConfig, LatencyMode, ProcessingConfig};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
@@ -153,8 +154,8 @@ impl IoSwitch {
 pub(crate) const EXCLUSIVE_FALLBACK: &str =
     "A device that refuses exclusive mode runs in shared mode, and a note at the top says why and how to fix it.";
 
-/// The settings file's version, saved with it: 1 from the automatic model depth on (a file without one is 0).
-pub const SETTINGS_VERSION: u32 = 1;
+/// Version 1 introduced automatic model depth. Version 2 makes a selected gate run independently of the denoiser.
+pub const SETTINGS_VERSION: u32 = 2;
 /// The model depth every window saved before the automatic depth (88d1caa on): the default then, which nothing in the
 /// window sets.
 const OLD_DEFAULT_MODEL_DEPTH: u32 = 2;
@@ -165,6 +166,59 @@ const OLD_DEFAULT_MODEL_DEPTH: u32 = 2;
 pub fn upgrade_engine(version: u32, engine: &mut EngineConfig) {
     if version < 1 && engine.processing.model_depth == OLD_DEFAULT_MODEL_DEPTH {
         engine.processing.model_depth = nf_engine::AUTO_MODEL_DEPTH;
+    }
+    if version < 2 && !engine.processing.noise_enabled {
+        // Previously, switching the noise filter off bypassed its gate too. Preserve the sound of that saved route.
+        engine.processing.gate.mode = GateMode::Off;
+    }
+}
+
+/// The stages that shape the signal. A preset can be applied to a different cable or microphone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PipelinePreset {
+    aec_enabled: bool,
+    noise_enabled: bool,
+    noise_model: String,
+    high_band: HighBand,
+    model_depth: u32,
+    floor_db: f32,
+    gate: GateConfig,
+    gate_position: GatePosition,
+    effect: EffectConfig,
+}
+
+impl PipelinePreset {
+    pub fn capture(engine: &EngineConfig) -> Self {
+        let p = &engine.processing;
+        Self {
+            aec_enabled: p.aec_enabled,
+            noise_enabled: p.noise_enabled,
+            noise_model: p.noise_model.clone(),
+            high_band: p.high_band,
+            model_depth: p.model_depth,
+            floor_db: p.floor_db,
+            gate: p.gate.clone(),
+            gate_position: p.gate_position,
+            effect: engine.effect.clone(),
+        }
+    }
+
+    pub fn apply(self, engine: &mut EngineConfig) {
+        let mut p = ProcessingConfig {
+            aec_enabled: self.aec_enabled,
+            noise_enabled: self.noise_enabled,
+            noise_model: self.noise_model,
+            high_band: self.high_band,
+            model_depth: self.model_depth,
+            floor_db: self.floor_db,
+            gate: self.gate,
+            gate_position: self.gate_position,
+            meters_enabled: engine.processing.meters_enabled,
+            latency_readout_enabled: engine.processing.latency_readout_enabled,
+        };
+        sanitize_processing(&mut p);
+        engine.processing = p;
+        engine.effect = self.effect;
     }
 }
 
@@ -180,11 +234,12 @@ pub(crate) struct Settings {
     /// engine skips that work when they're off, so they live in its config rather than here twice.
     pub engine: EngineConfig,
     pub ui: UiSettings,
+    pub presets: BTreeMap<String, PipelinePreset>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: SETTINGS_VERSION, engine: EngineConfig::default(), ui: UiSettings::default() }
+        Self { version: SETTINGS_VERSION, engine: EngineConfig::default(), ui: UiSettings::default(), presets: BTreeMap::new() }
     }
 }
 
@@ -274,15 +329,7 @@ impl Settings {
     /// on first show. Blank device ids become `None` (the default, or not chosen).
     pub fn sanitize(&mut self) {
         let defaults = Settings::default();
-        let (p, dp) = (&mut self.engine.processing, &defaults.engine.processing);
-        p.floor_db = FLOOR_DB.clamp(p.floor_db, dp.floor_db);
-        let (g, dg) = (&mut p.gate, &dp.gate);
-        g.threshold_db = THRESHOLD_DB.clamp(g.threshold_db, dg.threshold_db);
-        g.auto_margin_db = MARGIN_DB.clamp(g.auto_margin_db, dg.auto_margin_db);
-        g.attack_ms = ATTACK_MS.clamp(g.attack_ms, dg.attack_ms);
-        g.release_ms = RELEASE_MS.clamp(g.release_ms, dg.release_ms);
-        g.hold_ms = HOLD_MS.clamp(g.hold_ms, dg.hold_ms);
-        g.range_db = RANGE_DB.clamp(g.range_db, dg.range_db);
+        sanitize_processing(&mut self.engine.processing);
         let io = &mut self.engine.io;
         io.output_margin_ms = OUTPUT_MARGIN_MS.clamp(io.output_margin_ms, defaults.engine.io.output_margin_ms);
 
@@ -298,6 +345,18 @@ impl Settings {
         ui.window_width = clamp_side(ui.window_width, MIN_WIDTH, DEFAULT_WIDTH);
         ui.window_height = clamp_side(ui.window_height, MIN_HEIGHT, DEFAULT_HEIGHT);
     }
+}
+
+fn sanitize_processing(p: &mut ProcessingConfig) {
+    let dp = ProcessingConfig::default();
+    p.floor_db = FLOOR_DB.clamp(p.floor_db, dp.floor_db);
+    let (g, dg) = (&mut p.gate, &dp.gate);
+    g.threshold_db = THRESHOLD_DB.clamp(g.threshold_db, dg.threshold_db);
+    g.auto_margin_db = MARGIN_DB.clamp(g.auto_margin_db, dg.auto_margin_db);
+    g.attack_ms = ATTACK_MS.clamp(g.attack_ms, dg.attack_ms);
+    g.release_ms = RELEASE_MS.clamp(g.release_ms, dg.release_ms);
+    g.hold_ms = HOLD_MS.clamp(g.hold_ms, dg.hold_ms);
+    g.range_db = RANGE_DB.clamp(g.range_db, dg.range_db);
 }
 
 /// A window side for `client_size`, which asserts finite and > 0: NaN becomes `default`.
@@ -637,6 +696,39 @@ mod tests {
         let json = serde_json::to_vec_pretty(&s).unwrap();
         assert_eq!(parse(&json).unwrap(), s);
         assert_eq!(parse(&serde_json::to_vec(&Settings::default()).unwrap()).unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn an_old_bypassed_gate_stays_off_and_a_new_gate_only_profile_survives() {
+        let gate_in = |v| {
+            let json = format!(r#"{{"version":{v},"engine":{{"processing":{{"noise_enabled":false,"gate":{{"mode":"Auto"}}}}}}}}"#);
+            parse(json.as_bytes()).unwrap().engine.processing.gate.mode
+        };
+        assert_eq!(gate_in(0), GateMode::Off);
+        assert_eq!(gate_in(1), GateMode::Off);
+        assert_eq!(gate_in(2), GateMode::Auto);
+    }
+
+    #[test]
+    fn named_preset_restores_stage_settings_while_preserving_route_and_monitoring() {
+        let mut settings = changed();
+        settings.engine.processing.noise_enabled = false;
+        settings.engine.processing.gate_position = GatePosition::BeforeNoise;
+        settings.engine.effect.path = Some("gain.clap".into());
+        settings.engine.effect.plugin_id = Some("example.gain".to_owned());
+        settings.engine.effect.params.insert(3, 0.25);
+        settings.presets.insert("Quiet studio".to_owned(), PipelinePreset::capture(&settings.engine));
+        let restored = parse(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        let mut destination = EngineConfig::default();
+        destination.devices.output = Some("another speaker".into());
+        destination.processing.latency_readout_enabled = false;
+        let route = destination.devices.clone();
+        let io = destination.io.clone();
+        restored.presets["Quiet studio"].clone().apply(&mut destination);
+        assert_eq!(PipelinePreset::capture(&destination), restored.presets["Quiet studio"]);
+        assert_eq!((destination.devices, destination.io), (route, io));
+        assert!(destination.processing.meters_enabled);
+        assert!(!destination.processing.latency_readout_enabled);
     }
 
     #[test]

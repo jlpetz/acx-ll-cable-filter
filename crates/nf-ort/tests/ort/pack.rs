@@ -10,6 +10,36 @@ use nf_ort::{ModelSession, Pack, SessionOptions};
 
 use crate::common::{self, ID};
 
+#[test]
+fn discovery_reads_manifests_and_sizes_and_leaves_verification_to_load() {
+    let root = common::temp_dir("discovery");
+    let make = |id: &str, role: &str| {
+        let dir = root.join(id);
+        std::fs::create_dir(&dir).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(include_str!("../../../../packs/ulunas/manifest.json")).unwrap();
+        manifest["id"] = id.into();
+        manifest["name"] = "Example noise model".into();
+        manifest["role"]["kind"] = role.into();
+        for f in manifest["files"].as_array_mut().unwrap().iter_mut().filter(|f| f["role"] != "conformance") {
+            f["size"] = 1.into();
+            std::fs::write(dir.join(f["path"].as_str().unwrap()), [0u8]).unwrap();
+        }
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        dir
+    };
+    let first = make("first", "denoise");
+    make("second", "dereverb");
+    make("metric", "metric");
+    let incomplete = make("partial", "denoise");
+    std::fs::remove_file(incomplete.join("LICENSE")).unwrap();
+    assert_eq!(nf_ort::pack::noise_pack_names(&root), vec![
+        ("first".into(), "Example noise model".into()),
+        ("second".into(), "Example noise model".into())
+    ]);
+    assert!(Pack::load(&first).unwrap_err().0.contains("SHA-256"), "full loads still verify weights");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// The fetched pack's folder copied to `dir/<id>` (so the folder is named by the id), with `edit` applied to its
 /// manifest's JSON and `bytes` to its model file.
 fn copy(pack: &Pack, dir: &Path, edit: impl FnOnce(&mut serde_json::Value), bytes: impl FnOnce(&mut Vec<u8>)) -> std::path::PathBuf {

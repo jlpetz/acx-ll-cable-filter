@@ -22,6 +22,19 @@ can specify 1–4 blocks explicitly. An ordinary offline WAV render defaults to 
 When the processed block misses its deadline, the app plays the dry audio from the same instant. Removing the effect
 removes the host delay. Built-in stage export and hosting multiple external effects remain open.
 
+### Processing controls and reusable chains
+
+The settings window keeps a stage's on/off control separate from its implementation. RNNoise is built in. A build with model-pack
+support lists installed denoisers, and AEC currently has one implementation, WebRTC AEC3. The gate runs independently and can sit
+before echo cancellation, before noise reduction, after noise reduction or after the external effect. Its speech hold requires an
+upstream model that supplies a time-aligned speech probability.
+
+A named processing preset captures these choices and the selected external plugin's identity, bypass and parameter values. It can
+be loaded onto another route while keeping that route's devices, access mode and meters. The owner's requested general stage
+list still needs multiple effect instances and arbitrary ordering. For that editor, we propose a bypass control per row, an
+implementation picker where there is a choice, and a labelled Settings control on rows that expose parameters. An ordered preset
+will need an instance ID for each stage so two instances of the same EQ can save different settings.
+
 On the dev VM, an independently built [Clack Gain](https://github.com/prokopyl/clack/tree/27ca283/plugin/examples/gain)
 at quarter gain produced the expected 48,517 samples in an aligned offline WAV. With the same effect feeding cable A
 directly, the recorder measured −12.04 dB against the source over seven seconds. All 616,320 delay-aligned samples

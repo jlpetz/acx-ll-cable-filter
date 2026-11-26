@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use nf_core::config::{
-    AUTO_MODEL_DEPTH, BURSTY_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EffectConfig, EngineConfig, GateConfig, GateMode, HighBand,
-    IoConfig, MAX_MODEL_DEPTH, MicDelivery, OutputBackend, ProcessingConfig, STEADY_MODEL_DEPTH, is_model_id,
+    AUTO_MODEL_DEPTH, BURSTY_MODEL_DEPTH, DEFAULT_NOISE_MODEL, DeviceSelection, EffectConfig, EngineConfig, GateConfig, GateMode,
+    GatePosition, HighBand, IoConfig, MAX_MODEL_DEPTH, MicDelivery, OutputBackend, ProcessingConfig, STEADY_MODEL_DEPTH, is_model_id,
 };
 pub use nf_core::controls::{ChainParams, GateParams};
 pub use nf_core::telemetry::{
@@ -113,8 +113,10 @@ pub struct EngineStatus {
     /// a stream asked for in exclusive mode (the default) that runs shared: which, why, what it costs and how to fix it or
     /// stop it trying. Empty when all runs as asked. The window shows them calmer than the warnings, `run` as "note:".
     pub notes: Vec<String>,
-    /// Stopped by a fault but armed: the engine retries by itself (timed backoff and device events).
+    /// Stopped by a fault but armed: the engine can restart on settings or device changes.
     pub retrying: bool,
+    /// Waiting specifically for a settings or device change. Otherwise an armed engine also retries on a timer.
+    pub waiting_for_change: bool,
     /// What the user can do about the error in `message`, when the app can take them there.
     pub remedy: Option<Remedy>,
     /// The depth a model pack's inference worker runs at in this run, and how it was chosen (`None`: RNNoise, or stopped).

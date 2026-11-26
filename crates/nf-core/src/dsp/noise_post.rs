@@ -12,17 +12,17 @@
 //!   Return a `StageReport` with `speech_probability` and `gain_reduction_db` = what actually left
 //!   the stage against what went in: `rms_db(output) - rms_db(dry_aligned)`, measured after the
 //!   floor mix and the gate, so the floor's cap and the gate's gain are both in it. Clamped to
-//!   [-120, 0]; silence on both sides, output above input, or a NaN level reads as 0 dB.
+//!   [-120, 0]. An input below the measurement floor or an invalid level has no measurable ratio (NaN).
 //! - `reset()` clears all three.
 
 use crate::chain::MAX_STAGE_LATENCY;
 use crate::controls::NoiseControls;
 use crate::dsp::delay::DelayLine;
 use crate::dsp::gate::Gate;
-use crate::dsp::meter::mean_square;
+use crate::dsp::meter::{METER_FLOOR, mean_square};
 use crate::dsp::mix::FloorMix;
 use crate::stage::StageReport;
-use crate::{BLOCK, Block, lin_to_db};
+use crate::{BLOCK, Block};
 
 /// Floor mix plus gate, after a noise model.
 #[derive(Clone, Debug)]
@@ -30,7 +30,8 @@ pub struct NoisePost {
     /// Delays the stage input by the model's latency, so dry lines up with the model's output.
     delay: DelayLine,
     mix: FloorMix,
-    gate: Gate,
+    /// A standalone noise stage owns its gate. The app takes this gate into the chain during composition.
+    gate: Option<Gate>,
     dry_aligned: Box<Block>,
 }
 
@@ -41,7 +42,7 @@ impl NoisePost {
         Self {
             delay: DelayLine::new(latency.max(MAX_STAGE_LATENCY), latency),
             mix: FloorMix::new(),
-            gate: Gate::new(),
+            gate: Some(Gate::new()),
             dry_aligned: Box::new([0.0; BLOCK]),
         }
     }
@@ -49,21 +50,37 @@ impl NoisePost {
     /// `dry`: this block's stage input. `wet`: the model's output, modified in place.
     pub fn process(&mut self, dry: &Block, wet: &mut Block, controls: &NoiseControls, speech_probability: f32) -> StageReport {
         self.delay.process(dry, &mut self.dry_aligned);
-        let dry_db = lin_to_db(mean_square(&self.dry_aligned).sqrt());
+        let dry_power = mean_square(&self.dry_aligned);
         self.mix.process(&self.dry_aligned, wet, controls.floor_db.load());
-        self.gate.process(wet, &controls.gate.load(), speech_probability);
-        // Measured on the output, so the gate's gain is already in it. Silence on both sides reads
-        // as no reduction (-200 - -200); output above input, or a NaN level, reads as 0 dB.
-        let out = lin_to_db(mean_square(wet).sqrt()) - dry_db;
-        let reduction = if out < 0.0 { out.max(-120.0) } else { 0.0 };
+        if let Some(gate) = &mut self.gate {
+            gate.process(wet, &controls.gate.load(), speech_probability);
+        }
+        // The ratio is unreliable once the aligned dry input drops below the meter range. A closed gate attenuating
+        // only the engine's mic dither would otherwise show a changing reduction throughout digital silence.
+        let reduction = reduction_db(dry_power, mean_square(wet));
         StageReport { speech_probability, gain_reduction_db: reduction }
+    }
+
+    pub(crate) fn take_gate(&mut self) -> Option<Gate> {
+        self.gate.take()
     }
 
     pub fn reset(&mut self) {
         self.delay.reset();
         self.mix.reset();
-        self.gate.reset();
+        if let Some(gate) = &mut self.gate {
+            gate.reset();
+        }
         self.dry_aligned.fill(0.0);
+    }
+}
+
+/// The measured attenuation of a block, including any gain ramps within it.
+pub(crate) fn reduction_db(dry_power: f32, wet_power: f32) -> f32 {
+    if dry_power > METER_FLOOR * METER_FLOOR && dry_power.is_finite() && wet_power.is_finite() {
+        (10.0 * (wet_power / dry_power).log10()).clamp(-120.0, 0.0)
+    } else {
+        f32::NAN
     }
 }
 
@@ -189,6 +206,7 @@ mod tests {
         let mut wet = [0.0f32; BLOCK];
         let r = post.process(&x, &mut wet, &c.noise, f32::NAN);
         assert_eq!(r.gain_reduction_db, -120.0);
+        assert_eq!(reduction_db(1e-10, 0.0), -120.0, "full suppression of a measurable -100 dBFS signal");
         // The same silent model output with a -10 dB floor: the floor caps it at -10 dB (review
         // DSP-2: the old estimate said -120 here, and the GUI showed "-inf").
         let c10 = controls(-10.0, GateConfig::default());
@@ -196,17 +214,35 @@ mod tests {
         let mut wet = [0.0f32; BLOCK];
         let r = post.process(&x, &mut wet, &c10.noise, f32::NAN);
         assert!((r.gain_reduction_db - -10.0).abs() < 0.01, "{}", r.gain_reduction_db);
-        // Silence in, silence out: no reduction; a NaN in the signal: 0 dB, not NaN.
+        // No ratio can be measured on silence or invalid samples.
         let mut post = NoisePost::new(0);
-        assert_eq!(post.process(&[0.0; BLOCK], &mut [0.0; BLOCK], &c.noise, f32::NAN).gain_reduction_db, 0.0);
+        assert!(post.process(&[0.0; BLOCK], &mut [0.0; BLOCK], &c.noise, f32::NAN).gain_reduction_db.is_nan());
         let mut wet = x;
         wet[3] = f32::NAN;
-        assert_eq!(post.process(&x, &mut wet, &c.noise, f32::NAN).gain_reduction_db, 0.0);
+        assert!(post.process(&x, &mut wet, &c.noise, f32::NAN).gain_reduction_db.is_nan());
         // Model louder than its input: reads as no reduction, never a gain.
         let c = controls(-200.0, GateConfig::default());
         let mut post = NoisePost::new(0);
         let mut wet = x.map(|v| v * 2.0);
         assert_eq!(post.process(&x, &mut wet, &c.noise, f32::NAN).gain_reduction_db, 0.0);
+    }
+
+    #[test]
+    fn reduction_uses_the_aligned_input_and_ignores_dither_even_while_the_gate_is_active() {
+        let dither: Block = std::array::from_fn(|i| if i % 2 == 0 { 1e-9 } else { -1e-9 });
+        let quiet = [1e-5; BLOCK]; // A real -100 dBFS input is inside the numerical metering range.
+        for mode in [GateMode::Off, GateMode::Static, GateMode::Auto] {
+            let c = controls(-200.0, GateConfig { mode, ..GateConfig::default() });
+            let mut post = NoisePost::new(BLOCK as u32);
+            let mut wet = dither;
+            assert!(post.process(&dither, &mut wet, &c.noise, 0.0).gain_reduction_db.is_nan());
+            let mut wet = dither;
+            assert!(post.process(&quiet, &mut wet, &c.noise, 0.0).gain_reduction_db.is_nan());
+            let mut wet = quiet.map(|x| x * 0.1);
+            assert!(post.process(&dither, &mut wet, &c.noise, 0.0).gain_reduction_db <= -19.9);
+            let mut wet = dither;
+            assert!(post.process(&dither, &mut wet, &c.noise, 0.0).gain_reduction_db.is_nan());
+        }
     }
 
     #[test]

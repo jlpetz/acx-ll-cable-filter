@@ -18,12 +18,15 @@ masks, so the approach depends on the model:
 - **Floor:** static (the user sets a threshold), or auto (track the noise floor; tunable rise and
   fall rates).
 - **Envelope:** attack/release and hold, no lookahead, so no added latency.
-- The gate measures the level after the dry signal is mixed into the denoised audio, before the effects (TODO 17).
-  A model's speech probability can also hold the gate open. A third-party denoiser without that signal can use the
-  level detector alone. By default the gate is off.
-- For the effects host (TODO 17), we propose reusing this gate when denoising is off. A gate-only chain can use
-  the level detector directly. With denoising on, apply the gate once and preserve the existing settings.
-  Try quiet word endings and pauses with AGC2 both on and off to hear whether the gain brings room noise back up.
+- The gate is off by default. Its default position is after the denoiser's floor mix and before the external effect.
+  It can also run on its own, before AEC, before denoising, or after the effect. It measures the level at its selected position.
+  Speech detection can hold it open where the upstream denoiser supplies a probability aligned to the same block.
+- Try quiet word endings and pauses with AGC2 both on and off to hear whether the gain brings room noise back up.
+
+Settings saved by an older window keep their old sound. If the denoiser used to be off, its gate was bypassed too.
+Gate-only processing is explicit in a new bare engine JSON config with e.g. `"gate_position":"AfterNoise"` alongside
+`"noise_enabled":false` and `"gate":{"mode":"Static"}` inside `processing`. Old unversioned chain recordings omitted
+that position. The CLI also accepts `--no-ns --gate static` to request a gate-only render.
 
 ## Input level meter (owner's request)
 - **What it shows:**

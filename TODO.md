@@ -127,12 +127,12 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 11. [dsp] Noise floor and gate
-**Priority**: Medium (phase 1) | **Status**: built in v0 (`NoisePost`: floor mix + gate); gate redesigned 2026-10-26.
+**Priority**: Medium (phase 1) | **Status**: the app has a model attenuation floor and an independent gate. The gate can run alone or at any of the four boundaries around AEC, noise reduction and the external effect.
 - Floor = maximum attenuation: mix delay-matched dry signal into the model's output, in the same frames, with no added latency. It also hides model artifacts.
-- Gate: static or auto threshold, hold, linear-in-dB attack/release, no lookahead. Auto follows a smoothed level of the model's output.
+- Gate: static or auto threshold, hold, linear-in-dB attack/release, no lookahead. Auto follows the signal at the selected position.
 - Our call (2026-10-26, not the owner's): "hold open on speech (VAD)" defaults to off. RNNoise's VAD fires on 87-100% of pure-noise blocks, which held the Auto gate open.
 - Open: at the default 6 dB margin, RNNoise's residual bursts sometimes open the gate (9-12 dB measured better, speech effect at those margins not measured); some gaps take 0.7-2 s to close after a talk spurt.
-**Next**: tune the margin and rise rates on real recordings in the Lab (#14). Evaluate using the existing gate on its own with denoising off (#17).
+**Next**: tune the margin and rise rates on real recordings in the Lab (#14).
 **Detail**: `doc/todo/11-floor-gate-meter.md`
 
 ---
@@ -170,9 +170,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 15. [gui] Settings window (Reactor)
 **Priority**: High for v0.1 | **Status**: settings window implemented. Stopped and running acceptance passed on the virtual dev box.
-- The window selects the mic, echo reference and output route, starts and stops the filter, controls AEC, RNNoise and the gate, and shows meters and latency. It loads a CLAP effect with bypass and parameter controls.
+- The window selects the mic, echo reference and output route. It controls AEC, the noise model, gate position and one CLAP effect, shows meters and latency, and saves named processing presets independently of the route.
 - Settings survive close and reopen. Minimise keeps the process alive. Closing stops the engine. The tray and background engine are TODO 16.
-**Next**: verify the standard-user grant and physical Windows 11 experience. The later model-pack picker and quality Lab page have separate scope.
+**Next**: verify the standard-user grant and physical Windows 11 experience. The quality Lab page remains open.
 **Detail**: `doc/todo/15-gui-tray.md`
 
 ---
@@ -187,13 +187,13 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 
 ### 17. [plugins] Stage format: CLAP for effects, the AEC and the noise filter (owner)
 **Priority**: Medium (shapes phase 0) | **Status**: CLAP chosen for plugins (owner, 2026-10-26); the AEC and the noise filter are CLAP-shaped stages too (owner, 2026-11-02: "the best and most modern alt to VST3"). The stage interface built 2026-11-02 (68b25ef): descriptors, ports (the AEC's reference on a non-main input), activation, params, state and typed extensions, in-process Rust; AEC3 and the noise stage on it.
-- Every stage is CLAP-shaped. The AEC takes the mic on its main input and the speaker reference on a second input port (CLAP allows one main input plus non-main ones, the sidechain convention). The noise filter is a stage that loads model packs (#3), with the floor and gate inside it and a namespaced extension publishing its speech probability. Effects (a voice changer) come after.
+- AEC takes the mic on its main input and the speaker reference on a second input. The noise stage loads its model (#3), applies the attenuation floor and publishes speech probability. The app's independent gate can use that probability after the denoiser.
 - Our own stages run in-process through the same Rust interface (no FFI). They can also be exported as `.clap` files (and VST3 via clap-wrapper) for other hosts. Third-party plugins run in an fx-host process (shared memory, a watchdog that passes clean audio through on a miss, editors as its own windows).
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
 - EQ, voice changers and automatic gain control are in scope (owner, 2026-11-20). Evaluate Sonora AGC2 as an optional app effect that can run with AEC and denoising off.
 - Exact mute (not built; detail, "Exact mute"): an end stage writing exact zeros, the owner's (agreed 2026-11-22, for later; TODO 10); as an explicit output guarantee, triggered once the mic as captured has been exact zeros for longer than the chain's latency plus a tail, ours (2026-11-23, the owner's to confirm). The filters don't get there alone: with the far end playing, AEC3 puts out -75 to -89 dBFS from a silent mic, and no gate after AEC3 brings that to 24-bit zero.
 - The app hosts one external `.clap` after the built-ins. A restricted worker processes the audio, the GUI edits its parameters and bypass, and offline WAV rendering uses the same effect. An independent gain plugin exercises the public ABI.
-**Next**: test additional third-party effects against the host profile; recheck CLAP's headers before exporting the built-in stages.
+**Next**: test more third-party effects. Extend named presets and the GUI to an ordered stage list with per-instance parameters and bypass. Recheck CLAP's headers before exporting the built-in stages.
 **Detail**: `doc/todo/17-post-effects.md`
 
 ---

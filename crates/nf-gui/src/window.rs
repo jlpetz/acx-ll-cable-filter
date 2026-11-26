@@ -14,6 +14,7 @@
 //! - **Two InfoBars.** The notice (errors and results; a fault that stops a run, once per fault)
 //!   and, under it, the engine's warnings while it runs, which closes by itself when they clear.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +39,10 @@ use crate::widgets::{
 use crate::{SharedEngine, format, screen, waiting};
 
 mod effect;
+mod presets;
+
+use nf_engine::GatePosition;
+use presets::{PresetAction, PresetPicker};
 
 /// The status waiter's period: the status line and the diagnostics change slowly.
 const STATUS_TICK: Duration = Duration::from_millis(500);
@@ -47,6 +52,12 @@ const TEST_TICK: Duration = Duration::from_millis(200);
 const NOT_RUN: &str = "The window was too busy to start that. Try again.";
 
 const GATE_MODES: [&str; 3] = ["Off", "Static", "Auto"];
+const GATE_POSITIONS: [(GatePosition, &str); 4] = [
+    (GatePosition::BeforeAec, "Before echo cancellation"),
+    (GatePosition::BeforeNoise, "Before noise reduction"),
+    (GatePosition::AfterNoise, "After noise reduction"),
+    (GatePosition::AfterEffect, "After the external effect"),
+];
 
 fn gate_index(mode: GateMode) -> usize {
     match mode {
@@ -65,9 +76,19 @@ fn gate_mode(index: usize) -> Option<GateMode> {
     }
 }
 
+/// A single available model needs a picker only when the saved selection is unavailable.
+/// Keeping that selection empty leaves its ID visible in the placeholder and lets the user choose a replacement.
+fn model_selection(models: &[(String, String)], saved: &str) -> (bool, Option<usize>) {
+    let selected = models.iter().position(|(id, _)| id == saved);
+    (models.len() != 1 || selected.is_none(), selected)
+}
+
 /// What [`crate::run`] hands the window.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Start {
+    /// Offline component tests inject an empty device list instead of enumerating this machine.
+    #[cfg(test)]
+    pub isolated: bool,
     pub engine: SharedEngine,
     pub settings: Settings,
     /// Why the settings are the defaults (an unreadable file), for the InfoBar.
@@ -96,7 +117,7 @@ pub(crate) enum Msg {
     Feed(Box<Feed>),
     Started(Result<(), EngineError>),
     Stopped,
-    Devices(Result<Vec<DeviceInfo>, EngineError>),
+    Devices(Result<Vec<DeviceInfo>, EngineError>, Option<Vec<(String, String)>>),
     TestStarted(Result<LatencyTest, EngineError>),
     LargePages(Result<u32, String>),
     AllowDriver,
@@ -110,9 +131,16 @@ pub(crate) enum Msg {
     Reference(Option<usize>),
     // Processing
     Noise(bool),
+    NoiseModel {
+        catalog: u64,
+        index: Option<usize>,
+    },
     Aec(bool),
     Floor(f64),
     GateMode(Option<usize>),
+    GatePosition(Option<usize>),
+    GateSettingsExpanded(bool),
+    Preset(PresetAction),
     Threshold(f64),
     Margin(f64),
     Attack(f64),
@@ -134,6 +162,7 @@ pub(crate) enum Msg {
     ShowMeters(bool),
     ShowReadout(bool),
     // Latency test
+    TestExpanded(bool),
     TestMode(Option<usize>),
     Probe(Option<usize>),
     Capture(Option<usize>),
@@ -141,6 +170,7 @@ pub(crate) enum Msg {
     /// Run, or cancel the running test.
     RunTest,
     // Diagnostics
+    DiagnosticsExpanded(bool),
     /// One of the I/O switches (the latency options, and the streams' others).
     Io(IoSwitch, bool),
     OutputMargin(f64),
@@ -181,14 +211,11 @@ fn stops(status: &EngineStatus) -> bool {
     matches!(status.state, EngineState::Running | EngineState::Starting) || status.retrying
 }
 
-/// Brings runtime faults to the InfoBar (gui/F10): a run stopped by a fault (a device unplugged, a
-/// stream invalidated) is otherwise only the status line's secondary text. Raised once per fault,
-/// not again for each failed retry or after the user closed it, and cleared when the engine runs
-/// again.
+/// Shows each distinct fault once, even across retries and notice dismissals. Clears on recovery.
 #[derive(Debug, Default)]
 struct FaultWatch {
     /// The current fault has its notice (or a start error is showing for it).
-    raised: bool,
+    raised: Option<String>,
 }
 
 impl FaultWatch {
@@ -196,25 +223,26 @@ impl FaultWatch {
     fn observe(&mut self, status: &EngineStatus, job: Option<Job>, notice: &mut Option<Notice>) {
         let faulted = status.state == EngineState::Error || (status.state == EngineState::Stopped && status.retrying);
         if status.state == EngineState::Running {
-            self.raised = false;
+            self.raised = None;
             // Recovered: by itself (a retry), or by a start
             if notice.as_ref().is_some_and(|n| n.about_run) {
                 *notice = None;
             }
         } else if faulted {
-            if job.is_none() && !self.raised {
-                self.raised = true;
+            let reason = status.message.as_deref().unwrap_or_default();
+            if job.is_none() && self.raised.as_deref() != Some(reason) {
+                self.raised = Some(reason.to_owned());
                 *notice = Some(Notice::about_run("The filter stopped", format::fault(status)));
             }
         } else if status.state == EngineState::Stopped {
             // Stopped for good (the user's stop): the next fault is a new one
-            self.raised = false;
+            self.raised = None;
         }
     }
 
     /// A start failed and its error is showing: the fault it leaves isn't raised again.
-    fn start_failed(&mut self) {
-        self.raised = true;
+    fn start_failed(&mut self, reason: &str) {
+        self.raised = Some(reason.to_owned());
     }
 }
 
@@ -423,6 +451,8 @@ pub(crate) struct Window {
     status: EngineStatus,
     effect: Option<EffectInfo>,
     choosing_effect: bool,
+    preset_picker: PresetPicker,
+    gate_settings_expanded: bool,
     job: Option<Job>,
     faults: FaultWatch,
     warnings: WarningsBar,
@@ -430,7 +460,12 @@ pub(crate) struct Window {
     devices: Option<Vec<DeviceInfo>>,
     refreshing: bool,
     choices: Choices,
+    /// Model IDs and display names, loaded with the devices at startup or on an explicit refresh.
+    noise_models: Vec<(String, String)>,
+    noise_models_key: u64,
     test: TestPanel,
+    test_expanded: bool,
+    diagnostics_expanded: bool,
     elevating: bool,
     granting_driver: bool,
     elevated: bool,
@@ -503,8 +538,8 @@ impl Window {
         }
         self.refreshing = true;
         context.spawn_background_with_rejection(
-            |_| Msg::Devices(nf_engine::list_devices()),
-            Msg::Devices(Err(EngineError(NOT_RUN.to_owned()))),
+            |_| Msg::Devices(nf_engine::list_devices(), Some(nf_engine::models::available_noise_models())),
+            Msg::Devices(Err(EngineError(NOT_RUN.to_owned())), None),
         );
     }
 
@@ -575,6 +610,7 @@ impl Window {
 
     fn started(&mut self, result: Result<(), EngineError>) {
         self.job = None;
+        let status = self.engine.status();
         match result {
             Ok(()) => {
                 if self.notice.as_ref().is_some_and(|n| n.about_run) {
@@ -582,11 +618,12 @@ impl Window {
                 }
             }
             Err(e) => {
-                self.notice = Some(Notice::about_run("Couldn't start", e.0));
-                self.faults.start_failed();
+                self.faults.start_failed(&e.0);
+                let message = format::start_error(&status, e.0);
+                self.notice = Some(Notice::about_run("Couldn't start", message));
             }
         }
-        self.take_status(self.engine.status());
+        self.take_status(status);
     }
 
     /// The user's stop has finished.
@@ -719,13 +756,19 @@ impl Component for Window {
             status,
             effect: None,
             choosing_effect: false,
+            preset_picker: PresetPicker::default(),
+            gate_settings_expanded: false,
             job: None,
             faults: FaultWatch::default(),
             warnings: WarningsBar::default(),
             devices: None,
             refreshing: false,
             choices: Choices::default(),
+            noise_models: Vec::new(),
+            noise_models_key: 0,
             test: TestPanel::default(),
+            test_expanded: false,
+            diagnostics_expanded: false,
             elevating: false,
             granting_driver: false,
             elevated: nf_mem::privilege::is_elevated(),
@@ -733,6 +776,11 @@ impl Component for Window {
             notice: start.warning.clone().map(|w| Notice::new(InfoBarSeverity::Warning, "Settings reset", w)),
             feed: None,
         };
+        #[cfg(test)]
+        if start.isolated {
+            window.devices_listed(Ok(Vec::new()));
+            return window;
+        }
         window.refresh_devices(context);
         window.ensure_feed(context);
         window
@@ -743,7 +791,15 @@ impl Component for Window {
             Msg::Feed(feed) => self.take_feed(*feed),
             Msg::Started(result) => self.started(result),
             Msg::Stopped => self.stopped(),
-            Msg::Devices(result) => self.devices_listed(result),
+            Msg::Devices(result, models) => {
+                if let Some(models) = models {
+                    let mut hasher = DefaultHasher::new();
+                    models.hash(&mut hasher);
+                    self.noise_models_key = hasher.finish();
+                    self.noise_models = models;
+                }
+                self.devices_listed(result);
+            }
             Msg::TestStarted(result) => self.test.started(result),
             Msg::LargePages(result) => self.large_pages_done(result),
             Msg::AllowDriver if !self.granting_driver => {
@@ -791,6 +847,13 @@ impl Component for Window {
                 }
             }
             Msg::Noise(on) => self.configure(|c| c.processing.noise_enabled = on),
+            Msg::NoiseModel { catalog, index } if catalog == self.noise_models_key && !self.test.busy() => {
+                if let Some((id, _)) = index.and_then(|i| self.noise_models.get(i)) {
+                    let id = id.clone();
+                    self.configure(|c| c.processing.noise_model = id);
+                }
+            }
+            Msg::NoiseModel { .. } => {}
             Msg::Aec(on) => self.configure(|c| c.processing.aec_enabled = on),
             Msg::Floor(v) => self.configure(|c| c.processing.floor_db = FLOOR_DB.clamp(v as f32, c.processing.floor_db)),
             Msg::GateMode(index) => {
@@ -798,6 +861,13 @@ impl Component for Window {
                     self.configure(|c| c.processing.gate.mode = mode);
                 }
             }
+            Msg::GatePosition(index) => {
+                if let Some(&(position, _)) = index.and_then(|i| GATE_POSITIONS.get(i)) {
+                    self.configure(|c| c.processing.gate_position = position);
+                }
+            }
+            Msg::Preset(action) => self.edit_preset(action),
+            Msg::GateSettingsExpanded(open) => self.gate_settings_expanded = open,
             Msg::Threshold(v) => self.configure(|c| {
                 let g = &mut c.processing.gate;
                 g.threshold_db = THRESHOLD_DB.clamp(v as f32, g.threshold_db);
@@ -839,6 +909,7 @@ impl Component for Window {
             Msg::EffectParam { path, plugin_id, id, value } => self.set_effect_param(&path, &plugin_id, id, value),
             Msg::ShowMeters(on) => self.configure(|c| c.processing.meters_enabled = on),
             Msg::ShowReadout(on) => self.configure(|c| c.processing.latency_readout_enabled = on),
+            Msg::TestExpanded(open) => self.test_expanded = open,
             Msg::TestMode(index) => {
                 if let Some(mode) = index.and_then(TestMode::from_index) {
                     self.settings.ui.test_mode = mode;
@@ -866,6 +937,7 @@ impl Component for Window {
             }
             Msg::Repetitions(_) => {}
             Msg::RunTest => self.run_or_cancel_test(context),
+            Msg::DiagnosticsExpanded(open) => self.diagnostics_expanded = open,
             Msg::Io(switch, on) => self.configure(|c| switch.set(&mut c.io, on)),
             Msg::OutputMargin(v) => self.configure(|c| c.io.output_margin_ms = OUTPUT_MARGIN_MS.clamp(v as f32, c.io.output_margin_ms)),
             Msg::EnableLargePages => self.enable_large_pages(context),
@@ -909,6 +981,7 @@ impl Component for Window {
                 self.devices_card(context),
                 self.processing_card(context),
                 self.effect_card(context),
+                self.presets_section(context),
                 View::component::<Live>(self.live_input(context)),
                 self.test_section(context),
                 self.diagnostics_section(context),
@@ -918,6 +991,9 @@ impl Component for Window {
 }
 
 // ---- view pieces ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod interaction_tests;
 
 impl Window {
     fn header(&self, context: &ViewContext<Self>) -> View {
@@ -932,7 +1008,7 @@ impl Window {
             StackPanel::new().grid_column(0).spacing(2.0).children((
                 TextBlock::new().text("noise-filter").font_size(28.0).font_weight(FontWeight::SEMI_BOLD),
                 secondary(status),
-                if stops(&self.status) {
+                if self.status.state == EngineState::Running {
                     secondary("Minimize to keep filtering. Closing the window stops the filter.").into()
                 } else {
                     View::empty()
@@ -1048,18 +1124,46 @@ impl Window {
                 Button::new().is_enabled(!self.refreshing).on_click(context.callback(|()| Msg::Refresh)).content(if self.refreshing {
                     "Refreshing…"
                 } else {
-                    "Refresh devices"
+                    "Refresh devices and models"
                 }),
             )),
         )
+    }
+
+    fn noise_controls(&self, context: &ViewContext<Self>) -> View {
+        let p = &self.settings.engine.processing;
+        let toggle = CheckBox::new().is_checked(p.noise_enabled).on_is_checked_changed(context.callback(Msg::Noise));
+        let (show_picker, selected) = model_selection(&self.noise_models, &p.noise_model);
+        if !show_picker {
+            return toggle.content(format!("Noise reduction ({})", self.noise_models[0].1));
+        }
+        let placeholder = if self.noise_models.is_empty() && self.refreshing {
+            "Loading noise models…".to_owned()
+        } else {
+            format!("Unavailable: {}", p.noise_model)
+        };
+        let catalog = self.noise_models_key;
+        let picker = ComboBox::new()
+            .items_source(self.noise_models.iter().map(|(_, name)| name.as_str()))
+            .selected_index(selected)
+            .placeholder_text(placeholder)
+            .is_enabled(!self.noise_models.is_empty() && !self.test.busy())
+            .on_selection_changed(context.callback(move |index| Msg::NoiseModel { catalog, index }))
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .slot(ComboBoxSlot::Header, "Noise reduction model");
+        // A different item list must mount a fresh native ComboBox so its items are set before its selection.
+        StackPanel::new().spacing(4.0).children((toggle.content("Noise reduction"), View::keyed_fragment([(catalog, picker)])))
     }
 
     fn processing_card(&self, context: &ViewContext<Self>) -> View {
         let p = &self.settings.engine.processing;
         let g = &p.gate;
         let noise = p.noise_enabled;
-        // The gate ends the noise stage: with the filter off it's bypassed too
-        let gate_on = noise && g.mode != GateMode::Off;
+        let gate_on = g.mode != GateMode::Off;
+        let position = GATE_POSITIONS.iter().position(|&(pos, _)| pos == p.gate_position).unwrap_or(2);
+        let aligned_vad = noise
+            && (p.gate_position == GatePosition::AfterNoise
+                || (p.gate_position == GatePosition::AfterEffect && self.settings.engine.effect.path.is_none()));
         // Keyed by mode: each mode gets its own native slider, so switching ranges can't make WinUI
         // coerce one mode's value into the other's range.
         let level = match g.mode {
@@ -1084,40 +1188,39 @@ impl Window {
                 ),
             ),
         };
-        let bypassed: View =
-            if noise { View::empty() } else { secondary("The noise filter is off: suppression and the gate are bypassed.").into() };
+        let gate_settings = StackPanel::new().spacing(8.0).children((
+            combo("Position in pipeline", &GATE_POSITIONS.map(|(_, label)| label), position, gate_on, context.callback(Msg::GatePosition)),
+            View::keyed_fragment([level]),
+            slider(format::labelled("Attack", g.attack_ms, 1, "ms"), ATTACK_MS, g.attack_ms, gate_on, context.callback(Msg::Attack)),
+            slider(format::labelled("Release", g.release_ms, 0, "ms"), RELEASE_MS, g.release_ms, gate_on, context.callback(Msg::Release)),
+            slider(format::labelled("Hold", g.hold_ms, 0, "ms"), HOLD_MS, g.hold_ms, gate_on, context.callback(Msg::Hold)),
+            slider(format::labelled("Range (dB)", g.range_db, 0, ""), RANGE_DB, g.range_db, gate_on, context.callback(Msg::Range)),
+            CheckBox::new()
+                .is_checked(g.use_vad)
+                .is_enabled(gate_on && aligned_vad)
+                .on_is_checked_changed(context.callback(Msg::Vad))
+                .content("Hold open on speech (when the noise model supplies VAD)")
+                .tooltip("Uses speech detection only where the noise model and the gate see the same audio block."),
+        ));
         card(
             "Processing",
             None,
             StackPanel::new().spacing(10.0).children((
-                CheckBox::new().is_checked(noise).on_is_checked_changed(context.callback(Msg::Noise)).content("Noise filter (RNNoise)"),
                 StackPanel::new().children((
                     CheckBox::new()
                         .is_checked(p.aec_enabled)
                         .on_is_checked_changed(context.callback(Msg::Aec))
-                        .content("Echo cancellation (using speakers)"),
+                        .content("Echo cancellation (WebRTC AEC3)"),
                     secondary("Leave off with headphones.").margin(Thickness::new(28.0, 0.0, 0.0, 0.0)),
                 )),
-                bypassed,
+                self.noise_controls(context),
                 slider(format::suppression(p.floor_db), FLOOR_DB, p.floor_db, noise, context.callback(Msg::Floor)),
-                TextBlock::new().text("Gate").font_weight(FontWeight::SEMI_BOLD).margin(Thickness::new(0.0, 6.0, 0.0, 0.0)),
-                combo("Mode", &GATE_MODES, gate_index(g.mode), noise, context.callback(Msg::GateMode)),
-                View::keyed_fragment([level]),
-                slider(format::labelled("Attack", g.attack_ms, 1, "ms"), ATTACK_MS, g.attack_ms, gate_on, context.callback(Msg::Attack)),
-                slider(
-                    format::labelled("Release", g.release_ms, 0, "ms"),
-                    RELEASE_MS,
-                    g.release_ms,
-                    gate_on,
-                    context.callback(Msg::Release),
-                ),
-                slider(format::labelled("Hold", g.hold_ms, 0, "ms"), HOLD_MS, g.hold_ms, gate_on, context.callback(Msg::Hold)),
-                slider(format::labelled("Range (dB)", g.range_db, 0, ""), RANGE_DB, g.range_db, gate_on, context.callback(Msg::Range)),
-                CheckBox::new()
-                    .is_checked(g.use_vad)
-                    .is_enabled(gate_on)
-                    .on_is_checked_changed(context.callback(Msg::Vad))
-                    .content("Hold open on speech (VAD)"),
+                combo("Noise gate", &GATE_MODES, gate_index(g.mode), true, context.callback(Msg::GateMode)),
+                Expander::new()
+                    .is_expanded(self.gate_settings_expanded)
+                    .on_is_expanded_changed(context.callback(Msg::GateSettingsExpanded))
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .slots([SlotView::new(ExpanderSlot::Header, "Gate settings"), SlotView::new(ExpanderSlot::Content, gate_settings)]),
             )),
         )
     }
@@ -1203,6 +1306,8 @@ impl Window {
             self.test_outcome(),
         ));
         Expander::new()
+            .is_expanded(self.test_expanded)
+            .on_is_expanded_changed(context.callback(Msg::TestExpanded))
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .slots([SlotView::new(ExpanderSlot::Header, "Measure latency"), SlotView::new(ExpanderSlot::Content, body)])
     }
@@ -1260,6 +1365,8 @@ impl Window {
             )),
         ));
         Expander::new()
+            .is_expanded(self.diagnostics_expanded)
+            .on_is_expanded_changed(context.callback(Msg::DiagnosticsExpanded))
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .slots([SlotView::new(ExpanderSlot::Header, "Diagnostics"), SlotView::new(ExpanderSlot::Content, body)])
     }
@@ -1301,6 +1408,16 @@ mod tests {
         assert_eq!(helper_args("S-1-5-21-1"), ["setup-large-pages", "--sid", "S-1-5-21-1", "--elevated-helper"]);
         assert!(helper_failed(HELPER_NOT_ELEVATED).contains("UAC"));
         assert_eq!(helper_failed(2), "The elevated setup exited with code 2.");
+    }
+
+    #[test]
+    fn the_noise_model_picker_keeps_an_unavailable_selection_recoverable() {
+        let mut models = vec![("rnnoise".into(), "RNNoise".into())];
+        assert_eq!(model_selection(&models, "rnnoise"), (false, Some(0)), "a single built-in needs only its toggle");
+        assert_eq!(model_selection(&models, "removed-pack"), (true, None), "keep the picker so RNNoise can be selected");
+        models.push(("other-pack".into(), "Noise model".into()));
+        assert_eq!(model_selection(&models, "other-pack"), (true, Some(1)), "resolve the saved ID, independent of display name");
+        assert_eq!(model_selection(&models, "removed-pack"), (true, None));
     }
 
     #[test]
@@ -1439,10 +1556,15 @@ mod tests {
         assert_eq!(notice, None, "the start's own result says why");
 
         // A failed start's error is showing: the fault it leaves isn't raised over it
-        notice = Some(Notice::about_run("Couldn't start", "The device is in use"));
-        watch.start_failed();
+        notice = Some(Notice::about_run("Couldn't start", "The mic was unplugged"));
+        watch.start_failed("The mic was unplugged");
         watch.observe(&engine_status(S::Error, true), None, &mut notice);
         assert_eq!(notice.as_ref().map(|n| n.title), Some("Couldn't start"));
+        notice = None;
+        let changed =
+            EngineStatus { message: Some("Audio routing loop".into()), waiting_for_change: true, ..engine_status(S::Error, true) };
+        watch.observe(&changed, None, &mut notice);
+        assert_eq!(notice.as_ref().map(|n| n.message.as_str()), Some("Audio routing loop."));
 
         // The user stops it; a fault in a later run is new
         watch.observe(&engine_status(S::Stopped, false), Some(Job::Stopping), &mut notice);

@@ -1335,6 +1335,7 @@ impl<D: DriftControl, R: Resampler> Pipeline<D, R> {
             }
             None => self.out_meter.reset(),
         }
+        tel.gate_reduction_db.store(report.gate_reduction_db.unwrap_or(f32::NAN));
         match report.noise {
             Some(n) => {
                 tel.speech_probability.store(n.speech_probability);

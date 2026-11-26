@@ -13,7 +13,7 @@ use crate::window::Job;
 
 /// Shown for a value that isn't available.
 pub(crate) const DASH: &str = "—";
-/// Levels at or below this are silence (the engine reports -200 dBFS for digital zero).
+/// Display floor for a measured signal level. `-∞` here also covers finite samples below the display range.
 pub(crate) const SILENT_DB: f32 = -120.0;
 
 /// `value` with `decimals` places: "—" unless finite, and never "-0" or "-0.0".
@@ -69,30 +69,40 @@ fn sentence(text: &str) -> String {
     if text.ends_with(['.', '!', '?']) { text.to_owned() } else { format!("{text}.") }
 }
 
-/// The header's status line: the state (or the job under way), then the engine's message. A
-/// fault the engine will retry by itself reads "Waiting to retry", not "Stopped" (gui/F8).
+/// The header names the filter's state. The notice contains the explanation and remedy for a fault.
 pub(crate) fn status_line(status: &EngineStatus, job: Option<Job>) -> String {
     let state = match (job, status.state) {
         (Some(Job::Starting), _) | (None, EngineState::Starting) => "Starting…",
         (Some(Job::Stopping), _) => "Stopping…",
         (None, EngineState::Running) => "Running",
+        (None, EngineState::Stopped | EngineState::Error) if status.waiting_for_change => "Waiting for a device or settings change",
         (None, EngineState::Stopped | EngineState::Error) if status.retrying => "Waiting to retry",
         (None, EngineState::Stopped) => "Stopped",
         (None, EngineState::Error) => "Stopped by an error",
     };
-    match message(status) {
-        Some(message) => format!("{state} · {message}"),
-        None => state.to_owned(),
-    }
+    state.to_owned()
 }
 
 /// The InfoBar's text when a fault stops a run (gui/F10): what happened, and what happens next.
 pub(crate) fn fault(status: &EngineStatus) -> String {
     let what = sentence(message(status).unwrap_or("An audio device stopped working"));
-    if status.retrying {
+    if status.waiting_for_change {
+        what
+    } else if status.retrying {
         format!("{what} The filter starts again by itself when it can. Press Stop to keep it off.")
     } else {
         format!("{what} Press Start to try again.")
+    }
+}
+
+/// Some start failures are caught before the engine arms itself. The user must start again after correcting those settings.
+pub(crate) fn start_error(status: &EngineStatus, reason: String) -> String {
+    if status.message.as_deref() == Some(&reason) {
+        fault(status)
+    } else if status.state == EngineState::Stopped && !status.retrying {
+        format!("{} Press Start to try again.", sentence(&reason))
+    } else {
+        reason
     }
 }
 
@@ -131,7 +141,11 @@ pub(crate) fn meter_numbers(m: MeterSnapshot) -> String {
 /// noise stage took off (its floor and the gate included).
 pub(crate) fn reduction_and_speech(t: &TelemetrySnapshot) -> String {
     let speech = if t.speech_probability.is_nan() { f32::NAN } else { t.speech_probability.clamp(0.0, 1.0) };
-    format!("Reduction: {} dB · Speech: {}", db(t.noise_reduction_db), fixed(speech, 2))
+    let gain = t.noise_reduction_db;
+    let reduction = if gain.is_finite() { format!("{} dB", fixed(gain, 1)) } else { DASH.to_owned() };
+    let gate = t.gate_reduction_db;
+    let gate = if gate.is_finite() { format!(" · Gate: {} dB", fixed(gate, 1)) } else { String::new() };
+    format!("Reduction: {reduction}{gate} · Speech: {}", fixed(speech, 2))
 }
 
 /// Readout line 1a: "Pipeline: 12.3 ms (p95 14.1)", or "Pipeline: —" while it isn't valid. The direct driver route's ends at
@@ -481,6 +495,23 @@ mod tests {
     }
 
     #[test]
+    fn reduction_distinguishes_an_unmeasurable_ratio_from_a_measured_120_db_cut() {
+        let mut t = TelemetrySnapshot {
+            noise_reduction_db: f32::NAN,
+            gate_reduction_db: f32::NAN,
+            speech_probability: 0.0,
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(reduction_and_speech(&t), "Reduction: — · Speech: 0.00");
+        t.noise_reduction_db = -120.0;
+        assert_eq!(reduction_and_speech(&t), "Reduction: -120.0 dB · Speech: 0.00");
+        t.noise_reduction_db = f32::NAN;
+        t.gate_reduction_db = -12.5;
+        t.speech_probability = f32::NAN;
+        assert_eq!(reduction_and_speech(&t), "Reduction: — · Gate: -12.5 dB · Speech: —");
+    }
+
+    #[test]
     fn slider_labels() {
         assert_eq!(labelled("Attack", 2.0, 1, "ms"), "Attack: 2.0 ms");
         assert_eq!(labelled("Threshold (dBFS)", -50.0, 0, ""), "Threshold (dBFS): -50");
@@ -496,28 +527,25 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_shows_the_job_then_the_message() {
+    fn the_header_shows_state_and_leaves_the_fault_in_the_notice() {
         assert_eq!(status_line(&status(EngineState::Stopped, None), None), "Stopped");
         assert_eq!(status_line(&status(EngineState::Stopped, None), Some(Job::Starting)), "Starting…");
         assert_eq!(status_line(&status(EngineState::Running, None), Some(Job::Stopping)), "Stopping…");
         assert_eq!(status_line(&status(EngineState::Starting, Some(" ")), None), "Starting…");
-        assert_eq!(status_line(&status(EngineState::Running, Some("Reference device lost")), None), "Running · Reference device lost");
-        assert_eq!(
-            status_line(&status(EngineState::Error, Some("The mic was unplugged")), None),
-            "Stopped by an error · The mic was unplugged"
-        );
+        assert_eq!(status_line(&status(EngineState::Running, Some("Reference device lost")), None), "Running");
+        assert_eq!(status_line(&status(EngineState::Error, Some("The mic was unplugged")), None), "Stopped by an error");
     }
 
     /// gui/F8: an engine armed to restart by itself isn't "Stopped".
     #[test]
     fn a_retrying_engine_is_waiting_to_retry() {
         let retrying = EngineStatus { retrying: true, ..status(EngineState::Error, Some("The mic was unplugged")) };
-        assert_eq!(status_line(&retrying, None), "Waiting to retry · The mic was unplugged");
+        assert_eq!(status_line(&retrying, None), "Waiting to retry");
         let stopped = EngineStatus { state: EngineState::Stopped, ..retrying.clone() };
-        assert_eq!(status_line(&stopped, None), "Waiting to retry · The mic was unplugged");
+        assert_eq!(status_line(&stopped, None), "Waiting to retry");
         // The retry itself, and the user's stop, read as usual
         let starting = EngineStatus { state: EngineState::Starting, ..retrying.clone() };
-        assert_eq!(status_line(&starting, None), "Starting… · The mic was unplugged");
+        assert_eq!(status_line(&starting, None), "Starting…");
         assert!(status_line(&retrying, Some(Job::Stopping)).starts_with("Stopping…"));
     }
 
@@ -529,6 +557,14 @@ mod tests {
         let final_ = status(EngineState::Error, Some("The output cable's format isn't supported."));
         assert_eq!(fault(&final_), "The output cable's format isn't supported. Press Start to try again.");
         assert_eq!(fault(&status(EngineState::Error, Some("  "))), "An audio device stopped working. Press Start to try again.");
+        let route = EngineStatus { waiting_for_change: true, retrying: true, ..status(EngineState::Error, Some("Choose another output.")) };
+        assert_eq!(status_line(&route, None), "Waiting for a device or settings change");
+        assert_eq!(fault(&route), "Choose another output.");
+        assert_eq!(start_error(&route, "Choose another output.".into()), "Choose another output.");
+        assert_eq!(
+            start_error(&EngineStatus::default(), "Choose another output.".into()),
+            "Choose another output. Press Start to try again."
+        );
     }
 
     #[test]
@@ -587,6 +623,7 @@ mod tests {
             reference_target_ms: 12.0,
             reference_stamped: true,
             noise_reduction_db: -12.0,
+            gate_reduction_db: f32::NAN,
             speech_probability: 0.874,
             input: MeterSnapshot { peak_dbfs: -12.06, rms_dbfs: -23.4 },
             ..TelemetrySnapshot::default()

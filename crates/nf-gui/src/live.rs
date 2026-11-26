@@ -135,7 +135,8 @@ fn meter_header(name: &str, numbers: String, badge: View, top: f64) -> View {
                 .opacity(0.72)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .vertical_alignment(VerticalAlignment::Center)
-                .grid_column(1),
+                .grid_column(1)
+                .tooltip("The bar starts at −60 dBFS. Levels at or below −120 dBFS display as −∞."),
             Border::new().grid_column(2).vertical_alignment(VerticalAlignment::Center).content(badge),
         ))
 }

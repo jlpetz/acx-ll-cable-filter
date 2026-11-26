@@ -97,6 +97,10 @@ pub(crate) struct StatusInfo {
     pub(crate) output: Option<StreamInfo>,
     pub(crate) driver_ring: bool,
     pub(crate) reference: Option<StreamInfo>,
+    /// The microphone and playback reference belong to this cable; its playback may be the microphone signal.
+    shared_reference_cable: Option<String>,
+    /// A settings or device change can restart the run, but the engine hasn't scheduled a timed retry.
+    waiting_for_change: bool,
     pub(crate) mmcss: bool,
     pub(crate) mic_id: Option<String>,
     pub(crate) output_id: Option<String>,
@@ -466,11 +470,13 @@ impl Inner {
                     }
                     let remedy = fault.and_then(remedy_for_fault);
                     flight::note(self, Note::Fault(msg.clone()));
-                    *lock(&self.status) = StatusInfo { message: Some(msg), remedy, ..StatusInfo::default() };
+                    let transient = fault.is_none_or(Fault::device_related);
+                    *lock(&self.status) =
+                        StatusInfo { message: Some(msg), remedy, waiting_for_change: !transient, ..StatusInfo::default() };
                     self.telemetry.set_state(EngineState::Error);
                     // A device that went away, is busy or is being reset (a format change, an
                     // exclusive-mode app) may send no event when it's back: retry on a timer too.
-                    outcome = Outcome::Down { transient: fault.is_none_or(Fault::device_related) };
+                    outcome = Outcome::Down { transient };
                 }
             } else if let Some(f) = Fault::unpack(shared.reference_fault.load(Relaxed)) {
                 let mut st = lock(&self.status);
@@ -606,6 +612,7 @@ pub(crate) fn restart_needed(running: &EngineConfig, aec_built: bool, new: &Engi
         || running.effect.worker_blocks != new.effect.worker_blocks
         || (n.aec_enabled && !aec_built)
         || r.noise_model != n.noise_model
+        || (n.noise_model != nf_core::config::DEFAULT_NOISE_MODEL && n.noise_enabled && !r.noise_enabled)
         || (n.noise_model != nf_core::config::DEFAULT_NOISE_MODEL && r.model_depth != n.model_depth)
 }
 
@@ -617,11 +624,17 @@ pub(crate) fn io_changed(a: &EngineConfig, b: &EngineConfig) -> bool {
 /// Whether an `apply` asks the control thread for a restart (gui/F2): the devices, I/O or AEC
 /// switch changed from the previous wanted config (which also catches a change made while the
 /// streams reopen), or the live run doesn't match the new config. While waiting after a failure
-/// only the first counts, so a processing-only change (floor, gate, meters) never retries. The
+/// device, effect or model selection changes can retry it. Adjusting a floor, gate or meters alone never retries. The
 /// control thread judges the restart again when it's due (`restart_due`), so turning AEC off, a
 /// bypass, doesn't restart either.
 pub(crate) fn apply_wants_restart(prev: &EngineConfig, new: &EngineConfig, running: Option<&EngineConfig>, aec_built: bool) -> bool {
+    let (p, n) = (&prev.processing, &new.processing);
+    let model_retry = running.is_none()
+        && (p.noise_model != n.noise_model
+            || (n.noise_model != nf_core::config::DEFAULT_NOISE_MODEL
+                && (p.noise_enabled != n.noise_enabled || (n.noise_enabled && p.model_depth != n.model_depth))));
     io_changed(prev, new)
+        || model_retry
         || prev.effect.worker_blocks != new.effect.worker_blocks
         || prev.effect.path != new.effect.path
         || prev.effect.plugin_id != new.effect.plugin_id
@@ -842,7 +855,7 @@ pub(crate) fn validate(config: &EngineConfig) -> Result<(), String> {
     let Some(out) = config.devices.output.as_deref().filter(|s| !s.is_empty()) else {
         return Err(no_output_message().to_owned());
     };
-    if config.devices.reference.as_deref() == Some(out) {
+    if config.processing.aec_enabled && config.devices.reference.as_deref() == Some(out) {
         return Err(same_device_message().to_owned());
     }
     Ok(())
@@ -859,6 +872,7 @@ fn reset_telemetry(t: &Telemetry) {
     t.near_clip.store(false, Relaxed);
     // NaN reads as "—": nothing reported yet (DSP-4).
     t.noise_reduction_db.store(f32::NAN);
+    t.gate_reduction_db.store(f32::NAN);
     t.speech_probability.store(f32::NAN);
     t.latency_valid.store(false, Relaxed);
     t.latency_ms_median.store(0.0);
@@ -1077,6 +1091,7 @@ fn fail(inner: &Inner, f: &StartFailure, config: &EngineConfig) -> Failed {
         let mut st = lock(&inner.status);
         st.message = Some(msg.clone());
         st.remedy = remedy_for_start(f);
+        st.waiting_for_change = !f.transient();
     }
     inner.telemetry.set_state(EngineState::Error);
     resend(inner, stale, deferred);
@@ -1154,6 +1169,8 @@ fn status_from(o: Opened) -> StatusInfo {
         output: Some(o.output),
         driver_ring: o.driver_ring,
         reference: o.reference,
+        shared_reference_cable: o.shared_reference_cable,
+        waiting_for_change: false,
         mmcss: o.mmcss,
         mic_id: o.mic_id,
         output_id: o.output_id,
@@ -1268,6 +1285,15 @@ pub(crate) fn apply(inner: &Arc<Inner>, config: &EngineConfig) {
 
 pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
     let mut st = lock(&inner.status).clone();
+    if st.reference.is_some()
+        && inner.controls.aec.enabled.load(Relaxed)
+        && let Some(cable) = &st.shared_reference_cable
+    {
+        st.warnings.push(format!(
+            "Microphone and echo reference both use {cable}. If the microphone carries this cable's playback, echo cancellation can \
+             remove the audio you want to keep. Choose a different microphone or the speakers playing the far-end audio as the echo reference."
+        ));
+    }
     if st.driver_ring
         && let Some(output) = &mut st.output
     {
@@ -1275,6 +1301,7 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
     }
     let chain_latency_ms =
         lock(&inner.current).as_ref().map_or(0.0, |s| s.chain_latency.load(Relaxed) as f32 * 1000.0 / nf_core::SAMPLE_RATE as f32);
+    let retrying = inner.armed();
     EngineStatus {
         state: inner.telemetry.state(),
         message: st.message,
@@ -1286,7 +1313,8 @@ pub(crate) fn status(inner: &Arc<Inner>) -> EngineStatus {
         chain_latency_ms,
         warnings: st.warnings,
         notes: st.notes,
-        retrying: inner.armed(),
+        retrying,
+        waiting_for_change: retrying && st.waiting_for_change,
         remedy: st.remedy,
         model_depth: st.model_depth,
     }
@@ -1442,6 +1470,7 @@ mod tests {
         assert_eq!(validate(&cfg(None, None, None, false)), Err(no_output_message().to_owned()));
         assert_eq!(validate(&cfg(None, Some(""), None, false)), Err(no_output_message().to_owned()));
         assert_eq!(validate(&cfg(None, Some("cable"), Some("cable"), true)), Err(same_device_message().to_owned()));
+        assert!(validate(&cfg(None, Some("cable"), Some("cable"), false)).is_ok(), "a disabled echo reference cannot form a loop");
         assert!(validate(&cfg(None, Some("cable"), Some("speakers"), true)).is_ok());
         assert!(validate(&cfg(Some("mic"), Some("cable"), None, true)).is_ok());
         let mut direct = cfg(Some("mic"), None, Some("speakers"), true);
@@ -1452,12 +1481,53 @@ mod tests {
     }
 
     #[test]
+    fn an_armed_route_failure_retries_when_a_conflicting_selection_changes() {
+        use nf_vmic::cables::EndpointKind;
+        use nf_vmic::identity::CableId;
+        let role = |id, endpoint| crate::cable_endpoint_selection(CableId(id), endpoint);
+        let a_mic = role(1, EndpointKind::Microphone);
+        let b_mic = role(2, EndpointKind::CallMicrophone);
+        let a_speakers = role(1, EndpointKind::Speakers);
+        let b_speakers = role(2, EndpointKind::Speakers);
+        let mut direct = cfg(Some(&a_mic), None, Some(&a_speakers), true);
+        direct.io.output_backend = nf_core::config::OutputBackend::DriverRing;
+        let wasapi = cfg(Some(&a_mic), Some(&b_speakers), None, true); // Windows default speakers resolved to B at open.
+        let mut change_mic = direct.clone();
+        change_mic.devices.mic = Some(b_mic);
+        let mut change_output = direct.clone();
+        change_output.io.output_backend = nf_core::config::OutputBackend::Wasapi;
+        change_output.devices.output = Some(b_speakers);
+        let mut change_ref = wasapi.clone();
+        change_ref.devices.reference = Some(a_speakers);
+        let mut disable_aec = wasapi.clone();
+        disable_aec.processing.aec_enabled = false;
+        for (old, refusal, new) in [
+            (&direct, StartFailure::MicIsOutput("ACX-LL-Cable A".into()), change_mic),
+            (&direct, StartFailure::MicIsOutput("ACX-LL-Cable A".into()), change_output),
+            (&wasapi, StartFailure::OutputIsReference, change_ref),
+            (&wasapi, StartFailure::OutputIsReference, disable_aec),
+        ] {
+            let inner = Inner::new();
+            let (tx, commands) = mpsc::channel();
+            *lock(&inner.ctl) = Some(tx);
+            lock(&inner.desired).config = Some(old.clone());
+            assert!(!fail(&inner, &refusal, old).transient);
+            assert!(status(&inner).waiting_for_change);
+            apply(&inner, &new);
+            assert!(matches!(commands.try_recv(), Ok(Ctl::Restart)));
+            let d = lock(&inner.desired);
+            assert_eq!(d.config.as_ref(), Some(&new));
+            assert!(restart_due(d.config.as_ref(), d.running.as_ref(), d.aec_built, false));
+        }
+    }
+
+    #[test]
     fn engine_refuses_to_start_without_an_output() {
         let engine = crate::Engine::new();
         let err = engine.start(&EngineConfig::default()).unwrap_err();
         assert_eq!(err.0, "Pick the virtual cable to send the cleaned mic to.");
-        let err = engine.start(&cfg(None, Some("x"), Some("x"), false)).unwrap_err();
-        assert!(err.0.contains("same device"));
+        let err = engine.start(&cfg(None, Some("x"), Some("x"), true)).unwrap_err();
+        assert_eq!(err.0, same_device_message());
         // Nothing was started: stop and apply are harmless.
         engine.stop();
         engine.apply(&cfg(None, Some("x"), None, true));
@@ -1516,6 +1586,18 @@ mod tests {
         let mut model = base.clone();
         model.processing.noise_model = "ulunas".into();
         assert!(restart_needed(&base, false, &model), "another noise model is another stage");
+        let mut gate_only = model.clone();
+        gate_only.processing.noise_enabled = false;
+        assert!(restart_needed(&gate_only, false, &model), "enabling a model pack skipped at startup must build its worker");
+        assert!(!restart_needed(&model, false, &gate_only), "bypassing an existing model can be done live");
+        assert!(apply_wants_restart(&model, &gate_only, None, false), "turn the failed model pack off and retry gate-only");
+        assert!(apply_wants_restart(&model, &base, None, false), "correct a failed model selection");
+        let mut new_depth = model.clone();
+        new_depth.processing.model_depth = 3;
+        assert!(apply_wants_restart(&model, &new_depth, None, false), "retry an active pack at its new worker depth");
+        let mut level_only = model.clone();
+        level_only.processing.gate.threshold_db -= 1.0;
+        assert!(!apply_wants_restart(&model, &level_only, None, false), "a gate edit cannot repair the pack");
         assert!(!io_changed(&base, &model), "but not other streams");
         let mut hb = base.clone();
         hb.processing.high_band = nf_core::config::HighBand::Zero;
@@ -1624,9 +1706,10 @@ mod tests {
         };
         let o = Opened {
             mic: info.clone(),
-            output: info,
+            output: info.clone(),
             driver_ring: false,
-            reference: None,
+            reference: Some(info),
+            shared_reference_cable: Some("ACX-LL-Cable A".into()),
             mic_id: Some("m".into()),
             output_id: Some("o".into()),
             reference_id: None,
@@ -1655,6 +1738,17 @@ mod tests {
         assert_eq!(s.targets.output_ms, 22.0);
         assert_eq!(s.mic_id.as_deref(), Some("m"));
         assert!(s.output_default, "kept for the device events");
+        let inner = Inner::new();
+        *lock(&inner.status) = s;
+        inner.controls.aec.enabled.store(true, Relaxed);
+        let warned = status(&inner).warnings;
+        assert_eq!(warned.len(), 3);
+        assert!(warned[2].contains("ACX-LL-Cable A") && warned[2].contains("different microphone or the speakers"));
+        inner.controls.aec.enabled.store(false, Relaxed);
+        assert_eq!(status(&inner).warnings.len(), 2, "inactive reference never warns");
+        inner.controls.aec.enabled.store(true, Relaxed);
+        lock(&inner.status).reference = None;
+        assert_eq!(status(&inner).warnings.len(), 2, "missing reference never warns");
     }
 
     #[test]
@@ -1938,6 +2032,7 @@ mod tests {
             assert_eq!(inner.telemetry.state(), EngineState::Error);
             let st = status(&inner);
             assert!(st.retrying && st.message.is_some(), "{st:?}");
+            assert_eq!(st.waiting_for_change, !transient);
             assert!(lock(&inner.current).is_none());
             // Stopping by hand disarms it.
             stop(&inner);
@@ -2005,6 +2100,7 @@ mod tests {
         let f = fail(&inner, &StartFailure::Open { role: StreamRole::Mic, hr: hr::E_ACCESSDENIED }, &c);
         assert!(!f.transient, "waits for the user, not a timer");
         let st = status(&inner);
+        assert!(st.waiting_for_change);
         assert_eq!(st.remedy, Some(Remedy::MicPrivacy));
         assert!(st.message.is_some_and(|m| m.contains("Privacy")));
         fail(&inner, &StartFailure::NotFound(StreamRole::Mic), &c);

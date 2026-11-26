@@ -63,6 +63,8 @@ pub struct ProcessingConfig {
     /// Maximum attenuation the noise stage may apply, in dB (negative). -60 is effectively unlimited.
     pub floor_db: f32,
     pub gate: GateConfig,
+    /// Where the independent gate receives its audio in the processing chain.
+    pub gate_position: GatePosition,
     /// Compute and publish the input and output meters.
     pub meters_enabled: bool,
     /// Compute and publish the per-block latency readout.
@@ -79,6 +81,7 @@ impl Default for ProcessingConfig {
             model_depth: AUTO_MODEL_DEPTH,
             floor_db: -60.0,
             gate: GateConfig::default(),
+            gate_position: GatePosition::default(),
             meters_enabled: true,
             latency_readout_enabled: true,
         }
@@ -220,7 +223,29 @@ impl GateMode {
     }
 }
 
-/// The gate that ends the noise stage (TODO #11).
+/// The four boundaries available in the current processing chain. The historic default uses the noise model's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum GatePosition {
+    #[default]
+    AfterNoise = 0,
+    BeforeAec = 1,
+    BeforeNoise = 2,
+    AfterEffect = 3,
+}
+
+impl GatePosition {
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::BeforeAec,
+            2 => Self::BeforeNoise,
+            3 => Self::AfterEffect,
+            _ => Self::AfterNoise,
+        }
+    }
+}
+
+/// The level gate (TODO 11).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GateConfig {

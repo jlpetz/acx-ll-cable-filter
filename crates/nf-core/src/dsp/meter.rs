@@ -27,6 +27,8 @@ pub const CLIP_RUN: usize = 3;
 pub const CLIP_LEVEL: f32 = 0.999;
 /// Peaks at or above this magnitude are "near clip" (-0.1 dBFS).
 pub const NEAR_CLIP_LEVEL: f32 = 0.988_553_1;
+/// Lower end of the numerical level display, -120 dBFS. Actual audio samples remain available below this level.
+pub(crate) const METER_FLOOR: f32 = 1e-6;
 
 /// One block's reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -50,7 +52,8 @@ impl MeterReading {
 
 /// Display ballistics for a published meter, so a reader sampling the value (the GUI at 20 Hz, the
 /// CLI at 1 Hz) still sees every block's peak: the peak holds for 1 s and then falls 20 dB/s, and the
-/// RMS is averaged with a 300 ms time constant. O(1) per block, no allocation.
+/// RMS is averaged with a 300 ms time constant. When the signal stays below the numerical display range, release the
+/// historical RMS after 300 ms and the held peak after 1 s. O(1) per block, no allocation.
 ///
 /// Non-finite readings are skipped: a NaN never wins the peak or enters the average, and neither
 /// does an infinity (it would hold forever, since `inf * decay` is `inf`). Both values flush to 0
@@ -61,10 +64,13 @@ pub struct MeterBallistics {
     hold_left: u32,
     mean_square: f32,
     primed: bool,
+    below_floor_blocks: u32,
 }
 
 /// Blocks the peak holds before it falls (1 s).
 const HOLD_BLOCKS: u32 = 100;
+/// After this many consecutive below-range blocks, show the current RMS (300 ms).
+const RMS_RELEASE_BLOCKS: u32 = 30;
 /// Per-block peak fall: 20 dB/s at 100 blocks/s, 10^(-20/20/100).
 const PEAK_DECAY: f32 = 0.977_237_2;
 /// One-pole coefficient for a 300 ms RMS average at 10 ms blocks: 1 - exp(-10/300).
@@ -72,12 +78,14 @@ const RMS_ALPHA: f32 = 0.032_783_9;
 
 impl MeterBallistics {
     pub const fn new() -> Self {
-        Self { peak: 0.0, hold_left: 0, mean_square: 0.0, primed: false }
+        Self { peak: 0.0, hold_left: 0, mean_square: 0.0, primed: false, below_floor_blocks: 0 }
     }
 
     /// Takes one block's reading; returns the (peak, RMS) to display, in dBFS.
     pub fn update(&mut self, r: &MeterReading) -> (f32, f32) {
-        if r.peak.is_finite() && r.peak >= self.peak {
+        let below_floor = (0.0..=METER_FLOOR).contains(&r.peak) && r.mean_square.is_finite();
+        self.below_floor_blocks = if below_floor { (self.below_floor_blocks + 1).min(HOLD_BLOCKS) } else { 0 };
+        if r.peak.is_finite() && (r.peak >= self.peak || self.below_floor_blocks == HOLD_BLOCKS) {
             self.peak = r.peak;
             self.hold_left = HOLD_BLOCKS;
         } else if self.hold_left > 0 {
@@ -89,7 +97,7 @@ impl MeterBallistics {
             }
         }
         if r.mean_square.is_finite() {
-            if self.primed {
+            if self.primed && self.below_floor_blocks < RMS_RELEASE_BLOCKS {
                 self.mean_square += RMS_ALPHA * (r.mean_square - self.mean_square);
                 if self.mean_square < 1e-20 {
                     self.mean_square = 0.0;
@@ -207,7 +215,7 @@ mod tests {
         // ... then it falls 0.2 dB a block, 20 dB a second.
         let mut last = -6.0206;
         for k in 0..100 {
-            let (p, _) = b.update(&reading(0.0, 0.0));
+            let (p, _) = b.update(&reading(0.001, 0.001));
             assert!((last - p - 0.2).abs() < 1e-3, "fall at block {k}: {last} -> {p}");
             last = p;
         }
@@ -216,15 +224,36 @@ mod tests {
         let (p, _) = b.update(&reading(0.1, 0.0));
         assert!((p - -20.0).abs() < 1e-3);
         for _ in 0..HOLD_BLOCKS {
-            assert!((b.update(&reading(0.0, 0.0)).0 - -20.0).abs() < 1e-3);
+            assert!((b.update(&reading(0.001, 0.001)).0 - -20.0).abs() < 1e-3);
         }
-        assert!(b.update(&reading(0.0, 0.0)).0 < -20.1);
+        assert!(b.update(&reading(0.001, 0.001)).0 < -20.1);
         // It falls all the way to the floor value and stays exactly 0, not denormal.
         for _ in 0..2000 {
             b.update(&reading(0.0, 0.0));
         }
         assert_eq!(b.peak, 0.0);
         assert_eq!(b.update(&reading(0.0, 0.0)).0, -200.0);
+    }
+
+    #[test]
+    fn sustained_silence_releases_the_meters_and_the_next_signal_registers_immediately() {
+        for (level, expected) in [(0.0, -200.0), (1e-9, -180.0)] {
+            let mut b = MeterBallistics::new();
+            b.update(&reading(1.0, 1.0));
+            for block in 1..=HOLD_BLOCKS {
+                let (peak, rms) = b.update(&reading(level, level));
+                if block >= RMS_RELEASE_BLOCKS {
+                    assert!((rms - expected).abs() < 0.01, "RMS after {block} blocks: {rms}");
+                }
+                if block < HOLD_BLOCKS {
+                    assert_eq!(peak, 0.0);
+                } else {
+                    assert!((peak - expected).abs() < 0.01, "peak after {block} blocks: {peak}");
+                }
+            }
+            let (peak, rms) = b.update(&reading(1e-5, 1e-5));
+            assert!((peak + 100.0).abs() < 0.01 && rms > -120.0, "{peak}, {rms}");
+        }
     }
 
     #[test]

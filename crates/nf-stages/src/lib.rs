@@ -3,7 +3,7 @@
 //!   [`RnnoiseModel`], RNNoise through nnnoiseless.
 //! - [`Aec3Stage`]: WebRTC AEC3 through sonora, at 48 kHz (`Rate48kHz`), with the reference dithered, on a non-main input.
 //! - [`build_chain`]: the v0 chain, built and activated: what the engine runs and the offline tools rerun;
-//!   [`build_chain_with`] the same around another noise stage (a model pack's, nf-ort, through nf-engine's `models.rs`).
+//!   [`build_model_chain`] uses a chosen model (or gate alone), and [`build_chain_with`] hosts a standalone custom stage.
 //! - [`harness`]: TODO 2's offline harness: run a stage or the chain block by block as the engine does, measure stream
 //!   offsets and parity, and the test scenes.
 //! - [`synth`]: deterministic test signals for the harness (`tests/`).
@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use nf_core::chain::Chain;
 use nf_core::controls::ChainControls;
+use nf_core::noise::NoiseStage;
 use nf_core::stage::{Stage, StageError};
 
 mod aec3;
@@ -48,16 +49,26 @@ pub fn warm_up_fft_thread() {
 /// easyfft's per-thread FFT state there, so `Chain::process` then doesn't allocate on that thread,
 /// with AEC3 in it or not (see [`Aec3Stage`]).
 pub fn build_chain(controls: Arc<ChainControls>, with_aec: bool) -> Result<Chain, StageError> {
-    let noise: Box<dyn Stage> = Box::new(rnnoise_stage(controls.clone())?);
-    build_chain_with(controls, with_aec, noise)
+    let noise = Box::new(rnnoise_stage(controls.clone())?);
+    build_model_chain(controls, with_aec, Some(noise))
 }
 
-/// [`build_chain`] around `noise` (built on `controls`) in the noise slot: AEC3 first if `with_aec`, then the chain is
-/// activated on the calling thread. nf-engine's `models::build_chain` is the one caller that picks the noise stage by the
-/// config's model.
+/// Compose the app's chain around the selected model, with a single independent gate even when no model is installed.
+pub fn build_model_chain(controls: Arc<ChainControls>, with_aec: bool, noise: Option<Box<NoiseStage>>) -> Result<Chain, StageError> {
+    let aec = aec_stage(&controls, with_aec)?;
+    let mut chain = Chain::with_noise_model(controls, aec, noise);
+    chain.activate()?;
+    Ok(chain)
+}
+
+/// Host an arbitrary caller-supplied noise stage with its own processing and params.
 pub fn build_chain_with(controls: Arc<ChainControls>, with_aec: bool, noise: Box<dyn Stage>) -> Result<Chain, StageError> {
-    let aec: Option<Box<dyn Stage>> = if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None };
+    let aec = aec_stage(&controls, with_aec)?;
     let mut chain = Chain::new(controls, aec, Some(noise));
     chain.activate()?;
     Ok(chain)
+}
+
+fn aec_stage(controls: &Arc<ChainControls>, with_aec: bool) -> Result<Option<Box<dyn Stage>>, StageError> {
+    Ok(if with_aec { Some(Box::new(Aec3Stage::new(controls.clone())?)) } else { None })
 }

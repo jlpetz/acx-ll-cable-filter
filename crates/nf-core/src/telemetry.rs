@@ -412,8 +412,10 @@ pub struct Telemetry {
     pub clip_latched: AtomicBool,
     /// The raw input came within 0.1 dB of full scale in the last second.
     pub near_clip: AtomicBool,
-    /// What the noise stage took off this block, measured on its output (floor and gate included), in dB (<= 0).
+    /// Noise reduction in dB, including the gate when it immediately follows the model.
     pub noise_reduction_db: AtomicF32,
+    /// Input-to-output attenuation of the independent gate at its selected boundary, NaN when unavailable.
+    pub gate_reduction_db: AtomicF32,
     pub speech_probability: AtomicF32,
     pub latency_valid: AtomicBool,
     /// The readout over the last 100 blocks; on the direct driver route to the sample time, what the latency test's sweeps
@@ -611,6 +613,7 @@ pub struct TelemetrySnapshot {
     pub clip_latched: bool,
     pub near_clip: bool,
     pub noise_reduction_db: f32,
+    pub gate_reduction_db: f32,
     pub speech_probability: f32,
     pub latency_valid: bool,
     pub latency_ms_median: f32,
@@ -748,6 +751,7 @@ impl Telemetry {
             clip_latched: self.clip_latched.load(Relaxed),
             near_clip: self.near_clip.load(Relaxed),
             noise_reduction_db: self.noise_reduction_db.load(),
+            gate_reduction_db: self.gate_reduction_db.load(),
             speech_probability: self.speech_probability.load(),
             latency_valid: self.latency_valid.load(Relaxed),
             latency_ms_median: self.latency_ms_median.load(),

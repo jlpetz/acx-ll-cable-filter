@@ -7,8 +7,8 @@ minimise for now; the tray comes later (TODO #15, #16).
 ## Layout (top to bottom, one column, about 520×760 by default, scrollable)
 1. **Header:**
    - title "noise-filter";
-   - a status line (state, plus the engine's status message). A fault the engine retries by
-     itself reads "Waiting to retry", not "Stopped";
+   - a status line showing the filter state. A timed retry reads "Waiting to retry". A fault that
+     needs a device or routing change reads "Waiting for a device or settings change". The notice gives the cause and remedy.
    - a Start/Stop button (one button that toggles). While the engine retries it offers Stop,
      which disarms the retry.
    - Two InfoBars under it:
@@ -30,23 +30,24 @@ minimise for now; the tray comes later (TODO #15, #16).
      speakers".
    - A "Refresh devices" button.
 3. **Processing:**
-   - CheckBox "Noise filter (RNNoise)".
-   - CheckBox "Echo cancellation (using speakers)", with a hint: "Leave off with headphones".
+   - Noise reduction can be bypassed. The control names the sole available model or offers a selector when there are alternatives.
+   - Echo cancellation enables WebRTC AEC3 with the chosen speakers as its reference.
    - Slider "Max suppression": -60..0 dB. The label shows "unlimited" at -60.
    - **Gate:**
-     - ComboBox Off / Static / Auto;
+     - Off / Static / Auto. The gate works independently with noise reduction bypassed.
+     - The Gate settings panel places it before echo cancellation, before noise reduction, after noise reduction or after the external effect.
      - Slider "Threshold (dBFS)", -80..-10 (Static), or "Margin above noise (dB)", 0..20 (Auto);
      - Sliders for Attack (0.5..50 ms), Release (20..1000 ms) and Hold (0..500 ms);
      - Slider "Range (dB)", -80..0;
-     - CheckBox "Hold open on speech (VAD)", off by default: RNNoise's VAD fires on most noise-only
-       blocks, which held the Auto gate open (verify 2026-10-26).
+     - "Hold open on speech" can use an adjacent noise model's speech estimate. It defaults off.
+   - Processing presets save the stages, gate placement and external effect parameters. Loading a preset preserves the current devices,
+     output route and monitoring settings.
 4. **Meters** (ToggleSwitch "Show meters"; updated at 20 Hz when on):
    - **Input:** a horizontal bar of Borders. The RMS fill colours green / yellow (> -12 dBFS) /
      red (> -3); a thin peak marker; the numbers alongside; a "CLIP" badge that latches red. Click
      the badge to call `engine.reset_clip()`. A "near clip" hint.
-   - **Output:** the same bar, plus "Reduction: -x dB · Speech: 0.xx". The reduction is what the
-     noise stage took off, its floor and gate included; both read "—" while the stage isn't
-     reporting (off, or in passthrough).
+   - **Output:** the same bar with noise reduction, speech probability when available, and measured gate attenuation when available.
+     Silence has no measurable input-to-output ratio. Its reduction readout shows "—".
 5. **Latency** (ToggleSwitch "Live readout"):
    - Line 1: "Pipeline: 12.3 ms (p95 14.1)", or "—" when invalid; under it its budget, "Budget (means): mic 16.2 + wait
      0.1 + output queue 22.0 + render 23.4 ms, chain 10.0 ms on top" (engine.md, "The latency budget"); then "Drift

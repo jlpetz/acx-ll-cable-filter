@@ -142,6 +142,14 @@ impl Gate {
     /// Gates `buf` in place. `speech_probability` is `NaN` when the model gives none.
     pub fn process(&mut self, buf: &mut Block, params: &GateParams, speech_probability: f32) -> GateReport {
         let ms = mean_square(buf);
+        self.process_with_power(buf, params, speech_probability, ms)
+    }
+
+    pub(crate) fn releasing_to_unity(&self) -> bool {
+        self.gain != 1.0
+    }
+
+    pub(crate) fn process_with_power(&mut self, buf: &mut Block, params: &GateParams, speech_probability: f32, ms: f32) -> GateReport {
         let rms_db = power_db(ms);
         // NaN compares false everywhere below: a NaN level or probability never opens the gate.
         let vad = params.use_vad && speech_probability >= 0.5;

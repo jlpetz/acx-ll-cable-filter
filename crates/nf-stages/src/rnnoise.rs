@@ -501,9 +501,14 @@ mod tests {
         s.process(ProcessIo::new(&[&[0.0; BLOCK]], &mut y));
         assert_eq!(read(&s).0, 0.0, "a silent frame reports 0");
         let x = noise(BLOCK, 1, 0.3);
-        s.process(ProcessIo::new(&[x.as_slice().try_into().expect("block")], &mut y));
+        let x: &Block = x.as_slice().try_into().expect("block");
+        s.process(ProcessIo::new(&[x], &mut y));
         let (sp, gr) = read(&s);
         assert!((0.0..=1.0).contains(&sp));
-        assert!(gr <= 0.0);
+        assert!(gr.is_nan(), "the aligned input is still the preceding silent block");
+        s.process(ProcessIo::new(&[&[0.0; BLOCK]], &mut y));
+        let (sp, gr) = read(&s);
+        assert!((0.0..=1.0).contains(&sp));
+        assert!((-120.0..=0.0).contains(&gr), "the noisy block now has a measurable reduction: {gr}");
     }
 }

@@ -1,7 +1,7 @@
 //! The noise stage (TODO 3, 17): one CLAP-shaped stage that runs a noise model, then the floor mix and the gate
 //! ([`NoisePost`]). The floor and gate are its params, over [`ChainControls`]' atomics; the stage's gain is its
-//! `gain-adjustment-metering/0` and the model's VAD its `speech-probability/0` (the owner's TODO 17 decision: the floor and
-//! gate inside the noise stage, an extension publishing speech probability).
+//! `gain-adjustment-metering/0` and the model's VAD its `speech-probability/0`. [`crate::chain::Chain::with_noise_model`]
+//! moves the gate into the app's chain, where it can run by itself and receive audio at the selected boundary.
 //!
 //! Models plug in through [`NoiseModel`], the internal model trait (not in the public spec): RNNoise
 //! (`nf_stages::RnnoiseModel`), and model packs through ONNX Runtime (TODO 5: `nf_ort::OrtSpectralModel`, which owns its
@@ -209,6 +209,10 @@ pub struct NoiseStage {
 }
 
 impl NoiseStage {
+    pub(crate) fn take_gate(&mut self) -> Option<crate::dsp::gate::Gate> {
+        self.post.take_gate()
+    }
+
     /// Wraps `model`, sizing everything for it: refuses a hop of 0, a `latency_samples` under the hop, and a stage latency
     /// over [`MAX_STAGE_LATENCY`]. Allocates.
     pub fn new(controls: Arc<ChainControls>, model: Box<dyn NoiseModel>) -> Result<Self, StageError> {

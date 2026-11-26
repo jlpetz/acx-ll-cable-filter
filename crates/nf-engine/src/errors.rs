@@ -87,6 +87,8 @@ pub(crate) enum StartFailure {
     /// (this interface friendly name, e.g. "VB-Audio Virtual Cable"): the output cable's own
     /// recording side. The engine waits for another default, as for a missing mic.
     DefaultMicIsOutput(String),
+    /// The selected microphone belongs to the cable that the filter feeds.
+    MicIsOutput(String),
     /// Opening or starting a stream failed with this HRESULT.
     Open { role: StreamRole, hr: i32 },
     /// Opening the live driver attachment failed. A removed or busy device can become available again.
@@ -303,9 +305,13 @@ pub(crate) fn describe_start_failure(f: &StartFailure) -> String {
         }
         StartFailure::WrongDirection(role) => format!("{} must be a playback device, but a recording device was picked.", role.noun()),
         StartFailure::OutputIsReference => same_device_message().to_owned(),
-        StartFailure::DefaultMicIsOutput(adapter) => format!(
-            "The default microphone is the recording side of the output cable ({adapter}), so the filter would only hear its own output. Pick your real microphone, or make it the default; the filter starts when the default changes."
-        ),
+        StartFailure::DefaultMicIsOutput(cable) | StartFailure::MicIsOutput(cable) => {
+            let mic = if matches!(f, StartFailure::DefaultMicIsOutput(_)) { "Windows default microphone" } else { "selected microphone" };
+            format!(
+                "Audio routing loop on {cable}. The {mic} receives the filter's own output. \
+                 Choose a microphone on a different device or send the filtered output to another cable."
+            )
+        }
         StartFailure::Open { role, hr } => describe_hr(*role, *hr),
         StartFailure::DriverRing { message, .. } => message.clone(),
         StartFailure::Stage(msg) => format!("The audio processing couldn't start: {msg}"),
@@ -335,7 +341,8 @@ pub(crate) fn describe_warning(w: &Warning) -> String {
             *code as u32
         ),
         Warning::MicSharesOutputDevice(adapter) => format!(
-            "The microphone is on the same device as the output ({adapter}). If it is the output cable's recording side, the filter only hears its own output and your apps get silence. Pick your real microphone."
+            "Possible audio routing loop on {adapter}. If this microphone carries the output cable's playback, \
+             the filter receives its own output. Choose a microphone on a different device or send the filtered output to another cable."
         ),
         Warning::OutputIsSpeakers { name, exclusive_withheld } => format!(
             "The output is your default playback device ({name}), which doesn't look like a virtual cable: the cleaned \
@@ -486,7 +493,8 @@ pub(crate) fn describe_fault(f: Fault) -> String {
 
 /// The output can't be the echo reference: our own output would be cancelled as echo.
 pub(crate) fn same_device_message() -> &'static str {
-    "The output and the echo reference are the same device, so the filter would hear its own output as echo. Pick the speakers you listen on as the reference."
+    "The filtered output and echo reference use the same playback endpoint. Echo cancellation would use the filter's own output \
+     as its reference. Choose the speakers playing the far-end audio as the echo reference or send the filtered output to another cable."
 }
 
 /// The output isn't chosen.
@@ -543,7 +551,11 @@ mod tests {
         let m = describe_hr(StreamRole::Output, 0x8889_0099_u32 as i32);
         assert_eq!(m, "The output device couldn't be used (error 0x88890099).");
         assert!(describe_start_failure(&StartFailure::NotFound(StreamRole::Output)).contains("pick it again"));
-        assert!(describe_start_failure(&StartFailure::OutputIsReference).contains("same device"));
+        let reference = describe_start_failure(&StartFailure::OutputIsReference);
+        assert!(
+            reference.contains("same playback endpoint") && reference.contains("echo reference or send the filtered output"),
+            "{reference}"
+        );
         assert!(describe_start_failure(&StartFailure::WrongDirection(StreamRole::Mic)).contains("recording device"));
         assert!(describe_start_failure(&StartFailure::Stage("boom".into())).ends_with("boom"));
         assert!(describe_fault(Fault::MicStalled).contains("2 seconds"));
@@ -555,9 +567,11 @@ mod tests {
         let w = describe_warning(&Warning::ReferenceUnavailable(StartFailure::NotFound(StreamRole::Reference)));
         assert!(w.starts_with("Echo cancellation has no reference signal: No speakers"), "{w}");
         let w = describe_warning(&Warning::MicSharesOutputDevice("VB-Audio Virtual Cable".into()));
-        assert!(w.contains("(VB-Audio Virtual Cable)") && w.contains("Pick your real microphone"), "{w}");
+        assert!(w.contains("VB-Audio Virtual Cable") && w.contains("different device or send the filtered output"), "{w}");
         let m = describe_start_failure(&StartFailure::DefaultMicIsOutput("VB-Audio Virtual Cable".into()));
         assert!(m.contains("default microphone") && m.contains("VB-Audio Virtual Cable"), "{m}");
+        let m = describe_start_failure(&StartFailure::MicIsOutput("ACX-LL-Cable A".into()));
+        assert!(m.contains("routing loop on ACX-LL-Cable A") && m.contains("different device or send the filtered output"), "{m}");
         let r = describe_reference_lost(Fault::Stream { role: StreamRole::Reference, hr: hr::AUDCLNT_E_DEVICE_INVALIDATED });
         assert!(r.starts_with("Echo cancellation lost its reference:") && r.contains("keeps running"), "{r}");
         assert!(describe_hr(StreamRole::Mic, hr::AUDCLNT_E_ENDPOINT_CREATE_FAILED).contains("disconnected"));
@@ -753,6 +767,7 @@ mod tests {
             open(hr::E_ACCESSDENIED),
             StartFailure::WrongDirection(StreamRole::Mic),
             StartFailure::OutputIsReference,
+            StartFailure::MicIsOutput("x".into()),
             StartFailure::Stage("x".into()),
             StartFailure::Spawn,
             StartFailure::Com(0),

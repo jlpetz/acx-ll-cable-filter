@@ -14,7 +14,8 @@ pub const AEC_TELEMETRY_ID: &str = crate::namespaced!(".", "aec-telemetry/0");
 /// Deviations from the draft, which the `.clap` export adapts:
 /// - its `get()` is the current (last-sample) adjustment; ours is the block's output level against its latency-aligned
 ///   input's, so every part of the stage counts (the noise stage: the model, the floor mix and the gate);
-/// - it reads zero when not processing; ours is NaN before the first block and after a reset (the export maps NaN to 0).
+/// - ours is NaN before the first block, after a reset, or when the aligned input is too quiet for a measurable ratio
+///   (the export maps NaN to 0).
 pub trait GainAdjustmentMetering {
     fn gain_adjustment_db(&self) -> f32;
 }

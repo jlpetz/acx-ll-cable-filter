@@ -25,7 +25,7 @@ use std::sync::Arc;
 use nf_core::chain::Chain;
 use nf_core::config::{DEFAULT_NOISE_MODEL, ProcessingConfig, is_model_id};
 use nf_core::controls::ChainControls;
-use nf_core::noise::{InferenceStats, WorkerCounters, WorkerGuard, WorkerHooks};
+use nf_core::noise::{InferenceStats, NoiseStage, WorkerCounters, WorkerGuard, WorkerHooks};
 use nf_core::stage::{Stage, StageError};
 
 /// Whether the wait for a worker's model should end (the run was stopped).
@@ -82,12 +82,30 @@ impl WorkerHooks for EngineHooks {
 
 /// A noise stage, and its model's inference stats when it has them (a pack's).
 pub type NoiseStageWithStats = (Box<dyn Stage>, Option<Arc<InferenceStats>>);
+type BuiltModel = (Box<NoiseStage>, Option<Arc<InferenceStats>>);
 
 /// Whether this build can run model packs (the `onnx` feature).
 pub const ONNX: bool = cfg!(feature = "onnx");
 
+/// Noise-model IDs and display names for this build: the built-in first, then the installed packs in ID order.
+/// The catalog reads pack manifests and file metadata. Loading and verifying a selected model stays on the usual start path.
+pub fn available_noise_models() -> Vec<(String, String)> {
+    let built_in = (DEFAULT_NOISE_MODEL.to_owned(), "RNNoise".to_owned());
+    #[cfg(feature = "onnx")]
+    if let Some(root) = nf_ort::models_dir() {
+        let packs = nf_ort::pack::noise_pack_names(&root);
+        return std::iter::once(built_in).chain(packs.into_iter().filter(|(id, _)| id != DEFAULT_NOISE_MODEL)).collect();
+    }
+    vec![built_in]
+}
+
 /// The noise stage `cfg.noise_model` names, on `controls`, and its inference stats (a pack's).
 pub fn noise_stage(controls: Arc<ChainControls>, cfg: &ProcessingConfig, thread: ModelThread) -> Result<NoiseStageWithStats, StageError> {
+    let (noise, stats) = model_stage(controls, cfg, thread)?;
+    Ok((noise, stats))
+}
+
+fn model_stage(controls: Arc<ChainControls>, cfg: &ProcessingConfig, thread: ModelThread) -> Result<BuiltModel, StageError> {
     let id = cfg.noise_model.as_str();
     if id == DEFAULT_NOISE_MODEL {
         return Ok((Box::new(nf_stages::rnnoise_stage(controls)?), None));
@@ -99,7 +117,7 @@ pub fn noise_stage(controls: Arc<ChainControls>, cfg: &ProcessingConfig, thread:
 }
 
 #[cfg(feature = "onnx")]
-fn pack_stage(controls: Arc<ChainControls>, id: &str, depth: u32, thread: ModelThread) -> Result<NoiseStageWithStats, StageError> {
+fn pack_stage(controls: Arc<ChainControls>, id: &str, depth: u32, thread: ModelThread) -> Result<BuiltModel, StageError> {
     use nf_core::noise::Executor;
     let exec = match thread {
         ModelThread::Inline => Executor::Inline,
@@ -110,7 +128,7 @@ fn pack_stage(controls: Arc<ChainControls>, id: &str, depth: u32, thread: ModelT
 }
 
 #[cfg(not(feature = "onnx"))]
-fn pack_stage(_controls: Arc<ChainControls>, id: &str, _depth: u32, _thread: ModelThread) -> Result<NoiseStageWithStats, StageError> {
+fn pack_stage(_controls: Arc<ChainControls>, id: &str, _depth: u32, _thread: ModelThread) -> Result<BuiltModel, StageError> {
     Err(StageError(format!("noise model '{id}' needs a build with --features onnx (this one has RNNoise only)")))
 }
 
@@ -119,8 +137,14 @@ fn pack_stage(_controls: Arc<ChainControls>, id: &str, _depth: u32, _thread: Mod
 pub fn build_chain(
     controls: Arc<ChainControls>, cfg: &ProcessingConfig, with_aec: bool, thread: ModelThread,
 ) -> Result<BuiltChain, StageError> {
-    let (noise, inference) = noise_stage(controls.clone(), cfg, thread)?;
-    let chain = nf_stages::build_chain_with(controls, with_aec, noise)?;
+    // Keep the built-in ready for a hot toggle. Disabled model packs need no install, load or inference worker.
+    let (noise, inference) = if cfg.noise_enabled || cfg.noise_model == DEFAULT_NOISE_MODEL {
+        let (noise, inference) = model_stage(controls.clone(), cfg, thread)?;
+        (Some(noise), inference)
+    } else {
+        (None, None)
+    };
+    let chain = nf_stages::build_model_chain(controls, with_aec, noise)?;
     Ok(BuiltChain { chain, inference })
 }
 
@@ -145,6 +169,27 @@ mod tests {
             } else {
                 assert!(e.contains("needs a build with --features onnx"), "{e}");
             }
+        }
+    }
+
+    #[test]
+    fn a_gate_only_chain_can_start_with_an_uninstalled_noise_model() {
+        use nf_core::config::{GateConfig, GateMode};
+        use nf_core::{BLOCK, Block};
+        let cfg = ProcessingConfig {
+            noise_enabled: false,
+            noise_model: "no-such-pack".into(),
+            gate: GateConfig { mode: GateMode::Static, threshold_db: -20.0, range_db: -30.0, release_ms: 0.0, ..GateConfig::default() },
+            ..ProcessingConfig::default()
+        };
+        for thread in [ModelThread::Inline, ModelThread::Worker { give_up: None }] {
+            let mut b = build_chain(Arc::new(ChainControls::new(&cfg)), &cfg, false, thread).unwrap();
+            assert!(b.inference.is_none());
+            assert_eq!(b.chain.latency(), 0);
+            assert!(!b.chain.runs_a_stage());
+            let mut out: Block = [0.0; BLOCK];
+            let report = b.chain.process(&[0.01; BLOCK], &[0.0; BLOCK], &mut out);
+            assert!(report.noise.is_none() && (report.gate_reduction_db.unwrap() + 30.0).abs() < 0.001);
         }
     }
 

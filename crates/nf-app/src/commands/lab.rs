@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use nf_core::controls::ChainControls;
 use nf_engine::ProcessingConfig;
-use nf_engine::models::{ModelThread, build_chain};
+use nf_engine::models::{ModelThread, available_noise_models, build_chain};
 use nf_stages::harness::run_chain;
 
 use crate::cli::{LabArgs, LabMetric};
@@ -58,7 +58,13 @@ pub fn lab(args: &LabArgs) -> Result<(), Failure> {
     cfg.noise_enabled = true;
     let models = match &args.models {
         Some(m) => m.clone(),
-        None => default_models(),
+        None => {
+            let ids = available_noise_models().into_iter().map(|(id, _)| id);
+            // A default sweep skips corrupt installs. An explicitly requested pack reports its load error below.
+            #[cfg(feature = "onnx")]
+            let ids = ids.filter(|id| id == nf_core::config::DEFAULT_NOISE_MODEL || nf_ort::Pack::installed(id).is_ok());
+            ids.collect()
+        }
     };
     // Each model's chain once, to check it before the batch and for its latency
     let mut latencies = Vec::with_capacity(models.len());
@@ -168,13 +174,6 @@ pub fn lab(args: &LabArgs) -> Result<(), Failure> {
         say!("Wrote scorecard.txt, clips.csv and lab.json to {}.", out.display());
     }
     Ok(())
-}
-
-/// The models a lab compares by default: RNNoise, and with the `onnx` feature every noise model pack installed.
-fn default_models() -> Vec<String> {
-    let mut m = vec![nf_core::config::DEFAULT_NOISE_MODEL.to_owned()];
-    m.extend(mos::installed_noise_packs());
-    m
 }
 
 /// Which MOS metrics run, and the note when they can't: the asked ones (`--metrics`), or by default all this build has.
@@ -309,16 +308,6 @@ mod mos {
             (windows, errors)
         }
     }
-
-    /// The installed packs that load as noise models (their ids, sorted).
-    pub fn installed_noise_packs() -> Vec<String> {
-        let Some(dir) = nf_ort::models_dir() else { return Vec::new() };
-        let mut ids: Vec<String> =
-            std::fs::read_dir(dir).map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect()).unwrap_or_default();
-        ids.sort();
-        ids.retain(|id| nf_ort::Pack::installed(id).is_ok());
-        ids
-    }
 }
 
 /// Without ONNX Runtime: no MOS metrics, RNNoise alone.
@@ -338,10 +327,6 @@ mod mos {
         pub fn score(&mut self, _x: &[f32], _s: &mut Scores) -> (Option<usize>, Vec<String>) {
             (None, Vec::new())
         }
-    }
-
-    pub fn installed_noise_packs() -> Vec<String> {
-        Vec::new()
     }
 }
 

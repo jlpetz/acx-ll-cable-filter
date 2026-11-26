@@ -18,8 +18,8 @@ pub fn load(path: &Path) -> Result<EngineConfig, Failure> {
 /// The window's settings file (`{"engine": {...}, "ui": {...}}`) or a bare `EngineConfig`. Missing
 /// fields take their defaults and unknown ones are ignored, as the window loads it; a UTF-8 BOM is
 /// fine. The window's file is brought up to date by its version, as the window does
-/// (`nf_gui::upgrade_saved_engine`); a bare config (`quality --save`'s `chain_config.json`) is taken
-/// as it is.
+/// (`nf_gui::upgrade_saved_engine`). Bare engine configs predate the version field. Before `gate_position` was introduced,
+/// disabling the denoiser also bypassed its gate. Preserve this for old chain recordings and config files.
 pub fn parse(text: &str) -> Result<EngineConfig, String> {
     let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
     let (engine, version) = match value {
@@ -30,9 +30,12 @@ pub fn parse(text: &str) -> Result<EngineConfig, String> {
         serde_json::Value::Object(map) => (serde_json::Value::Object(map), None),
         _ => return Err("expected a JSON object".into()),
     };
+    let has_gate_position = engine["processing"].get("gate_position").is_some();
     let mut cfg: EngineConfig = serde_json::from_value(engine).map_err(|e| e.to_string())?;
     if let Some(v) = version {
         nf_gui::upgrade_saved_engine(v, &mut cfg);
+    } else if !has_gate_position && !cfg.processing.noise_enabled {
+        cfg.processing.gate.mode = nf_engine::GateMode::Off;
     }
     Ok(cfg)
 }
@@ -230,6 +233,10 @@ mod tests {
         assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 2}}, "ui": {}}"#), nf_engine::AUTO_MODEL_DEPTH);
         assert_eq!(depth(r#"{"version": 1, "engine": {"processing": {"model_depth": 2}}}"#), 2);
         assert_eq!(depth(r#"{"processing": {"model_depth": 2}}"#), 2);
+        let old = r#"{"processing":{"noise_enabled":false,"gate":{"mode":"Auto"}}}"#;
+        let new = r#"{"processing":{"noise_enabled":false,"gate":{"mode":"Auto"},"gate_position":"AfterNoise"}}"#;
+        assert_eq!(parse(old).unwrap().processing.gate.mode, GateMode::Off);
+        assert_eq!(parse(new).unwrap().processing.gate.mode, GateMode::Auto);
     }
 
     #[test]
