@@ -11,22 +11,27 @@ for it."
 So: no mixer app now; the per-cable driver (TODO 19's step 1) and the engine's fan-out (TODO 19's E1, Astra's) are built
 so that one can be added without redoing either.
 
+The owner chose mono and stereo for the first routing implementation. Surround layouts such as 5.1 and 7.1 can come later.
+Today the app averages capture channels to mono and the direct writer repeats that sample on left and right. E1 should
+keep both channels of a stereo source through the split. A dry recording gets the original left and right. A branch
+using a mono voice effect downmixes at that effect's input. A mono signal stays mono until a stereo output needs the
+same sample on both channels.
+
 ## Why in the app (the owner, 2026-11-26)
 One capture feeding every destination lets the physical microphone be opened in exclusive mode, which admits a single
-client: several apps opening the mic themselves would force it to shared mode. Measured (TODO 13): mic delivery about
+client: several apps opening the mic themselves would force it to shared mode. With VB-CABLE A as the mic on the dev VM (TODO 13), mic delivery was about
 0.7 ms exclusive against 17-19 ms shared, app + output cable 38.5-41.0 ms with the defaults against 46.7-49.4 with the mic
 shared. Exclusive is the default since 2026-11-02, with the shared fallback for a device that refuses it (some drivers,
 Bluetooth hands-free, or Windows' "Allow applications to take exclusive control" turned off). Two costs to show the user:
-no app can open the mic directly while the filter runs (they record from the cables), and exclusive mode bypasses the mic
-driver's own effects (vendor noise suppression, beamforming).
+other apps record from the cables while the app holds the mic, and exclusive mode bypasses the shared Windows audio engine.
+Processing in the microphone's own hardware can still apply.
 
 ## The model (ours, for the owner and Astra)
 A routing graph evaluated block by block on the engine's real-time thread, in topological order:
 - **Sources:** a physical input (WASAPI capture), and later a cable's playback side (below: the render tap).
 - **Stages:** the filters we have (AEC, the noise models, the gate, a CLAP effect) and any later ones.
-- **Branch (split):** one block handed to several consumers in the same cycle, read-only; a consumer that changes the
-  samples works on its own copy (one block, about 4 KB at 10 ms stereo float, about a microsecond). A split adds no
-  latency: no queue, no thread hop.
+- A split gives consumers a read-only view of the same samples in one pass. A branch that changes samples writes into
+  preallocated scratch. The split needs no extra audio period. Measure processing time with all intended branches active.
 - **Mix (merge):** the sum of several inputs with a gain each. Inputs on one clock mix in the same cycle; each input's
   path latency is known (every node reports its own), and a mix can delay the earlier inputs to align them (optional per
   mix: off for a mic and a separate music feed, on for a dry and a processed copy of one voice).
@@ -34,8 +39,9 @@ A routing graph evaluated block by block on the engine's real-time thread, in to
 - **Sinks:** a cable's app ring (the direct route, lowest latency) or a WASAPI output.
 
 ## Clocks (the part that decides latency)
-- **Our cables share one clock:** every cable's timers run on the driver's one QPC time line. Branches and mixes among
-  our own cables are synchronous: no resampling, no drift, no queue. Keep it that way: no per-cable clocks.
+- Our cables use the same QPC time base at the same nominal rate. Each reader starts independently and has its own
+  packet size, phase, ring headroom and restart handling. A split needs no extra queue between the app's branches.
+  For a mix, identify the source frame positions and account for the processing delay of each input.
 - **A device on its own clock** (a USB or Bluetooth mic, real speakers, VB-CABLE) joins through an adapter on its own
   thread: a lock-free queue and drift control (slips or resampling, as the WASAPI output already does, TODO 9). That
   costs it one queue (a period and a margin); only it pays.
@@ -53,8 +59,8 @@ others.
   as a low-latency source through a read-only lock-free ring, as the app ring is in the other direction. Today the only
   ways in are the driver's own loopback onto the cable's microphone and WASAPI loopback capture, which is slower. The
   per-cable state leaves room for a second ring.
-- **Formats per cable:** the ring's format is negotiated per cable, not fixed driver-wide: stereo now, more channels
-  later (VB-CABLE has 16-channel inputs).
+- Each direct ring currently carries 48 kHz stereo float32 (`crates/nf-vmic/src/protocol.rs`). It can carry distinct
+  left and right samples or the same mono sample on both channels. Surround would require a new ring layout.
 - **Mixing stays in user mode:** the driver only moves samples, which keeps it small and the mixer free to change.
 
 ## Groundwork in the engine (TODO 19's E1, Astra's)

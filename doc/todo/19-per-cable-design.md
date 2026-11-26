@@ -250,8 +250,9 @@ endpoints come or go, and when a cable picker opens.
   MMDevice endpoint ids, their cached names and properties, the Sound panel's renames, apps' saved device choices (an app
   set to B would silently get D). variant.rs avoids reuse only because it creates the new element before removing the old
   node. With the identity in the ID, a cable's instance ID can never be another cable's.
-  - **Re-adding keeps n:** the same instance ID, so the same KS filter paths, so (we expect [C]) the same MMDevice
-    endpoints: an app set to B finds B again. Open question 2 asks the owner to agree.
+  - Re-adding the same variant keeps n and the cable's instance ID. S0a step 12 observed three new MMDevice endpoint
+    IDs after uninstalling B. The app identifies a cable endpoint by CableId and role. Disable/enable keeps the cable
+    installed for temporary use.
   - **A variant switch takes n + 1:** fresh endpoints, which TODO 22's default period needs (Windows reads it only when
     it makes an endpoint).
   - **If a removed node's key is still there,** `SetupDiCreateDeviceInfoW` fails with ERROR_DEVINST_ALREADY_EXISTS
@@ -690,6 +691,8 @@ compatibility promise).
 **Engine (E1), fan-out:**
 - The physical microphone is captured once and goes to N destinations. Each destination's source is the dry mic, the
   shared chain's output, or its own chain; its output is `Direct(CableId)` or `Wasapi(endpoint id)`.
+- E1 supports mono and stereo routes (TODO 24). Split before the voice chain so a dry stereo route preserves both
+  channels. Downmix on branches that require mono. A mono route feeds both channels of the existing stereo cable.
 - Amended (ours, 2026-11-26, after the owner's routing intent, TODO 24): our cables' branches run inline on the capture
   thread, in the same block, and write their rings directly (a split adds no latency: the block is shared read-only, a
   branch that changes it works on a copy); only a WASAPI destination (its own clock) or a heavy branch gets its own
@@ -770,6 +773,9 @@ compatibility promise).
     x 0.25 (a power of two, exact in float32).
   - Check A decodes bit-exact (0 corrupt, 0 repeats) and its ring deltas are 0. `isolation --external` checks the
     counters.
+  - Passed on the dev VM, 2026-11-26. B's recorder measured -12.044 dB. All 555,840 delay-aligned samples at the output
+    of the chain exactly matched its input times 0.25. A carried 1,296,000 consecutive coded frames without gaps or repeats.
+    A's STATS before and after showed no ring activity. Used `nf-vmic-test stats` on A in place of the planned T1 command.
 - **P1, direct to B** (after B1 and E1): as P1w, with B's ring deltas showing the app's one attachment and A's ring
   untouched.
 - **P2, swapped:** direct to A with the gain, B plain carrying the test signal bit-exact.
@@ -777,9 +783,9 @@ compatibility promise).
   `Cable.ps1 remove B` mid-run.
   - Check: B's feed ends with ERROR_DEVICE_REMOVED; A's verify passes; A's generation is unchanged and its DetachRemoval
     +0.
-  - Then `Cable.ps1 add B`. Check: B is back with the same id and instance ID, its endpoints' MMDevice ids those it had
-    before the removal [C], a new generation, Attaches 0 and empty logs (SkipEventsLogged 0); A's counters continued; no
-    id moved between cables.
+  - Then `Cable.ps1 add B`. Check that B has the same CableId and instance ID, a new generation, Attaches 0 and empty logs
+    (SkipEventsLogged 0). Resolve B's endpoints by CableId and role, compare them with the setup map and open both
+    microphones. A's recording must finish bit-exact and its counters continue. No endpoint ID may move between cables.
 - **P4, a reduced-rights token:**
   - Each command runs as `runas /trustlevel:0x20000 "cmd /c <command> > %TEMP%\p4-<n>.txt 2>&1"`, one at a time, then
     the files are read: runas opens a console of its own, so the output has to be redirected inside it.
@@ -807,7 +813,9 @@ compatibility promise).
   running app lists D without a restart.
 - **P6, fan-out** (after E1 and G1): one capture (the stand-in microphone of P1w).
   - Destinations: A dry (direct), B gain 0.25 (direct).
-  - Check, recording both at once: A is the source bit-exact, B the source x 0.25.
+  - Record both at once with a left-only marker followed by a right-only marker and digital silence. A reproduces
+    the stereo source bit-exactly. B applies 0.25 gain to each channel independently. Repeat with a mono source and
+    check that both channels of each cable carry that route's mono signal at the expected gain.
   - Then stop B's destination, reconfigure it (gain 0.5) and start it again. Check: A's verify passes across each change,
     with its attachment unchanged (Attaches +0).
   - The owner's run on real hardware: OBS on A dry, Discord on B with AEC and the noise stage on.
@@ -929,8 +937,8 @@ owner agrees.
 ### Open questions
 **The owner's decisions (2026-11-25, adopting Astra's answers):** Also: the migrated Cable B keeps both microphones; its existing microphone maps to B's low-latency one (an app's saved choice keeps working) and the Call Microphone appears as a new endpoint; a cable stays pending until Windows shows its expected endpoints, after a restart too; a run stops if it can't put back the user's default devices (keeping the new ones is the user's explicit choice). 1, A's counters reset
 when A itself restarts, and B removed, restarted or updated alone leaves A's running. 2, a re-add keeps the logical
-identity and aims to keep the Windows endpoint IDs on an ordinary same-variant re-add, checked in S0a by default (the
-active endpoint IDs compared, a saved selection opening the intended microphone). 3, both microphones by default on every
+identity. On 2026-11-26 the owner accepted new Windows endpoint IDs on full removal and re-add. Use disable/enable to keep
+the installation and its endpoints. 3, both microphones by default on every
 cable, with a one-mic option. 4, aliases (A, B, D...) in the tools and GUI only, over the stable identity: no kernel names.
 5, devices made outside the tool adopted only explicitly (shown, then adopted at the user's choice). Also: treat the first
 migration as a device change, recording the old-to-new endpoint mapping and remapping our own saved settings where the
@@ -943,10 +951,8 @@ routes by cable id.
    restart is a new binding like any cable's, with the GUI joining the history. If you meant A's counters survive A's own
    disable, update or variant switch, that needs state kept outside A's device (a global or a registry carry-over), which
    the per-instance design otherwise avoids. Which did you mean?
-2. **Endpoints across re-adding (ours, for you to agree).** Re-adding a cable now reuses its instance ID (section 4), so
-   we expect Windows to bring back its endpoints [C]. OBS or Discord set to B find B again, with the Sound panel's names
-   and settings, and its cached properties (TODO 22) are those it had, from the same INF. A variant switch makes new ones,
-   which TODO 22 needs. Keep the endpoints on re-adding, or make re-added cables fresh (n + 1 on every add)?
+2. **Endpoints across re-adding (decided 2026-11-26).** The setup map relates the old and new Windows IDs by role.
+   External apps that saved the old IDs may need their device selected again. A variant switch still takes n + 1 (section 4).
 3. **Microphones on new cables.** `add` defaults to both microphones for every cable (ours), so each cable shows a
    Microphone and a Call Microphone in every app. Or one microphone by default, as B has now?
 4. **Kernel alias links.** Your aliases (`\\.\NoiseFilterVmicB` style names, `--cable b`) are served in user mode: the
