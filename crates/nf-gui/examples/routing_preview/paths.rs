@@ -5,7 +5,7 @@ pub(super) fn paths(app: &Preview, cx: &ViewContext<Preview>) -> View {
     let sources = StackPanel::new().spacing(8.0).keyed_children((0..SOURCES.len()).map(|s| (s, source_card(app, cx, s))));
     let mixes = Grid::new().columns([GridLength::STAR; 3]).column_spacing(6.0).keyed_children(DESTS.iter().enumerate().map(|(d, dest)| {
         let inputs = (0..SOURCES.len()).filter(|&s| app.scene.connected(s, d)).count();
-        let count = if inputs == 1 { "1 input".to_owned() } else { format!("{inputs} inputs") };
+        let count = if inputs == 1 { "1 source".to_owned() } else { format!("{inputs} sources") };
         let scope = Scope::Output(d);
         let button = Button::new()
             .style(if app.scene.scope == scope { ButtonStyle::Accent } else { ButtonStyle::Default })
@@ -13,9 +13,10 @@ pub(super) fn paths(app: &Preview, cx: &ViewContext<Preview>) -> View {
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .automation_name(format!("Edit {dest} mix with {count}"))
             .on_click(cx.callback(move |()| Msg::Select(scope)))
-            .content(
-                StackPanel::new().spacing(1.0).children((TextBlock::new().text(*dest).font_weight(FontWeight::SEMI_BOLD), small(&count))),
-            )
+            .content(StackPanel::new().spacing(1.0).children((
+                TextBlock::new().text(*dest).text_wrapping(TextWrapping::Wrap).font_weight(FontWeight::SEMI_BOLD),
+                small(&count),
+            )))
             .tooltip(DEST_INFO[d]);
         (d, button)
     }));
@@ -23,7 +24,7 @@ pub(super) fn paths(app: &Preview, cx: &ViewContext<Preview>) -> View {
         heading("Sources and sends").into(),
         muted("Select a source for shared processing, or a branch for effects on one send.").into(),
         sources,
-        heading("Output mixes").into(),
+        heading("Destination mixes").into(),
         mixes,
     ])
 }
@@ -75,7 +76,12 @@ fn source_card(app: &Preview, cx: &ViewContext<Preview>, s: usize) -> View {
                     .horizontal_alignment(HorizontalAlignment::Stretch)
                     .automation_name(&label)
                     .on_click(cx.callback(move |()| Msg::Send(s, d)))
-                    .content(TextBlock::new().text(format!("{} {dest}", if on { "✓" } else { "+" })).font_size(13.0))
+                    .content(
+                        TextBlock::new()
+                            .text(format!("{} {dest}", if on { "✓" } else { "+" }))
+                            .font_size(13.0)
+                            .text_wrapping(TextWrapping::Wrap),
+                    )
                     .tooltip(label);
                 (d, button)
             }));

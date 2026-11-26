@@ -12,11 +12,7 @@ pub(super) fn mixer(app: &Preview, cx: &ViewContext<Preview>) -> View {
             .enumerate()
             .map(|(d, _)| (d, Border::new().grid_column(d as i32).content(output_strip(app, cx, d, sends_to == Some(d))))),
     );
-    let mut body = vec![
-        heading("Output mixes").into(),
-        muted("Select an input on each output you want it to reach. Selected inputs play together.").into(),
-        strips,
-    ];
+    let mut body = vec![heading("Destination mixes").into(), muted("Choose the sources to mix at each destination.").into(), strips];
     if let Some(d) = sends_to {
         let sends: Vec<View> = SOURCES
             .iter()
@@ -26,7 +22,7 @@ pub(super) fn mixer(app: &Preview, cx: &ViewContext<Preview>) -> View {
             .collect();
         body.push(card(column(vec![
             heading(&format!("Send effects to {}", DESTS[d])).into(),
-            if sends.is_empty() { muted("Select an input on this output to edit its send effects.").into() } else { row(sends) },
+            if sends.is_empty() { muted("Connect a source to this destination to edit its send effects.").into() } else { row(sends) },
         ])));
     }
     let sources = SOURCES
@@ -34,7 +30,7 @@ pub(super) fn mixer(app: &Preview, cx: &ViewContext<Preview>) -> View {
         .enumerate()
         .map(|(s, name)| action(name, cx.callback(move |()| Msg::Select(Scope::Source(s))), app.scene.scope == Scope::Source(s)))
         .collect();
-    body.push(card(column(vec![heading("Shared input effects").into(), row(sources)])));
+    body.push(card(column(vec![heading("Shared source effects").into(), row(sources)])));
     column(body)
 }
 
@@ -43,12 +39,17 @@ fn output_strip(app: &Preview, cx: &ViewContext<Preview>, d: usize, selected: bo
     let signal = if inputs == 0 { 0.0 } else { [0.78, 0.69, 0.63][d] };
     let peak = if inputs == 0 { "−∞" } else { ["−13.2", "−18.6", "−22.2"][d] };
     let count = match inputs {
-        0 => "No inputs".to_owned(),
-        1 => "1 input".to_owned(),
-        n => format!("{n} inputs"),
+        0 => "No sources".to_owned(),
+        1 => "1 source".to_owned(),
+        n => format!("{n} sources"),
     };
     let mut body = vec![
-        TextBlock::new().text(DESTS[d]).font_size(16.0).font_weight(FontWeight::SEMI_BOLD).tooltip(DEST_INFO[d]),
+        TextBlock::new()
+            .text(DESTS[d])
+            .font_size(16.0)
+            .font_weight(FontWeight::SEMI_BOLD)
+            .text_wrapping(TextWrapping::Wrap)
+            .tooltip(DEST_INFO[d]),
         column(vec![
             meter(signal),
             TextBlock::new().text(format!("{peak} dBFS")).font_size(16.0).automation_name(format!("{} peak, {peak} dBFS", DESTS[d])).into(),
@@ -68,7 +69,7 @@ fn output_strip(app: &Preview, cx: &ViewContext<Preview>, d: usize, selected: bo
                 })
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .automation_name(format!("Send {name} to {}", DESTS[d]))
-                .content(TextBlock::new().text(*name).font_size(12.0).text_trimming(TextTrimming::CharacterEllipsis))
+                .content(TextBlock::new().text(*name).font_size(12.0).text_wrapping(TextWrapping::Wrap))
                 .tooltip(format!("{} → {}", SOURCE_INFO[s], DEST_INFO[d])),
         );
     }

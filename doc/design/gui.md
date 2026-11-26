@@ -10,10 +10,15 @@ The owner wants visible split and mix controls and a single ordered list for bui
 Reactor mockups are available for choosing the layout. The current settings window is documented below.
 [Compare the concepts](routing-preview.png). Run `cargo run -p nf-gui --example routing_preview` to try them.
 
-All three layouts edit one in-memory example. The studio mic feeds Cable A dry for OBS and Cable B through AEC and RNNoise
-for Discord. Cable C playback joins the mic on A at −9 dB. To try a two-cable mix,
-turn on **Cable D playback → Cable A** and turn off **Studio mic → Cable A**. Both C and D now feed A, and B keeps its own mic chain.
-The meters, devices and plugin catalog are examples.
+All three layouts edit one in-memory example. **Hardware mic** represents a physical microphone. It feeds **Cable A Output**
+dry for OBS and **Cable B Output** through AEC and RNNoise for Discord. Audio played into **Cable C Input** joins the mic
+on A at −9 dB. To try a two-cable mix, turn on **Cable D Input → Cable A Output** and turn off **Hardware mic → Cable A Output**.
+Both C and D now feed A. B keeps its own mic chain. The meters, devices and plugin catalog are examples.
+
+**Input** and **Output** name the two ends from the cable's perspective. Windows currently lists the playback end as **Speakers**
+and its recording ends as **Microphone** (low latency) and **Call Microphone** (communications). Both recording ends carry the
+same cable signal. A preview destination represents that signal. The recording app chooses the endpoint. **Source** and
+**destination** describe a pipeline connection, so a cable output used downstream keeps its Output name.
 
 - **Signal paths** shows where each source goes. Choose **Edit sends** on the source to connect another destination.
 - **Routing matrix** shows all source/destination pairs. Each active cell in a row is a copy, and each active cell in a column contributes to the mix.

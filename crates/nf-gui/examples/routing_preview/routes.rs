@@ -1,9 +1,9 @@
 use super::*;
 
 pub(super) fn matrix(app: &Preview, cx: &ViewContext<Preview>) -> View {
-    let mut cells = vec![small("Inputs / outputs").vertical_alignment(VerticalAlignment::Center).into()];
+    let mut cells = vec![small("Source ↓\nDestination →").vertical_alignment(VerticalAlignment::Center).into()];
     for (d, dest) in DESTS.iter().enumerate() {
-        let label = format!("Edit the {dest} output chain. {}", DEST_INFO[d]);
+        let label = format!("Edit the {dest} mix. {}", DEST_INFO[d]);
         cells.push(
             Button::new()
                 .style(if app.scene.scope == Scope::Output(d) { ButtonStyle::Default } else { ButtonStyle::Subtle })
@@ -11,7 +11,7 @@ pub(super) fn matrix(app: &Preview, cx: &ViewContext<Preview>) -> View {
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .automation_name(&label)
                 .grid_column(d as i32 + 1)
-                .content(TextBlock::new().text(*dest).font_size(12.0))
+                .content(TextBlock::new().text(*dest).font_size(12.0).text_wrapping(TextWrapping::Wrap))
                 .tooltip(label),
         );
     }
@@ -52,7 +52,7 @@ pub(super) fn matrix(app: &Preview, cx: &ViewContext<Preview>) -> View {
     cells.push(small("In the mix").vertical_alignment(VerticalAlignment::Center).grid_row(footer_row).into());
     for (d, _) in DESTS.iter().enumerate() {
         let n = (0..SOURCES.len()).filter(|&s| app.scene.connected(s, d)).count();
-        let count = if n == 1 { "1 input".to_owned() } else { format!("{n} inputs") };
+        let count = if n == 1 { "1 source".to_owned() } else { format!("{n} sources") };
         cells.push(small(&count).horizontal_alignment(HorizontalAlignment::Center).grid_column(d as i32 + 1).grid_row(footer_row).into());
     }
     let table = Grid::new()
@@ -96,7 +96,7 @@ pub(super) fn matrix(app: &Preview, cx: &ViewContext<Preview>) -> View {
     };
     column(vec![
         heading("Routing table").into(),
-        muted("Switch on a send to route an input. Inputs in the same output column are mixed.").into(),
+        muted("Switch on a send to connect a source. Sources in the same destination column are mixed.").into(),
         card(table),
         card(column(vec![heading("Send effects").into(), sends])),
     ])

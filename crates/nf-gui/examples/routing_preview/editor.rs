@@ -74,7 +74,7 @@ fn stage_row(stage: &Stage, index: usize, count: usize, selected: bool, cx: &Vie
     if selected {
         let parameter = if matches!(kind, Kind::Echo) {
             let sender = cx.sender();
-            let choices = ["Speakers (system playback)", "Headset playback", "Cable C playback"];
+            let choices = ["Speakers (system playback)", "Headset playback", SOURCES[1]];
             ComboBox::new()
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .items_source(choices)

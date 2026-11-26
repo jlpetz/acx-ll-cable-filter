@@ -169,7 +169,7 @@ impl Preview {
             .into_iter()
             .map(|(choice, label)| action(label, cx.callback(move |()| Msg::Concept(choice)), self.concept == choice))
             .collect());
-        column(vec![title_row, navigation])
+        column(vec![title_row, navigation, muted("Play audio into a Cable Input. Record from a Cable Output.").into()])
     }
 
     fn routing(&self, cx: &ViewContext<Self>) -> View {
@@ -184,7 +184,7 @@ impl Preview {
         let send = &self.scene.sends[s][d];
         let choices = self.scene.taps(s);
         let selected = choices.iter().position(|(tap, _)| *tap == send.tap);
-        let summary = selected.map_or("After all input stages", |i| choices[i].1.as_str());
+        let summary = selected.map_or("After all source stages", |i| choices[i].1.as_str());
         let action_label = format!("{}   ·   {summary}   ·   {:+} dB", if self.send_options { "▾  Send" } else { "▸  Send" }, send.gain_db);
         let button = Button::new()
             .style(ButtonStyle::Subtle)

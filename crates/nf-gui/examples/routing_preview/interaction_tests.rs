@@ -50,16 +50,16 @@ fn dispatch(pump: &mut PreviewPump, id: NodeId, event: EventId, payload: EventPa
 fn two_cables_can_mix_into_a_third_and_split_to_a_second_destination() {
     let mut pump = Pump::new(RecordingRuntime::default());
     pump.mount_view(View::component::<Preview>(Concept::Matrix)).unwrap();
-    click(&mut pump, "Disconnect Studio mic from Cable A");
-    click(&mut pump, "Send Cable D playback to Cable A");
-    button(&pump, "Disconnect Cable C playback from Cable A");
-    button(&pump, "Disconnect Cable D playback from Cable A");
-    click(&mut pump, "Send Cable C playback to Cable B");
-    click(&mut pump, "Edit processing for the Cable C playback to Cable B send");
+    click(&mut pump, "Disconnect Hardware mic from Cable A Output");
+    click(&mut pump, "Send Cable D Input to Cable A Output");
+    button(&pump, "Disconnect Cable C Input from Cable A Output");
+    button(&pump, "Disconnect Cable D Input from Cable A Output");
+    click(&mut pump, "Send Cable C Input to Cable B Output");
+    click(&mut pump, "Edit processing for the Cable C Input to Cable B Output send");
     click(&mut pump, "+ Add stage");
     click(&mut pump, "Add Equalizer");
     button(&pump, "Edit stage 1, Equalizer");
-    click(&mut pump, "Edit processing for the Cable C playback to Cable A send");
+    click(&mut pump, "Edit processing for the Cable C Input to Cable A Output send");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Dry signal · no stages")));
 }
 
@@ -67,9 +67,9 @@ fn two_cables_can_mix_into_a_third_and_split_to_a_second_destination() {
 fn a_new_send_and_its_pan_stage_follow_the_user_between_layouts() {
     let mut pump = Pump::new(RecordingRuntime::default());
     pump.mount_view(View::component::<Preview>(Concept::Matrix)).unwrap();
-    click(&mut pump, "Send Studio mic to Headphones");
-    button(&pump, "Disconnect Studio mic from Headphones");
-    click(&mut pump, "Edit processing for the Studio mic to Headphones send");
+    click(&mut pump, "Send Hardware mic to Headphones");
+    button(&pump, "Disconnect Hardware mic from Headphones");
+    click(&mut pump, "Edit processing for the Hardware mic to Headphones send");
     click(&mut pump, "+ Add stage");
     click(&mut pump, "Add Stereo pan");
     button(&pump, "Edit stage 1, Stereo pan");
@@ -78,8 +78,8 @@ fn a_new_send_and_its_pan_stage_follow_the_user_between_layouts() {
         click(&mut pump, view);
         button(&pump, "Edit stage 1, Stereo pan");
     }
-    click(&mut pump, "Disconnect Studio mic from Headphones");
-    button(&pump, "Send Studio mic to Headphones");
+    click(&mut pump, "Disconnect Hardware mic from Headphones");
+    button(&pump, "Send Hardware mic to Headphones");
 }
 
 #[test]
@@ -108,9 +108,9 @@ fn a_clap_voice_effect_can_be_reordered_tuned_bypassed_and_removed_from_one_bran
     dispatch(&mut pump, slider, EventId::SliderValueChanged, EventPayload::F64(-7.0));
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Pitch  ·  -7 semitones")));
 
-    click(&mut pump, "Edit processing for the Studio mic to Cable A send");
+    click(&mut pump, "Edit processing for the Hardware mic to Cable A Output send");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Dry signal · no stages")));
-    click(&mut pump, "Edit processing for the Studio mic to Cable B send");
+    click(&mut pump, "Edit processing for the Hardware mic to Cable B Output send");
     click(&mut pump, "Edit stage 2, Voice tone");
     button(&pump, "Enable");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Pitch  ·  -7 semitones")));

@@ -1,10 +1,11 @@
 //! In-memory signal graph for comparing the three editors against exactly the same session.
 use std::collections::BTreeMap;
 
-pub(super) const SOURCES: [&str; 3] = ["Studio mic", "Cable C playback", "Cable D playback"];
-pub(super) const SOURCE_INFO: [&str; 3] = ["Microphone input", "What apps play to Cable C", "What apps play to Cable D"];
-pub(super) const DESTS: [&str; 3] = ["Cable A", "Cable B", "Headphones"];
-pub(super) const DEST_INFO: [&str; 3] = ["OBS recording", "Discord microphone", "Stereo monitor"];
+pub(super) const SOURCES: [&str; 3] = ["Hardware mic", "Cable C Input", "Cable D Input"];
+pub(super) const SOURCE_INFO: [&str; 3] =
+    ["Example physical microphone", "Audio apps play into Speakers (ACX-LL-Cable C)", "Audio apps play into Speakers (ACX-LL-Cable D)"];
+pub(super) const DESTS: [&str; 3] = ["Cable A Output", "Cable B Output", "Headphones"];
+pub(super) const DEST_INFO: [&str; 3] = ["Recorded by OBS", "Recorded by Discord", "Physical listening device"];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Scope {
@@ -16,7 +17,7 @@ pub(super) enum Scope {
 impl Scope {
     pub(super) fn title(self) -> String {
         match self {
-            Self::Source(s) => format!("{} input", SOURCES[s]),
+            Self::Source(s) => SOURCES[s].to_owned(),
             Self::Send(s, d) => format!("{} → {}", SOURCES[s], DESTS[d]),
             Self::Output(d) => format!("{} mix", DESTS[d]),
         }
@@ -24,7 +25,7 @@ impl Scope {
 
     pub(super) fn description(self) -> &'static str {
         match self {
-            Self::Source(_) => "Shared input effects. Each send chooses where it takes the signal.",
+            Self::Source(_) => "Shared source effects. Each send chooses where it takes the signal.",
             Self::Send(_, _) => "Only this copy of the signal passes through these stages.",
             Self::Output(_) => "Runs after the incoming sends have been mixed.",
         }
@@ -231,7 +232,7 @@ impl Scene {
     }
 
     pub(super) fn taps(&self, s: usize) -> Vec<(Tap, String)> {
-        let mut options = vec![(Tap::Raw, "Original input (dry)".into()), (Tap::End, "After all input stages".into())];
+        let mut options = vec![(Tap::Raw, "Original source (dry)".into()), (Tap::End, "After all source stages".into())];
         options.extend(
             self.at(Scope::Source(s))
                 .iter()
