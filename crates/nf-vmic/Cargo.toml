@@ -11,9 +11,18 @@ publish.workspace = true
 name = "nf-vmic-test"
 path = "src/bin/nf-vmic-test.rs"
 
+# The cables' setup tool (TODO 19, the per-cable design, section 9): add, remove, list, variant, update, migrate.
+# `cargo build --release -p nf-vmic --bin acx-ll-cable`; driver\scripts\Cable.ps1 -Build runs that.
+[[bin]]
+name = "acx-ll-cable"
+path = "src/bin/acx-ll-cable.rs"
+
 [dependencies]
 # The tool's verify, kill-test, open and latency open the endpoints; the library itself doesn't use it.
 wasapi.workspace = true
+# The setup's endpoint map (acx-ll-cable migrate|add --endpoint-map): JSON.
+serde.workspace = true
+serde_json.workspace = true
 # The library: Foundation, Security (CreateFileW's and CreateEventW's signatures), Storage_FileSystem (CreateFileW), System_IO
 # (DeviceIoControl, OVERLAPPED, CancelIoEx), System_Memory (VirtualAlloc), System_Threading (events). The tool: System_Threading
 # (the waitable timer, MMCSS), System_Console (Ctrl+C handlers), System_JobObjects (kill-test's job for its children),
@@ -24,7 +33,8 @@ wasapi.workspace = true
 # (SetupQueryInfOriginalFileInformationW's and SetupGetInfDriverStoreLocationW's signatures), Media_Audio, Com,
 # UI_Shell_PropertiesSystem and Devices_FunctionDiscovery (the endpoints' names and IAudioSessionManager2), System_Threading
 # (OpenProcess, QueryFullProcessImageNameW). The switch's lock (variant.rs): System_Threading (the private namespace and its
-# mutex), Security (the Administrators SID), Security_Authorization (their security descriptor, from SDDL).
+# mutex), Security (the Administrators SID), Security_Authorization (their security descriptor, from SDDL). The setup (TODO 19,
+# setup.rs): System_Registry (the store, D1's start count), System_Services (QueryServiceStatusEx: the old image unloaded).
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -39,6 +49,7 @@ windows = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
     "Win32_System_Registry",
+    "Win32_System_Services",
     "Win32_UI_Shell",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",

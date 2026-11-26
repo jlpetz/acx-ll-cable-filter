@@ -7,8 +7,8 @@ there (doc/todo/19-driver-base-2026-10-28.md has the plan and the spike's checks
 **Licence.** The files under `src/` derive from the sample, which is MS-PL (`LICENSE-MS-PL.txt`): they stay MS-PL (its
 section 3(D)). The scripts are ours, under the repo's licence. `src/Common/PacketSize.{h,cpp}` are ported from
 microsoft/low-latency-audio (MIT, `LICENSE-MIT-low-latency-audio.txt`) and keep its Microsoft and Yamaha notices.
-`src/Shared/nf_vmic.h`, `src/Common/AppRing.{h,cpp}` and `src/AudioCodec/Driver/Control.cpp` are ours, not the sample's:
-MIT OR Apache-2.0, so the Rust mirror of the protocol stays under the repo's licence (the repo's licence, the owner, 2026-11-23: `LICENSE-MIT` and `LICENSE-APACHE` at the root).
+`src/Shared/nf_vmic.h`, `src/Shared/Cable.h`, `src/Common/AppRing.{h,cpp}` and `src/AudioCodec/Driver/Control.cpp` are ours,
+not the sample's: MIT OR Apache-2.0, so the Rust mirror of the protocol stays under the repo's licence (the repo's licence, the owner, 2026-11-23: `LICENSE-MIT` and `LICENSE-APACHE` at the root).
 
 **What changed from the sample** (the first commit after the import shows it): KMDF 1.35 (Windows 11 24H2 / Server 2025,
 build 26100, and up: the owner, 2026-11-20) in both projects, and the INF's OS floor 10.0...26100 to match. ACX stays 1.1,
@@ -52,33 +52,132 @@ Two microphones (TODO 19, the owner's option A): "Microphone" keeps IAudioClient
 packet-size constraints) for apps that ask for them, and "Call Microphone" (a second capture circuit, `Microphone1`) has a
 5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
 reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
-Three hardware IDs pick the microphones (`Install-Driver.ps1 -Variant both|call|low-latency`; the driver reads
-`NfMicrophones` from the device's hardware key): `ROOT\AudioCodec` both, `ROOT\AudioCodecCall` the call microphone,
-`ROOT\AudioCodecLowLatency` the low-latency one. Switching re-creates the device, which needs admin.
+Three hardware IDs pick the microphones (`Cable.ps1 variant <label> both|call|low-latency`, and `Install-Driver.ps1
+-Variant` for A; the driver reads `NfMicrophones` from the device's hardware key): `ROOT\AcxLlCable` both,
+`ROOT\AcxLlCableCall` the call microphone, `ROOT\AcxLlCableLowLatency` the low-latency one. Switching re-creates that
+cable's device, which needs admin.
 
-### Independent Cable B
+**Cables (TODO 19, the per-cable design, `doc/todo/19-per-cable-design.md`).** Every cable (A, B, C...) is a device node of
+the one package, with one of the three hardware IDs (shared by every cable) and an instance ID the setup tool fixes,
+`ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`: the label one to eight of A-Z and 0-9, the id the cable's identity (a GUID's 36
+characters), n an instance number from 1. The driver reads the label and identity there at AddDevice and refuses a node
+without them (STATUS_DEVICE_CONFIGURATION_ERROR, code 31: devcon and Add legacy hardware make `ROOT\MEDIA\NNNN`). Each cable
+has its own app ring and copy, counters, event logs, timer statistics, capture trace and control device,
+`\\.\AcxLlCable_<id>` (the identity in lower case), all in its device's context: removing or re-adding one cable touches no
+other's, and its counters start at zero with each binding (AddDevice). Only the stream serial is driver-wide. The device's
+friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
+circuit's component ID is the identity XOR the sample's constant.
 
-Either cable works with the filter app closed. Send audio to its **Speakers** endpoint and select the **Microphone** on
-the same adapter in the receiving application. For the primary pair the adapter is **AudioCodec Device**. Both of its
-microphones receive the same signal. The optional **Noise Filter Cable B** adapter has a separate playback and recording
-pair, loopback memory and format negotiation.
+**The boot crash breaker** (ours, for the owner's go; `Device.cpp` says what it can't catch). With Driver Verifier on at
+boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
+attempts in its hardware key (`NfStartAttempts` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters`,
+flushed before it goes on); a completed start (EvtDeviceSelfManagedIoInit) or a binding that ends without a crash clears it.
+A clear that fails (the key or the value) is tried again when the binding ends (its context cleanup): the binding forgets
+its count only once the value is gone.
+A device whose last start never completed is refused: code 31, with 0xE0AC0001 as its problem status, a System event from
+the source `AudioCodec` (event ID 1, "ACX-LL-Cable <label> refused: its last start never completed"), and a debug message
+saying how to clear it. The setup tool deletes the count when it installs a cable (`Cable.ps1 add <label>` repairs a
+refused cable in place). By hand, elevated, to test the refusal: `pnputil /disable-device "<instance>"`, then `reg add
+"HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters" /v NfStartAttempts /t REG_DWORD /d 1 /f`, then `pnputil
+/enable-device "<instance>"`, in that order: the disable ends the running binding, whose context cleanup clears a count it
+still holds (one whose clear at start failed), so a value set before the disable could be gone by the enable; set after it,
+nothing clears it before AddDevice reads it. To clear it: `reg delete "HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device
+Parameters" /v NfStartAttempts /f`, then a disable and an enable. It refuses at one start, not two, because at boot the cables
+most likely start before the Session Manager makes the SYSTEM hive writable (to confirm on the box), and a crash then loses
+the boot's count: the count that stops a loop is the one a crash in start leaves in a session (an install, an update, an
+enable), and at two every boot after would count its second attempt in memory only and crash again. So it stops the loop
+that follows a crash first seen in a session; it can't catch a crash that only happens at boot, nor one in DriverEntry,
+before the count is written.
 
-On the development checkout, install the current primary driver first. In an elevated PowerShell window run
-`driver\scripts\Cable-B.ps1 add` to create B. The script uses the primary device's installed INF, retains its microphone
-variant and restores any pre-existing default roles that Windows moved to B. `Cable-B.ps1 list` shows B and its endpoints.
-`Cable-B.ps1 remove` removes only B. Running `add` again on a healthy pair keeps its endpoint IDs.
+### Using the cables
 
-To process the signal on A, choose **Direct driver ring** or its WASAPI Speakers endpoint in the filter app. For B, choose
-**WASAPI** and **Speakers (Noise Filter Cable B)**. A direct feed takes over A's microphones while attached. B continues
-carrying whatever is played into B. The app currently runs one filter chain per engine instance.
+Every cable works with the filter app closed. Send audio to a cable's **Speakers** endpoint and select a microphone of the
+same cable in the receiving application: what's played into "Speakers (ACX-LL-Cable A)" comes out of both "Microphone
+(ACX-LL-Cable A)" and "Call Microphone (ACX-LL-Cable A)" (those its variant makes). Each cable has its own playback and
+recording pair, loopback memory, format negotiation, app ring and control device, and any cable can be fed directly: a
+direct feed takes over that cable's microphones while attached, and the others carry what is played into them.
+
+**Making, removing and moving cables (S1).** Only the setup tool, `acx-ll-cable` (a bin in `crates\nf-vmic`), makes a
+cable's device node; the scripts run it, and fail if it isn't built (`-Build` builds it: `cargo build --release -p nf-vmic
+--bin acx-ll-cable`). In an elevated PowerShell window (`list` takes any user):
+- `scripts\Cable.ps1 list`: the present cables with their devices, endpoints and control devices, the remembered absent ones,
+  the old driver's devices and setup errors.
+- `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>] [-EndpointMap <file>]`: makes a cable on the
+  package the others run, with both microphones unless `-Mics` (or what it had). Present and working: no change. Present but
+  not working: repaired in place. Removed earlier: back with its identity and, with the microphones it had, its instance ID,
+  so (we expect, to confirm on the box) its endpoints and their ids; with other microphones, the next instance number (new
+  endpoints, as a variant switch). `-Adopt` re-creates a device made outside the tool (`list` shows them as "Not a cable")
+  as the cable; nothing adopts one otherwise.
+- `Cable.ps1 remove <label> [-Forget]`: removes that cable's device only; its identity stays in the setup's store
+  (`HKLM\SOFTWARE\ACX-LL-Cable\Cables`) unless `-Forget`.
+- `Cable.ps1 variant <label> both|call|low-latency`: re-creates that cable's device with the next instance number (new
+  endpoints, which Windows makes with the variant's default period); no other cable is touched.
+
+  `add` and `variant` put back the default roles Windows moved to a new endpoint.
+
+`scripts\Install-Driver.ps1` adds the package to the driver store, then:
+- the old driver's devices present (`ROOT\AudioCodec*` as A, `ROOT\NoiseFilterCableB` as B): the migration, once
+  (`acx-ll-cable migrate`). Nothing changes unless the package makes A and B; then A and B are recorded in the store, every
+  device of ours is disabled until the old image unloads, the old devices are removed, and A (its variant, or `-Variant`)
+  and B (`-CableBMics`, default both) are made on the new package. A run that stops part way is finished by running it again:
+  a cable it made and didn't record yet (or made in a run that needs a restart, which stays pending until then) is checked (its
+  identity on one device, working on the package, its endpoints) and recorded, and with the old devices gone and every cable
+  on the package, nothing is disabled or installed again. A cable made stays pending until Windows has made every endpoint of
+  its microphones (after a restart too), and `acx-ll-cable list` says so (a `note:` under it); a restart Windows needs, the
+  removal of a cable that failed to install among them, stops the run (exit 7) before the next cable. It runs the migration
+  while a record in the store has `Pending` or `Replaces` (below).
+- cables present: `acx-ll-cable update <package folder>`, every cable moved to the package together. Every cable stops for a
+  few seconds: one image serves them all. If a cable refuses the disable, or the old image is still loaded 10 s after every
+  cable was disabled (an app has a cable's control device open), every cable is enabled again, nothing is installed, and it
+  says to close the apps using the cables. `-Variant` then switches A.
+- none: `acx-ll-cable add A --mics <Variant>`.
+
+`scripts\Uninstall-Driver.ps1` removes every device of ours (`acx-ll-cable remove --all --forget`, the old driver's too) and
+deletes the packages; `-KeepIdentities` keeps the store, so cables added again keep their identities. A cable's id is a
+random GUID unique to the machine: scrub it from logs pasted into docs.
+
+**Exit codes**, the tool's, the three scripts' and `noise-filter mic variant`'s: 0 done (or nothing to do); 7 Windows wants
+a restart to finish, with or without other errors beside it (a caller stops there: restart, then run it again, which finishes
+what is left and says what is still wrong; a removal Windows finishes at the restart, the migration's of an old device among
+them; pnputil's own 3010 is 7 too); 2 the tool's error (its steps say what changed), or a package Uninstall-Driver.ps1
+couldn't delete; 1 a usage error or a script's own check (not elevated, test signing, no package, no tool).
+
+**The endpoint map.** `Install-Driver.ps1 -EndpointMap <file>` (the migration, or the first `add A`) and `Cable.ps1 add
+<label> -EndpointMap <file>` pass `--endpoint-map <file>` to the tool, which writes, as JSON, which new endpoint takes each
+old one's place, by cable and role (Speakers, Microphone, Call Microphone), with the ids and names. The old driver's
+endpoints map to A's and B's; a re-added cable's to its own. Each old endpoint's `match` is `same` (Windows kept the
+endpoint), `moved` (one new endpoint of that role: remap the id), `gone`, `ambiguous` or, for a new endpoint without an old
+one, `added`; only `same` and `moved` are remapped. B's one microphone maps to its low-latency Microphone, and its Call
+Microphone is `added`. The tool publishes the file whole at the end, once it has read the endpoints before the run: written
+to `<file>.tmp` beside it, flushed, then renamed over it, so a reader finds the file as it was or the new map, never part of
+one; a run that publishes none (stopped earlier, killed) leaves the file as it was (format and fields:
+`crates\nf-vmic\src\setup\endpoint_map.rs`). A reader closes the file before the run ends: Windows doesn't rename over a file
+another process has open, so the tool waits about a second for it, then refuses the run at the start (nothing changed) or
+doesn't publish (the file as it was). A migration's cable keeps the old devices it replaces in its record (`Replaces`) once
+it is made. Each run maps the cables it makes or checks, and every present cable recorded as made whose record has them,
+however the run ends, so the map of the run that finishes the migration (no record left pending) holds all of it, whatever
+runs came before (killed, stopped by a restart); that run then drops them, a record at a time, each keeping them as
+`Replaced`, so a drop cut short loses no cable from the next run's map. A map published while a record is pending may lack
+a cable not made or recorded yet (`result` is then `error` or `restart`). Whichever run publishes the whole map, its rows
+are the same (cable, role, old and new ids, `match`); an old endpoint's `state` may differ (a retry after the old devices'
+removal finds them `notpresent`). A map asked for and not published keeps them, and the next `Install-Driver.ps1` runs the
+migration again to publish it.
+
+**Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
+\\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker
+always, take the cable labelled A, else the only cable. Each mode records or plays that cable's own endpoints, found by the
+instance ID in their KS filter's path. `\\.\NoiseFilterVmic` is gone: a tool that opens it gets ERROR_FILE_NOT_FOUND. The
+control device admits SYSTEM and Administrators only, so the tools run elevated. The box's installed package (the old one:
+"AudioCodec Device" and "Noise Filter Cable B") stays until the owner's go for S0a, which migrates both.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
-on each Speakers endpoint (`--device "Speakers (AudioCodec Device)"` and `--device "Speakers (Noise Filter Cable B)"`),
-with `--start 100000` on A and `--start 4000000` on B. While both renderers play, run
-`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (AudioCodec Device)"` and the equivalent on
-`Microphone (Noise Filter Cable B)` concurrently. Each capture's decoded marker range should remain inside its own
-renderer’s range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440`
-in place of A's renderer to verify an attached A ring coexists with B.
+on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with
+`--start 100000` on A and `--start 4000000` on B. While both renderers play, run
+`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (ACX-LL-Cable A)"` and the equivalent on
+`Microphone (ACX-LL-Cable B)` concurrently. Each capture's decoded marker range should remain inside its own renderer's
+range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440` (with N0's
+`--path` to A's control device) in place of A's renderer to verify an attached A ring coexists with B, and the same on B
+with A attached.
 
 **Latency: two figures, measured at different points** (the Server 2025 VM, 2026-11-20 to 23;
 doc/todo/19-spike-2026-11-20.md):
@@ -93,8 +192,8 @@ one-packet fill, so it follows the client's period. The second is the loopback's
 behind the render) and compares with another cable's `--cable-only` figure (VB-CABLE's: 50-62 ms on the same VM); a client
 gets each packet about a packet plus its wake after its first frame's device time (10.4 ms at a 10 ms period).
 
-The app feed (spike check 4): a control device, `\\.\NoiseFilterVmic`, takes an app's ring of 48 kHz float32 stereo frames
-(page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
+The app feed (spike check 4): each cable's control device, `\\.\AcxLlCable_<id>`, takes an app's ring of 48 kHz float32
+stereo frames (page-aligned, 1,024 to 262,144 frames) in one pending METHOD_OUT_DIRECT IOCTL; while one is attached, the microphone endpoint
 plays it instead of the loopback, frame for frame. The request ends with ERROR_OPERATION_ABORTED (a cancel, the issuing thread
 or process exiting, or the handle closed) or ERROR_DEVICE_REMOVED (the device is going away: the app must then close every
 handle, since an open handle on the control device keeps the driver loaded). `src/Shared/nf_vmic.h` has the protocol, every
@@ -104,7 +203,7 @@ Only SYSTEM and Administrators may open it for the spike: letting unelevated use
 session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for the same reason as above.
 
 Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
-others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, in the image's .data) on the same QPC
+others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, the cable's) on the same QPC
 time line, the reader's packet plus 1 ms behind (`SecondaryFramesCopied`; `SecondaryUnderrunFrames` counts the silence
 they get where no reader delivered, a jump in the reader's time line included). No stream gets a frame twice. At a handoff
 (the reader stops and another stream takes the reader slot) the taker skips its lag once (`ReaderHandoffs`,
@@ -113,10 +212,10 @@ is shorter moving on to its lag at once and skipping the difference once, counte
 `SecondarySkippedFrames`: the owner, 2026-11-23, lower latency over a one-time skip; from a66d8ab to e801320 they kept the
 longer lag until they next ran). A reader gives the reader slot up as its Pause starts, while its timer still runs: given
 up after the timer stopped, it left the copy short for as long as the stop took, and the streams playing on lost 55 to 111
-frames at live handoffs (2026-11-23). More than one can run: the microphones of two of the driver's devices share the one
-ring, and a RAW and a DEFAULT client make two device streams on one (spike check 4's live runs).
+frames at live handoffs (2026-11-23). More than one can run: a cable's two microphones share its ring, and a RAW and a
+DEFAULT client make two device streams on one (spike check 4's live runs).
 
-Each device also keeps two event logs, which STATS copies for the app feed's device (`nf_vmic.h`, "The event logs"; the
+Each cable also keeps two event logs, which its STATS copies (`nf_vmic.h`, "The event logs"; the
 owner, 2026-11-24: telemetry to find bugs by, and to prove the design). The skip log (64 entries) holds every event in which
 a capture stream never got some of the audio it was due, each with its stream (a serial given at creation), its time, the
 span on the QPC time line and the ring's frames it concerns: a taker's handoff skip, a skip to a shorter lag, a jump in a
@@ -172,8 +271,9 @@ the larger, local-time versions and outrank later builds of the same date until 
    evening's builds before it). A package with an older DriverVer doesn't replace a newer one: `Uninstall-Driver.ps1`
    first. Packages built before 2026-11-23's change carry the local time of day as the version, so one from earlier the
    same UTC day can outrank a newer build.
-3. `scripts\Install-Driver.ps1`: makes the `ROOT\AudioCodec` device with devcon (or updates the driver on it).
-4. `scripts\Get-DriverStatus.ps1`, `scripts\Uninstall-Driver.ps1`.
+3. `scripts\Install-Driver.ps1 [-BuildTool]`: the migration from the old driver's devices, the update of every cable, or
+   cable A, through the setup tool ("Using the cables", above). More cables: `scripts\Cable.ps1 add <label>`.
+4. `scripts\Get-DriverStatus.ps1` (the tool's `list`), `scripts\Uninstall-Driver.ps1 [-KeepIdentities]`.
 5. An install can make the new endpoints Windows' defaults: `scripts\Set-DefaultAudio.ps1 -Playback ID -Recording ID` puts
    them back (`noise-filter devices` lists the ids). `scripts\Get-EndpointFormat.ps1` shows the device format Windows
    stored for each endpoint.

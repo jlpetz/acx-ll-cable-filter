@@ -67,9 +67,10 @@ CStreamEngine::CStreamEngine(
     RtlZeroMemory(m_Packets, sizeof(m_Packets));
 
     //
-    // noise-filter (TODO 19): find the device's loopback ring. The stream's circuit belongs to our one WDFDEVICE
-    // (AcxStreamGetCircuit, acxstreams.h:839, up to DISPATCH_LEVEL; then LoopbackRingOfCircuit). The pointer is kept: the
-    // device context outlives the stream (inference: the stream descends from the device).
+    // noise-filter (TODO 19): find the device's loopback ring and its cable. The stream's circuit belongs to one of our
+    // WDFDEVICEs, a cable (AcxStreamGetCircuit, acxstreams.h:839, up to DISPATCH_LEVEL; then LoopbackRingOfCircuit and
+    // CableOfCircuit). The pointers are kept: the device context outlives the stream (inference: the stream descends from the
+    // device).
     //
     RtlZeroMemory(&m_LbFormat, sizeof(m_LbFormat));
     m_LbPacketFrames = 0;
@@ -92,7 +93,11 @@ CStreamEngine::CStreamEngine(
         ACXCIRCUIT circuit = AcxStreamGetCircuit(Stream);
 
         m_Loopback = (circuit != NULL) ? LoopbackRingOfCircuit(circuit) : NULL;
+        m_Cable = (circuit != NULL) ? CableOfCircuit(circuit) : NULL;
     }
+
+    // One context holds both (the per-cable design, section 5): the cable's app ring logs into this loopback ring's logs.
+    NT_ASSERT(m_Cable == NULL || m_Cable->Ring.Loopback == m_Loopback);
 }
 
 _Use_decl_annotations_
@@ -102,7 +107,7 @@ CStreamEngine::~CStreamEngine()
     PAGED_CODE();
 
     // noise-filter (TODO 19): this stream is no longer open on its circuit (the record LoopbackStreamOpen or, for a capture
-    // stream, CaptureStreamOpen made).
+    // stream, CaptureStreamOpen made: on its cable, whose loopback ring m_LbOpenRing is).
     if (m_LbOpen)
     {
         if (m_LbOpenRender)
@@ -111,7 +116,8 @@ CStreamEngine::~CStreamEngine()
         }
         else
         {
-            CaptureStreamClose(m_LbOpenRing, &m_LbOpenFormat);
+            NT_ASSERT(m_Cable != NULL && m_Cable->Ring.Loopback == m_LbOpenRing);
+            CaptureStreamClose(m_Cable, &m_LbOpenFormat);
         }
         m_LbOpen = FALSE;
         m_LbOpenRing = NULL;
@@ -465,10 +471,10 @@ CStreamEngine::Run()
 
     ScheduleNextPass();
 
-    // noise-filter (TODO 19, spike check 5): counted per stream kind (NF_VMIC_IOCTL_STATS).
-    if (m_Loopback && m_Loopback->AppFeed)
+    // noise-filter (TODO 19, spike check 5): counted per stream kind (NF_VMIC_IOCTL_STATS), in the stream's cable.
+    if (m_Cable != NULL)
     {
-        NfVmicRecordRun(m_StatsKind);
+        NfVmicRecordRun(m_Cable, m_StatsKind);
     }
 
     m_CurrentState = AcxStreamStateRun;
@@ -502,9 +508,9 @@ CStreamEngine::GetPresentationPosition(
     *PositionInBlocks = m_Position / blockAlign;
     *QPCPosition = (ULONGLONG)qpc.QuadPart;
 
-    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Loopback && m_Loopback->AppFeed)
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Cable != NULL)
     {
-        NfVmicTraceCaptureCount(NF_VMIC_TRACE_POSITION);
+        NfVmicTraceCaptureCount(m_Cable, NF_VMIC_TRACE_POSITION);
     }
 
     return STATUS_SUCCESS;
@@ -640,23 +646,25 @@ CStreamEngine::s_EvtStreamPassCallback(
     // The same reading starts the pass's working time (NF_VMIC_STREAM_STATS.WorkQpcTicks), taken again once StreamPassCallback
     // returns: the CPU cost of a pass, for the /Os and /Ot comparison and the soak.
     //
-    if (!This->m_Loopback || !This->m_Loopback->AppFeed)
+    // Both counted in the stream's cable (NF_CABLE.StreamStats).
+    if (This->m_Cable == NULL)
     {
         This->StreamPassCallback();
         return;
     }
+    PNF_CABLE       cable = This->m_Cable;
     ULONG           kind = This->m_StatsKind;
     LARGE_INTEGER   passStart = KeQueryPerformanceCounter(NULL);
     {
         ULONGLONG now = This->QpcToHns(passStart);
 
-        NfVmicRecordTimerPass(kind, (LONGLONG)(now - This->m_ArmedHns));
+        NfVmicRecordTimerPass(cable, kind, (LONGLONG)(now - This->m_ArmedHns));
     }
 
     // Call the StreamPassCallback for the engine
     This->StreamPassCallback();
 
-    NfVmicRecordPassWork(kind, (ULONGLONG)(KeQueryPerformanceCounter(NULL).QuadPart - passStart.QuadPart));
+    NfVmicRecordPassWork(cable, kind, (ULONGLONG)(KeQueryPerformanceCounter(NULL).QuadPart - passStart.QuadPart));
 }
 
 // This is run every time the stream timer fires
@@ -687,9 +695,9 @@ CStreamEngine::StreamPassCallback()
     {
         qpcNotify = PacketStartQpc(completedPacket);
         InterlockedExchange64(&m_LastPacketStart.QuadPart, (LONG64)qpcNotify);
-        if (m_Loopback && m_Loopback->AppFeed)
+        if (m_Cable != NULL)
         {
-            NfVmicTraceCaptureNotify(completedPacket, qpcNotify);
+            NfVmicTraceCaptureNotify(m_Cable, completedPacket, qpcNotify);
         }
     }
 
@@ -765,9 +773,9 @@ CStreamEngine::ScheduleNextPass()
         m_GlitchAdjust += delay;
 
         // noise-filter (TODO 19, spike check 5): counted, with the time it moved the stream's time line.
-        if (m_Loopback && m_Loopback->AppFeed)
+        if (m_Cable != NULL)
         {
-            NfVmicRecordGlitch(m_StatsKind, (ULONGLONG)delay);
+            NfVmicRecordGlitch(m_Cable, m_StatsKind, (ULONGLONG)delay);
         }
 
         StreamPassCallback();
@@ -896,9 +904,9 @@ CStreamEngine::GetCurrentPacket(
     // ACX's packet numbers are 32-bit: the count's low 32 bits (m_CurrentPacket).
     *CurrentPacket = (ULONG)currentPacket;
 
-    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Loopback && m_Loopback->AppFeed)
+    if (m_StatsKind == NF_VMIC_KIND_CAPTURE && m_Cable != NULL)
     {
-        NfVmicTraceCaptureCount(NF_VMIC_TRACE_CURRENT_PACKET);
+        NfVmicTraceCaptureCount(m_Cable, NF_VMIC_TRACE_CURRENT_PACKET);
     }
 
     return STATUS_SUCCESS;
@@ -968,17 +976,39 @@ AppRingFormatIs(
             IsEqualGUID(Format->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) ? TRUE : FALSE;
 }
 
+// The context of the device a circuit belongs to, or NULL: its loopback ring and its cable.
+static
+PCODEC_DEVICE_CONTEXT
+CodecContextOfCircuit(
+    _In_ ACXCIRCUIT Circuit
+)
+{
+    // AcxCircuitGetWdfDevice: acxcircuit.h:1290, up to DISPATCH_LEVEL.
+    WDFDEVICE device = AcxCircuitGetWdfDevice(Circuit);
+
+    return (device != NULL) ? GetCodecDeviceContext(device) : NULL;
+}
+
 _Use_decl_annotations_
 PLOOPBACK_RING
 LoopbackRingOfCircuit(
     ACXCIRCUIT  Circuit
 )
 {
-    // AcxCircuitGetWdfDevice: acxcircuit.h:1290, up to DISPATCH_LEVEL.
-    WDFDEVICE               device = AcxCircuitGetWdfDevice(Circuit);
-    PCODEC_DEVICE_CONTEXT   devCtx = (device != NULL) ? GetCodecDeviceContext(device) : NULL;
+    PCODEC_DEVICE_CONTEXT devCtx = CodecContextOfCircuit(Circuit);
 
     return (devCtx != NULL) ? &devCtx->Loopback : NULL;
+}
+
+_Use_decl_annotations_
+PNF_CABLE
+CableOfCircuit(
+    ACXCIRCUIT  Circuit
+)
+{
+    PCODEC_DEVICE_CONTEXT devCtx = CodecContextOfCircuit(Circuit);
+
+    return (devCtx != NULL) ? &devCtx->Cable : NULL;
 }
 
 _Use_decl_annotations_
@@ -1105,27 +1135,33 @@ LoopbackStreamClose(
 // noise-filter (TODO 19, spike check 4): the app ring is a separate attachment from the loopback, so a capture stream in
 // 24-in-32 could otherwise take the reader slot of an attached ring and get only zeros (AppRingCapturePass's mismatch
 // branch). Each refusal makes the conflict visible at open time instead, whichever came first: here a capture stream while a
-// ring is attached, in NfVmic_Attach (Control.cpp) an ATTACH while such a stream is open. Both decide under the app ring's
-// lock, and this records the stream under it, so a non-float open and an ATTACH can't both get through. The loopback's check
-// and record (LoopbackStreamOpen) run inside, under its own lock: the app ring's, then the loopback's, the one order
-// (AppRing.h). Shared-mode streams run at the device format (float32), so in practice this refuses exclusive-mode clients.
+// ring is attached, in NfVmic_Attach (Control.cpp) an ATTACH while such a stream is open. Both decide under the cable's app
+// ring's lock, and this records the stream under it, so a non-float open and an ATTACH can't both get through. The
+// loopback's check and record (LoopbackStreamOpen) run inside, under its own lock: the app ring's, then the loopback's, the one
+// order (Cable.h). Shared-mode streams run at the device format (float32), so in practice this refuses exclusive-mode clients.
+// Every cable has its own app ring (the per-cable design), so the checks are per cable: a stream on one cable never meets
+// another's ring.
 //
 _Use_decl_annotations_
 NTSTATUS
 CaptureStreamOpen(
-    PLOOPBACK_RING          Ring,
+    PNF_CABLE               Cable,
     const LOOPBACK_FORMAT * Format
 )
 {
-    PNF_APP_RING    app = &g_NfAppRing;
+    PNF_APP_RING    app;
+    PLOOPBACK_RING  ring;
     BOOLEAN         ringFormat = AppRingFormatIs(Format);
     NTSTATUS        status = STATUS_SUCCESS;
     KIRQL           oldIrql;
 
-    if (!Ring || !Ring->AppFeed)
+    if (Cable == NULL || Cable->Ring.Loopback == NULL)
     {
-        return Ring ? LoopbackStreamOpen(Ring, FALSE, Format) : STATUS_INVALID_DEVICE_STATE;
+        return STATUS_INVALID_DEVICE_STATE;
     }
+    app = &Cable->Ring;
+    ring = app->Loopback;
+
     KeAcquireSpinLock(&app->Lock, &oldIrql);
 
     if (!ringFormat && app->Header != NULL)
@@ -1135,10 +1171,7 @@ CaptureStreamOpen(
     }
     else
     {
-        if (Ring != NULL)
-        {
-            status = LoopbackStreamOpen(Ring, FALSE, Format);
-        }
+        status = LoopbackStreamOpen(ring, FALSE, Format);
         if (NT_SUCCESS(status) && !ringFormat)
         {
             app->OtherFormatCaptureOpens++;
@@ -1153,27 +1186,24 @@ CaptureStreamOpen(
 _Use_decl_annotations_
 VOID
 CaptureStreamClose(
-    PLOOPBACK_RING          Ring,
+    PNF_CABLE               Cable,
     const LOOPBACK_FORMAT * Format
 )
 {
-    PNF_APP_RING    app = &g_NfAppRing;
+    PNF_APP_RING    app;
     KIRQL           oldIrql;
 
-    if (!Ring || !Ring->AppFeed)
+    // Every close matches an open, which needed the cable (CaptureStreamOpen).
+    NT_ASSERT(Cable != NULL && Cable->Ring.Loopback != NULL);
+    if (Cable == NULL || Cable->Ring.Loopback == NULL)
     {
-        if (Ring)
-        {
-            LoopbackStreamClose(Ring, FALSE, Format);
-        }
         return;
     }
+    app = &Cable->Ring;
+
     KeAcquireSpinLock(&app->Lock, &oldIrql);
 
-    if (Ring != NULL)
-    {
-        LoopbackStreamClose(Ring, FALSE, Format);
-    }
+    LoopbackStreamClose(app->Loopback, FALSE, Format);
     if (!AppRingFormatIs(Format))
     {
         ASSERT(app->OtherFormatCaptureOpens != 0);
@@ -1187,7 +1217,7 @@ CaptureStreamClose(
 }
 
 // Writes Frames frames from Source (NULL: zeros) at ring frame Frame, splitting at the wrap. The lock of the ring that Buffer
-// is held (a LOOPBACK_RING's, or the app ring's for g_NfAppHistory).
+// is held (a LOOPBACK_RING's, or the app ring's for its History).
 static
 VOID
 LoopbackRingWrite(
@@ -1833,10 +1863,11 @@ CCaptureStreamEngine::GetCapturePacket(
     *QPCPacketStart = (ULONGLONG)qpcPacketStart;
     *MoreData = FALSE;
 
-    // noise-filter (TODO 19): the capture-timestamp trace (NF_VMIC_CAPTURE_TRACE).
-    if (m_Loopback && m_Loopback->AppFeed)
+    // noise-filter (TODO 19): the capture-timestamp trace (NF_VMIC_CAPTURE_TRACE), the stream's cable's.
+    if (m_Cable != NULL)
     {
-        NfVmicTraceCaptureQuery((ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, (ULONG)(currentPacket - 1), (ULONGLONG)qpcPacketStart);
+        NfVmicTraceCaptureQuery(m_Cable, (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart, (ULONG)(currentPacket - 1),
+                                (ULONGLONG)qpcPacketStart);
     }
 
     return status;
@@ -1862,11 +1893,11 @@ CCaptureStreamEngine::ProcessPacket()
     }
 
     //
-    // noise-filter (TODO 19): an attached app ring (spike check 4) serves the pass first; without one, the capture half of the
-    // loopback pair (spike check 7). Both in place of the sample's tone generator and WAV reader (m_ToneGenerator.GenerateSine,
-    // m_WaveReader.ReadWaveData).
+    // noise-filter (TODO 19): an attached app ring (spike check 4: its cable's) serves the pass first; without one, the capture
+    // half of the loopback pair (spike check 7). Both in place of the sample's tone generator and WAV reader
+    // (m_ToneGenerator.GenerateSine, m_WaveReader.ReadWaveData).
     //
-    if (!m_Loopback || !m_Loopback->AppFeed || !AppRingCapturePass(currentPacket, packetBuffer, m_PacketSize))
+    if (m_Cable == NULL || !AppRingCapturePass(currentPacket, packetBuffer, m_PacketSize))
     {
         LoopbackCapturePass(currentPacket, packetBuffer, m_PacketSize);
     }
@@ -2128,7 +2159,8 @@ CCaptureStreamEngine::Pause()
 
 ///////////////////////////////////////////////////////////////////////////////
 //
-// noise-filter (TODO 19, spike check 4): the app-fed capture ring. Shared\nf_vmic.h has the rules, Common\AppRing.h the state.
+// noise-filter (TODO 19, spike check 4): the app-fed capture ring, one per cable (m_Cable->Ring). Shared\nf_vmic.h has the rules,
+// Shared\Cable.h the state.
 //
 // An attached app ring serves every capture pass ahead of the loopback. The read is sample-continuous: read_frame advances by
 // the frames copied, a whole packet when the ring holds it, so every frame the app writes comes out once and in order, and an
@@ -2137,7 +2169,7 @@ CCaptureStreamEngine::Pause()
 // stereo packets. All under the ring's lock, held for one packet's copy (two for the reader); nothing allocates.
 //
 // One stream reads the app's ring (the reader); the audio engine runs one device stream per processing mode, so others can
-// be running too. The reader also writes each packet it delivers into the driver's copy (g_NfAppHistory) at its frames on the
+// be running too. The reader also writes each packet it delivers into the cable's copy (NF_APP_RING.History) at its frames on the
 // stream engine's QPC time line, and every other stream reads that copy at its own place on the time line, a lag behind: the
 // reader writes a packet at the pass that ends it, so the copy holds the time line up to that pass, a packet and a late timer
 // behind now at worst. The lag is the reader's packet (NF_APP_RING.HistoryLeadFrames) plus LOOPBACK_LAG_HNS and a frame
@@ -2195,7 +2227,7 @@ AppRingHistoryWrite(
         // Recorded (AppRing.h), so the other streams count this silence as an underrun: no reader delivered it.
         PNF_APP_HISTORY_GAP gap = &Ring->HistoryGaps[Ring->HistoryGapNext % NF_APP_HISTORY_GAPS];
 
-        LoopbackRingWrite(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, Ring->HistoryEnd, NULL, Frame - Ring->HistoryEnd);
+        LoopbackRingWrite(Ring->History, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, Ring->HistoryEnd, NULL, Frame - Ring->HistoryEnd);
         gap->From = Ring->HistoryEnd;
         gap->End = Frame;
         Ring->HistoryGapNext++;
@@ -2210,7 +2242,7 @@ AppRingHistoryWrite(
         {
             from = end - NF_APP_HISTORY_FRAMES;
         }
-        LoopbackRingWrite(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, from,
+        LoopbackRingWrite(Ring->History, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, from,
                           (Source != NULL) ? Source + (SIZE_T)(from - Frame) * NF_VMIC_FRAME_BYTES : NULL, end - from);
         if (Source != NULL)
         {
@@ -2324,7 +2356,7 @@ AppRingHistoryRead(
     }
     if (copyHi > copyLo)
     {
-        LoopbackRingRead(g_NfAppHistory, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, copyLo,
+        LoopbackRingRead(Ring->History, NF_APP_HISTORY_FRAMES, NF_VMIC_FRAME_BYTES, copyLo,
                          Dest + (SIZE_T)(copyLo - From) * NF_VMIC_FRAME_BYTES, copyHi - copyLo);
     }
     if (end > copyHi)
@@ -2364,8 +2396,8 @@ AppRingStoreCounters(
 }
 
 //
-// The app ring's event logs (nf_vmic.h, "The event logs"): the app feed device's (NF_APP_RING.Loopback, the device every stream
-// that reads the app ring belongs to), which STATS copies. NULL with no such device (then nothing is logged). Ring lock held.
+// The app ring's event logs (nf_vmic.h, "The event logs"): its cable's (NF_APP_RING.Loopback, in the context every stream that
+// reads the app ring belongs to), which STATS copies. NULL with no such device (then nothing is logged). Ring lock held.
 //
 static
 PNF_EVENT_LOG
@@ -2395,7 +2427,7 @@ CCaptureStreamEngine::AppRingEventInit(
     ULONGLONG       SpanTo
 )
 {
-    PNF_APP_RING ring = &g_NfAppRing;
+    PNF_APP_RING ring = &m_Cable->Ring;
 
     RtlZeroMemory(Event, sizeof(*Event));
     Event->Kind = Kind;
@@ -2418,7 +2450,7 @@ CCaptureStreamEngine::AppRingLogSkip(
     BOOLEAN     Claim
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &m_Cable->Ring;
     NF_VMIC_EVENT   event;
     ULONGLONG       sequence;
 
@@ -2461,7 +2493,7 @@ CCaptureStreamEngine::AppRingCapturePass(
     ULONG   PacketSize
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &m_Cable->Ring;
     KIRQL           oldIrql;
     ULONG           packetFrames;
     ULONG           capacity;
@@ -2480,7 +2512,8 @@ CCaptureStreamEngine::AppRingCapturePass(
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
 
-    if (ring->Header == NULL)
+    // History: never NULL while a ring is published (Cable.h); checked anyway, so no pass can write a copy that isn't there.
+    if (ring->Header == NULL || ring->History == NULL)
     {
         // No app ring attached: the loopback serves this pass. A place in an earlier attachment's copy means nothing now, and
         // its open runs in the event logs have ended (the next attachment's silence starts its own).
@@ -2759,7 +2792,7 @@ CCaptureStreamEngine::AppRingOtherPass(
     ULONG   PacketSize
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &m_Cable->Ring;
     ULONG           lead = ring->HistoryLeadFrames;
     ULONGLONG       from;
 
@@ -2796,21 +2829,18 @@ CCaptureStreamEngine::AppRingOtherPass(
 
         //
         // A jump in its own time line (a late timer's glitch adjustment): its read at the old lag starts past its place, and
-        // what the copy holds between never reaches it. Logged, so its gap has an entry too, and counted in the device whose
-        // skip log takes the entry (NF_APP_RING.Loopback, the app feed's: SecondaryJumps, SecondaryJumpFrames, the owner,
-        // 2026-11-24), the frames as the entry has them (the copy's, at most its length: the entry's 32 bits hold them), so
-        // the log's jumps over a window add up to the counters' rise. Those are the frames the copy holds there now, as a
-        // skip's are counted: what lies past its end (claimed below) joins only the entry's ring span as the reader writes it.
+        // what the copy holds between never reaches it. Logged, so its gap has an entry too, and counted in the cable whose
+        // skip log takes the entry (the app ring's SecondaryJumps and SecondaryJumpFrames, the owner, 2026-11-24), the
+        // frames as the entry has them (the copy's, at most its length: the entry's 32 bits hold them), so the log's jumps
+        // over a window add up to the counters' rise. Those are the frames the copy holds there now, as a skip's are counted:
+        // what lies past its end (claimed below) joins only the entry's ring span as the reader writes it.
         //
         if (jumpEnd > m_AppEnd)
         {
             ULONGLONG jumped = AppRingSkipFrames(ring, m_AppEnd, jumpEnd);
 
-            if (ring->Loopback != NULL)
-            {
-                ring->Loopback->SecondaryJumps++;
-                ring->Loopback->SecondaryJumpFrames += jumped;
-            }
+            ring->SecondaryJumps++;
+            ring->SecondaryJumpFrames += jumped;
             (void)AppRingLogSkip(NF_VMIC_EVENT_SECONDARY_JUMP, jumped, m_AppEnd, jumpEnd, TRUE);
         }
 
@@ -2860,7 +2890,7 @@ CCaptureStreamEngine::AppRingPlayCopy(
     PBYTE       Dest
 )
 {
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &m_Cable->Ring;
     ULONGLONG       end = From + Frames;
     ULONGLONG       from = From;
     ULONGLONG       audio;
@@ -2937,7 +2967,7 @@ CCaptureStreamEngine::AppRingPlaceReached(
     ULONGLONG   End
 )
 {
-    PNF_APP_RING ring = &g_NfAppRing;
+    PNF_APP_RING ring = &m_Cable->Ring;
 
     // Stats.Attaches counts the attachments, so it names this one: a place in an earlier one's copy means nothing now.
     if (m_AppEndAttach != ring->Stats.Attaches || End > m_AppEnd)
@@ -2951,11 +2981,11 @@ _Use_decl_annotations_
 VOID
 CCaptureStreamEngine::AppRingReaderStop()
 {
-    if (!m_Loopback || !m_Loopback->AppFeed)
+    if (m_Cable == NULL)
     {
         return;
     }
-    PNF_APP_RING    ring = &g_NfAppRing;
+    PNF_APP_RING    ring = &m_Cable->Ring;
     KIRQL           oldIrql;
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);

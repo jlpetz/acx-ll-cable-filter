@@ -16,14 +16,16 @@ $script:Solution     = Join-Path $DriverRoot 'src\AudioCodec\Driver\AudioCodec.s
 $script:ProjectDir   = Join-Path $DriverRoot 'src\AudioCodec\Driver'
 $script:PackageName  = 'AudioCodec'
 $script:InfName      = 'AudioCodec.inf'
-$script:HardwareId   = 'ROOT\AudioCodec'
-$script:CableBHardwareId = 'ROOT\NoiseFilterCableB' # optional independent device; never part of the primary variant switch
-# The three variants (TODO 19, the owner's options A and D): one INF, the microphones chosen by hardware ID.
+# The three variants (TODO 19, the owner's options A and D), shared by every cable (the per-cable design, D1's INF): one INF,
+# a cable's microphones chosen by hardware ID. Each cable's device node is ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>, made by the
+# setup tool (acx-ll-cable, crates\nf-vmic) and nothing else: the driver refuses a node devcon makes (Code 31).
 $script:HardwareIds  = [ordered]@{
-    'both'        = 'ROOT\AudioCodec'              # the low-latency and the call microphone
-    'call'        = 'ROOT\AudioCodecCall'          # the call microphone (a 5 ms default period)
-    'low-latency' = 'ROOT\AudioCodecLowLatency'    # the low-latency microphone (IAudioClient3's small periods)
+    'both'        = 'ROOT\AcxLlCable'              # the low-latency and the call microphone
+    'call'        = 'ROOT\AcxLlCableCall'          # the call microphone (a 5 ms default period)
+    'low-latency' = 'ROOT\AcxLlCableLowLatency'    # the low-latency microphone (IAudioClient3's small periods)
 }
+# The old driver's hardware IDs, before the per-cable driver: the migration (Install-Driver.ps1) removes their devices.
+$script:LegacyHardwareIds = @('ROOT\AudioCodec', 'ROOT\AudioCodecCall', 'ROOT\AudioCodecLowLatency', 'ROOT\NoiseFilterCableB')
 # KMDF 1.35 needs Windows 11 24H2 or Server 2025 (build 26100).
 $script:CatalogOs    = '10_GE_X64,Server2025_X64'
 
@@ -55,6 +57,71 @@ function Find-WdkTool([string]$Name) {
     )
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     throw "$Name not found in the WDK $WdkVersion (looked in bin and Tools)."
+}
+
+# The cables' setup tool (TODO 19, the per-cable design, section 9): the release build of crates\nf-vmic's acx-ll-cable.
+# -Build builds it first (cargo build --release -p nf-vmic --bin acx-ll-cable), so no run rebuilds anything unasked; without
+# it, a missing tool is an error.
+$script:RepoRoot = Split-Path -Parent $DriverRoot
+function Get-CableTool([switch]$Build) {
+    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RepoRoot 'target' }
+    $tool = Join-Path $target 'release\acx-ll-cable.exe'
+    if ($Build) {
+        Write-Step 'Build the setup tool (cargo build --release -p nf-vmic --bin acx-ll-cable)'
+        Push-Location $RepoRoot
+        try { cargo build --release -p nf-vmic --bin acx-ll-cable } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+    }
+    if (-not (Test-Path $tool)) { throw "The setup tool isn't built ($tool): run this with -Build, or Cable.ps1 -Build list." }
+    return $tool
+}
+
+# Runs the setup tool with its arguments, its output shown as it comes; its exit code (0 done, 1 usage, 2 an error, 7 a
+# restart).
+function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
+    & $Tool @Arguments | Out-Host
+    return $LASTEXITCODE
+}
+
+# The scripts' exit codes (TODO 19; Install-Driver.ps1, Cable.ps1, Uninstall-Driver.ps1): 0 done; 7 Windows wants a restart to
+# finish, with or without other errors beside it (a caller stops there: restart, then run the script again, which finishes what
+# is left and says what is still wrong); 2 the setup tool's error (its steps say what changed); 1 the tool's usage error, or the
+# script's own check (not elevated, test signing, no package, no tool: a thrown error). pnputil's own "restart required"
+# (ERROR_SUCCESS_REBOOT_REQUIRED) is 7 too.
+$script:RebootRequired = 3010
+
+# Ends the script with the setup tool's exit code `$Code` unless it is 0, saying so (`$What`: the step), after `$Then` (the
+# status, say) if given. The code survives whatever `$Then` does: an error in it is only said.
+function Exit-ForToolCode([int]$Code, [string]$What, [scriptblock]$Then) {
+    if ($Code -eq 0) { return }
+    if ($Code -eq 7) {
+        Write-Note "Windows wants a restart to finish $($What): restart, then run this again. Exit 7."
+    } else {
+        Write-Host "   the setup tool failed at $($What) (exit $Code): its steps are above" -ForegroundColor Red
+    }
+    if ($Then) {
+        try { & $Then } catch { Write-Note "the status couldn't be shown: $($_.Exception.Message)" }
+    }
+    exit $Code
+}
+
+# The setup tool's store of cable identities (crates\nf-vmic\src\setup\store.rs), read-only here.
+$script:CableStore = 'HKLM:\SOFTWARE\ACX-LL-Cable\Cables'
+
+# The cables a migration hasn't finished: recorded (Pending = 1) and not made, or made and not checked and recorded yet (a run
+# stopped after the old devices went: a failure, a restart Windows needed, a killed tool), or made with the migration's
+# endpoint map not final yet (Replaces, the old devices' instance IDs: dropped by the run that leaves none pending, once its
+# map is published; a map asked for and not published keeps them; Replaced keeps them for good and doesn't count). A cable
+# made stays pending until Windows has made its endpoints. While there are any, Install-Driver.ps1 runs the migration again,
+# which makes them, checks and records the ones there, and maps the whole migration.
+function Get-PendingCables {
+    if (-not (Test-Path $CableStore)) { return @() }
+    @(Get-ChildItem $CableStore -ErrorAction SilentlyContinue |
+        Where-Object {
+            $pending = (Get-ItemProperty -Path $_.PSPath -Name Pending -ErrorAction SilentlyContinue).Pending
+            ($pending -eq 1) -or (@($_.GetValueNames()) -contains 'Replaces')
+        } |
+        ForEach-Object { $_.PSChildName })
 }
 
 function Find-MSBuild {

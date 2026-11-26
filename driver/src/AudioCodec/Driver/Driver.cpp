@@ -126,11 +126,8 @@ Return Value:
     //
     RETURN_NTSTATUS_IF_FAILED(AcxDriverInitialize(driver, &acxCfg));
 
-    //
-    // noise-filter (TODO 19, spike check 4): the app ring's spin lock and the control device's wait lock, before any device
-    // exists (Control.cpp). After AcxDriverInitialize, which the sample calls straight after WdfDriverCreate.
-    //
-    RETURN_NTSTATUS_IF_FAILED(NfVmic_DriverInit(driver));
+    // noise-filter (TODO 19, the per-cable design): nothing driver-wide to set up. Each cable's state, its app ring and its
+    // control device are made in its AddDevice (Device.cpp, Control.cpp); the stream serial starts at 0 in .bss.
 
     return status;
 }

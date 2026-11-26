@@ -79,7 +79,7 @@ typedef struct _LOOPBACK_OPEN {
 
 //
 // noise-filter (TODO 19): one of a device's event logs (nf_vmic.h, "The event logs"): event n (Sequence n, from 1) in slot
-// (n - 1) % Entries of Slots. Its own spin lock, the last in every lock order (AppRing.h): taken inside the app ring's and the
+// (n - 1) % Entries of Slots. Its own spin lock, the last in every lock order (Cable.h): taken inside the app ring's and the
 // loopback's, and nothing is taken inside it. Init in Codec_EvtBusDeviceAdd; Slots are its LOOPBACK_RING's, which never moves.
 //
 typedef struct _NF_EVENT_LOG {
@@ -90,7 +90,6 @@ typedef struct _NF_EVENT_LOG {
 } NF_EVENT_LOG, *PNF_EVENT_LOG;
 
 typedef struct _LOOPBACK_RING {
-    BOOLEAN         AppFeed;                // immutable after AddDevice: only primary cable A participates in the named control feed
     KSPIN_LOCK      Lock;
     PUCHAR          Buffer;                 // LOOPBACK_RING_BYTES, non-paged: Codec_EvtBusDeviceAdd to Codec_EvtDeviceContextCleanup
 
@@ -106,8 +105,8 @@ typedef struct _LOOPBACK_RING {
 
     // Written at stream creation and destruction (LoopbackStreamOpen, LoopbackStreamClose): the formats open on each circuit,
     // so a stream in a format other than one open on the other circuit is refused (STATUS_NOT_SUPPORTED). The capture
-    // circuit's go through CaptureStreamOpen and CaptureStreamClose, which hold the app ring's lock around this one's
-    // (AppRing.h has the order).
+    // circuit's go through CaptureStreamOpen and CaptureStreamClose, which hold the same cable's app ring's lock around this
+    // one's (Cable.h has the order).
     LOOPBACK_OPEN   RenderOpen[LOOPBACK_OPEN_FORMATS];
     LOOPBACK_OPEN   CaptureOpen[LOOPBACK_OPEN_FORMATS];
 
@@ -128,22 +127,16 @@ typedef struct _LOOPBACK_RING {
     ULONG           LeadSkips;              // capture reads moved on at once by a fall in the render lead: a one-time skip
     ULONGLONG       LeadSkippedFrames;      // the ring's audio such skips passed over (the difference in leads at most)
 
-    // The app ring's jumps in a capture stream's own time line (NF_VMIC_EVENT_SECONDARY_JUMP) this device's skip log holds, and
-    // the copy's frames they passed over (each entry's Frames: what the copy held there as it was logged; a part past its end
-    // then joins only the entry's ring span, nf_vmic.h), counted where each is logged (StreamEngine.cpp,
-    // AppRingOtherPass): the app feed device's only (NF_APP_RING.Loopback is this ring), under the app ring's lock, not Lock.
-    // STATS copies them inside both, with the log (the owner, 2026-11-24: two totals per device, so the log's cross-check
-    // covers jumps too).
-    ULONGLONG       SecondaryJumps;
-    ULONGLONG       SecondaryJumpFrames;
-
-    // This device's event logs (NF_EVENT_LOG: their own locks, not Lock): its loopback's, and for the app feed's device the
-    // app ring's (NF_APP_RING.Loopback is this ring). STATS copies the app feed device's.
+    // This device's event logs (NF_EVENT_LOG: their own locks, not Lock): its loopback's and its cable's app ring's
+    // (NF_APP_RING.Loopback is this ring; the copy's jump totals are the app ring's, Cable.h). STATS copies them.
     NF_EVENT_LOG    SkipLog;
     NF_EVENT_LOG    UnderrunLog;
     NF_VMIC_EVENT   SkipSlots[NF_VMIC_SKIP_LOG_ENTRIES];
     NF_VMIC_EVENT   UnderrunSlots[NF_VMIC_UNDERRUN_LOG_ENTRIES];
 } LOOPBACK_RING, *PLOOPBACK_RING;
+
+// noise-filter (TODO 19, the per-cable design): a cable's app ring, names and statistics (NF_CABLE).
+#include "Cable.h"
 
 //
 // Define CODEC device context.
@@ -154,7 +147,12 @@ typedef struct _CODEC_DEVICE_CONTEXT {
     ACXCIRCUIT      Capture2;               // noise-filter (TODO 19): the call microphone (DriverSettings.h)
     WDF_TRI_STATE   ExcludeD3Cold;
     LOOPBACK_RING   Loopback;               // noise-filter (TODO 19)
-    BOOLEAN         VmicRegistered;         // noise-filter (TODO 19, spike check 4): NfVmic_DeviceAdd ran; the cleanup undoes it
+    NF_CABLE        Cable;                  // noise-filter (TODO 19, the per-cable design): this device's cable (Cable.h)
+    BOOLEAN         StartCounted;           // noise-filter (TODO 19, the boot crash breaker, Device.cpp): this binding's start
+                                            // is counted in the hardware key and the count not removed yet. PASSIVE_LEVEL only.
+    BOOLEAN         StartClearUnflushed;    // noise-filter (TODO 19, the boot crash breaker): the count removed, its removal not
+                                            // known to be on disk (its ZwFlushKey failed): flushed again by the next clear, the
+                                            // context cleanup at the latest. PASSIVE_LEVEL only.
 } CODEC_DEVICE_CONTEXT, * PCODEC_DEVICE_CONTEXT;
 
 //
@@ -171,6 +169,7 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE     Codec_EvtDevicePrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE     Codec_EvtDeviceReleaseHardware;
 EVT_WDF_DEVICE_D0_ENTRY             Codec_EvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT              Codec_EvtDeviceD0Exit;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT Codec_EvtDeviceSelfManagedIoInit;     // noise-filter (TODO 19, the boot crash breaker)
 EVT_WDF_DEVICE_CONTEXT_CLEANUP      Codec_EvtDeviceContextCleanup;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CODEC_DEVICE_CONTEXT, GetCodecDeviceContext)

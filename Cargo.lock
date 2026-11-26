@@ -456,6 +456,8 @@ dependencies = [
 name = "nf-vmic"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "wasapi",
  "windows",
 ]

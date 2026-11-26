@@ -101,7 +101,7 @@ fn start_feed(parent: &OwnedHandle, active: &mut Option<Attachment>) -> io::Resu
         return Err(io::Error::from_raw_os_error(ERROR_BUSY.0 as i32));
     }
     let (ring, section) = RingMemory::shared(LIVE_CAPACITY)?;
-    let attachment = Device::open()?.attach_live(ring).map_err(|e| e.error)?;
+    let attachment = Device::open_default()?.attach_live(ring).map_err(|e| e.error)?;
     let mut remote = HANDLE::default();
     // SAFETY: fresh anonymous pagefile section only; verified, live recipient. Limit access to the two view rights and disallow inheritance.
     unsafe {

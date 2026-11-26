@@ -4,12 +4,12 @@
     the shared-mode engine runs the device at.
 
 .EXAMPLE
-    .\Get-EndpointFormat.ps1 -Match 'AudioCodec'
+    .\Get-EndpointFormat.ps1 -Match 'ACX-LL-Cable B'
 #>
-param([string]$Match = 'AudioCodec')
+param([string]$Match = 'ACX-LL-Cable')
 
 $ErrorActionPreference = 'Stop'
-$nameKey = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'      # the device's name (e.g. 'AudioCodec Device')
+$nameKey = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'      # the device's name (e.g. 'ACX-LL-Cable A')
 $formatKey = '{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0'    # PKEY_AudioEngine_DeviceFormat
 $float = [guid]'00000003-0000-0010-8000-00aa00389b71'
 $pcm = [guid]'00000001-0000-0010-8000-00aa00389b71'

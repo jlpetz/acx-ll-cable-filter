@@ -7,14 +7,24 @@
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use crate::identity::CableId;
+
 /// `NF_VMIC_MAGIC`: "NFVM" in memory order.
 pub const MAGIC: u32 = 0x4D56_464E;
 /// `NF_VMIC_VERSION`.
 pub const VERSION: u32 = 1;
 /// `NF_VMIC_LIVE_VERSION`: live ATTACH request and its ring. Ordinary feeds and STATS keep the v1 contract.
 pub const LIVE_VERSION: u32 = 2;
-/// `NF_VMIC_USER_PATH`: the control device, opened from user mode.
-pub const USER_PATH: &str = r"\\.\NoiseFilterVmic";
+/// `NF_VMIC_USER_PREFIX`: a cable's control device, opened from user mode, is this followed by the cable's identity in lower
+/// case ([`control_path`]). One control device per cable (TODO 19, the per-cable design, section 3); `\\.\NoiseFilterVmic` is
+/// gone, and opening it gets ERROR_FILE_NOT_FOUND.
+pub const USER_PREFIX: &str = r"\\.\AcxLlCable_";
+
+/// A cable's control device as the driver names it (D1: `\DosDevices\AcxLlCable_<id>`, the identity's 36 lower-case characters),
+/// opened from user mode: `\\.\AcxLlCable_<id>`. Built from the identity, never taken from a string a user could set.
+pub fn control_path(id: &CableId) -> String {
+    format!("{USER_PREFIX}{id}")
+}
 
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 const METHOD_BUFFERED: u32 = 0;
@@ -716,6 +726,21 @@ mod tests {
         assert_eq!((a.magic, a.version, a.in_bytes, a.flags), (0x4D56_464E, 1, 16, 0));
         // "NFVM" in memory order.
         assert_eq!(&MAGIC.to_le_bytes(), b"NFVM");
+    }
+
+    /// A cable's control path is the driver's (step 1's contract, D1): nf_vmic.h's user-mode prefix, and its kernel names with
+    /// the same `AcxLlCable_` before the identity, which the path carries in lower case.
+    #[test]
+    fn the_control_path_is_the_drivers() {
+        let h = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../driver/src/Shared/nf_vmic.h")).unwrap();
+        // The header writes each backslash twice (a C string)
+        let c_string = |s: &str| s.replace('\\', r"\\");
+        assert!(h.contains(&format!("#define NF_VMIC_USER_PREFIX             L\"{}\"", c_string(USER_PREFIX))));
+        let tail = USER_PREFIX.trim_start_matches(r"\\.\");
+        assert!(h.contains(&format!("#define NF_VMIC_DEVICE_PREFIX           L\"{}\"", c_string(&format!(r"\Device\{tail}")))));
+        assert!(h.contains(&format!("#define NF_VMIC_SYMLINK_PREFIX          L\"{}\"", c_string(&format!(r"\DosDevices\{tail}")))));
+        let id: CableId = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0".parse().unwrap();
+        assert_eq!(control_path(&id), r"\\.\AcxLlCable_0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0");
     }
 
     /// Every outcome's Win32 error is what RtlNtStatusToDosError makes of its NTSTATUS (ntdll, no device), and its NTSTATUS is
