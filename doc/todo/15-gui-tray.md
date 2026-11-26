@@ -8,8 +8,8 @@ Facts: `doc/research-2026-10.md` (GUI). Decided by the owner on 2026-10-26:
 ## Current implementation and acceptance
 
 `nf-gui` hosts the engine in the settings process. The window controls direct output to the driver or output to a WASAPI
-playback endpoint. A stopped filter allows the primary cable to carry ordinary Windows playback. The optional Noise Filter
-Cable B has a separate pair of endpoints for another route. The output, microphone and echo-reference choices, processing
+playback endpoint. A stopped filter allows the primary cable to carry ordinary Windows playback. ACX-LL-Cable B has its
+own Speakers and microphone endpoints for another route. The output, microphone and echo-reference choices, processing
 controls, effect settings and UI preferences persist in `%APPDATA%\noise-filter\settings.json`.
 
 The CLAP card accepts a file selected through the Windows picker. Starting the engine loads the effect in a separate worker

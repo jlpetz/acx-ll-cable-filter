@@ -997,30 +997,16 @@ impl Window {
         // Changing a device mid-test would break the test's loop
         let enabled = loaded && !self.test.busy();
         let ring = self.settings.engine.io.output_backend == OutputBackend::DriverRing;
-        let cable_b = self.devices.iter().flatten().find(|d| d.flow == nf_engine::Flow::Render && d.name.contains("Noise Filter Cable B"));
-        let filtering_to_b = !ring && cable_b.is_some_and(|b| self.settings.engine.devices.output.as_ref() == Some(&b.id));
-        let plain = if filtering_to_b {
-            Some(
-                "The filter feeds the Noise Filter Cable B microphone. For a separate plain cable, play to Speakers (AudioCodec Device) \
-                  and record from its microphone.",
-            )
-        } else if cable_b.is_some() {
-            Some(
-                "For a separate plain cable, play to Speakers (Noise Filter Cable B) and record from its microphone. \
-                  Direct output feeds the AudioCodec microphone.",
-            )
-        } else if !stops(&self.status) {
-            Some("For a plain cable, leave the filter stopped. Play to Speakers (AudioCodec Device) and record from its microphone.")
-        } else {
-            None
-        };
         let placeholder = |p: &'static str| if loaded { p } else { "Loading devices…" };
         card(
             "Devices",
             None,
             StackPanel::new().spacing(12.0).children((
                 device_combo("Microphone", &self.choices.mic, placeholder("Choose a microphone"), enabled, context.callback(Msg::Mic)),
-                plain.map_or_else(View::empty, |text| secondary(text).into()),
+                secondary(
+                    "To use a plain cable, play to its Speakers endpoint and record from a microphone on the same cable. \
+                     You can leave this app closed or run filters on a different cable.",
+                ),
                 combo(
                     "Output route",
                     &["Direct to driver", "WASAPI playback device"],
@@ -1030,7 +1016,10 @@ impl Window {
                 ),
                 if ring {
                     StackPanel::new().spacing(6.0).children((
-                        secondary("Select the AudioCodec microphone in your recording or call app."),
+                        secondary(
+                            "Direct output feeds ACX-LL-Cable A, or the only installed cable. \
+                             In your recording or call app, select a microphone on that cable.",
+                        ),
                         if self.elevated || nf_vmic::broker::authorized() {
                             View::empty()
                         } else {
@@ -1044,7 +1033,7 @@ impl Window {
                     device_combo(
                         "Output (virtual cable)",
                         &self.choices.output,
-                        placeholder("Pick the cable your apps use as their mic"),
+                        placeholder("Choose the cable's playback endpoint"),
                         enabled,
                         context.callback(Msg::Output),
                     )

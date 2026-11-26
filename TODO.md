@@ -138,10 +138,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 12. [dsp] Input level meter
-**Priority**: Medium (phase 1) | **Status**: the console readout is in `run`'s status line (input and output peak/RMS dBFS), with a clip latch shown once after a clip and clipped seconds in the run's summary (2026-11-02).
-- Raw-input peak and RMS in dBFS with peak hold, before any processing; a clip light that latches at about −0.1 dBFS or on flat-topped runs.
-- Toggle on/off, about 20 Hz; auto-pause when the window closes (minimise detection is still open, #15). Later: output level and gain reduction.
-**Next**: the GUI meter in phase 3.
+**Priority**: Medium (phase 1) | **Status**: the settings window and CLI show input and output peak/RMS. The window has a resettable input clip indicator, gain reduction, speech probability and a meter toggle.
+- The window reads live levels at about 20 Hz with meters enabled. Closing it stops the current engine.
+**Next**: check the clip indication on a real microphone. Automatic meter pausing while minimised remains open with TODO 15.
 **Detail**: `doc/todo/11-floor-gate-meter.md`
 
 ---
