@@ -7,6 +7,10 @@ Facts: `doc/research-2026-10.md` (GUI). Decided by the owner on 2026-10-26:
 
 ## Current implementation and acceptance
 
+The owner asked to compare visible routing and ordered stage editors on 2026-11-26. The interactive previews run in the
+same Reactor library and share the same example graph. Selection of the product layout is open.
+[Designs and launch instructions](../design/gui.md#routing-and-effects-design-review).
+
 `nf-gui` hosts the engine in the settings process. The window controls direct output to the driver or output to a WASAPI
 playback endpoint. A stopped filter allows the primary cable to carry ordinary Windows playback. ACX-LL-Cable B has its
 own Speakers and microphone endpoints for another route. The output, microphone and echo-reference choices, processing

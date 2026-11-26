@@ -4,6 +4,32 @@ A windows-reactor 0.100.0 window (patterns: `TMR-APP/crates/tmr-gui`, and
 `doc/dev/api/windows-reactor.md`). Single process for v0: closing the window exits. The owner said
 minimise for now; the tray comes later (TODO #15, #16).
 
+## Routing and effects design review
+
+The owner wants visible split and mix controls and a single ordered list for built-ins and CLAP effects. Three native
+Reactor mockups are available for choosing the layout. The current settings window is documented below.
+[Compare the concepts](routing-preview.png). Run `cargo run -p nf-gui --example routing_preview` to try them.
+
+All three layouts edit one in-memory example. The studio mic feeds Cable A dry for OBS and Cable B through AEC and RNNoise
+for Discord. Cable C playback joins the mic on A at −9 dB. To try a two-cable mix,
+turn on **Cable D playback → Cable A** and turn off **Studio mic → Cable A**. Both C and D now feed A, and B keeps its own mic chain.
+The meters, devices and plugin catalog are examples.
+
+- **Signal paths** shows where each source goes. Choose **Edit sends** on the source to connect another destination.
+- **Routing matrix** shows all source/destination pairs. Each active cell in a row is a copy, and each active cell in a column contributes to the mix.
+- **Mixer strips** puts the contributing sources and a stereo meter on each output.
+
+Select a source to edit its shared stages, a send to process one copy, or an output for effects after the mix. **Add stage**
+opens the same catalog at each location. Select a stage to adjust it, move it earlier or later, bypass it or remove it.
+Open **Send** to pick the original input, the output of a particular shared stage, or the end of the shared pipeline, and to set its gain.
+**Reuse this pipeline** copies stage instances and their settings onto a different route for the duration of the preview.
+
+The proposed first view is Signal paths, with the matrix available for larger setups. The owner is choosing the layout.
+Live split and mix depend on the engine work in [TODO 24](../todo/24-routing-graph.md) and multiple live effect instances
+in [TODO 17](../todo/17-post-effects.md). The product's existing plain-cable use remains available with the app closed.
+Voicemeeter Banana's per-input sends and separate output meters informed the matrix and strips.
+[VB-Audio's routing diagram, p. 10](https://vb-audio.com/Voicemeeter/VoicemeeterBanana_UserManual.pdf#page=10).
+
 ## Layout (top to bottom, one column, about 520×760 by default, scrollable)
 1. **Header:**
    - title "noise-filter";

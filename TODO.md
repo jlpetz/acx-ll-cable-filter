@@ -172,7 +172,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High for v0.1 | **Status**: settings window implemented. Stopped and running acceptance passed on the virtual dev box.
 - The window selects the mic, echo reference and output route. It controls AEC, the noise model, gate position and one CLAP effect, shows meters and latency, and saves named processing presets independently of the route.
 - Settings survive close and reopen. Minimise keeps the process alive. Closing stops the engine. The tray and background engine are TODO 16.
-**Next**: verify the standard-user grant and physical Windows 11 experience. The quality Lab page remains open.
+- Three native design previews let the owner compare visible splits, mixes and an ordered built-in/CLAP pipeline. They use simulated audio.
+**Next**: choose the routing layout, then connect its controls to TODO 24 and TODO 17. The standard-user grant, physical Windows 11 and the quality Lab page remain open.
 **Detail**: `doc/todo/15-gui-tray.md`
 
 ---
