@@ -22,9 +22,12 @@
 //! - [`identity`]: a cable's names (TODO 19, the per-cable design): its identity, its label and its device node's fixed
 //!   instance ID, `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`, parsed as the driver parses it. The one parse: [`cables`], [`setup`]
 //!   and [`sessions`] all use it.
-//! - [`setup`]: the cables' setup, behind the `acx-ll-cable` tool and the driver scripts: list, add, remove, update and the
-//!   migration from the old driver's devices; the package rule, the store of identities, the lock; the sequences of update and
-//!   the migration over a seam the tests fake.
+//! - [`setup`]: the cables' setup, behind the `acx-ll-cable` tool and the driver scripts: list, add, remove, disable, enable,
+//!   update and the migration from the old driver's devices; the package rule, the store of identities, the lock; the
+//!   sequences of update, the migration, disable and enable over a seam the tests fake.
+//! - [`roles`]: the endpoint resolver by role, the app's contract: a cable's identity and a role (Speakers, Microphone, Call
+//!   Microphone) to the MMDevice id Windows has for it now, by the KS filter's instance ID and pin, never by name; or none, and
+//!   why. The app saves the identity and the role, never the endpoint's id, which a cable's re-add changes.
 //! - [`variant`]: the driver's three variants (one INF, three hardware IDs shared by every cable: both microphones, the call
 //!   one, the low-latency one), and the elevated switch of one cable between them (`noise-filter mic variant`,
 //!   `acx-ll-cable variant`).
@@ -47,6 +50,7 @@ pub mod latency;
 pub mod memory;
 pub mod protocol;
 pub mod ring;
+pub mod roles;
 pub mod sessions;
 pub mod setup;
 pub mod signal;

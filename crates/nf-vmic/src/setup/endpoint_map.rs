@@ -21,14 +21,17 @@
 //! - `ambiguous`: more than one endpoint of that role on the new instance, none with the old id. Not remapped.
 //! - `added`: a new endpoint no old one maps to (`old` is null).
 //!
-//! **Publishing** (Astra's review, 2026-11-25). The file is published whole at the end of a run that has read the endpoints
-//! before it ([`publish`]): written to `<file>.tmp` beside it, flushed to disk, then renamed over the file. A reader finds the
-//! file as it was or this run's map, never part of one, and never no file where there was one. A run that publishes none (it
-//! stopped before reading the endpoints, or was killed, or its map couldn't be made) leaves the file as it was: an earlier
-//! run's map, the whole migration's among them, stays until a run publishes another. `start` only checks, before anything
-//! changes, that the file can be published (its folder there, a file beside it writable, the file itself replaceable and open
-//! in no other process: it opens it exclusively). So a file there afterwards is this run's only if the run said so ("The
-//! endpoint map: <file> ..."): a reader that needs this run's own map passes a path no earlier run used.
+//! **Publishing** (Astra's reviews, 2026-11-25 and 2026-11-26). The file is published whole at the end of a run that has read
+//! the endpoints before it ([`publish`]): written to a temporary file of the run's own beside it, `<file>.<pid>-<k>.tmp`,
+//! created exclusively (a file or folder there already, of any name, is passed over and never opened, truncated or replaced),
+//! flushed to disk, then renamed over the file. A reader finds the file as it was or this run's map, never part of one, and
+//! never no file where there was one. A run that publishes none (it stopped before reading the endpoints, or was killed, or its
+//! map couldn't be made) leaves the file as it was: an earlier run's map, the whole migration's among them, stays until a run
+//! publishes another (a killed run may leave its temporary file, which nothing reads). `start` only checks, before anything
+//! changes, that the file can be published (its folder there, a temporary file of its own creatable beside it and deleted
+//! again, the file itself replaceable and open in no other process: it opens it exclusively). So a file there afterwards is
+//! this run's only if the run said so ("The endpoint map: <file> ..."): a reader that needs this run's own map passes a path
+//! no earlier run used.
 //!
 //! **A reader closes the file before the run ends.** Windows doesn't rename over a file another process has open, whatever it
 //! shares (ERROR_ACCESS_DENIED). The start's check and the publish each try again for about a second ([`BUSY`]: a scanner's
@@ -50,9 +53,11 @@
 //! run reads the old endpoints before it disables the old nodes (`active`, `disabled`), a retry after their removal finds them
 //! lingering (`notpresent`).
 
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -208,13 +213,7 @@ impl Match {
 }
 
 fn side(e: &Endpoint) -> Side {
-    let state = match e.state {
-        State::Active => "active",
-        State::Disabled => "disabled",
-        State::Unplugged => "unplugged",
-        State::NotPresent => "notpresent",
-    };
-    Side { id: e.id.clone(), name: e.name.clone(), instance_id: e.instance_id.clone(), state }
+    Side { id: e.id.clone(), name: e.name.clone(), instance_id: e.instance_id.clone(), state: e.state.arg() }
 }
 
 /// One cable's map from the endpoints before and after the run (pure).
@@ -282,13 +281,41 @@ pub fn map(
     EndpointMap { format: FORMAT, version: VERSION, command, result, cables }
 }
 
-/// The temporary file a map is written to before it is renamed over `path`: `<file>.tmp`, beside it (a rename stays on its
-/// volume). `None` if `path` names no file.
-fn temporary(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?;
-    let mut tmp = name.to_os_string();
-    tmp.push(".tmp");
-    Some(path.with_file_name(tmp))
+/// How many names a temporary file tries before it gives up, each one taken already (another file's or folder's) passed over.
+const TEMPORARY_TRIES: u32 = 32;
+
+/// The names the temporary file a map is written to may take, before it is renamed over `path`: `<file>.<pid>-<k>.tmp`, beside
+/// it (a rename stays on its volume), `k` a count the process keeps across calls, so no two calls of one run share one. `None`
+/// if `path` names no file.
+fn temporaries(path: &Path) -> Option<impl Iterator<Item = PathBuf>> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let name = path.file_name()?.to_os_string();
+    let path = path.to_path_buf();
+    let pid = std::process::id();
+    Some((0..TEMPORARY_TRIES).map(move |_| {
+        let mut tmp = name.clone();
+        tmp.push(format!(".{pid}-{}.tmp", NEXT.fetch_add(1, Ordering::Relaxed)));
+        path.with_file_name(tmp)
+    }))
+}
+
+/// A temporary file of this run's own (Astra's review of the first install, 2026-11-26): the first of `names` nothing has,
+/// created exclusively (CREATE_NEW: never a file or folder there already, of any name, which is passed over and left as it is,
+/// never opened, truncated or replaced). Its path and handle; why not, if none could be made.
+fn create_temporary(names: impl IntoIterator<Item = PathBuf>) -> Result<(PathBuf, File), String> {
+    let mut taken = None;
+    for name in names {
+        match OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(f) => return Ok((name, f)),
+            // A folder of that name gives ERROR_ACCESS_DENIED rather than ERROR_FILE_EXISTS: taken all the same
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || name.symlink_metadata().is_ok() => taken = Some(name),
+            Err(e) => return Err(format!("{} couldn't be created ({e})", name.display())),
+        }
+    }
+    Err(match taken {
+        Some(last) => format!("every name tried for a temporary file is taken, the last {}", last.display()),
+        None => "no name was tried for a temporary file".into(),
+    })
 }
 
 /// How long the start's check and the publish wait out another process that has the file open (a scanner's brief look, a
@@ -332,38 +359,46 @@ fn start_within(path: Option<&Path>, busy: Busy) -> Result<(), SetupError> {
     let Some(path) = path else { return Ok(()) };
     let refuse = |why: String| Err(SetupError::EndpointMap(format!("{why}: nothing was changed")));
     let shown = path.display();
-    let Some(tmp) = temporary(path).filter(|_| !path.is_dir()) else { return refuse(format!("{shown} isn't a file's name")) };
+    let Some(names) = temporaries(path).filter(|_| !path.is_dir()) else { return refuse(format!("{shown} isn't a file's name")) };
     if path.exists() {
         // Exclusively (no sharing): it fails while any other process has the file open, as the publish's rename would
-        let open = || std::fs::OpenOptions::new().write(true).share_mode(0).open(path);
+        let open = || OpenOptions::new().write(true).share_mode(0).open(path);
         if let Err(e) = busy.retry(|e: &std::io::Error| e.raw_os_error().map(|c| c as u32), open) {
             return refuse(format!("{shown} is there and can't be replaced: open in another process, or read-only ({e})"));
         }
     }
-    if let Err(e) = std::fs::File::create(&tmp) {
-        return refuse(format!("{} can't be written beside it ({e})", tmp.display()));
+    // A temporary file of its own made and deleted again: only that one
+    match create_temporary(names) {
+        Ok((tmp, f)) => {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(why) => refuse(format!("no temporary file can be made beside {shown} ({why})")),
     }
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
 }
 
-/// `text` published at `path` whole (Astra's review, 2026-11-25): written to `<file>.tmp` beside it (one a killed run left is
-/// written over), flushed to disk (FlushFileBuffers), then renamed over `path` (MoveFileExW with MOVEFILE_REPLACE_EXISTING, and
-/// MOVEFILE_WRITE_THROUGH: it returns once the rename is on disk), tried again for about a second while another process has
-/// `path` open ([`BUSY`]). A reader finds `path` as it was, or `text`. On a failure the temporary file is deleted and `path` is
-/// as it was.
+/// `text` published at `path` whole (Astra's reviews, 2026-11-25 and 2026-11-26): written to a temporary file of this run's own
+/// beside it (`<file>.<pid>-<k>.tmp`, created exclusively: a file or folder there already, of any name, is never opened,
+/// truncated or replaced), flushed to disk (FlushFileBuffers), then renamed over `path` (MoveFileExW with
+/// MOVEFILE_REPLACE_EXISTING, and MOVEFILE_WRITE_THROUGH: it returns once the rename is on disk), tried again for about a second
+/// while another process has `path` open ([`BUSY`]). A reader finds `path` as it was, or `text`. On a failure the temporary file
+/// (this run's own) is deleted and `path` is as it was. A run killed in between leaves its temporary file, which nothing reads.
 pub fn publish(path: &Path, text: &str) -> Result<(), String> {
     publish_within(path, text, BUSY)
 }
 
 /// [`publish`], another process's open waited out as `busy` says.
 fn publish_within(path: &Path, text: &str, busy: Busy) -> Result<(), String> {
-    let tmp = temporary(path).ok_or_else(|| format!("{} isn't a file's name", path.display()))?;
-    let written = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()
-    })();
+    let names = temporaries(path).ok_or_else(|| format!("{} isn't a file's name", path.display()))?;
+    publish_through(path, text, busy, names)
+}
+
+/// [`publish_within`], its temporary file the first of `names` nothing has ([`create_temporary`]).
+fn publish_through(path: &Path, text: &str, busy: Busy, names: impl IntoIterator<Item = PathBuf>) -> Result<(), String> {
+    let (tmp, mut f) = create_temporary(names)?;
+    let written = f.write_all(text.as_bytes()).and_then(|()| f.sync_all());
+    drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{} couldn't be written ({e})", tmp.display()));
@@ -589,18 +624,19 @@ pub(crate) mod tests {
         let dir = scratch("file");
         let path = dir.join("map.json");
         std::fs::write(&path, "an earlier run's").unwrap();
+        // A file of the old temporary name (an older tool's killed run left it, or the user made it): never touched
+        std::fs::write(dir.join("map.json.tmp"), "someone's").unwrap();
         start(Some(&path)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "an earlier run's", "the start doesn't touch it");
-        assert!(!dir.join("map.json.tmp").exists(), "the start's check leaves nothing beside it");
-        // A temporary file a killed run left is written over
-        std::fs::write(dir.join("map.json.tmp"), "a killed run's").unwrap();
+        assert_eq!(names_in(&dir), ["map.json", "map.json.tmp"], "the start's check leaves nothing beside it");
         let mut said = Vec::new();
         let gathered = Gathered { before: Some(vec![]), cables: vec![] };
         let r = finish(Some(&path), "add", gathered, Ok(Done::Nothing), &mut || Ok(vec![]), &mut |s: &str| said.push(s.to_string()));
         assert_eq!(r, (Ok(Done::Nothing), true));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(r#""command": "add""#) && text.contains(r#""cables": []"#), "{text}");
-        assert!(!dir.join("map.json.tmp").exists());
+        assert_eq!(names_in(&dir), ["map.json", "map.json.tmp"]);
+        assert_eq!(std::fs::read_to_string(dir.join("map.json.tmp")).unwrap(), "someone's");
         // The endpoints before weren't read: a done run fails, a failed one keeps its error; neither publishes, and the file
         // is as it was
         let none = Gathered::default();
@@ -620,7 +656,7 @@ pub(crate) mod tests {
         let e = start(Some(&dir)).unwrap_err().to_string();
         assert!(e.contains("isn't a file's name") && e.ends_with("nothing was changed"), "{e}");
         let e = start(Some(&dir.join("no folder").join("map.json"))).unwrap_err().to_string();
-        assert!(e.contains("map.json.tmp can't be written beside it"), "{e}");
+        assert!(e.contains("no temporary file can be made beside") && e.contains("couldn't be created"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -633,12 +669,11 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first", "no file before: made");
         publish(&path, "second").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second", "renamed over the first");
-        // The temporary file can't be made (a folder holds its name): nothing changes
-        std::fs::create_dir(dir.join("map.json.tmp")).unwrap();
-        let why = publish(&path, "third").unwrap_err();
-        assert!(why.contains("map.json.tmp couldn't be written"), "{why}");
+        assert_eq!(names_in(&dir), ["map.json"], "no temporary file left");
+        // The temporary file can't be made (its folder isn't there): nothing changes
+        let why = publish_through(&path, "third", QUICK, [dir.join("gone").join("map.json.1-0.tmp")]).unwrap_err();
+        assert!(why.contains("map.json.1-0.tmp couldn't be created"), "{why}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-        std::fs::remove_dir(dir.join("map.json.tmp")).unwrap();
         // The rename refused (the file is read-only): the file as it was, the temporary one gone
         let writable = std::fs::metadata(&path).unwrap().permissions();
         let mut read_only = writable.clone();
@@ -647,7 +682,7 @@ pub(crate) mod tests {
         let why = publish_within(&path, "fourth", QUICK).unwrap_err();
         assert!(why.contains("couldn't be renamed over") && why.contains("MoveFileExW failed"), "{why}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-        assert!(!dir.join("map.json.tmp").exists());
+        assert_eq!(names_in(&dir), ["map.json"], "its own temporary file deleted");
         assert!(start_within(Some(&path), QUICK).unwrap_err().to_string().contains("is there and can't be replaced"));
         std::fs::set_permissions(&path, writable).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -655,6 +690,50 @@ pub(crate) mod tests {
 
     /// The busy waits, short: where the wait isn't what is tested.
     const QUICK: Busy = Busy { tries: 2, pause: Duration::from_millis(10) };
+
+    /// The names in a folder, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// Astra's review of the first install (2026-11-26): the temporary file is the run's own, created exclusively, so a file or
+    /// folder there already, of any name (the names the run would take among them), is passed over and never opened, truncated
+    /// or replaced; the names differ from call to call.
+    #[test]
+    fn the_temporary_file_is_a_new_one_of_the_runs_own() {
+        let dir = scratch("temporary");
+        let path = dir.join("map.json");
+        let named = |s: &str| dir.join(s);
+        std::fs::write(named("map.json"), "the last map").unwrap();
+        std::fs::write(named("map.json.7-0.tmp"), "someone's file").unwrap();
+        std::fs::create_dir(named("map.json.7-1.tmp")).unwrap();
+        let names = ["map.json.7-0.tmp", "map.json.7-1.tmp", "map.json.7-2.tmp"].map(named);
+        publish_through(&path, "the new map", QUICK, names.clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the new map");
+        assert_eq!(std::fs::read_to_string(named("map.json.7-0.tmp")).unwrap(), "someone's file", "never truncated");
+        assert!(named("map.json.7-1.tmp").is_dir(), "a folder of that name is left too");
+        assert_eq!(names_in(&dir), ["map.json", "map.json.7-0.tmp", "map.json.7-1.tmp"], "the third, renamed over the map");
+        // Every name taken: nothing written, the map as it was, the others untouched
+        std::fs::write(named("map.json.7-2.tmp"), "another").unwrap();
+        let why = publish_through(&path, "a third map", QUICK, names).unwrap_err();
+        assert!(why.starts_with("every name tried for a temporary file is taken, the last") && why.ends_with("map.json.7-2.tmp"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the new map");
+        assert_eq!(std::fs::read_to_string(named("map.json.7-2.tmp")).unwrap(), "another");
+        // The process's own names: beside the file, by its pid, a new one each time
+        let pid = std::process::id();
+        let ours: Vec<PathBuf> = temporaries(&path).unwrap().take(2).collect();
+        assert_ne!(ours[0], ours[1]);
+        for t in &ours {
+            let name = t.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(t.parent() == Some(dir.as_path()) && name.starts_with(&format!("map.json.{pid}-")) && name.ends_with(".tmp"), "{name}");
+        }
+        assert_ne!(temporaries(&path).unwrap().next(), temporaries(&path).unwrap().next(), "calls don't share a name");
+        assert!(temporaries(Path::new(r"C:\")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Astra's review (2026-11-25): a reader that has the file open blocks the rename, whatever it shares (std's open shares
     /// read, write and delete, the most a reader can). The start refuses the run while it is open; the publish waits for it
@@ -670,7 +749,7 @@ pub(crate) mod tests {
         let why = publish_within(&path, "second", QUICK).unwrap_err();
         assert!(why.contains("couldn't be renamed over") && why.contains("MoveFileExW failed"), "{why}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first", "the file as it was");
-        assert!(!dir.join("map.json.tmp").exists());
+        assert_eq!(names_in(&dir), ["map.json"]);
         // Closed within the wait: published
         let closer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));

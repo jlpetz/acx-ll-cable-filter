@@ -68,6 +68,22 @@ other's, and its counters start at zero with each binding (AddDevice). Only the 
 friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
 circuit's component ID is the identity XOR the sample's constant.
 
+**A cable's endpoints, by role (the app's contract, `nf_vmic::roles`).** Windows' endpoint ids belong to one installation
+of a cable's device: a cable removed and added again gets new ones (the first install's trial, 2026-11-26: Windows keeps the
+old ones as not present and never reuses them; accepted by the owner), while a disable and enable keeps them. So an app saves
+a cable's id with the endpoint's role ("B's Call Microphone": the `CableId` and an `EndpointKind`, Speakers, Microphone or
+Call Microphone), never the endpoint's id or name, and resolves the current id each time it opens one:
+`nf_vmic::roles::resolve(id, role)`, or `Snapshot::read()` then `snapshot.resolve(id, role)` for many. It matches endpoints by
+the KS filter they're connected to, its device instance ID (the cable's node) and its reference string (the pin: `Speaker0`,
+`Microphone0`, `Microphone1`), never by name, and never returns an endpoint Windows keeps for a removed node or an earlier
+installation (not present), even with the same instance ID and pin. It returns the endpoint's id, its state (active,
+disabled in the Sound panel, unplugged), its name for display and its node; or none, and why: the cable isn't present, its
+microphones lack the role (a one-microphone variant), it is disabled (its endpoints come back with their ids once enabled),
+its device isn't working, or Windows hasn't made that endpoint yet. Any user, on a control thread (it enumerates devices and
+reads endpoint properties through COM on a thread of its own), never an audio thread. From a shell: `acx-ll-cable endpoint
+<label|id> speakers|microphone|call-microphone` (or `scripts\Cable.ps1 endpoint ...`) prints `<id> <state> "<name>"` and
+exits 0, or says why on stderr and exits 3.
+
 **The boot crash breaker** (ours, for the owner's go; `Device.cpp` says what it can't catch). With Driver Verifier on at
 boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
 attempts in its hardware key (`NfStartAttempts` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters`,
@@ -101,15 +117,24 @@ direct feed takes over that cable's microphones while attached, and the others c
 cable's device node; the scripts run it, and fail if it isn't built (`-Build` builds it: `cargo build --release -p nf-vmic
 --bin acx-ll-cable`). In an elevated PowerShell window (`list` takes any user):
 - `scripts\Cable.ps1 list`: the present cables with their devices, endpoints and control devices, the remembered absent ones,
-  the old driver's devices and setup errors.
+  the old driver's devices and setup errors. A disabled cable's line ends `: disabled` (`: disabled for now` if not
+  persistently: a stopped setup run's), its device's line says how it comes back, and its endpoints are listed as not
+  present; a failed cable's device line says its problem code instead ("a problem: Code 31 ...").
 - `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>] [-EndpointMap <file>]`: makes a cable on the
-  package the others run, with both microphones unless `-Mics` (or what it had). Present and working: no change. Present but
-  not working: repaired in place. Removed earlier: back with its identity and, with the microphones it had, its instance ID,
-  so (we expect, to confirm on the box) its endpoints and their ids; with other microphones, the next instance number (new
-  endpoints, as a variant switch). `-Adopt` re-creates a device made outside the tool (`list` shows them as "Not a cable")
-  as the cable; nothing adopts one otherwise.
+  package the others run, with both microphones unless `-Mics` (or what it had). Present and working, or disabled: no change
+  (`enable` turns a disabled cable on). Present but not working: repaired in place. Removed earlier: back with its identity
+  and, with the microphones it had, its instance ID, though Windows gives it new endpoint ids (the first install's trial);
+  with other microphones, the next instance number (as a variant switch). `-Adopt` re-creates a device made outside the tool
+  (`list` shows them as "Not a cable") as the cable; nothing adopts one otherwise.
 - `Cable.ps1 remove <label> [-Forget]`: removes that cable's device only; its identity stays in the setup's store
   (`HKLM\SOFTWARE\ACX-LL-Cable\Cables`) unless `-Forget`.
+- `Cable.ps1 disable <label>` and `Cable.ps1 enable <label>` (`acx-ll-cable disable|enable <label>`): keeps the cable
+  installed but off, across restarts too, until `enable`; its endpoints keep their ids (not present while it is off), so
+  apps find them again. Only that cable's device, through SetupAPI's DIF_PROPERTYCHANGE in every hardware profile, as Device
+  Manager disables a device (`crates\nf-vmic\src\setup\devices.rs` says why rather than CfgMgr32's `CM_DISABLE_PERSIST`).
+  `enable` clears the crash breaker's count first, waits for the device and its endpoints, and fails its check (exit 2) for an
+  endpoint that came back with a new id. A device Windows can't stop or start now is changed at the next restart (exit 7).
+  `update` leaves a disabled cable disabled, on the new package.
 - `Cable.ps1 variant <label> both|call|low-latency`: re-creates that cable's device with the next instance number (new
   endpoints, which Windows makes with the variant's default period); no other cable is touched.
 
@@ -140,7 +165,8 @@ random GUID unique to the machine: scrub it from logs pasted into docs.
 a restart to finish, with or without other errors beside it (a caller stops there: restart, then run it again, which finishes
 what is left and says what is still wrong; a removal Windows finishes at the restart, the migration's of an old device among
 them; pnputil's own 3010 is 7 too); 2 the tool's error (its steps say what changed), or a package Uninstall-Driver.ps1
-couldn't delete; 1 a usage error or a script's own check (not elevated, test signing, no package, no tool).
+couldn't delete; 3 `endpoint` only, no endpoint for that role now; 1 a usage error or a script's own check (not elevated,
+test signing, no package, no tool).
 
 **The endpoint map.** `Install-Driver.ps1 -EndpointMap <file>` (the migration, or the first `add A`) and `Cable.ps1 add
 <label> -EndpointMap <file>` pass `--endpoint-map <file>` to the tool, which writes, as JSON, which new endpoint takes each
@@ -149,8 +175,10 @@ endpoints map to A's and B's; a re-added cable's to its own. Each old endpoint's
 endpoint), `moved` (one new endpoint of that role: remap the id), `gone`, `ambiguous` or, for a new endpoint without an old
 one, `added`; only `same` and `moved` are remapped. B's one microphone maps to its low-latency Microphone, and its Call
 Microphone is `added`. The tool publishes the file whole at the end, once it has read the endpoints before the run: written
-to `<file>.tmp` beside it, flushed, then renamed over it, so a reader finds the file as it was or the new map, never part of
-one; a run that publishes none (stopped earlier, killed) leaves the file as it was (format and fields:
+to a new temporary file of its own beside it (`<file>.<pid>-<n>.tmp`, created exclusively, so no file there already, of any
+name, is opened, truncated or replaced), flushed, then renamed over it, so a reader finds the file as it was or the new map,
+never part of one; a run that publishes none (stopped earlier, killed) leaves the file as it was, a killed one perhaps its
+temporary file too (format and fields:
 `crates\nf-vmic\src\setup\endpoint_map.rs`). A reader closes the file before the run ends: Windows doesn't rename over a file
 another process has open, so the tool waits about a second for it, then refuses the run at the start (nothing changed) or
 doesn't publish (the file as it was). A migration's cable keeps the old devices it replaces in its record (`Replaces`) once

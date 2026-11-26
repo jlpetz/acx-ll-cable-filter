@@ -5,13 +5,22 @@
 //!
 //! - [`list`] (any user): the present nodes with one of our hardware IDs (the old driver's too, so unconfigured ones and ones
 //!   with a problem show), the remembered absent cables, and setup errors.
-//! - [`add`]: a cable by label. Present and healthy: nothing. Present but unhealthy: its node gets the package again in place
-//!   (same identity, same instance ID), D1's start count cleared. Absent: made with the identity and n the store has, or new
-//!   ones. The node is created with its fixed instance ID, `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`, its hardware ID and
-//!   friendly name set before registration; the package is the one the cables run ([`package::pick`]). `add` never restarts
-//!   another cable. A migration's cable whose record is still pending is recorded as made only once its endpoints are there,
-//!   as the migration's own check has it.
+//! - [`add`]: a cable by label. Present and healthy: nothing. Present and disabled on purpose ([`disable`], or Device Manager's
+//!   disable): left so. Present but unhealthy: its node gets the package again in place (same identity, same instance ID), D1's
+//!   start count cleared ([`steps::reinstall`]: a restart the install asks for is exit 7 even if the enable after it fails).
+//!   Absent: made with the identity and n the store has, or new ones. The node is created with its fixed instance ID,
+//!   `ROOT\MEDIA\ACXLLCABLE_<label>_<id>_<n>`, its hardware ID and friendly name set before registration; the package is the
+//!   one the cables run ([`package::pick`]). `add` never restarts another cable. A migration's cable whose record is still
+//!   pending is recorded as made only once its endpoints are there, as the migration's own check has it.
 //! - [`remove`]: a cable's nodes (by identity), or every node of ours (`--all`); the store keeps the identity unless forgotten.
+//!   A full removal gives the cable new endpoint ids when it is added again (the first install's trial: Windows keeps the old
+//!   ones NOTPRESENT and makes new ones; accepted by the owner, 2026-11-26).
+//! - [`disable`] and [`enable`]: a cable kept installed but off, across restarts too, until `enable` (the owner's decision,
+//!   2026-11-26: for temporary use), through SetupAPI's DIF_PROPERTYCHANGE in every hardware profile
+//!   ([`devices::DeviceSet::change_state`], which says why that rather than CfgMgr32's). Only that cable's nodes. Nothing is
+//!   uninstalled, so its endpoints keep their ids (NOTPRESENT while it is off); `enable` checks that every endpoint came back
+//!   with an id Windows had before, and says which didn't. `update` leaves a disabled cable disabled (on the new package), and
+//!   `add` leaves it as it is. `list` ends a disabled cable's line with ": disabled" ([`disabled_suffix`]).
 //! - [`update`]: every node of ours to a package folder's driver. Every cable runs one service and one image, which reloads
 //!   only once no device and no control-device handle holds it, so the update disables every node (politely, without
 //!   persistence), waits for the driver's service to stop ([`service`]), installs, enables and checks each. If the image
@@ -47,7 +56,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W};
 use windows::Win32::System::Com::CoCreateGuid;
 
-use self::devices::{Bound, DRIVER_WAIT, DeviceSet, InstallFailure, Installed, NewNode, judge_install};
+use self::devices::{DRIVER_WAIT, DeviceSet, InstallFailure, Installed, NewNode, judge_install};
 use self::endpoint_map::Gathered;
 use self::endpoints::{ENDPOINTS_WAIT, Endpoint, EndpointCheck, Names};
 use self::lock::{LOCK, LOCK_WAIT, LockError, SetupLock};
@@ -767,7 +776,7 @@ fn add_planned(
     let replaced = plan::union(adopted, &ours.mapped_old);
     let theirs: Vec<String> = mapped.iter().flat_map(|m| m.replaces()).cloned().collect();
     let also = plan::union(replaced.clone(), &theirs);
-    let quiet = matches!(plan, AddPlan::Nothing { pending: false, .. }) && mapped.is_empty();
+    let quiet = matches!(plan, AddPlan::Nothing { pending: false, .. } | AddPlan::Disabled { .. }) && mapped.is_empty();
     gathered.before = if quiet { Some(Vec::new()) } else { endpoints_before(&also, say) };
     let before = gathered.before.clone().unwrap_or_default();
     match plan {
@@ -799,6 +808,18 @@ fn add_planned(
             }
             Ok(if prune.is_empty() && !recorded { Done::Nothing } else { Done::Changed })
         }
+        AddPlan::Disabled { node, identity } => {
+            let n = &present.nodes[node];
+            say(&format!("{} is present and disabled: {}", label.friendly_name(), n.describe()));
+            say(&format!("  left as it is: `acx-ll-cable enable {label}` turns it back on (`add` repairs it if it then doesn't work)"));
+            let (Some(c), Some(v)) = (&n.cable, n.variant()) else { unreachable!("plan_add keeps cables only") };
+            if identity == Identity::FromNode {
+                record(c, v, &[], false)?;
+                say("  recorded in the setup's store");
+                return Ok(Done::Changed);
+            }
+            Ok(Done::Nothing)
+        }
         AddPlan::Repair { node, prune, mics_differ, .. } => {
             let n = &present.nodes[node];
             say(&format!("{} is present but not healthy: {}", label.friendly_name(), n.describe()));
@@ -815,8 +836,8 @@ fn add_planned(
                 _ => format!("Adding {} with its identity, as {} (new endpoints)", label.friendly_name(), create.instance.instance_id()),
             });
             let running = present.running();
-            // A re-added cable's endpoints come back with their names (we expect: to confirm on the box); a new one's are new. A
-            // make that fails is the answer as it is (a restart Windows needs among them: exit 7); a migration's cable stays
+            // A re-added cable's endpoints are new ones (the first install's trial), named as expected; one Windows kept would keep
+            // its name. A make that fails is the answer as it is (a restart Windows needs among them: exit 7); a migration's cable stays
             // pending until its endpoints are there (the run after a restart Windows needs checks it)
             let names = Names::Since(&before);
             let (made, r) = steps::make_recorded(&mut Real { present }, &create, Want::Rule(&running), ours.recording, names, say);
@@ -845,25 +866,9 @@ fn repair(
     let (driver, candidate) = drivers[chosen].clone();
     lacks(&candidate, variant, variant.hardware_id())?;
     uninstall_nodes(present, prune, say)?;
-    clear_count(&present.set, &data, &n.instance_id, say);
-    rename(&present.set, &mut data, &cable, say);
-    say(&format!("Installing {} on {} (DiInstallDevice)", candidate.inf, n.instance_id));
-    let call = present.set.install(&data, &driver);
-    if n.health == Health::Problem(plan::PROBLEM_DISABLED) || matches!(present.set.bound(&data).health, Health::Problem(22)) {
-        clear_count(&present.set, &data, &n.instance_id, say);
-        say("  enabling it");
-        present.set.enable(&data)?;
-    }
-    let restart = matches!(call, Ok(true));
-    let now: Bound = if restart { present.set.bound(&data) } else { present.set.wait_working(&data, DRIVER_WAIT) };
-    say(&format!("  {}: {}", n.instance_id, now.describe()));
-    match judge_install(call.as_ref().map(drop), restart, &now, &candidate) {
-        Ok(Installed::Working) => {}
-        Ok(Installed::Restart) => return Ok(Done::RestartPending { device: n.instance_id.clone() }),
-        Err(failure) => {
-            let not = NotInstalled { device: n.instance_id.clone(), chosen: candidate.describe(), failure, removed: None };
-            return Err(SetupError::Install(Box::new(not)));
-        }
+    // The install, the enable and the wait, over the seam (a restart the install asks for is kept if the enable then fails)
+    if steps::reinstall(&mut Real { present }, &present.nodes, node, &driver, &candidate, say)? == Installed::Restart {
+        return Ok(Done::RestartPending { device: n.instance_id.clone() });
     }
     rename(&present.set, &mut data, &cable, say);
     let problems = if ours.recording.pending {
@@ -933,6 +938,26 @@ pub fn remove(target: &RemoveTarget, forget: bool, say: &mut dyn FnMut(&str)) ->
         None if plan.remove.is_empty() && plan.forget.is_empty() => Done::Nothing,
         None => Done::Changed,
     })
+}
+
+/// `disable <label>` (the module's docs; the sequence is [`steps::run_disable`]): the cable kept installed but off, across
+/// restarts too, its endpoints keeping their ids; no other cable is touched.
+pub fn disable(label: &Label, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+    let _lock = SetupLock::take(&LOCK, LOCK_WAIT, say)?;
+    let present = Present::read()?;
+    let entries = read_store(say)?;
+    let plan = plan::plan_disable(label, &entries, &present.nodes)?;
+    steps::run_disable(&mut Real { present: &present }, &present.nodes, &plan, say)
+}
+
+/// `enable <label>` (the module's docs; the sequence is [`steps::run_enable`]): a disabled cable on again, its endpoints checked
+/// to be the ones it had; no other cable is touched.
+pub fn enable(label: &Label, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+    let _lock = SetupLock::take(&LOCK, LOCK_WAIT, say)?;
+    let present = Present::read()?;
+    let entries = read_store(say)?;
+    let plan = plan::plan_enable(label, &entries, &present.nodes)?;
+    steps::run_enable(&mut Real { present: &present }, &present.nodes, &plan, say)
 }
 
 /// A package folder's INF, staged in the driver store: its published INF. Ours only.
@@ -1024,6 +1049,26 @@ pub fn read_report() -> Result<Report, SetupError> {
     Ok(Report { nodes: present.nodes, store, endpoints: endpoints::all() })
 }
 
+/// What a cable's line in `list` ends with when the cable is off on purpose: ": disabled" when each of its nodes is disabled
+/// persistently (`acx-ll-cable disable`, Device Manager's), ": disabled for now" when each is disabled and one not persistently
+/// (a stopped setup run's); nothing otherwise, a failed node among them (its own line says "a problem: Code N").
+pub fn disabled_suffix<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> &'static str {
+    let mut nodes = nodes.into_iter().peekable();
+    if nodes.peek().is_none() {
+        return "";
+    }
+    let (mut all, mut persistent) = (true, true);
+    for n in nodes {
+        all &= n.health == Health::Problem(plan::PROBLEM_DISABLED);
+        persistent &= n.disabled_by_user();
+    }
+    match (all, persistent) {
+        (true, true) => ": disabled",
+        (true, false) => ": disabled for now",
+        (false, _) => "",
+    }
+}
+
 /// `list`'s text (pure).
 pub fn format_list(r: &Report) -> String {
     let mut s = String::new();
@@ -1036,7 +1081,7 @@ pub fn format_list(r: &Report) -> String {
         line("No cable is present.".into());
     }
     for c in &l.cables {
-        line(format!("{} (id {})", c.label.friendly_name(), c.id));
+        line(format!("{} (id {}){}", c.label.friendly_name(), c.id, disabled_suffix(c.nodes.iter().map(|&i| &r.nodes[i]))));
         for &i in &c.nodes {
             let n = &r.nodes[i];
             line(format!("  {}", n.describe()));
@@ -1049,6 +1094,9 @@ pub fn format_list(r: &Report) -> String {
                 if !check.is_done() && n.health == Health::Working {
                     line(format!("    note: {check}"));
                 }
+            }
+            if n.health == Health::Problem(plan::PROBLEM_DISABLED) {
+                line("    its endpoints: not present while it is disabled, back with their ids once it is enabled".into());
             }
         }
         // A migration's cable it hasn't finished: pending until its endpoints are there (after a restart too), and its map not
@@ -1103,6 +1151,7 @@ pub fn format_list(r: &Report) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::setup::devices::Bound;
     use crate::setup::plan::tests::{A_ID, B_ID, node};
 
     /// A clock that moves only when slept on.
@@ -1175,6 +1224,49 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains("ACX-LL-Cable E (id eeeeeeee-0000-4000-8000-00000000000e): absent, the migration's to make (n 1, both)"));
+    }
+
+    /// A disabled cable in `list` (the owner's disable, 2026-11-26): its line ends ": disabled" (": disabled for now" if not
+    /// persistently), its node says how it comes back, and its endpoints are said to be off with their ids kept, never a `note:`
+    /// (s0a.sh takes a note as a problem). A failed cable has none of it: its node says its problem code.
+    #[test]
+    fn the_list_shows_a_disabled_cable_apart_from_a_failed_one() {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED;
+        let a = node("A", A_ID, 1, Variant::Both);
+        let mut b = node("B", B_ID, 1, Variant::Both);
+        b.health = Health::Problem(plan::PROBLEM_DISABLED);
+        b.config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let list = |b: &Node| {
+            let store = store::Store { entries: vec![], problems: vec![] };
+            format_list(&Report { nodes: vec![a.clone(), b.clone()], store, endpoints: Ok(vec![]) })
+        };
+        let text = list(&b);
+        let lines: Vec<&str> = text.lines().collect();
+        let b_at = lines.iter().position(|l| l.starts_with("ACX-LL-Cable B")).unwrap();
+        assert_eq!(lines[b_at], format!("ACX-LL-Cable B (id {B_ID}): disabled"));
+        assert!(lines[b_at + 1].contains("disabled (Code 22)"), "{}", lines[b_at + 1]);
+        assert!(
+            lines[b_at + 1].ends_with("; it stays disabled across restarts until `acx-ll-cable enable B`, its endpoints keeping their ids")
+        );
+        assert_eq!(lines[b_at + 2], "    its endpoints: not present while it is disabled, back with their ids once it is enabled");
+        assert_eq!(lines[0], format!("ACX-LL-Cable A (id {A_ID})"), "A as it was");
+        assert!(!lines[b_at..].iter().any(|l| l.contains("note:")), "{text}");
+        // Disabled for now (a stopped run's)
+        b.config_flags = Some(0);
+        assert!(list(&b).contains(&format!("ACX-LL-Cable B (id {B_ID}): disabled for now\n")));
+        // Failed (the breaker's Code 31): no "disabled" anywhere about B
+        b.health = Health::Problem(plan::PROBLEM_FAILED_ADD);
+        b.problem_status = Some(plan::STATUS_START_BREAKER);
+        let text = list(&b);
+        assert!(text.contains(&format!("ACX-LL-Cable B (id {B_ID})\n")) && !text.contains("disabled"), "{text}");
+        assert!(text.contains("a problem: Code 31"), "{text}");
+        // One node disabled, another of its identity failing: not shown as disabled
+        let mut off = node("B", B_ID, 2, Variant::Both);
+        off.health = Health::Problem(plan::PROBLEM_DISABLED);
+        off.config_flags = Some(CONFIGFLAG_DISABLED.0);
+        assert_eq!(disabled_suffix([&b, &off]), "");
+        assert_eq!(disabled_suffix([&off]), ": disabled");
+        assert_eq!(disabled_suffix(std::iter::empty()), "");
     }
 
     /// How a migration's unfinished cable shows when it is present (Astra's review, 2026-11-25): its record pending (made, its

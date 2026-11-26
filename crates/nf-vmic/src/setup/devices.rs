@@ -13,6 +13,18 @@
 //!   (`NfStartAttempts`, Cable.h); every install path deletes the count before it installs or enables (D1's contract).
 //! - [`DeviceSet::disable`] and [`DeviceSet::enable`]: `CM_Disable_DevNode`, polite and without `CM_DISABLE_PERSIST` (a crash
 //!   or a reboot mid-update brings every cable back).
+//! - [`DeviceSet::change_state`]: `acx-ll-cable disable` and `enable`'s persistent, global change, through SetupAPI's
+//!   DIF_PROPERTYCHANGE (SP_PROPCHANGE_PARAMS: DICS_DISABLE or DICS_ENABLE, DICS_FLAG_GLOBAL, "make the change in all hardware
+//!   profiles" [V: Learn]), as Device Manager and devcon do it, rather than CfgMgr32's equivalent, `CM_Disable_DevNode` with
+//!   `CM_DISABLE_PERSIST` ("disables the device across reboots", Windows 10 and later [V: Learn]). Ours, for two reasons: the
+//!   restart is documented, SetupDiCallClassInstaller's page saying that after the call the caller reads the element's install
+//!   parameters and restarts if DI_NEEDREBOOT or DI_NEEDRESTART is set (a device Windows couldn't stop now, which it changes at
+//!   the restart: exit 7), where CfgMgr32's call documents only a CONFIGRET; and the class's installers take part, as for any
+//!   disable a user makes in Device Manager, so a cable disabled either way is the same to `update` (CONFIGFLAG_DISABLED: left
+//!   disabled) and to `list`. The enable is the same request with DICS_ENABLE. The device isn't uninstalled: its instance ID and
+//!   its device interfaces (the KS filters, by instance ID and reference string) stay, so Windows keeps its endpoints,
+//!   NOTPRESENT while it is off, and an enable brings the same ones back (Microsoft: an endpoint id belongs to one installation
+//!   of the device; the first install's trial saw all six ids survive a disable and enable through pnputil).
 
 use std::fmt;
 use std::mem::size_of;
@@ -20,16 +32,19 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DEVNODE_STATUS_FLAGS, CM_DISABLE_POLITE, CM_DISABLE_UI_NOT_OK, CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status,
-    CM_MapCrToWin32Err, CM_PROB, CM_PROB_NEED_RESTART, CONFIGRET, CR_SUCCESS, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE,
-    DIGCF_ALLCLASSES, DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DIREG_DEV, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA,
-    HDEVINFO, INF_STYLE_WIN4, INFCONTEXT, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_REGISTRY_PROPERTY, SP_COPY_STYLE, SP_DEVINFO_DATA,
-    SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W, SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SPDIT_COMPATDRIVER, SPDRP_CONFIGFLAGS,
-    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SPOST_PATH, SetupCloseInfFile, SetupCopyOEMInfW, SetupDiBuildDriverInfoList,
-    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
-    SetupDiGetActualSectionToInstallW, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW,
-    SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW, SetupDiOpenDevRegKey, SetupDiOpenDeviceInfoW,
-    SetupDiSetDeviceRegistryPropertyW, SetupFindFirstLineW, SetupFindNextMatchLineW, SetupGetInfDriverStoreLocationW,
-    SetupGetInfInformationW, SetupGetStringFieldW, SetupOpenInfFileW, SetupQueryInfOriginalFileInformationW,
+    CM_MapCrToWin32Err, CM_PROB, CM_PROB_NEED_RESTART, CONFIGRET, CR_SUCCESS, DI_NEEDREBOOT, DI_NEEDRESTART, DICD_GENERATE_ID,
+    DICS_DISABLE, DICS_ENABLE, DICS_FLAG_CONFIGSPECIFIC, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES,
+    DIGCF_PRESENT, DIIDFLAG_NOFINISHINSTALLUI, DIREG_DEV, DiInstallDevice, DiUninstallDevice, GUID_DEVCLASS_MEDIA, HDEVINFO,
+    INF_STYLE_WIN4, INFCONTEXT, INFINFO_INF_NAME_IS_ABSOLUTE, SETUP_DI_PROPERTY_CHANGE_SCOPE, SETUP_DI_REGISTRY_PROPERTY,
+    SP_CLASSINSTALL_HEADER, SP_COPY_STYLE, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W, SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W,
+    SP_INF_INFORMATION, SP_ORIGINAL_FILE_INFO_W, SP_PROPCHANGE_PARAMS, SPDIT_COMPATDRIVER, SPDRP_CONFIGFLAGS, SPDRP_FRIENDLYNAME,
+    SPDRP_HARDWAREID, SPOST_PATH, SetupCloseInfFile, SetupCopyOEMInfW, SetupDiBuildDriverInfoList, SetupDiCallClassInstaller,
+    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
+    SetupDiGetActualSectionToInstallW, SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW, SetupDiGetDeviceInstanceIdW,
+    SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW, SetupDiOpenDevRegKey,
+    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW, SetupFindFirstLineW, SetupFindNextMatchLineW,
+    SetupGetInfDriverStoreLocationW, SetupGetInfInformationW, SetupGetStringFieldW, SetupOpenInfFileW,
+    SetupQueryInfOriginalFileInformationW,
 };
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_DriverVersion, DEVPKEY_Device_ProblemStatus, DEVPROPTYPE,
@@ -362,6 +377,61 @@ impl DeviceSet {
         // SAFETY: as in disable.
         let cr = unsafe { CM_Enable_DevNode(data.DevInst, 0) };
         if cr == CR_SUCCESS { Ok(()) } else { Err(WinError { call: "CM_Enable_DevNode", code: cr_win32(cr) }) }
+    }
+
+    /// `disable` and `enable`'s change (the module's docs): DIF_PROPERTYCHANGE with DICS_DISABLE or DICS_ENABLE in every hardware
+    /// profile (DICS_FLAG_GLOBAL), as Device Manager and devcon disable and enable a device. The default handler
+    /// (SetupDiChangeState) stops the device and keeps it disabled across restarts until an enable (we expect by
+    /// CONFIGFLAG_DISABLED in its ConfigFlags, as for Device Manager's disable, which [`super::plan::Node::disabled_by_user`]
+    /// reads: to confirm on the box). An enable that leaves the device disabled (Code 22), with no restart asked for, is made
+    /// again for the current hardware profile (DICS_FLAG_CONFIGSPECIFIC, profile 0), as Microsoft's devcon sample enables: a
+    /// device another tool disabled for the profile only (devcon's own disable) comes back too. Whether Windows needs a restart
+    /// to finish it (DI_NEEDRESTART or DI_NEEDREBOOT in the element's install parameters afterwards, SetupDiCallClassInstaller's
+    /// documented signal: a device it couldn't change now). Elevated only.
+    pub fn change_state(&self, data: &SP_DEVINFO_DATA, enable: bool) -> Result<bool, WinError> {
+        let restart = self.property_change(data, enable, DICS_FLAG_GLOBAL)?;
+        if enable && !restart && health(data.DevInst) == Health::Problem(super::plan::PROBLEM_DISABLED) {
+            return self.property_change(data, true, DICS_FLAG_CONFIGSPECIFIC);
+        }
+        Ok(restart)
+    }
+
+    /// One DIF_PROPERTYCHANGE of `change_state`, in `scope` (the current hardware profile, for DICS_FLAG_CONFIGSPECIFIC);
+    /// whether Windows needs a restart to finish it.
+    fn property_change(&self, data: &SP_DEVINFO_DATA, enable: bool, scope: SETUP_DI_PROPERTY_CHANGE_SCOPE) -> Result<bool, WinError> {
+        let params = SP_PROPCHANGE_PARAMS {
+            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+                cbSize: size_of::<SP_CLASSINSTALL_HEADER>() as u32,
+                InstallFunction: DIF_PROPERTYCHANGE,
+            },
+            StateChange: if enable { DICS_ENABLE } else { DICS_DISABLE },
+            Scope: scope,
+            // The current hardware profile (read only with DICS_FLAG_CONFIGSPECIFIC)
+            HwProfile: 0,
+        };
+        // SAFETY: an element of our set; the parameters (a header and the rest of its structure, with the whole structure's
+        // size) outlive the call, which copies them.
+        unsafe {
+            SetupDiSetClassInstallParamsW(
+                self.get(),
+                Some(data),
+                Some(&params.ClassInstallHeader),
+                size_of::<SP_PROPCHANGE_PARAMS>() as u32,
+            )
+        }
+        .map_err(WinError::of("SetupDiSetClassInstallParamsW(DIF_PROPERTYCHANGE)"))?;
+        let call = match (enable, scope == DICS_FLAG_GLOBAL) {
+            (true, true) => "SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, DICS_ENABLE)",
+            (true, false) => "SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, DICS_ENABLE, DICS_FLAG_CONFIGSPECIFIC)",
+            (false, _) => "SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, DICS_DISABLE)",
+        };
+        // SAFETY: an element of our set, its class install parameters set above.
+        unsafe { SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, self.get(), Some(data)) }.map_err(WinError::of(call))?;
+        let mut install = SP_DEVINSTALL_PARAMS_W { cbSize: size_of::<SP_DEVINSTALL_PARAMS_W>() as u32, ..Default::default() };
+        // SAFETY: an element of our set; `install` is a live out-structure with its size set.
+        unsafe { SetupDiGetDeviceInstallParamsW(self.get(), Some(data), &mut install) }
+            .map_err(WinError::of("SetupDiGetDeviceInstallParamsW"))?;
+        Ok(install.Flags.0 & (DI_NEEDRESTART.0 | DI_NEEDREBOOT.0) != 0)
     }
 
     /// The compatible drivers found for `data` (after SetupDiBuildDriverInfoList), with each one's INF.

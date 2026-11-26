@@ -1,7 +1,8 @@
 //! The sequences `update` and the migration run (TODO 19, the per-cable design, section 9): what is checked, disabled, waited
-//! for, removed, installed, enabled and made, in which order, and what is put back when a step fails. They go through [`Ops`],
-//! the seam between them and Windows ([`Real`]: SetupAPI, the configuration manager, the service control manager and the
-//! store), so the tests run them against a fake and check the calls.
+//! for, removed, installed, enabled and made, in which order, and what is put back when a step fails; and those of `disable`
+//! and `enable` ([`run_disable`], [`run_enable`]) and of `add`'s repair in place ([`reinstall`]). They go through [`Ops`], the
+//! seam between them and Windows ([`Real`]: SetupAPI, the configuration manager, the service control manager and the store),
+//! so the tests run them against a fake and check the calls.
 //!
 //! The rules they keep:
 //! - **Nothing changes until every check has passed:** the package's driver for each present cable, and (the migration) that
@@ -28,12 +29,16 @@
 //! - **A restart Windows needs stops the run** (exit 7): an install's, a node's that needs one to start, or the removal of a
 //!   node that failed to install; nothing more is made before it.
 
+use windows::Win32::Devices::DeviceAndDriverInstallation::CM_PROB_NEED_RESTART;
+
 use super::devices::{Bound, DRIVER_WAIT, Disabled, Installed, NewNode, judge_install};
 use super::endpoint_map::{self, Gathered};
 use super::endpoints::{self, ENDPOINTS_WAIT, Endpoint, EndpointCheck, Names};
 use super::package::Candidate;
-use super::plan::{Create, Entry, Finish, MigratePlan, Node, UpdatePlan};
-use super::{Done, Made, Present, SetupError, SystemClock, Want, choose_driver, entry_of, lacks, make_or_next, service, store};
+use super::plan::{Create, Entry, Finish, Health, MigratePlan, Node, PROBLEM_DISABLED, StatePlan, UpdatePlan};
+use super::{
+    Done, Made, NotInstalled, Present, SetupError, SystemClock, Want, choose_driver, entry_of, lacks, make_or_next, service, store,
+};
 use crate::identity::{CableInstance, Label, same_instance};
 use crate::variant::Variant;
 use crate::win_error::WinError;
@@ -51,6 +56,11 @@ pub trait Ops {
     /// CM_Disable_DevNode, polite and not persistent.
     fn disable(&mut self, i: usize) -> Disabled;
     fn enable(&mut self, i: usize) -> Result<(), WinError>;
+    /// `disable` and `enable`'s persistent, global change (DIF_PROPERTYCHANGE: [`super::devices::DeviceSet::change_state`]);
+    /// whether Windows needs a restart to finish it.
+    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError>;
+    /// Node `i`'s state now, without waiting.
+    fn bound(&mut self, i: usize) -> Bound;
     /// D1's start count deleted; whether there was one.
     fn clear_count(&mut self, i: usize) -> Result<bool, WinError>;
     /// DiInstallDevice; whether Windows asked for a restart.
@@ -108,6 +118,14 @@ impl Ops for Real<'_> {
 
     fn enable(&mut self, i: usize) -> Result<(), WinError> {
         self.present.set.enable(&self.present.data[i])
+    }
+
+    fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
+        self.present.set.change_state(&self.present.data[i], enable)
+    }
+
+    fn bound(&mut self, i: usize) -> Bound {
+        self.present.set.bound(&self.present.data[i])
     }
 
     fn clear_count(&mut self, i: usize) -> Result<bool, WinError> {
@@ -290,11 +308,7 @@ pub fn install_all<O: Ops>(
             Ok(false) => {}
             Err(e) => problems.push(format!("{}: {e}", n.instance_id)),
         }
-        if let Some(c) = &n.cable
-            && let Err(e) = ops.set_friendly_name(*i, &c.label.friendly_name())
-        {
-            say(&format!("  warning: the friendly name \"{}\" couldn't be set again: {e}", c.label.friendly_name()));
-        }
+        rename(ops, n, *i, say);
     }
     for &i in disabled.iter().filter(|&&i| !nodes[i].is_legacy()) {
         clear_count(ops, nodes, i, say);
@@ -335,6 +349,12 @@ pub fn run_update<O: Ops>(
     let before = endpoints_before(ops, &[], say).unwrap_or_default();
     let disabled = unload(ops, nodes, &plan.disable, &plan.reenable, say)?;
     let (problems, restart) = install_all(ops, nodes, &drivers, &disabled, &before, say);
+    ended(restart, problems)
+}
+
+/// A run that changed something, by what is left: a node Windows needs a restart to finish (`restart`) and the checks that
+/// failed (`problems`).
+fn ended(restart: Option<String>, problems: Vec<String>) -> Result<Done, SetupError> {
     match restart {
         Some(device) if problems.is_empty() => Ok(Done::RestartPending { device }),
         // The restart first (exit 7): the run after it says what is still wrong
@@ -342,6 +362,169 @@ pub fn run_update<O: Ops>(
         None if problems.is_empty() => Ok(Done::Changed),
         None => Err(SetupError::Checks(problems)),
     }
+}
+
+/// A present cable's node `i` given the package again in place (`add`'s repair, [`super::repair`], once its driver is
+/// chosen): D1's start count cleared, its friendly name re-applied, DiInstallDevice with `driver`, the node enabled if it is
+/// disabled (before the install or after it: CM_Enable_DevNode, or for a persistent disable the global change that clears
+/// it), then up to [`DRIVER_WAIT`] for it to work. What it came to ([`judge_install`]): working on `candidate`'s package, or a
+/// restart Windows needs to finish. A restart the install asked for is kept whatever fails after it (Astra's review of the
+/// first install, 2026-11-26): an enable that fails then is an error that needs the restart first (exit 7).
+pub fn reinstall<O: Ops>(
+    ops: &mut O, nodes: &[Node], i: usize, driver: &O::Driver, candidate: &Candidate, say: &mut dyn FnMut(&str),
+) -> Result<Installed, SetupError> {
+    let n = &nodes[i];
+    clear_count(ops, nodes, i, say);
+    rename(ops, n, i, say);
+    say(&format!("Installing {} on {} (DiInstallDevice)", candidate.inf, n.instance_id));
+    let call = ops.install(i, driver);
+    let mut restart = matches!(call, Ok(true));
+    if n.health == Health::Problem(PROBLEM_DISABLED) || ops.bound(i).health == Health::Problem(PROBLEM_DISABLED) {
+        clear_count(ops, nodes, i, say);
+        say("  enabling it");
+        let enabled = if n.disabled_by_user() { ops.change_state(i, true).map(|r| restart |= r) } else { ops.enable(i) };
+        if let Err(e) = enabled {
+            return Err(SetupError::Windows(e).and_restart(restart.then(|| n.instance_id.clone())));
+        }
+    }
+    let now = if restart { ops.bound(i) } else { ops.wait_working(i) };
+    say(&format!("  {}: {}", n.instance_id, now.describe()));
+    judge_install(call.as_ref().map(drop), restart, &now, candidate).map_err(|failure| {
+        let not = NotInstalled { device: n.instance_id.clone(), chosen: candidate.describe(), failure, removed: None };
+        SetupError::Install(Box::new(not))
+    })
+}
+
+/// A cable node's friendly name re-applied, said if it fails.
+fn rename<O: Ops>(ops: &mut O, n: &Node, i: usize, say: &mut dyn FnMut(&str)) {
+    if let Some(c) = &n.cable
+        && let Err(e) = ops.set_friendly_name(i, &c.label.friendly_name())
+    {
+        say(&format!("  warning: the friendly name \"{}\" couldn't be set again: {e}", c.label.friendly_name()));
+    }
+}
+
+/// `disable <label>`, its plan made (the module's docs, [`super::disable`]): each node of `plan.change` disabled for good
+/// (DIF_PROPERTYCHANGE, DICS_DISABLE in every hardware profile), so the cable stays off across restarts until `enable`. Nothing
+/// is uninstalled, so its endpoints keep their ids (Windows shows them as not present while it is off). No other cable is
+/// touched. A node Windows can't stop now is disabled at the next restart ([`Done::RestartPending`]: exit 7).
+pub fn run_disable<O: Ops>(ops: &mut O, nodes: &[Node], plan: &StatePlan, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+    let name = plan.label.friendly_name();
+    if plan.change.is_empty() {
+        for &i in &plan.left {
+            say(&format!("{name} is disabled already: {}", nodes[i].describe()));
+        }
+        return Ok(Done::Nothing);
+    }
+    let mut restart = None;
+    let mut problems = Vec::new();
+    for &i in &plan.change {
+        let n = &nodes[i];
+        say(&format!(
+            "Disabling {} (DIF_PROPERTYCHANGE, DICS_DISABLE in every hardware profile: it stays off across restarts)",
+            n.instance_id
+        ));
+        match ops.change_state(i, false) {
+            Ok(true) => {
+                say("  Windows finishes disabling it when it restarts (it couldn't stop the device now: something has it in use)");
+                restart.get_or_insert_with(|| n.instance_id.clone());
+            }
+            Ok(false) => {
+                let now = ops.bound(i);
+                say(&format!("  {}: {}", n.instance_id, now.describe()));
+                if now.health != Health::Problem(PROBLEM_DISABLED) {
+                    problems.push(format!("{} isn't disabled after the disable: {}", n.instance_id, now.health.describe()));
+                }
+            }
+            Err(e) => return Err(SetupError::Windows(e).and_restart(restart)),
+        }
+    }
+    if restart.is_none() && problems.is_empty() {
+        say(&format!(
+            "{name} is off, across restarts too; its endpoints keep their ids (not present while it is off): `acx-ll-cable enable {}` \
+             turns it back on",
+            plan.label
+        ));
+    }
+    ended(restart, problems)
+}
+
+/// `enable <label>`, its plan made ([`super::enable`]): the cable's node enabled (DIF_PROPERTYCHANGE, DICS_ENABLE in every
+/// hardware profile, D1's start count cleared first), then up to [`DRIVER_WAIT`] for it to work and [`ENDPOINTS_WAIT`] for its
+/// endpoints, each checked as an update checks them and against the endpoints before the enable: one Windows brought back with
+/// an id it didn't have before ([`new_ids`]) is a failed check, since the cable is meant to keep its ids. No other cable is
+/// touched. Windows needing a restart to finish it is [`Done::RestartPending`] (exit 7).
+pub fn run_enable<O: Ops>(ops: &mut O, nodes: &[Node], plan: &StatePlan, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+    let name = plan.label.friendly_name();
+    if plan.change.is_empty() {
+        for &i in &plan.left {
+            say(&format!("{name} isn't disabled: {}", nodes[i].describe()));
+        }
+        return Ok(Done::Nothing);
+    }
+    // The endpoints it had (NOTPRESENT while it is off), whose ids and names it keeps
+    let before = ops
+        .endpoints_before(&[])
+        .inspect_err(|e| say(&format!("  note: the endpoints couldn't be read before the enable ({e}): their ids aren't compared")))
+        .ok();
+    let mut restart = None;
+    let mut problems = Vec::new();
+    for &i in &plan.change {
+        let n = &nodes[i];
+        clear_count(ops, nodes, i, say);
+        say(&format!("Enabling {} (DIF_PROPERTYCHANGE, DICS_ENABLE in every hardware profile)", n.instance_id));
+        match ops.change_state(i, true) {
+            Ok(false) => {}
+            Ok(true) => {
+                say("  Windows needs a restart to finish enabling it: its endpoints come after it");
+                restart.get_or_insert_with(|| n.instance_id.clone());
+                continue;
+            }
+            Err(e) => return Err(SetupError::Windows(e).and_restart(restart)),
+        }
+        let now = ops.wait_working(i);
+        say(&format!("  {}: {}", n.instance_id, now.describe()));
+        match now.health {
+            Health::Working => {
+                let (Some(cable), Some(variant)) = (&n.cable, n.variant()) else { continue };
+                say(&format!("Waiting for Windows to bring back {}'s endpoints (up to {} s)", name, ENDPOINTS_WAIT.as_secs()));
+                let found = ops.wait_endpoints(cable, variant, Names::Since(before.as_deref().unwrap_or_default()));
+                if let (Some(before), Some(check)) = (&before, &found.0) {
+                    problems.extend(new_ids(cable, before, check));
+                }
+                problems.extend(endpoint_problems(cable, found, say));
+            }
+            Health::Problem(p) if p == CM_PROB_NEED_RESTART.0 => {
+                say("  Windows needs a restart to start it: its endpoints come after it");
+                restart.get_or_insert_with(|| n.instance_id.clone());
+            }
+            _ => problems.push(format!(
+                "{} was enabled, but isn't working ({}): `acx-ll-cable add {}` repairs it",
+                n.instance_id,
+                now.describe(),
+                plan.label
+            )),
+        }
+    }
+    ended(restart, problems)
+}
+
+/// The endpoints an enable brought back that Windows didn't have before it (`before`, NOTPRESENT ones included: a disabled
+/// cable's), by MMDevice id: each a problem, since a disable is meant to keep them (an app that saved the old id finds the new
+/// one by the cable and role: [`crate::roles`]). Pure.
+pub fn new_ids(cable: &CableInstance, before: &[Endpoint], check: &EndpointCheck) -> Vec<String> {
+    check
+        .found
+        .iter()
+        .filter(|(_, e)| !before.iter().any(|b| b.id == e.id))
+        .map(|(kind, _)| {
+            format!(
+                "{}'s {} came back as a new endpoint, not the one it had (an app finds it by the cable and role)",
+                cable.label.friendly_name(),
+                kind.name()
+            )
+        })
+        .collect()
 }
 
 /// Nothing for the migration's unload to do: no node of the old driver's, none an earlier run left disabled, and every cable on
@@ -755,6 +938,18 @@ mod tests {
         /// This cable's endpoints come with Windows' "2- " numbering in their names.
         endpoints_numbered: Option<&'static str>,
         records: Vec<Entry>,
+        /// CM_Enable_DevNode fails on this node.
+        enable_fails: Option<usize>,
+        /// The persistent change (DIF_PROPERTYCHANGE) fails on this node.
+        state_fails: Option<usize>,
+        /// The persistent change on this node needs a restart to finish (DI_NEEDRESTART): its state stays as it was.
+        state_restart: Option<usize>,
+        /// This node doesn't start after an enable (Code 10).
+        enable_broken: Option<usize>,
+        /// The endpoints before the run (endpoints_before's look).
+        before: Vec<Endpoint>,
+        /// The nodes disabled persistently (CONFIGFLAG_DISABLED), by the persistent change.
+        persistent: BTreeSet<usize>,
     }
 
     impl Fake {
@@ -809,8 +1004,33 @@ mod tests {
 
         fn enable(&mut self, i: usize) -> Result<(), WinError> {
             self.log(format!("enable {i}"));
+            if self.enable_fails == Some(i) {
+                return Err(failed("CM_Enable_DevNode"));
+            }
             self.disabled.remove(&i);
             Ok(())
+        }
+
+        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
+            self.log(format!("{} {i}", if enable { "state-on" } else { "state-off" }));
+            if self.state_fails == Some(i) {
+                return Err(failed("SetupDiCallClassInstaller(DIF_PROPERTYCHANGE)"));
+            }
+            if self.state_restart == Some(i) {
+                return Ok(true);
+            }
+            if enable {
+                self.disabled.remove(&i);
+                self.persistent.remove(&i);
+            } else {
+                self.disabled.insert(i);
+                self.persistent.insert(i);
+            }
+            Ok(false)
+        }
+
+        fn bound(&mut self, i: usize) -> Bound {
+            self.wait_working(i)
         }
 
         fn clear_count(&mut self, i: usize) -> Result<bool, WinError> {
@@ -846,6 +1066,8 @@ mod tests {
                 Health::Problem(22)
             } else if self.start_restart == Some(i) {
                 Health::Problem(14)
+            } else if self.enable_broken == Some(i) {
+                Health::Problem(10)
             } else {
                 Health::Working
             };
@@ -868,7 +1090,7 @@ mod tests {
 
         fn endpoints_before(&mut self, also: &[String]) -> Result<Vec<Endpoint>, WinError> {
             self.log(format!("endpoints {}", also.join(" ")));
-            Ok(Vec::new())
+            Ok(self.before.clone())
         }
 
         fn wait_endpoints(&mut self, cable: &CableInstance, variant: Variant, names: Names) -> (Option<EndpointCheck>, Option<WinError>) {
@@ -1380,6 +1602,27 @@ mod tests {
             Ok(())
         }
 
+        /// As a disable or enable that persists (the migration never makes one).
+        fn change_state(&mut self, i: usize, enable: bool) -> Result<bool, WinError> {
+            if !self.spend(format!("state {} {}", if enable { "on" } else { "off" }, self.nodes[i].instance_id)) {
+                return Err(World::killed());
+            }
+            let n = &mut self.nodes[i];
+            n.health = if !enable {
+                Health::Problem(22)
+            } else if n.running.is_some() {
+                Health::Working
+            } else {
+                Health::Problem(28)
+            };
+            n.config_flags = Some(if enable { 0 } else { windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED.0 });
+            Ok(false)
+        }
+
+        fn bound(&mut self, i: usize) -> Bound {
+            self.wait_working(i)
+        }
+
         fn clear_count(&mut self, i: usize) -> Result<bool, WinError> {
             if !self.spend(format!("clear {}", self.nodes[i].instance_id)) {
                 return Err(World::killed());
@@ -1692,7 +1935,8 @@ mod tests {
                 let done = next.next();
                 assert_migrated(&done, with_c, &why);
                 assert_eq!(read_map(&map), Some(("done".into(), whole_map_rows(&done))), "{why}: after the retry");
-                assert!(!dir.join("endpoint-map.json.tmp").exists(), "{why}");
+                let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+                assert_eq!(left, ["endpoint-map.json"], "{why}: no temporary file left");
                 let text = std::fs::read_to_string(&map).unwrap();
                 let mut again = done.next();
                 assert!(run_on(&mut again, [NEW_A2, NEW_B2]).is_none(), "{why}: a third run has nothing to do");
@@ -2022,6 +2266,156 @@ mod tests {
             assert_eq!(fake.only(&["record", "wait-endpoints"]), recorded);
             assert!(fake.records.last().is_some_and(|e| !e.pending && e.n == 2));
         }
+    }
+
+    /// Astra's review of the first install (2026-11-26): `add`'s repair keeps the restart its install asked for when the enable
+    /// after it fails (exit 7, the enable's failure said beside it); without the restart that failure is exit 2, as before. A
+    /// persistent disable is cleared by the global change, not CM_Enable_DevNode.
+    #[test]
+    fn a_repairs_restart_is_kept_when_the_enable_after_it_fails() {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED;
+        let mut nodes = three();
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        let c = candidate(PUBLISHED, "audiocodec.inf", 200, VERSION);
+        let run = |fake: &mut Fake, nodes: &[Node]| reinstall(fake, nodes, 1, &(), &c, &mut |_: &str| {});
+        let b = nodes[1].instance_id.clone();
+        let mut fake = Fake { install_restart: Some(1), enable_fails: Some(1), ..Fake::default() }.with_disabled(1);
+        let e = run(&mut fake, &nodes).unwrap_err();
+        assert!(e.needs_restart(), "{e:?}");
+        assert_eq!(e.restart_device(), Some(b.as_str()));
+        let SetupError::AndRestart { error, .. } = &e else { panic!("{e:?}") };
+        assert!(matches!(&**error, SetupError::Windows(w) if w.call == "CM_Enable_DevNode"), "{error:?}");
+        let text = e.to_string();
+        assert!(
+            text.starts_with("CM_Enable_DevNode failed") && text.contains(&format!("Windows needs a restart to finish with {b}")),
+            "{text}"
+        );
+        assert_eq!(fake.only(&["clear", "rename", "install", "enable"]), ["clear 1", "rename 1", "install 1", "clear 1", "enable 1"]);
+        // The enable fails, no restart asked for: the error alone (exit 2)
+        let mut fake = Fake { enable_fails: Some(1), ..Fake::default() }.with_disabled(1);
+        let e = run(&mut fake, &nodes).unwrap_err();
+        assert!(matches!(&e, SetupError::Windows(w) if w.call == "CM_Enable_DevNode") && !e.needs_restart(), "{e:?}");
+        // The restart, the enable working: a restart; neither: working
+        assert_eq!(run(&mut Fake { install_restart: Some(1), ..Fake::default() }.with_disabled(1), &nodes), Ok(Installed::Restart));
+        assert_eq!(run(&mut Fake::default().with_disabled(1), &nodes), Ok(Installed::Working));
+        // A working node isn't enabled
+        let mut fake = Fake::default();
+        assert_eq!(run(&mut fake, &three()), Ok(Installed::Working));
+        assert!(fake.only(&["enable", "state-on"]).is_empty());
+        // Disabled persistently (a duplicate's node `add` repairs): the global change, its failure kept with the restart too
+        nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let mut fake = Fake { install_restart: Some(1), state_fails: Some(1), ..Fake::default() }.with_disabled(1);
+        let e = run(&mut fake, &nodes).unwrap_err();
+        assert!(e.needs_restart() && fake.only(&["enable", "state-on"]) == ["state-on 1"], "{e:?}");
+        // The global change asking for a restart itself: a restart
+        let mut fake = Fake { state_restart: Some(1), ..Fake::default() }.with_disabled(1);
+        assert_eq!(run(&mut fake, &nodes), Ok(Installed::Restart));
+    }
+
+    /// `disable`: that cable's node off for good (the global change), nothing else touched; a restart Windows needs to finish it
+    /// is exit 7; a cable disabled for good already is nothing to do.
+    #[test]
+    fn a_disable_turns_off_only_that_cable_for_good() {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED;
+
+        use crate::setup::plan::plan_disable;
+        let nodes = three();
+        let plan = plan_disable(&label("B"), &[], &nodes).unwrap();
+        let disable = |fake: &mut Fake, nodes: &[Node], plan: &StatePlan| {
+            let mut said = Vec::new();
+            let r = run_disable(fake, nodes, plan, &mut |s: &str| said.push(s.to_string()));
+            (r, said)
+        };
+        let mut fake = Fake::default();
+        let (r, said) = disable(&mut fake, &nodes, &plan);
+        assert_eq!(r, Ok(Done::Changed));
+        assert_eq!(fake.calls, ["state-off 1"], "no other cable, nothing removed or installed");
+        assert_eq!((fake.disabled.iter().collect::<Vec<_>>(), fake.persistent.contains(&1)), (vec![&1], true));
+        assert!(said.iter().any(|s| s.starts_with("Disabling") && s.contains("every hardware profile: it stays off across restarts")));
+        assert!(said.last().unwrap().starts_with("ACX-LL-Cable B is off, across restarts too; its endpoints keep their ids"), "{said:?}");
+        // Windows couldn't stop it now: it finishes at the restart (exit 7)
+        let mut fake = Fake { state_restart: Some(1), ..Fake::default() };
+        let (r, said) = disable(&mut fake, &nodes, &plan);
+        assert_eq!(r, Ok(Done::RestartPending { device: nodes[1].instance_id.clone() }));
+        assert!(said.iter().any(|s| s.contains("Windows finishes disabling it when it restarts")), "{said:?}");
+        // The change failed: its error (exit 2)
+        let (r, _) = disable(&mut Fake { state_fails: Some(1), ..Fake::default() }, &nodes, &plan);
+        assert!(matches!(&r, Err(SetupError::Windows(w)) if w.call.starts_with("SetupDiCallClassInstaller")), "{r:?}");
+        // Disabled for good already: nothing to do, nothing called
+        let mut off = nodes.clone();
+        off[1].health = Health::Problem(PROBLEM_DISABLED);
+        off[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let mut fake = Fake::default();
+        let (r, said) = disable(&mut fake, &off, &plan_disable(&label("B"), &[], &off).unwrap());
+        assert_eq!(r, Ok(Done::Nothing));
+        assert!(fake.calls.is_empty() && said[0].starts_with("ACX-LL-Cable B is disabled already: "), "{said:?}");
+    }
+
+    /// `enable`: the global change, D1's count cleared first, then the node working and its endpoints back with the ids Windows
+    /// had for them (NOTPRESENT while it was off); one with a new id is a failed check. A restart Windows needs is exit 7; a node
+    /// enabled that doesn't work is a failed check naming `add`.
+    #[test]
+    fn an_enable_brings_the_cable_back_with_its_endpoints() {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED;
+
+        use crate::setup::plan::plan_enable;
+        let mut nodes = three();
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let b = nodes[1].cable.clone().unwrap();
+        // B's endpoints while it is off, with the ids the fake's wait gives them back
+        let kept: Vec<Endpoint> = EndpointKind::of_variant(Variant::LowLatency)
+            .into_iter()
+            .map(|kind| Endpoint {
+                id: format!("{}.{kind:?}", b.instance_id()),
+                name: endpoints::expected_name(&b, kind),
+                kind,
+                state: endpoints::State::NotPresent,
+                instance_id: b.instance_id().to_lowercase(),
+            })
+            .collect();
+        let plan = plan_enable(&label("B"), &[], &nodes).unwrap();
+        let enable = |fake: &mut Fake, nodes: &[Node]| {
+            let mut said = Vec::new();
+            let r = run_enable(fake, nodes, &plan, &mut |s: &str| said.push(s.to_string()));
+            (r, said)
+        };
+        let off = |fake: Fake| Fake { before: kept.clone(), ..fake }.with_disabled(1);
+        let mut fake = off(Fake::default());
+        let (r, said) = enable(&mut fake, &nodes);
+        assert_eq!(r, Ok(Done::Changed), "{said:?}");
+        let kinds = ["clear", "state-on", "state-off", "enable", "disable", "install", "uninstall", "wait-endpoints"];
+        assert_eq!(fake.only(&kinds), ["clear 1", "state-on 1", "wait-endpoints B"], "no other cable touched");
+        assert!(fake.disabled.is_empty() && !fake.persistent.contains(&1));
+        // Windows made one anew (an id it didn't have before): a failed check, the others fine
+        let mut fake = Fake { before: kept[1..].to_vec(), ..Fake::default() }.with_disabled(1);
+        let (r, _) = enable(&mut fake, &nodes);
+        assert_eq!(
+            r,
+            Err(SetupError::Checks(vec![
+                "ACX-LL-Cable B's Speakers came back as a new endpoint, not the one it had (an app finds it by the cable and role)".into()
+            ]))
+        );
+        // A restart to finish it, or to start it (Code 14): exit 7, its endpoints not waited for
+        for fake in [Fake { state_restart: Some(1), ..Fake::default() }, Fake { start_restart: Some(1), ..Fake::default() }] {
+            let mut fake = off(fake);
+            let (r, _) = enable(&mut fake, &nodes);
+            assert_eq!(r, Ok(Done::RestartPending { device: nodes[1].instance_id.clone() }));
+            assert!(fake.only(&["wait-endpoints"]).is_empty());
+        }
+        // Enabled, not working: a failed check that names `add`
+        let (r, _) = enable(&mut off(Fake { enable_broken: Some(1), ..Fake::default() }), &nodes);
+        let Err(SetupError::Checks(p)) = r else { panic!("{r:?}") };
+        assert!(p[0].contains("was enabled, but isn't working (a problem: Code 10") && p[0].ends_with("`acx-ll-cable add B` repairs it"));
+        // The change failed: its error (exit 2)
+        let (r, _) = enable(&mut off(Fake { state_fails: Some(1), ..Fake::default() }), &nodes);
+        assert!(matches!(r, Err(SetupError::Windows(_))));
+        // Working: nothing to do
+        let mut fake = Fake::default();
+        let mut said = Vec::new();
+        let working = plan_enable(&label("B"), &[], &three()).unwrap();
+        assert_eq!(run_enable(&mut fake, &three(), &working, &mut |s: &str| said.push(s.to_string())), Ok(Done::Nothing));
+        assert!(fake.calls.is_empty() && said[0].starts_with("ACX-LL-Cable B isn't disabled: "), "{said:?}");
     }
 
     #[test]

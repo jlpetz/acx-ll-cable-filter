@@ -4,14 +4,16 @@
 //!
 //! Exit codes: 0 done (or nothing to do), 1 usage, 2 an error (the message says what changed, if anything), 7 Windows needs a
 //! restart to finish, with or without other problems beside it (stop there: restart, then run it again, which says what is still
-//! wrong). `migrate` and `add` take `--endpoint-map <file>`: the old endpoints' new ones, as JSON
-//! (`nf_vmic::setup::endpoint_map`).
+//! wrong); `endpoint` only: 3 the cable has no endpoint for that role now (stderr says why). `migrate` and `add` take
+//! `--endpoint-map <file>`: the old endpoints' new ones, as JSON (`nf_vmic::setup::endpoint_map`).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nf_vmic::identity::Label;
+use nf_vmic::cables::EndpointKind;
+use nf_vmic::identity::{CableId, Label};
+use nf_vmic::roles::{Resolved, Snapshot};
 use nf_vmic::setup::plan::RemoveTarget;
 use nf_vmic::setup::{self, Done, SetupError};
 use nf_vmic::variant::{self, Outcome, Variant};
@@ -20,16 +22,26 @@ const USAGE: &str = "\
 acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers and microphones)
 
   acx-ll-cable list
-      The present cables, their devices and endpoints, the remembered absent ones, and setup errors. Any user.
+      The present cables, their devices and endpoints, the remembered absent ones, and setup errors; a disabled cable's line
+      ends \": disabled\" (\": disabled for now\" if not persistently: a stopped setup run's). Any user.
+  acx-ll-cable endpoint <label|id> speakers|microphone|call-microphone
+      The cable's endpoint for that role as Windows has it now, found by the cable's identity and the endpoint's pin, never by
+      name: one line, its id, its state (active, disabled in the Sound panel, unplugged) and its name in quotes. None now
+      (removed, disabled, not working, not made yet, or a role its microphones lack): exit 3, why on stderr. Any user.
   acx-ll-cable add <label> [--mics both|call|low-latency] [--adopt <instance ID>] [--endpoint-map <file>]
-      Makes cable <label> (one to eight of A-Z and 0-9), on the driver package the other cables run. Present and working: no
-      change. Present but not working: repaired in place. Removed earlier: back with its identity and, with the microphones it
-      had, its endpoints (other microphones: new endpoints). --mics: its microphones (default both, or what it had). --adopt:
-      re-creates a device made outside this tool as the cable (only then: `list` shows such devices).
+      Makes cable <label> (one to eight of A-Z and 0-9), on the driver package the other cables run. Present and working, or
+      disabled: no change (`enable` turns a disabled one on). Present but not working: repaired in place. Removed earlier: back
+      with its identity and, with the microphones it had, its instance ID (Windows makes it new endpoint ids). --mics: its
+      microphones (default both, or what it had). --adopt: re-creates a device made outside this tool as the cable (only then:
+      `list` shows such devices).
   acx-ll-cable remove <label> [--forget]
   acx-ll-cable remove --all [--forget]
       Removes the cable's device (every device of ours with --all, the old driver's too). Its identity stays, so `add` brings
-      it back with its endpoints, unless --forget.
+      it back with its identity (its endpoints new), unless --forget.
+  acx-ll-cable disable <label>
+  acx-ll-cable enable <label>
+      Turns the cable off, keeping it installed, across restarts too, until `enable` turns it back on; its endpoints keep their
+      ids (not present while it is off). No other cable is touched. `enable` checks the endpoints came back as they were.
   acx-ll-cable variant <label> both|call|low-latency
       Switches the cable's microphones: its device re-created with new endpoints; no other cable is touched.
   acx-ll-cable update <package folder>
@@ -41,14 +53,14 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
       both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
   --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
-      names), as JSON, published whole at the end (a temporary file beside it, flushed, renamed over it) once the endpoints
-      before the run were read; a run that publishes none leaves the file as it was. Each run maps the cables it makes or
-      checks and those a migration made whose map isn't final; the run that leaves nothing pending maps all of it, whatever
-      runs came before. Close the file before a run ends: one open in another process is waited for about a second, then
-      the run is refused at the start (nothing changed) or its map not published (the file as it was).
+      names), as JSON, published whole at the end (a new temporary file of its own beside it, flushed, renamed over it) once
+      the endpoints before the run were read; a run that publishes none leaves the file as it was. Each run maps the cables
+      it makes or checks and those a migration made whose map isn't final; the run that leaves nothing pending maps all of
+      it, whatever runs came before. Close the file before a run ends: one open in another process is waited for about a
+      second, then the run is refused at the start (nothing changed) or its map not published (the file as it was).
 
 Exit codes: 0 done, 1 usage, 2 an error, 7 Windows needs a restart to finish, other errors beside it or not (stop there:
-restart, then run this again, which says what is still wrong).";
+restart, then run this again, which says what is still wrong); `endpoint`: 3 no endpoint for that role now.";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,9 +69,27 @@ enum Cmd {
     List,
     Add { label: Label, mics: Option<Variant>, adopt: Option<String>, map: Option<PathBuf> },
     Remove { target: RemoveTarget, forget: bool },
+    Disable { label: Label },
+    Enable { label: Label },
+    Endpoint { cable: CableArg, role: EndpointKind },
     Variant { label: Label, target: Variant },
     Update { folder: PathBuf },
     Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Option<Variant>, map: Option<PathBuf> },
+}
+
+/// `endpoint`'s cable: an identity (36 characters), or a present cable's label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CableArg {
+    Id(CableId),
+    Label(Label),
+}
+
+fn cable_arg(v: Option<&String>) -> Result<CableArg, String> {
+    let v = v.ok_or("'endpoint' takes a cable's label or id, and a role: speakers, microphone or call-microphone")?;
+    match v.parse::<CableId>() {
+        Ok(id) => Ok(CableArg::Id(id)),
+        Err(_) => v.parse().map(CableArg::Label).map_err(|e| format!("{e} (nor a cable's id)")),
+    }
 }
 
 fn mics(flag: &str, v: Option<&String>) -> Result<Variant, String> {
@@ -111,6 +141,15 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             };
             Cmd::Remove { target, forget }
         }
+        "disable" => Cmd::Disable { label: label(positional.first().copied(), "disable")? },
+        "enable" => Cmd::Enable { label: label(positional.first().copied(), "enable")? },
+        "endpoint" => {
+            let cable = cable_arg(positional.first().copied())?;
+            let role = positional.get(1).ok_or("'endpoint' takes a role after the cable: speakers, microphone or call-microphone")?;
+            let role = EndpointKind::from_arg(role)
+                .ok_or_else(|| format!("'endpoint' takes speakers, microphone or call-microphone, not '{role}'"))?;
+            Cmd::Endpoint { cable, role }
+        }
         "variant" => {
             let target = positional.get(1).ok_or("'variant' takes a label and both, call or low-latency")?;
             let target = Variant::from_arg(target).ok_or_else(|| format!("'variant' takes both, call or low-latency, not '{target}'"))?;
@@ -125,18 +164,13 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     };
     // What each command takes, and how many positional arguments
     let no_map = map.is_none();
+    let none = allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]);
     let (max, ok) = match &cmd {
-        Cmd::Help | Cmd::List => {
-            (0, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
-        }
+        Cmd::Help | Cmd::List => (0, none),
+        Cmd::Disable { .. } | Cmd::Enable { .. } | Cmd::Update { .. } => (1, none),
+        Cmd::Endpoint { .. } | Cmd::Variant { .. } => (2, none),
         Cmd::Add { .. } => (1, allowed(&[!forget, !all, a_mics.is_none(), b_mics.is_none()])),
         Cmd::Remove { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), a_mics.is_none(), b_mics.is_none(), no_map])),
-        Cmd::Variant { .. } => {
-            (2, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
-        }
-        Cmd::Update { .. } => {
-            (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]))
-        }
         Cmd::Migrate { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all])),
     };
     if positional.len() > max {
@@ -181,6 +215,30 @@ fn exit_of(r: Result<Done, SetupError>) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// `endpoint`'s answer from a snapshot (pure): the line it prints, `<id> <state> "<name>"` (exit 0); or its exit code and what
+/// it says on stderr: 3 and "none: <why>" when the cable has no endpoint for the role now (not present among them), 2 for a
+/// label on more than one identity (a setup error).
+fn endpoint_answer(s: &Snapshot, cable: &CableArg, role: EndpointKind) -> Result<String, (u8, String)> {
+    let id = match cable {
+        CableArg::Id(id) => *id,
+        CableArg::Label(l) => match s.cable_labelled(l) {
+            Ok(Some(id)) => id,
+            Ok(None) => return Err((3, format!("none: no cable labelled {l} is present (`acx-ll-cable list` shows the cables)"))),
+            Err(ids) => {
+                let ids: Vec<String> = ids.iter().map(CableId::to_string).collect();
+                return Err((
+                    2,
+                    format!("error: more than one cable is labelled {l} ({}), a setup error: name it by its id", ids.join(", ")),
+                ));
+            }
+        },
+    };
+    match s.resolve(id, role) {
+        Resolved::Endpoint(e) => Ok(format!("{} {} \"{}\"", e.id, e.state.arg(), e.name)),
+        Resolved::None(why) => Err((3, format!("none: {why}"))),
+    }
+}
+
 fn main() -> ExitCode {
     let Ok(args) = std::env::args_os().skip(1).map(|a| a.into_string()).collect::<Result<Vec<String>, _>>() else {
         eprintln!("error: an argument isn't Unicode");
@@ -209,8 +267,26 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Cmd::Endpoint { cable, role } => match Snapshot::read() {
+            Ok(s) => match endpoint_answer(&s, &cable, role) {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err((code, why)) => {
+                    eprintln!("{why}");
+                    ExitCode::from(code)
+                }
+            },
+            Err(e) => {
+                eprintln!("error: the cables or their endpoints couldn't be read: {e}");
+                ExitCode::from(2)
+            }
+        },
         Cmd::Add { label, mics, adopt, map } => exit_of(setup::add(&label, mics, adopt.as_deref(), map.as_deref(), &mut out)),
         Cmd::Remove { target, forget } => exit_of(setup::remove(&target, forget, &mut out)),
+        Cmd::Disable { label } => exit_of(setup::disable(&label, &mut out)),
+        Cmd::Enable { label } => exit_of(setup::enable(&label, &mut out)),
         Cmd::Variant { label, target } => exit_of(variant::switch(&label, target, &mut out).map(|o| match o {
             Outcome::Nothing => Done::Nothing,
             Outcome::Switched => Done::Changed,
@@ -251,6 +327,14 @@ mod tests {
         assert_eq!(p("remove B --forget"), Ok(Cmd::Remove { target: RemoveTarget::Label(l("B")), forget: true }));
         assert_eq!(p("remove --all --forget"), Ok(Cmd::Remove { target: RemoveTarget::All, forget: true }));
         assert_eq!(p("variant B low-latency"), Ok(Cmd::Variant { label: l("B"), target: Variant::LowLatency }));
+        assert_eq!(p("disable b"), Ok(Cmd::Disable { label: l("B") }));
+        assert_eq!(p("enable B"), Ok(Cmd::Enable { label: l("B") }));
+        assert_eq!(
+            p("endpoint B call-microphone"),
+            Ok(Cmd::Endpoint { cable: CableArg::Label(l("B")), role: EndpointKind::CallMicrophone })
+        );
+        let id: CableId = "bbbbbbbb-0000-4000-8000-00000000000b".parse().unwrap();
+        assert_eq!(p(&format!("endpoint {id} Speakers")), Ok(Cmd::Endpoint { cable: CableArg::Id(id), role: EndpointKind::Speakers }));
         assert_eq!(p(r"update C:\pkg"), Ok(Cmd::Update { folder: r"C:\pkg".into() }));
         assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: None, map: None }));
         assert_eq!(
@@ -284,6 +368,66 @@ mod tests {
         assert_eq!(code_of(&Err(SetupError::Checks(vec!["x".into()]))), 2);
         let still = SetupError::StillPresent { device: "X".into(), why: "w".into(), restart: true, error: Box::new(restart_first()) };
         assert_eq!(code_of(&Err(still)), 7);
+        // The repair's install asked for a restart and the enable after it failed (Astra's review, 2026-11-26)
+        let enable = SetupError::Windows(WinError { call: "CM_Enable_DevNode", code: 5 });
+        assert_eq!(code_of(&Err(enable.clone().and_restart(Some(r"ROOT\MEDIA\ACXLLCABLE_B_X_1".into())))), 7);
+        assert_eq!(code_of(&Err(enable)), 2);
+    }
+
+    /// `endpoint`'s answer: the id, state and name on one line (exit 0), or none (exit 3) and why; a label on two identities is a
+    /// setup error (exit 2). By identity and pin, as nf_vmic::roles has it.
+    #[test]
+    fn the_endpoint_command_answers_by_identity_and_role() {
+        use nf_vmic::identity::CableInstance;
+        use nf_vmic::setup::endpoints::{Endpoint, State};
+        use nf_vmic::setup::plan::{Health, Model, Node};
+        let b_id: CableId = "bbbbbbbb-0000-4000-8000-00000000000b".parse().unwrap();
+        let b = CableInstance { label: l("B"), id: b_id, n: 1 };
+        let node = |c: &CableInstance, v: Variant| Node {
+            instance_id: c.instance_id(),
+            model: Model::Cable(v),
+            cable: Some(c.clone()),
+            health: Health::Working,
+            running: None,
+            start_attempts: None,
+            problem_status: None,
+            config_flags: Some(0),
+        };
+        let endpoint = |kind, id: &str| Endpoint {
+            id: id.into(),
+            name: format!("{} (ACX-LL-Cable B)", EndpointKind::name(kind)),
+            kind,
+            state: State::Active,
+            instance_id: b.instance_id().to_lowercase(),
+        };
+        let s = Snapshot {
+            nodes: vec![node(&b, Variant::LowLatency)],
+            endpoints: vec![endpoint(EndpointKind::Speakers, "{0.0.0.00000000}.{b}")],
+        };
+        let by_label = CableArg::Label(l("B"));
+        assert_eq!(
+            endpoint_answer(&s, &by_label, EndpointKind::Speakers),
+            Ok(r#"{0.0.0.00000000}.{b} active "Speakers (ACX-LL-Cable B)""#.into())
+        );
+        assert_eq!(
+            endpoint_answer(&s, &CableArg::Id(b_id), EndpointKind::Speakers).unwrap().split(' ').next(),
+            Some("{0.0.0.00000000}.{b}")
+        );
+        let (code, why) = endpoint_answer(&s, &by_label, EndpointKind::CallMicrophone).unwrap_err();
+        assert_eq!(code, 3);
+        assert!(why.starts_with("none: ACX-LL-Cable B has no Call Microphone"), "{why}");
+        let (code, why) = endpoint_answer(&s, &by_label, EndpointKind::Microphone).unwrap_err();
+        assert!(code == 3 && why.contains("Windows shows no Microphone for it (yet)"), "{why}");
+        let (code, why) = endpoint_answer(&s, &CableArg::Label(l("C")), EndpointKind::Speakers).unwrap_err();
+        assert!(code == 3 && why.starts_with("none: no cable labelled C is present"), "{why}");
+        let gone: CableId = "cccccccc-0000-4000-8000-00000000000c".parse().unwrap();
+        let (code, why) = endpoint_answer(&s, &CableArg::Id(gone), EndpointKind::Speakers).unwrap_err();
+        assert!(code == 3 && why.starts_with("none: no cable with id cccccccc-"), "{why}");
+        // Two identities labelled B
+        let other = CableInstance { label: l("B"), id: gone, n: 1 };
+        let two = Snapshot { nodes: vec![node(&b, Variant::Both), node(&other, Variant::Both)], endpoints: vec![] };
+        let (code, why) = endpoint_answer(&two, &by_label, EndpointKind::Speakers).unwrap_err();
+        assert!(code == 2 && why.starts_with("error: more than one cable is labelled B"), "{why}");
     }
 
     #[test]
@@ -307,6 +451,16 @@ mod tests {
             ("migrate C:\\pkg --endpoint-map", "--endpoint-map takes a file"),
             ("update C:\\pkg --endpoint-map m.json", "'update' doesn't take that option"),
             ("remove B --endpoint-map m.json", "'remove' doesn't take that option"),
+            ("disable", "'disable' takes a cable's label"),
+            ("enable", "'enable' takes a cable's label"),
+            ("disable B C", "'disable' takes 1 argument; 'C' is one more"),
+            ("enable B --forget", "'enable' doesn't take that option"),
+            ("disable B --mics call", "'disable' doesn't take that option"),
+            ("endpoint", "'endpoint' takes a cable's label or id"),
+            ("endpoint B", "'endpoint' takes a role after the cable"),
+            ("endpoint B mic", "'endpoint' takes speakers, microphone or call-microphone, not 'mic'"),
+            ("endpoint B_1 speakers", "isn't a cable label"),
+            ("endpoint B speakers x", "'endpoint' takes 2 arguments; 'x' is one more"),
         ] {
             let e = p(line).unwrap_err();
             assert!(e.contains(why), "{line}: {e}");

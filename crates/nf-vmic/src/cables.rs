@@ -90,6 +90,24 @@ impl EndpointKind {
         }
     }
 
+    /// `speakers`, `microphone`, `call-microphone`: the role on a command line (`acx-ll-cable endpoint`).
+    pub fn arg(self) -> &'static str {
+        match self {
+            EndpointKind::Speakers => "speakers",
+            EndpointKind::Microphone => "microphone",
+            EndpointKind::CallMicrophone => "call-microphone",
+        }
+    }
+
+    /// A role from the command line: [`EndpointKind::arg`]'s forms or [`EndpointKind::name`]'s ("Call Microphone"), in any
+    /// case.
+    pub fn from_arg(s: &str) -> Option<Self> {
+        let s = s.trim();
+        [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone]
+            .into_iter()
+            .find(|k| s.eq_ignore_ascii_case(k.arg()) || s.eq_ignore_ascii_case(k.name()))
+    }
+
     /// Render (the Speakers) or capture (a microphone).
     pub fn is_render(self) -> bool {
         self == EndpointKind::Speakers
@@ -315,6 +333,14 @@ mod tests {
         }
         assert!(EndpointKind::Speakers.is_render() && !EndpointKind::Microphone.is_render() && !EndpointKind::CallMicrophone.is_render());
         assert_eq!(EndpointKind::CallMicrophone.name(), "Call Microphone");
+        for k in [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone] {
+            assert_eq!(EndpointKind::from_arg(k.arg()), Some(k));
+            assert_eq!(EndpointKind::from_arg(&k.name().to_uppercase()), Some(k));
+        }
+        assert_eq!(EndpointKind::from_arg(" Call-Microphone "), Some(EndpointKind::CallMicrophone));
+        for none in ["", "call", "mic", "speaker", "microphone0", "callmicrophone"] {
+            assert_eq!(EndpointKind::from_arg(none), None, "{none:?}");
+        }
         use EndpointKind::*;
         assert_eq!(EndpointKind::of_variant(Variant::Both), [Speakers, Microphone, CallMicrophone]);
         assert_eq!(EndpointKind::of_variant(Variant::Call), [Speakers, CallMicrophone]);

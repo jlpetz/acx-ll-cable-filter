@@ -92,8 +92,21 @@ pub enum State {
     /// Disabled in the Sound panel.
     Disabled,
     Unplugged,
-    /// Its node isn't present (removed, or not made yet): read only for the look before an action, never credited to a cable.
+    /// Its node isn't present (removed, disabled, or not made yet): read only for the look before an action, never credited to a
+    /// cable.
     NotPresent,
+}
+
+impl State {
+    /// `active`, `disabled`, `unplugged` or `notpresent`: the endpoint map's and `acx-ll-cable endpoint`'s text.
+    pub fn arg(self) -> &'static str {
+        match self {
+            State::Active => "active",
+            State::Disabled => "disabled",
+            State::Unplugged => "unplugged",
+            State::NotPresent => "notpresent",
+        }
+    }
 }
 
 /// One endpoint on one of our nodes.

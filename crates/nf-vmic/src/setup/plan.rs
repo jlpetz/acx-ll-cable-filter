@@ -2,13 +2,16 @@
 //! the nodes, the store and the request in, a plan out; [`super`] carries it out.
 //!
 //! **Per cable.** A cable is its identity. [`resolve`] finds a label's identity (the store's, or, if the store has none, the
-//! one its nodes' instance IDs carry) and the nodes with it; `add`, `variant` and `remove` act on those nodes alone, so no
-//! other cable is touched. Only `update` and the migration act on every node of ours, as every cable runs one image.
+//! one its nodes' instance IDs carry) and the nodes with it; `add`, `variant`, `remove`, `disable` and `enable` act on those
+//! nodes alone, so no other cable is touched. Only `update` and the migration act on every node of ours, as every cable runs
+//! one image.
 //!
-//! **Instance numbers.** Re-adding a cable with the microphones it had keeps its instance ID (its n), so (we expect, to confirm
-//! on the box) Windows brings back its endpoints, their ids among them (Astra's recommendation, forwarded by the owner,
-//! 2026-11-25); one that is there but unhealthy is repaired in place, the same node. A variant switch, and a re-add with other
-//! microphones, take n + 1: fresh endpoints, which Windows makes with the variant's default period (TODO 22).
+//! **Instance numbers.** Re-adding a cable with the microphones it had keeps its instance ID (its n) (Astra's recommendation,
+//! forwarded by the owner, 2026-11-25), though Windows makes it new endpoint ids all the same: the first install's trial
+//! (2026-11-26) found the old ones kept NOTPRESENT and never reused, which the owner accepted, the app resolving a cable's
+//! endpoints by role ([`crate::roles`]). A disable keeps them ([`plan_disable`]). One that is there but unhealthy is repaired
+//! in place, the same node. A variant switch, and a re-add with other microphones, take n + 1: fresh endpoints, which Windows
+//! makes with the variant's default period (TODO 22).
 
 use std::fmt;
 
@@ -166,8 +169,8 @@ pub struct Node {
 }
 
 impl Node {
-    /// Disabled (Code 22) with CONFIGFLAG_DISABLED: the user's disable, which `update` leaves. `None`: the flags didn't read,
-    /// so it is taken as the user's.
+    /// Disabled (Code 22) with CONFIGFLAG_DISABLED: a disable that persists across restarts, `acx-ll-cable disable`'s or the
+    /// user's (Device Manager's), which `update` and `add` leave. `None`: the flags didn't read, so it is taken as the user's.
     pub fn disabled_by_user(&self) -> bool {
         self.health == Health::Problem(PROBLEM_DISABLED) && self.config_flags.is_none_or(|f| f & CONFIGFLAG_DISABLED.0 != 0)
     }
@@ -222,6 +225,18 @@ impl Node {
             None => "no driver".into(),
         };
         let mut text = format!("{}: {what} ({}), {}, {driver}", self.instance_id, self.model.hardware_id(), self.health.describe());
+        // A cable's disable said apart from a failure ("a problem: Code N"): off on purpose, and how it comes back
+        if let Some(c) = self.cable.as_ref().filter(|_| self.health == Health::Problem(PROBLEM_DISABLED)) {
+            text.push_str(&if self.disabled_by_user() {
+                format!("; it stays disabled across restarts until `acx-ll-cable enable {}`, its endpoints keeping their ids", c.label)
+            } else {
+                format!(
+                    "; disabled for now, not by its ConfigFlags (a setup run's that stopped, which a restart undoes, or another tool's): \
+                     `acx-ll-cable enable {}` turns it back on",
+                    c.label
+                )
+            });
+        }
         match self.breaker() {
             Breaker::Clear => {}
             Breaker::Armed(n) => text.push_str(&format!(
@@ -279,6 +294,13 @@ pub enum PlanError {
     Mislabelled { label: Label, node: String },
     /// `variant` on a cable that isn't present.
     NotPresent(Label),
+    /// `disable` or `enable` (`action`) on a cable that isn't present.
+    Absent { label: Label, action: &'static str },
+    /// `enable` on a cable whose identity is on more than one node (a setup error): enabling them all would have two want one
+    /// control device's name.
+    OnSeveral { label: Label, nodes: Vec<String> },
+    /// `enable` on a cable that isn't disabled, and isn't working either (`node`, described).
+    NotDisabled { label: Label, node: String },
     /// `--adopt`: no present node of ours has that instance ID.
     AdoptNotFound(String),
     /// `--adopt`: that node already has an identity (it is a cable already).
@@ -323,6 +345,23 @@ impl fmt::Display for PlanError {
             PlanError::NotPresent(label) => {
                 write!(f, "cable {label} isn't present: `acx-ll-cable add {label} --mics <m>` makes it with those microphones")
             }
+            PlanError::Absent { label, action } => write!(
+                f,
+                "cable {label} isn't present, so there is nothing to {action} (`acx-ll-cable list` shows the cables; `acx-ll-cable add \
+                 {label}` makes it). Nothing was changed."
+            ),
+            PlanError::OnSeveral { label, nodes } => write!(
+                f,
+                "cable {label}'s identity is on {} devices ({}): a setup error. `acx-ll-cable add {label}` keeps one and removes the \
+                 others, enabling it. Nothing was changed.",
+                nodes.len(),
+                nodes.join(", ")
+            ),
+            PlanError::NotDisabled { label, node } => write!(
+                f,
+                "cable {label} isn't disabled, but it isn't working either ({node}): `acx-ll-cable add {label}` repairs it. Nothing was \
+                 changed."
+            ),
             PlanError::AdoptNotFound(id) => write!(f, "no present device of ours is {id}: `acx-ll-cable list` shows them"),
             PlanError::AdoptHasIdentity(id) => write!(f, "{id} is a cable already (its instance ID has an identity): nothing to adopt"),
             PlanError::AdoptLegacy(id) => {
@@ -454,7 +493,14 @@ pub enum AddPlan {
         identity: Identity,
         pending: bool,
     },
-    /// Present but unhealthy (disabled, failing, refused by the crash breaker, or a duplicate): its newest node gets the
+    /// Present and disabled on purpose, its only node (`acx-ll-cable disable`'s, or Device Manager's: it persists across
+    /// restarts): left as it is, as `update` leaves it, `enable` turning it back on; recorded in the store if the store lacked it
+    /// (`identity`). A migration's record pending stays so: its endpoints can't be checked while it is off.
+    Disabled {
+        node: usize,
+        identity: Identity,
+    },
+    /// Present but unhealthy (disabled for now, failing, refused by the crash breaker, or a duplicate): its newest node gets the
     /// package again in place, so it keeps its identity and instance ID (and its endpoints), its start count cleared; the
     /// cable's other nodes pruned. Its microphones stay (`mics_differ`: `variant` switches).
     Repair {
@@ -490,8 +536,8 @@ pub fn plan_add(
     let instance = |n| CableInstance { label: label.clone(), id, n };
     // Its instance ID was there before (a removed cable's), unless the migration recorded it and never made it
     let had_instance = resolved.as_ref().is_some_and(|r| !r.pending);
-    // The instance ID it had, for the microphones it had: (we expect) its endpoints back, with their ids. Other microphones take
-    // n + 1, as a variant switch does: fresh endpoints, with the variant's default period (TODO 22)
+    // The instance ID it had, for the microphones it had (its endpoint ids are new all the same: the module's docs). Other
+    // microphones take n + 1, as a variant switch does: fresh endpoints, with the variant's default period (TODO 22)
     let reuse = |variant: Variant| -> Result<(CableInstance, bool), PlanError> {
         if had_instance && last_mics.is_some_and(|m| m != variant) {
             let next = n.checked_add(1).ok_or_else(|| PlanError::NoNextInstance(label.clone()))?;
@@ -521,6 +567,12 @@ pub fn plan_add(
         let mics_differ = mics.filter(|&m| nodes[*keep].variant() != Some(m));
         let pending = resolved.as_ref().is_some_and(|r| r.pending);
         return Ok(AddPlan::Nothing { node: *keep, prune, mics_differ, identity, pending });
+    }
+    // Disabled on purpose, and nothing else of it there: left so (the user's choice; `enable` undoes it)
+    if let [only] = own.as_slice()
+        && nodes[*only].disabled_by_user()
+    {
+        return Ok(AddPlan::Disabled { node: *only, identity });
     }
     // Present but unhealthy (or several working: a setup error mended the same way): the newest node repaired in place
     if let Some(&newest) = own.iter().max_by_key(|&&i| nodes[i].cable.as_ref().map_or(0, |c| c.n)) {
@@ -566,6 +618,49 @@ pub fn plan_remove(target: &RemoveTarget, forget: bool, store: &[Entry], nodes: 
             let forget = if forget && stored.is_some() { vec![label.clone()] } else { Vec::new() };
             RemovePlan { remove, forget }
         }
+    }
+}
+
+/// What `disable` or `enable` does to one cable's nodes (every other cable's are left alone).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatePlan {
+    pub label: Label,
+    /// Indices into the nodes: the cable's nodes to disable (persistently), or to enable. None: nothing to do.
+    pub change: Vec<usize>,
+    /// The cable's nodes left as they are: disabled persistently already (`disable`), or not disabled (`enable`: working).
+    pub left: Vec<usize>,
+}
+
+/// The cable's present nodes, for `disable` or `enable` (`action`): by its identity ([`resolve`]); refused while the old
+/// driver's nodes are there (the migration first), or if none is present.
+fn present_nodes(label: &Label, action: &'static str, store: &[Entry], nodes: &[Node]) -> Result<Vec<usize>, PlanError> {
+    refuse_legacy(nodes)?;
+    match resolve(label, store, nodes)? {
+        Some(r) if !r.nodes.is_empty() => Ok(r.nodes),
+        _ => Err(PlanError::Absent { label: label.clone(), action }),
+    }
+}
+
+/// `disable <label>`: each of the cable's nodes not disabled persistently already (one disabled for now, by a run that stopped,
+/// included: a restart would bring it back), so the cable stays off across restarts until `enable`.
+pub fn plan_disable(label: &Label, store: &[Entry], nodes: &[Node]) -> Result<StatePlan, PlanError> {
+    let own = present_nodes(label, "disable", store, nodes)?;
+    let (left, change) = own.into_iter().partition(|&i| nodes[i].disabled_by_user());
+    Ok(StatePlan { label: label.clone(), change, left })
+}
+
+/// `enable <label>`: the cable's node, if it is disabled (persistently or not). One working is left (nothing to do); one with
+/// another problem is refused (`add` repairs it), as is an identity on several nodes (a setup error `add` mends).
+pub fn plan_enable(label: &Label, store: &[Entry], nodes: &[Node]) -> Result<StatePlan, PlanError> {
+    let own = present_nodes(label, "enable", store, nodes)?;
+    let [only] = own.as_slice() else {
+        return Err(PlanError::OnSeveral { label: label.clone(), nodes: own.iter().map(|&i| nodes[i].instance_id.clone()).collect() });
+    };
+    let n = &nodes[*only];
+    match n.health {
+        Health::Problem(PROBLEM_DISABLED) => Ok(StatePlan { label: label.clone(), change: own, left: Vec::new() }),
+        Health::Working => Ok(StatePlan { label: label.clone(), change: Vec::new(), left: own }),
+        _ => Err(PlanError::NotDisabled { label: label.clone(), node: n.describe() }),
     }
 }
 
@@ -1098,6 +1193,99 @@ pub(crate) mod tests {
         assert_eq!(p, AddPlan::Nothing { node: 1, prune: vec![2], mics_differ: None, identity: Identity::Stored, pending: false });
     }
 
+    /// A cable disabled persistently (`disable`, Device Manager's: CONFIGFLAG_DISABLED) is left as it is by `add`, as `update`
+    /// leaves it; one disabled for now (a stopped run's) is repaired, as before. Recorded if the store lacked it.
+    #[test]
+    fn add_leaves_a_disabled_cable_as_it_is() {
+        let (store, mut nodes) = two();
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let p = plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap();
+        assert_eq!(p, AddPlan::Disabled { node: 1, identity: Identity::Stored });
+        assert_eq!(plan_add(&label("B"), None, None, &store[..1], &nodes, cid(NEW_ID)).unwrap(), AddPlan::Disabled {
+            node: 1,
+            identity: Identity::FromNode
+        });
+        nodes[1].config_flags = Some(0);
+        assert!(matches!(plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap(), AddPlan::Repair { node: 1, .. }));
+        // A's add is untouched by B's state
+        assert!(matches!(plan_add(&label("A"), None, None, &store, &nodes, cid(NEW_ID)).unwrap(), AddPlan::Nothing { node: 0, .. }));
+    }
+
+    /// `disable` and `enable` act on that cable's nodes alone; each says when there is nothing to do, and refuses a cable that
+    /// isn't present, the old driver's devices (the migration first), an enable of an identity on two nodes, and an enable of a
+    /// cable that isn't disabled but failing.
+    #[test]
+    fn disable_and_enable_take_only_that_cables_nodes() {
+        let (store, mut nodes) = two();
+        let p = plan_disable(&label("b"), &store, &nodes).unwrap();
+        assert_eq!(p, StatePlan { label: label("B"), change: vec![1], left: vec![] });
+        // Disabled for now (a stopped run's, not persistent): disabled for good
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        nodes[1].config_flags = Some(0);
+        assert_eq!(plan_disable(&label("B"), &store, &nodes).unwrap().change, [1]);
+        assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap().change, [1]);
+        // Disabled for good already: nothing to disable; enable takes it
+        nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        assert_eq!(plan_disable(&label("B"), &store, &nodes).unwrap(), StatePlan { label: label("B"), change: vec![], left: vec![1] });
+        assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap(), StatePlan { label: label("B"), change: vec![1], left: vec![] });
+        // Working: nothing to enable
+        assert_eq!(plan_enable(&label("A"), &store, &nodes).unwrap(), StatePlan { label: label("A"), change: vec![], left: vec![0] });
+        // Failing, not disabled: `add` repairs it
+        nodes[1].health = Health::Problem(PROBLEM_FAILED_ADD);
+        nodes[1].problem_status = Some(STATUS_START_BREAKER);
+        let e = plan_enable(&label("B"), &store, &nodes).unwrap_err();
+        assert!(matches!(&e, PlanError::NotDisabled { node, .. } if node.contains("Code 31")), "{e:?}");
+        assert!(e.to_string().starts_with("cable B isn't disabled, but it isn't working either ("), "{e}");
+        assert!(e.to_string().ends_with("`acx-ll-cable add B` repairs it. Nothing was changed."), "{e}");
+        assert_eq!(plan_disable(&label("B"), &store, &nodes).unwrap().change, [1], "a failing cable can still be turned off");
+        // Absent
+        let e = plan_disable(&label("C"), &store, &nodes).unwrap_err();
+        assert_eq!(e, PlanError::Absent { label: label("C"), action: "disable" });
+        assert!(e.to_string().starts_with("cable C isn't present, so there is nothing to disable"), "{e}");
+        let gone = plan_enable(&label("B"), &store, &nodes[..1]).unwrap_err();
+        assert_eq!(gone, PlanError::Absent { label: label("B"), action: "enable" }, "B's record alone isn't B");
+        // B's identity on two nodes: disabled together; not enabled together
+        let mut two_b = nodes.clone();
+        two_b[1].health = Health::Problem(PROBLEM_DISABLED);
+        two_b[1].config_flags = Some(0);
+        two_b.push(node("B", B_ID, 2, Variant::Both));
+        assert_eq!(plan_disable(&label("B"), &store, &two_b).unwrap().change, [1, 2]);
+        let e = plan_enable(&label("B"), &store, &two_b).unwrap_err();
+        assert!(matches!(&e, PlanError::OnSeveral { nodes, .. } if nodes.len() == 2), "{e:?}");
+        assert!(e.to_string().contains("`acx-ll-cable add B` keeps one and removes the others"), "{e}");
+        // The old driver's devices: the migration first
+        let mut old = nodes.clone();
+        old.push(legacy(r"ROOT\MEDIA\0003", Legacy::AudioCodec(Variant::Both)));
+        assert!(matches!(plan_disable(&label("A"), &store, &old), Err(PlanError::Legacy(_))));
+        assert!(matches!(plan_enable(&label("A"), &store, &old), Err(PlanError::Legacy(_))));
+    }
+
+    /// `list` and every message say a cable's disable apart from a failure: off for good until `enable`, or for now (a stopped
+    /// run's); a failed node says its problem code only.
+    #[test]
+    fn a_disabled_node_is_described_apart_from_a_failed_one() {
+        let mut b = node("B", B_ID, 1, Variant::Both);
+        b.health = Health::Problem(PROBLEM_DISABLED);
+        b.config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let text = b.describe();
+        assert!(text.contains("both microphones (ROOT\\AcxLlCable), disabled (Code 22), driver oem12.inf"), "{text}");
+        assert!(
+            text.ends_with("; it stays disabled across restarts until `acx-ll-cable enable B`, its endpoints keeping their ids"),
+            "{text}"
+        );
+        b.config_flags = Some(0);
+        assert!(b.describe().ends_with(
+            "; disabled for now, not by its ConfigFlags (a setup run's that stopped, which a restart undoes, or another tool's): \
+             `acx-ll-cable enable B` turns it back on"
+        ));
+        b.health = Health::Problem(PROBLEM_FAILED_ADD);
+        let failed = b.describe();
+        assert!(failed.contains("a problem: Code 31 (CM_PROB_FAILED_ADD)") && !failed.contains("disabled"), "{failed}");
+        b.health = Health::Working;
+        assert!(!b.describe().contains("disabled"));
+    }
+
     #[test]
     fn add_adopts_a_node_made_outside_the_tool() {
         let (store, mut nodes) = two();
@@ -1371,8 +1559,8 @@ pub(crate) mod tests {
         mapped(store, nodes, &[])
     }
 
-    /// A re-add keeps the identity, and the instance ID (so, we expect, the endpoint ids) only with the microphones it had: other
-    /// microphones take n + 1, as a variant switch does (Astra's recommendation, 2026-11-25).
+    /// A re-add keeps the identity, and the instance ID only with the microphones it had (its endpoint ids are new either way:
+    /// the first install's trial): other microphones take n + 1, as a variant switch does (Astra's recommendation, 2026-11-25).
     #[test]
     fn a_re_add_with_other_microphones_takes_the_next_n() {
         let (mut store, nodes) = two();

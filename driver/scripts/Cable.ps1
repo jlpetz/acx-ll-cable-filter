@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Lists, adds, removes or switches the variant of an ACX-LL-Cable (any number of cables: A, B, C...).
+    Lists, adds, removes, disables, enables or switches the variant of an ACX-LL-Cable (any number of cables: A, B, C...), or
+    finds a cable's endpoint by role.
 
 .DESCRIPTION
     TODO 19, the per-cable design (doc/todo/19-per-cable-design.md, section 9). Replaces Cable-B.ps1. Every action runs the
@@ -11,13 +12,20 @@
     A cable is added on the driver package the other cables run. Only Install-Driver.ps1 (the tool's update) changes the
     package, and moves every cable together.
 
+    disable <label> keeps the cable installed but off, across restarts too, until enable <label>; its endpoints keep their ids
+    (not present while it is off), and enable checks they came back as they were. No other cable is touched.
+
+    endpoint <label|id> speakers|microphone|call-microphone (any user) writes the cable's endpoint for that role as Windows has
+    it now, found by the cable's identity and the endpoint's pin, never by name: one line, "<id> <state> "<name>"", to the
+    output (so a caller can take it: $line = .\Cable.ps1 endpoint B call-microphone). None now: exit 3, why on stderr.
+
     -Build builds the tool first (cargo build --release -p nf-vmic --bin acx-ll-cable); without it, a missing tool is an
     error, so no run rebuilds anything unasked. add -EndpointMap <file>: which new endpoint takes each old one's place (a
     re-added or repaired cable's, an adopted device's), as JSON (acx-ll-cable's --endpoint-map).
 
     Exit codes: 0 done (or nothing to do); 7 Windows wants a restart to finish, with or without other errors beside it (stop
-    there: restart, then run this again); 2 the setup tool's error (its steps above say what changed); 1 a usage error or this
-    script's own check (not elevated, no tool).
+    there: restart, then run this again); 2 the setup tool's error (its steps above say what changed); 3 endpoint only: no
+    endpoint for that role now; 1 a usage error or this script's own check (not elevated, no tool).
 
 .EXAMPLE
     .\Cable.ps1 list
@@ -32,12 +40,19 @@
 .EXAMPLE
     .\Cable.ps1 remove B -Forget
 .EXAMPLE
+    .\Cable.ps1 disable B
+.EXAMPLE
+    .\Cable.ps1 enable B
+.EXAMPLE
+    .\Cable.ps1 endpoint B call-microphone
+.EXAMPLE
     .\Cable.ps1 -Build list
 #>
 param(
-    [Parameter(Position = 0)][ValidateSet('list', 'add', 'remove', 'variant')][string]$Action = 'list',
+    [Parameter(Position = 0)][ValidateSet('list', 'add', 'remove', 'variant', 'disable', 'enable', 'endpoint')][string]$Action = 'list',
     [Parameter(Position = 1)][string]$Label,
-    [Parameter(Position = 2)][ValidateSet('both', 'call', 'low-latency')][string]$To,
+    # variant's microphones (both, call, low-latency), or endpoint's role (speakers, microphone, call-microphone): the tool checks it
+    [Parameter(Position = 2)][string]$To,
     [ValidateSet('both', 'call', 'low-latency')][string]$Mics,
     [string]$Adopt,
     [string]$EndpointMap,
@@ -47,10 +62,20 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 if ($EndpointMap -and $Action -ne 'add') { throw "-EndpointMap goes with add: Cable.ps1 add B -EndpointMap <file>" }
+if ($To -and $Action -notin 'variant', 'endpoint') { throw "'$Action' takes no third argument ('$To')" }
+if (($Mics -or $Adopt) -and $Action -ne 'add') { throw "-Mics and -Adopt go with add" }
+if ($Forget -and $Action -ne 'remove') { throw "-Forget goes with remove" }
 $tool = Get-CableTool -Build:$Build
 
 if ($Action -eq 'list') {
     exit (Invoke-CableTool $tool @('list'))
+}
+
+if ($Action -eq 'endpoint') {
+    # Any user. The tool's line goes to the output, for a caller to take; why there is none goes to stderr (exit 3)
+    if (-not $Label -or -not $To) { throw 'endpoint takes a cable and a role: Cable.ps1 endpoint B speakers|microphone|call-microphone' }
+    & $tool endpoint $Label $To
+    exit $LASTEXITCODE
 }
 
 Assert-Admin
@@ -72,10 +97,14 @@ $arguments = switch ($Action) {
         if (-not $To) { throw 'variant takes the microphones: Cable.ps1 variant B both|call|low-latency' }
         @('variant', $Label, $To)
     }
+    'disable' { @('disable', $Label) }
+    'enable' { @('enable', $Label) }
 }
 
-if ($Action -eq 'remove') {
-    Exit-ForToolCode (Invoke-CableTool $tool $arguments) "removing cable $Label"
+if ($Action -in 'remove', 'disable', 'enable') {
+    # No new endpoint, so no default role to put back (a disable moves Windows' defaults off the cable while it is off)
+    $doing = @{ 'remove' = 'removing'; 'disable' = 'disabling'; 'enable' = 'enabling' }[$Action]
+    Exit-ForToolCode (Invoke-CableTool $tool $arguments) "$doing cable $Label"
     exit 0
 }
 
