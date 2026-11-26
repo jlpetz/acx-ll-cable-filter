@@ -13,18 +13,29 @@
 //!   (`NfStartAttempts`, Cable.h); every install path deletes the count before it installs or enables (D1's contract).
 //! - [`DeviceSet::disable`] and [`DeviceSet::enable`]: `CM_Disable_DevNode`, polite and without `CM_DISABLE_PERSIST` (a crash
 //!   or a reboot mid-update brings every cable back).
-//! - [`DeviceSet::change_state`]: `acx-ll-cable disable` and `enable`'s persistent, global change, through SetupAPI's
-//!   DIF_PROPERTYCHANGE (SP_PROPCHANGE_PARAMS: DICS_DISABLE or DICS_ENABLE, DICS_FLAG_GLOBAL, "make the change in all hardware
-//!   profiles" [V: Learn]), as Device Manager and devcon do it, rather than CfgMgr32's equivalent, `CM_Disable_DevNode` with
-//!   `CM_DISABLE_PERSIST` ("disables the device across reboots", Windows 10 and later [V: Learn]). Ours, for two reasons: the
-//!   restart is documented, SetupDiCallClassInstaller's page saying that after the call the caller reads the element's install
-//!   parameters and restarts if DI_NEEDREBOOT or DI_NEEDRESTART is set (a device Windows couldn't stop now, which it changes at
-//!   the restart: exit 7), where CfgMgr32's call documents only a CONFIGRET; and the class's installers take part, as for any
-//!   disable a user makes in Device Manager, so a cable disabled either way is the same to `update` (CONFIGFLAG_DISABLED: left
-//!   disabled) and to `list`. The enable is the same request with DICS_ENABLE. The device isn't uninstalled: its instance ID and
-//!   its device interfaces (the KS filters, by instance ID and reference string) stay, so Windows keeps its endpoints,
-//!   NOTPRESENT while it is off, and an enable brings the same ones back (Microsoft: an endpoint id belongs to one installation
-//!   of the device; the first install's trial saw all six ids survive a disable and enable through pnputil).
+//! - [`DeviceSet::change_state`]: `acx-ll-cable disable` and `enable`'s persistent change, through SetupAPI's
+//!   DIF_PROPERTYCHANGE (SP_PROPCHANGE_PARAMS), rather than CfgMgr32's `CM_Disable_DevNode` with `CM_DISABLE_PERSIST`
+//!   ("disables the device across reboots", Windows 10 and later [V: Learn]). Ours, for two reasons: the restart is
+//!   documented, SetupDiCallClassInstaller's page saying that after the call the caller reads the element's install parameters
+//!   and restarts if DI_NEEDREBOOT or DI_NEEDRESTART is set (a device Windows couldn't stop now, which it changes at the
+//!   restart: exit 7), where CfgMgr32's call documents only a CONFIGRET; and the class's installers take part, as in a disable
+//!   from Device Manager.
+//!   - **The disable** is DICS_DISABLE with DICS_FLAG_GLOBAL ("make the change in all hardware profiles" [V: Learn]), which
+//!     we expect to set CONFIGFLAG_DISABLED in the device's ConfigFlags (to confirm on the box: `disable` checks it, and
+//!     says so if it isn't set), the flag `update` has read since step 1 as a user's disable that persists (Device Manager's,
+//!     which we take to be this one: also to confirm). Not devcon's: Microsoft's devcon sample disables in the current
+//!     hardware profile only (DICS_FLAG_CONFIGSPECIFIC [V: setup/devcon/cmds.cpp, ControlCallback]), its flag in the
+//!     profile's CSConfigFlags, which persists too, but which only CM_Get_HW_Prof_Flags reads, deprecated since Windows 8
+//!     [V: Learn]: so `list` can't tell a devcon disable from a stopped setup run's (no CONFIGFLAG_DISABLED either way).
+//!   - **The enable** is devcon's: DICS_ENABLE with DICS_FLAG_GLOBAL, then with DICS_FLAG_CONFIGSPECIFIC for the current
+//!     profile, each time, the global first (devcon: "global enable doesn't mark reboot required if device is still disabled
+//!     on current config whereas vice-versa isn't true"). So a disable of either scope is undone, and a global disable still
+//!     waiting for a restart (CONFIGFLAG_DISABLED set, the device running) is cancelled: the flag cleared, `enable` checks.
+//!
+//!   The device isn't uninstalled: its instance ID and its device interfaces (the KS filters, by instance ID and reference
+//!   string) stay, so Windows keeps its endpoints, NOTPRESENT while it is off, and an enable brings the same ones back
+//!   (Microsoft: an endpoint id belongs to one installation of the device; the first install's trial saw all six ids survive
+//!   a disable and enable through pnputil).
 
 use std::fmt;
 use std::mem::size_of;
@@ -211,7 +222,7 @@ impl DeviceSet {
                 running: bound.running(),
                 start_attempts: self.start_attempts(&data),
                 problem_status: self.u32_property(&data, &DEVPKEY_Device_ProblemStatus),
-                config_flags: self.registry_u32(&data, SPDRP_CONFIGFLAGS),
+                config_flags: self.config_flags(&data),
             };
             out.push((data, node));
         }
@@ -379,21 +390,26 @@ impl DeviceSet {
         if cr == CR_SUCCESS { Ok(()) } else { Err(WinError { call: "CM_Enable_DevNode", code: cr_win32(cr) }) }
     }
 
-    /// `disable` and `enable`'s change (the module's docs): DIF_PROPERTYCHANGE with DICS_DISABLE or DICS_ENABLE in every hardware
-    /// profile (DICS_FLAG_GLOBAL), as Device Manager and devcon disable and enable a device. The default handler
-    /// (SetupDiChangeState) stops the device and keeps it disabled across restarts until an enable (we expect by
-    /// CONFIGFLAG_DISABLED in its ConfigFlags, as for Device Manager's disable, which [`super::plan::Node::disabled_by_user`]
-    /// reads: to confirm on the box). An enable that leaves the device disabled (Code 22), with no restart asked for, is made
-    /// again for the current hardware profile (DICS_FLAG_CONFIGSPECIFIC, profile 0), as Microsoft's devcon sample enables: a
-    /// device another tool disabled for the profile only (devcon's own disable) comes back too. Whether Windows needs a restart
-    /// to finish it (DI_NEEDRESTART or DI_NEEDREBOOT in the element's install parameters afterwards, SetupDiCallClassInstaller's
+    /// `disable` and `enable`'s change (the module's docs): DIF_PROPERTYCHANGE. The disable is DICS_DISABLE in every hardware
+    /// profile (DICS_FLAG_GLOBAL): the default handler (SetupDiChangeState) stops the device and keeps it disabled across
+    /// restarts until an enable (we expect by CONFIGFLAG_DISABLED in its ConfigFlags, which
+    /// [`super::plan::Node::disabled_by_user`] reads: to confirm on the box). The enable is DICS_ENABLE in every profile, then
+    /// in the current one (DICS_FLAG_CONFIGSPECIFIC, profile 0), each time, as Microsoft's devcon sample enables: a device
+    /// disabled for the profile only (devcon's own disable) comes back too. Whether Windows needs a restart to finish it
+    /// (DI_NEEDRESTART or DI_NEEDREBOOT in the element's install parameters after either call, SetupDiCallClassInstaller's
     /// documented signal: a device it couldn't change now). Elevated only.
     pub fn change_state(&self, data: &SP_DEVINFO_DATA, enable: bool) -> Result<bool, WinError> {
         let restart = self.property_change(data, enable, DICS_FLAG_GLOBAL)?;
-        if enable && !restart && health(data.DevInst) == Health::Problem(super::plan::PROBLEM_DISABLED) {
-            return self.property_change(data, true, DICS_FLAG_CONFIGSPECIFIC);
+        if !enable {
+            return Ok(restart);
         }
-        Ok(restart)
+        Ok(self.property_change(data, true, DICS_FLAG_CONFIGSPECIFIC)? || restart)
+    }
+
+    /// SPDRP_CONFIGFLAGS now, if it reads: CONFIGFLAG_DISABLED marks a disable in every hardware profile, done or waiting for
+    /// a restart ([`DeviceSet::change_state`]).
+    pub fn config_flags(&self, data: &SP_DEVINFO_DATA) -> Option<u32> {
+        self.registry_u32(data, SPDRP_CONFIGFLAGS)
     }
 
     /// One DIF_PROPERTYCHANGE of `change_state`, in `scope` (the current hardware profile, for DICS_FLAG_CONFIGSPECIFIC);

@@ -13,7 +13,9 @@
     package, and moves every cable together.
 
     disable <label> keeps the cable installed but off, across restarts too, until enable <label>; its endpoints keep their ids
-    (not present while it is off), and enable checks they came back as they were. No other cable is touched.
+    (not present while it is off), and enable checks they came back as they were. No other cable is touched. A disable
+    Windows can't finish now (an app has the cable in use) is made at the next restart (exit 7): until then the cable works,
+    list says it is disabled at the next restart, and enable cancels it. variant refuses a disabled cable: enable it first.
 
     endpoint <label|id> speakers|microphone|call-microphone (any user) writes the cable's endpoint for that role as Windows has
     it now, found by the cable's identity and the endpoint's pin, never by name: one line, "<id> <state> "<name>"", to the
@@ -72,8 +74,11 @@ if ($Action -eq 'list') {
 }
 
 if ($Action -eq 'endpoint') {
-    # Any user. The tool's line goes to the output, for a caller to take; why there is none goes to stderr (exit 3)
+    # Any user. The tool's line goes to the output, for a caller to take; why there is none goes to stderr (exit 3). Not under
+    # common.ps1's 'Stop': a caller that redirects this script's stderr ($line = .\Cable.ps1 endpoint B speakers 2>$null, or
+    # 2>&1) makes Windows PowerShell 5.1 take the tool's "none: ..." as a NativeCommandError, which would end the script with 1
     if (-not $Label -or -not $To) { throw 'endpoint takes a cable and a role: Cable.ps1 endpoint B speakers|microphone|call-microphone' }
+    $ErrorActionPreference = 'Continue'
     & $tool endpoint $Label $To
     exit $LASTEXITCODE
 }

@@ -77,8 +77,11 @@ function Get-CableTool([switch]$Build) {
 }
 
 # Runs the setup tool with its arguments, its output shown as it comes; its exit code (0 done, 1 usage, 2 an error, 7 a
-# restart).
+# restart). Its stderr (its last line, "error: ...") isn't a terminating error here: under this file's 'Stop', a caller that
+# redirects the script's stderr (2>&1, 2>$null) makes Windows PowerShell 5.1 take the tool's stderr as a NativeCommandError,
+# which would end the script with 1 rather than the tool's code. 'Continue' in this function's scope only.
 function Invoke-CableTool([string]$Tool, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
     & $Tool @Arguments | Out-Host
     return $LASTEXITCODE
 }

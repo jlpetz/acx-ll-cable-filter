@@ -177,9 +177,25 @@ impl Node {
 
     /// Disabled (Code 22) without CONFIGFLAG_DISABLED: a disable that doesn't persist, as `update` and the migration make
     /// theirs. One there before a run is an earlier run's, stopped before it enabled the node again (Ctrl+C, a killed tool):
-    /// the next run enables it with the rest.
+    /// the next run enables it with the rest. (Another tool's disable for the current hardware profile only, devcon's, looks
+    /// the same: its CSConfigFlags read only through CM_Get_HW_Prof_Flags, deprecated since Windows 8 [V: Learn].)
     pub fn disabled_by_a_run(&self) -> bool {
         self.health == Health::Problem(PROBLEM_DISABLED) && !self.disabled_by_user()
+    }
+
+    /// Not disabled (no Code 22) though CONFIGFLAG_DISABLED is set: a disable in every hardware profile that Windows couldn't
+    /// finish now (`acx-ll-cable disable`'s exit 7: something had the device in use), so the device runs until the next
+    /// restart, which disables it (we expect: to confirm on the box). `enable` cancels it (its global DICS_ENABLE clears the
+    /// flag); `disable` asks again.
+    pub fn disable_pending(&self) -> bool {
+        self.health != Health::Problem(PROBLEM_DISABLED) && self.config_flags.is_some_and(|f| f & CONFIGFLAG_DISABLED.0 != 0)
+    }
+
+    /// Off on purpose, now or from the next restart: disabled with CONFIGFLAG_DISABLED ([`Node::disabled_by_user`]), or that
+    /// disable waiting for a restart ([`Node::disable_pending`]). `variant` refuses such a cable: its re-made device would be
+    /// enabled.
+    pub fn off_on_purpose(&self) -> bool {
+        self.disabled_by_user() || self.disable_pending()
     }
 
     pub fn breaker(&self) -> Breaker {
@@ -225,17 +241,28 @@ impl Node {
             None => "no driver".into(),
         };
         let mut text = format!("{}: {what} ({}), {}, {driver}", self.instance_id, self.model.hardware_id(), self.health.describe());
-        // A cable's disable said apart from a failure ("a problem: Code N"): off on purpose, and how it comes back
-        if let Some(c) = self.cable.as_ref().filter(|_| self.health == Health::Problem(PROBLEM_DISABLED)) {
-            text.push_str(&if self.disabled_by_user() {
-                format!("; it stays disabled across restarts until `acx-ll-cable enable {}`, its endpoints keeping their ids", c.label)
-            } else {
-                format!(
-                    "; disabled for now, not by its ConfigFlags (a setup run's that stopped, which a restart undoes, or another tool's): \
-                     `acx-ll-cable enable {}` turns it back on",
+        // A cable's disable said apart from a failure ("a problem: Code N"): off on purpose, and how it comes back; or a disable
+        // waiting for a restart
+        if let Some(c) = &self.cable {
+            if self.disabled_by_user() {
+                text.push_str(&format!(
+                    "; it stays disabled across restarts until `acx-ll-cable enable {}`, its endpoints keeping their ids",
                     c.label
-                )
-            });
+                ));
+            } else if self.disabled_by_a_run() {
+                text.push_str(&format!(
+                    "; disabled, though not in every hardware profile (no CONFIGFLAG_DISABLED): a setup run's that stopped, which a \
+                     restart undoes, or another tool's for this profile only (devcon's disable, which persists): `acx-ll-cable enable \
+                     {}` turns it back on",
+                    c.label
+                ));
+            } else if self.disable_pending() {
+                text.push_str(&format!(
+                    "; disabled at the next restart (CONFIGFLAG_DISABLED is set: a disable Windows couldn't finish while the device was \
+                     in use): `acx-ll-cable enable {}` cancels it",
+                    c.label
+                ));
+            }
         }
         match self.breaker() {
             Breaker::Clear => {}
@@ -301,6 +328,8 @@ pub enum PlanError {
     OnSeveral { label: Label, nodes: Vec<String> },
     /// `enable` on a cable that isn't disabled, and isn't working either (`node`, described).
     NotDisabled { label: Label, node: String },
+    /// `variant` on a cable off on purpose ([`Node::off_on_purpose`]): its device re-made would be enabled, undoing the disable.
+    Disabled(Label),
     /// `--adopt`: no present node of ours has that instance ID.
     AdoptNotFound(String),
     /// `--adopt`: that node already has an identity (it is a cable already).
@@ -361,6 +390,12 @@ impl fmt::Display for PlanError {
                 f,
                 "cable {label} isn't disabled, but it isn't working either ({node}): `acx-ll-cable add {label}` repairs it. Nothing was \
                  changed."
+            ),
+            PlanError::Disabled(label) => write!(
+                f,
+                "cable {label} is disabled, or disabled at the next restart (`acx-ll-cable disable`'s, or Device Manager's): a variant \
+                 switch re-makes its device enabled, which would undo that. `acx-ll-cable enable {label}` first, then the switch \
+                 (`acx-ll-cable disable {label}` after it keeps the cable off). Nothing was changed."
             ),
             PlanError::AdoptNotFound(id) => write!(f, "no present device of ours is {id}: `acx-ll-cable list` shows them"),
             PlanError::AdoptHasIdentity(id) => write!(f, "{id} is a cable already (its instance ID has an identity): nothing to adopt"),
@@ -495,9 +530,11 @@ pub enum AddPlan {
     },
     /// Present and disabled on purpose, its only node (`acx-ll-cable disable`'s, or Device Manager's: it persists across
     /// restarts): left as it is, as `update` leaves it, `enable` turning it back on; recorded in the store if the store lacked it
-    /// (`identity`). A migration's record pending stays so: its endpoints can't be checked while it is off.
+    /// (`identity`). A migration's record pending stays so: its endpoints can't be checked while it is off. Its microphones stay
+    /// (`mics_differ`: microphones asked for that it doesn't have; `variant` switches once it is enabled).
     Disabled {
         node: usize,
+        mics_differ: Option<Variant>,
         identity: Identity,
     },
     /// Present but unhealthy (disabled for now, failing, refused by the crash breaker, or a duplicate): its newest node gets the
@@ -572,7 +609,8 @@ pub fn plan_add(
     if let [only] = own.as_slice()
         && nodes[*only].disabled_by_user()
     {
-        return Ok(AddPlan::Disabled { node: *only, identity });
+        let mics_differ = mics.filter(|&m| nodes[*only].variant() != Some(m));
+        return Ok(AddPlan::Disabled { node: *only, mics_differ, identity });
     }
     // Present but unhealthy (or several working: a setup error mended the same way): the newest node repaired in place
     if let Some(&newest) = own.iter().max_by_key(|&&i| nodes[i].cable.as_ref().map_or(0, |c| c.n)) {
@@ -641,16 +679,20 @@ fn present_nodes(label: &Label, action: &'static str, store: &[Entry], nodes: &[
     }
 }
 
-/// `disable <label>`: each of the cable's nodes not disabled persistently already (one disabled for now, by a run that stopped,
-/// included: a restart would bring it back), so the cable stays off across restarts until `enable`.
+/// `disable <label>`: each of the cable's nodes not disabled persistently already, so the cable stays off across restarts until
+/// `enable`. One disabled but not in every hardware profile (a stopped run's, which a restart would bring back, or another
+/// tool's for this profile only) is included, and so is one whose disable waits for a restart ([`Node::disable_pending`]:
+/// asked again, as the device may stop now).
 pub fn plan_disable(label: &Label, store: &[Entry], nodes: &[Node]) -> Result<StatePlan, PlanError> {
     let own = present_nodes(label, "disable", store, nodes)?;
     let (left, change) = own.into_iter().partition(|&i| nodes[i].disabled_by_user());
     Ok(StatePlan { label: label.clone(), change, left })
 }
 
-/// `enable <label>`: the cable's node, if it is disabled (persistently or not). One working is left (nothing to do); one with
-/// another problem is refused (`add` repairs it), as is an identity on several nodes (a setup error `add` mends).
+/// `enable <label>`: the cable's node, if it is disabled (persistently or not), or its disable waits for a restart
+/// ([`Node::disable_pending`], its health whatever it is: the enable cancels the disable, so the restart doesn't make it). One
+/// working is left (nothing to do); one with another problem is refused (`add` repairs it), as is an identity on several
+/// nodes (a setup error `add` mends).
 pub fn plan_enable(label: &Label, store: &[Entry], nodes: &[Node]) -> Result<StatePlan, PlanError> {
     let own = present_nodes(label, "enable", store, nodes)?;
     let [only] = own.as_slice() else {
@@ -658,6 +700,7 @@ pub fn plan_enable(label: &Label, store: &[Entry], nodes: &[Node]) -> Result<Sta
     };
     let n = &nodes[*only];
     match n.health {
+        _ if n.disable_pending() => Ok(StatePlan { label: label.clone(), change: own, left: Vec::new() }),
         Health::Problem(PROBLEM_DISABLED) => Ok(StatePlan { label: label.clone(), change: own, left: Vec::new() }),
         Health::Working => Ok(StatePlan { label: label.clone(), change: Vec::new(), left: own }),
         _ => Err(PlanError::NotDisabled { label: label.clone(), node: n.describe() }),
@@ -674,12 +717,16 @@ pub enum VariantPlan {
 }
 
 /// `variant <label> <mics>`: only that cable's nodes. `recreate` re-creates a cable that is that variant already (its
-/// microphones didn't come).
+/// microphones didn't come). A cable off on purpose ([`Node::off_on_purpose`], any of its nodes) is refused: its device
+/// re-made would be enabled, undoing the disable (`enable` first, `disable` after).
 pub fn plan_variant(label: &Label, target: Variant, recreate: bool, store: &[Entry], nodes: &[Node]) -> Result<VariantPlan, PlanError> {
     refuse_legacy(nodes)?;
     let Some(r) = resolve(label, store, nodes)? else { return Err(PlanError::NotPresent(label.clone())) };
     if r.nodes.is_empty() {
         return Err(PlanError::NotPresent(label.clone()));
+    }
+    if r.nodes.iter().any(|&i| nodes[i].off_on_purpose()) {
+        return Err(PlanError::Disabled(label.clone()));
     }
     if let [only] = r.nodes.as_slice()
         && !recreate
@@ -1201,10 +1248,22 @@ pub(crate) mod tests {
         nodes[1].health = Health::Problem(PROBLEM_DISABLED);
         nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
         let p = plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap();
-        assert_eq!(p, AddPlan::Disabled { node: 1, identity: Identity::Stored });
+        assert_eq!(p, AddPlan::Disabled { node: 1, mics_differ: None, identity: Identity::Stored });
         assert_eq!(plan_add(&label("B"), None, None, &store[..1], &nodes, cid(NEW_ID)).unwrap(), AddPlan::Disabled {
             node: 1,
+            mics_differ: None,
             identity: Identity::FromNode
+        });
+        // Other microphones asked for: said, not made (B stays as it is; `variant` switches once it is enabled)
+        assert_eq!(plan_add(&label("B"), Some(Variant::Call), None, &store, &nodes, cid(NEW_ID)).unwrap(), AddPlan::Disabled {
+            node: 1,
+            mics_differ: Some(Variant::Call),
+            identity: Identity::Stored
+        });
+        assert_eq!(plan_add(&label("B"), Some(Variant::LowLatency), None, &store, &nodes, cid(NEW_ID)).unwrap(), AddPlan::Disabled {
+            node: 1,
+            mics_differ: None,
+            identity: Identity::Stored
         });
         nodes[1].config_flags = Some(0);
         assert!(matches!(plan_add(&label("B"), None, None, &store, &nodes, cid(NEW_ID)).unwrap(), AddPlan::Repair { node: 1, .. }));
@@ -1231,6 +1290,22 @@ pub(crate) mod tests {
         assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap(), StatePlan { label: label("B"), change: vec![1], left: vec![] });
         // Working: nothing to enable
         assert_eq!(plan_enable(&label("A"), &store, &nodes).unwrap(), StatePlan { label: label("A"), change: vec![], left: vec![0] });
+        // A disable waiting for a restart (Windows couldn't stop it: `disable`'s exit 7): working, CONFIGFLAG_DISABLED set. The
+        // enable takes it (its global DICS_ENABLE clears the flag, so the restart doesn't disable it); a disable asks again
+        nodes[1].health = Health::Working;
+        assert!(nodes[1].disable_pending() && nodes[1].off_on_purpose() && !nodes[1].disabled_by_user());
+        assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap(), StatePlan { label: label("B"), change: vec![1], left: vec![] });
+        assert_eq!(plan_disable(&label("B"), &store, &nodes).unwrap(), StatePlan { label: label("B"), change: vec![1], left: vec![] });
+        // Failing too, with that flag: the enable still cancels the disable (then says it isn't working: `add` repairs it)
+        nodes[1].health = Health::Problem(PROBLEM_FAILED_ADD);
+        assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap().change, [1]);
+        // Working, the flags unread or clear: nothing pending, nothing to enable
+        nodes[1].health = Health::Working;
+        for flags in [None, Some(0)] {
+            nodes[1].config_flags = flags;
+            assert!(!nodes[1].disable_pending());
+            assert_eq!(plan_enable(&label("B"), &store, &nodes).unwrap().left, [1]);
+        }
         // Failing, not disabled: `add` repairs it
         nodes[1].health = Health::Problem(PROBLEM_FAILED_ADD);
         nodes[1].problem_status = Some(STATUS_START_BREAKER);
@@ -1261,8 +1336,9 @@ pub(crate) mod tests {
         assert!(matches!(plan_enable(&label("A"), &store, &old), Err(PlanError::Legacy(_))));
     }
 
-    /// `list` and every message say a cable's disable apart from a failure: off for good until `enable`, or for now (a stopped
-    /// run's); a failed node says its problem code only.
+    /// `list` and every message say a cable's disable apart from a failure: off for good until `enable`, or not in every
+    /// hardware profile (a stopped run's, or another tool's for this profile only), or waiting for a restart (working, with
+    /// CONFIGFLAG_DISABLED); a failed node says its problem code only.
     #[test]
     fn a_disabled_node_is_described_apart_from_a_failed_one() {
         let mut b = node("B", B_ID, 1, Variant::Both);
@@ -1276,14 +1352,54 @@ pub(crate) mod tests {
         );
         b.config_flags = Some(0);
         assert!(b.describe().ends_with(
-            "; disabled for now, not by its ConfigFlags (a setup run's that stopped, which a restart undoes, or another tool's): \
-             `acx-ll-cable enable B` turns it back on"
+            "; disabled, though not in every hardware profile (no CONFIGFLAG_DISABLED): a setup run's that stopped, which a restart \
+             undoes, or another tool's for this profile only (devcon's disable, which persists): `acx-ll-cable enable B` turns it \
+             back on"
         ));
+        // Working, the disable waiting for a restart
+        b.health = Health::Working;
+        b.config_flags = Some(CONFIGFLAG_DISABLED.0);
+        let pending = b.describe();
+        assert!(pending.contains("both microphones (ROOT\\AcxLlCable), working, driver oem12.inf"), "{pending}");
+        assert!(
+            pending.ends_with(
+                "; disabled at the next restart (CONFIGFLAG_DISABLED is set: a disable Windows couldn't finish while the device was \
+                 in use): `acx-ll-cable enable B` cancels it"
+            ),
+            "{pending}"
+        );
         b.health = Health::Problem(PROBLEM_FAILED_ADD);
+        b.config_flags = Some(0);
         let failed = b.describe();
         assert!(failed.contains("a problem: Code 31 (CM_PROB_FAILED_ADD)") && !failed.contains("disabled"), "{failed}");
         b.health = Health::Working;
         assert!(!b.describe().contains("disabled"));
+    }
+
+    /// `variant` refuses a cable off on purpose (disabled, or its disable waiting for a restart): its device re-made would be
+    /// enabled, undoing the disable, even a switch to the microphones it has. One disabled by a stopped run is switched as
+    /// before; another cable's disable doesn't matter.
+    #[test]
+    fn a_variant_switch_refuses_a_cable_disabled_on_purpose() {
+        let (store, mut nodes) = two();
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        nodes[1].config_flags = Some(CONFIGFLAG_DISABLED.0);
+        for (target, recreate) in [(Variant::Call, false), (Variant::LowLatency, false), (Variant::LowLatency, true)] {
+            let e = plan_variant(&label("B"), target, recreate, &store, &nodes).unwrap_err();
+            assert_eq!(e, PlanError::Disabled(label("B")), "{target:?} {recreate}");
+            assert!(e.to_string().contains("`acx-ll-cable enable B` first, then the switch"), "{e}");
+            assert!(e.to_string().ends_with("Nothing was changed."), "{e}");
+        }
+        // Its disable waiting for a restart: refused too
+        nodes[1].health = Health::Working;
+        assert_eq!(plan_variant(&label("B"), Variant::Call, false, &store, &nodes), Err(PlanError::Disabled(label("B"))));
+        assert_eq!(plan_variant(&label("B"), Variant::LowLatency, false, &store, &nodes), Err(PlanError::Disabled(label("B"))));
+        // A's switch is untouched by B's state
+        assert!(matches!(plan_variant(&label("A"), Variant::Call, false, &store, &nodes), Ok(VariantPlan::Switch(_))));
+        // Disabled by a stopped run (no CONFIGFLAG_DISABLED): switched as before
+        nodes[1].health = Health::Problem(PROBLEM_DISABLED);
+        nodes[1].config_flags = Some(0);
+        assert!(matches!(plan_variant(&label("B"), Variant::Call, false, &store, &nodes), Ok(VariantPlan::Switch(_))));
     }
 
     #[test]

@@ -82,7 +82,7 @@ microphones lack the role (a one-microphone variant), it is disabled (its endpoi
 its device isn't working, or Windows hasn't made that endpoint yet. Any user, on a control thread (it enumerates devices and
 reads endpoint properties through COM on a thread of its own), never an audio thread. From a shell: `acx-ll-cable endpoint
 <label|id> speakers|microphone|call-microphone` (or `scripts\Cable.ps1 endpoint ...`) prints `<id> <state> "<name>"` and
-exits 0, or says why on stderr and exits 3.
+exits 0, or says why on stderr and exits 3 (a caller may redirect the script's stderr: the exit code stays the tool's).
 
 **The boot crash breaker** (ours, for the owner's go; `Device.cpp` says what it can't catch). With Driver Verifier on at
 boot, a deterministic bugcheck in a cable's start would come back at every boot. AddDevice counts the device's start
@@ -117,9 +117,12 @@ direct feed takes over that cable's microphones while attached, and the others c
 cable's device node; the scripts run it, and fail if it isn't built (`-Build` builds it: `cargo build --release -p nf-vmic
 --bin acx-ll-cable`). In an elevated PowerShell window (`list` takes any user):
 - `scripts\Cable.ps1 list`: the present cables with their devices, endpoints and control devices, the remembered absent ones,
-  the old driver's devices and setup errors. A disabled cable's line ends `: disabled` (`: disabled for now` if not
-  persistently: a stopped setup run's), its device's line says how it comes back, and its endpoints are listed as not
-  present; a failed cable's device line says its problem code instead ("a problem: Code 31 ...").
+  the old driver's devices and setup errors. A disabled cable's line ends `: disabled`, its device's line says how it comes
+  back, and its endpoints are listed as not present; a failed cable's device line says its problem code instead ("a problem:
+  Code 31 ..."). A cable whose disable waits for a restart (below) ends `: disabled at the next restart`, its device working;
+  one disabled without CONFIGFLAG_DISABLED ends `: disabled, not in every hardware profile` (a setup run that stopped, which
+  a restart undoes, or another tool's for this profile only, devcon's disable: Windows' documented calls that aren't
+  deprecated don't tell the two apart).
 - `Cable.ps1 add <label> [-Mics both|call|low-latency] [-Adopt <instance ID>] [-EndpointMap <file>]`: makes a cable on the
   package the others run, with both microphones unless `-Mics` (or what it had). Present and working, or disabled: no change
   (`enable` turns a disabled cable on). Present but not working: repaired in place. Removed earlier: back with its identity
@@ -130,13 +133,19 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
   (`HKLM\SOFTWARE\ACX-LL-Cable\Cables`) unless `-Forget`.
 - `Cable.ps1 disable <label>` and `Cable.ps1 enable <label>` (`acx-ll-cable disable|enable <label>`): keeps the cable
   installed but off, across restarts too, until `enable`; its endpoints keep their ids (not present while it is off), so
-  apps find them again. Only that cable's device, through SetupAPI's DIF_PROPERTYCHANGE in every hardware profile, as Device
-  Manager disables a device (`crates\nf-vmic\src\setup\devices.rs` says why rather than CfgMgr32's `CM_DISABLE_PERSIST`).
-  `enable` clears the crash breaker's count first, waits for the device and its endpoints, and fails its check (exit 2) for an
-  endpoint that came back with a new id. A device Windows can't stop or start now is changed at the next restart (exit 7).
-  `update` leaves a disabled cable disabled, on the new package.
+  apps find them again. Only that cable's device, through SetupAPI's DIF_PROPERTYCHANGE: the disable in every hardware
+  profile (CONFIGFLAG_DISABLED, which the tool checks it set), the enable in every profile and then the current one, as
+  Microsoft's devcon sample enables, so a devcon disable (the current profile only) is undone too
+  (`crates\nf-vmic\src\setup\devices.rs` says why rather than CfgMgr32's `CM_DISABLE_PERSIST`). `enable` clears the crash
+  breaker's count first, checks CONFIGFLAG_DISABLED is gone, waits for the device and its endpoints, and fails its check
+  (exit 2) for an endpoint that came back with a new id. A device Windows can't stop or start now is changed at the next
+  restart (exit 7): a disable that waits so leaves the cable working until then, `list` saying so, and `enable` cancels it.
+  `update` leaves a disabled cable disabled, on the new package; `add` leaves it as it is (other microphones asked for are
+  said, not made).
 - `Cable.ps1 variant <label> both|call|low-latency`: re-creates that cable's device with the next instance number (new
-  endpoints, which Windows makes with the variant's default period); no other cable is touched.
+  endpoints, which Windows makes with the variant's default period); no other cable is touched. A disabled cable, or one
+  whose disable waits for a restart, is refused (exit 2): the re-made device would be enabled, so `enable` it first, switch,
+  then `disable` it again.
 
   `add` and `variant` put back the default roles Windows moved to a new endpoint.
 

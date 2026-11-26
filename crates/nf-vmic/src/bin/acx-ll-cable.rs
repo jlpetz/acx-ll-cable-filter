@@ -22,8 +22,10 @@ const USAGE: &str = "\
 acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers and microphones)
 
   acx-ll-cable list
-      The present cables, their devices and endpoints, the remembered absent ones, and setup errors; a disabled cable's line
-      ends \": disabled\" (\": disabled for now\" if not persistently: a stopped setup run's). Any user.
+      The present cables, their devices and endpoints, the remembered absent ones, and setup errors. A disabled cable's line
+      ends \": disabled\"; \": disabled at the next restart\" while a disable Windows couldn't finish waits for one (the
+      cable still works); \": disabled, not in every hardware profile\" for a stopped setup run's, or another tool's for this
+      profile only (devcon's). Any user.
   acx-ll-cable endpoint <label|id> speakers|microphone|call-microphone
       The cable's endpoint for that role as Windows has it now, found by the cable's identity and the endpoint's pin, never by
       name: one line, its id, its state (active, disabled in the Sound panel, unplugged) and its name in quotes. None now
@@ -41,9 +43,12 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
   acx-ll-cable disable <label>
   acx-ll-cable enable <label>
       Turns the cable off, keeping it installed, across restarts too, until `enable` turns it back on; its endpoints keep their
-      ids (not present while it is off). No other cable is touched. `enable` checks the endpoints came back as they were.
+      ids (not present while it is off). No other cable is touched. `enable` checks the endpoints came back as they were. A
+      disable Windows can't finish now (an app has the cable in use) is made at the next restart (exit 7): until then the
+      cable works, and `enable` cancels it.
   acx-ll-cable variant <label> both|call|low-latency
-      Switches the cable's microphones: its device re-created with new endpoints; no other cable is touched.
+      Switches the cable's microphones: its device re-created with new endpoints; no other cable is touched. A disabled
+      cable is refused (exit 2): `enable` it first, then switch, then `disable` it again to keep it off.
   acx-ll-cable update <package folder>
       Moves every cable to the package in the folder (driver\\out\\Release\\AudioCodec): every cable stops for a few seconds.
       If the old driver image doesn't unload (an app has a cable's control device open), every cable is put back as it was.

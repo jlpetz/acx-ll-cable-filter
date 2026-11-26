@@ -445,6 +445,11 @@ mod tests {
         assert_eq!(precheck(&label("C"), Variant::Call, &[], &nodes, &Ok(eps)), Precheck::Refused(PlanError::NotPresent(label("C"))));
         let unread = WinError { call: "IMMDeviceEnumerator::EnumAudioEndpoints", code: 5 };
         assert_eq!(precheck(&label("A"), Variant::Both, &[], &nodes, &Err(unread.clone())), Precheck::Unchecked(unread));
+        // B disabled on purpose (`acx-ll-cable disable`): refused before any prompt, so the app's switch doesn't undo the disable
+        let mut off = nodes.clone();
+        off[1].health = Health::Problem(plan::PROBLEM_DISABLED);
+        off[1].config_flags = Some(windows::Win32::Devices::DeviceAndDriverInstallation::CONFIGFLAG_DISABLED.0);
+        assert_eq!(precheck(&label("B"), Variant::Call, &[], &off, &Ok(vec![])), Precheck::Refused(PlanError::Disabled(label("B"))));
     }
 
     #[test]
