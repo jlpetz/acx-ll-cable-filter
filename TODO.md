@@ -219,10 +219,11 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 (C++, Spectre libraries, WDK extension), WDK and SDK 10.0.28000 (ACX 1.1, KMDF 1.35). VB-CABLE 3.3.1.7 loads on Server 2025.
 - The spike (the VM, 2026-11-20 to 22): checks 1-7 passed. float32 then 24-in-32 on both endpoints; the app-fed ring (`nf_vmic.h`, `crates/nf-vmic`) bit-exact into shared and exclusive recordings, two capture streams at once, a counted one-time skip at a reader handoff (the owner: keep it); hour soaks at 128 and 96 frames with no timer glitch; Driver Verifier clean after one fix to the sample's removal path (1a0353d). Open: forced PCM, mixed formats, physical Windows 11.
 - Latency (2026-11-23): speakers to mic by the device stamps 1.91 ms, Call Microphone 1.62, VB-CABLE 50-62; the ring to the recorder in the spike file's table.
-- Per-cable step 1 is installed under Verifier and merged (6a9cc7e). With the ed38955 tools, A recorded bit-exactly across B's disable/enable and removal/re-add. All three IDs survived the disable, all three changed on uninstall, and both replacement microphones opened by CableId and role. Setup restored the six default audio roles.
+- Under Verifier, A recorded bit-exactly through B's disable/enable and removal/re-add. All three IDs survived disable and changed on uninstall. Both replacement microphones opened by CableId and role (6a9cc7e, ed38955).
 - Windows Sound on the dev box shows `LLCable-<label> In`, `Out` and `Out-5ms` with directional icons. An in-place package update also changed the Windows endpoint IDs. The per-cable design records the upgrade and audio checks.
 - Fixed the 415-frame Media Player startup loss on the dev VM. The installed driver passed 100 restarts and 16 full plays. Release checks require zero unexplained loss, including clip edges (spike notes).
-**Next**: real standard-user UAC, Sound-panel disable, variant switches and physical latency/CPU tests. Aggregate diagnostics and restricted-token permissions passed on both cables. At the owner’s next planned reboot, check Z endpoint reuse and the scheduled Verifier settings. The Windows packet restamp remains in TODO 22.
+- Sound-panel disable and microphone variant switches passed on the VM, including bit-exact recordings and restoring default roles across new endpoint IDs.
+**Next**: real standard-user UAC and physical latency/CPU tests. Aggregate diagnostics and restricted-token permissions passed on both cables. At the owner’s next planned reboot, check Z endpoint reuse and the scheduled Verifier settings. The Windows packet restamp remains in TODO 22.
 **Detail**: `doc/todo/19-per-cable-design.md`, `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`, `doc/todo/19-spike-2026-11-20.md`
 
 ---
@@ -256,7 +257,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 24. [engine] Routing graph: split and merge feeds (groundwork for a mixer)
-**Priority**: High | **Status**: reusable packet graph and live WinUI mixer built. Verified stereo fan-out, two-source mixing, simultaneous external playback, live rack edits and per-cable pause and recovery. Dry A stayed bit-exact while B switched RNNoise five times and in a separate B device-disable test.
+**Priority**: High | **Status**: reusable packet graph and live WinUI mixer built. Verified stereo fan-out, two-source mixing, simultaneous external playback, live destination and rack edits, and per-cable pause and recovery. Adding or removing a destination kept its sibling's full clip bit-exact in both A/B orders. A mid-chain subscriber preserved the running AEC3 and RNNoise outputs in the offline comparison.
 - The graph runs shared stages once and splits, sums, balances and ducks native packets. Consecutive compatible speech stages share a 480-frame buffer. Direct branches keep the source clock. Independent WASAPI sinks have their own bounded queue.
 - The owner chose mono and stereo for the first routing implementation. Preserve left and right on stereo routes. Surround is a later feature.
 - The cables use the same QPC time base. A split can write each ring in one pass. Each reader keeps its own packet timing and headroom. External clocks need drift control and heavy stages get a worker with a deadline.

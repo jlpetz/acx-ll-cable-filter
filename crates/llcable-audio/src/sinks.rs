@@ -11,8 +11,8 @@ use std::time::Duration;
 use llcable_sdk::driver::{ReaderSample, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_LIVE_HANDOFF, STATE_READING};
 use llcable_sdk::{CableId, LIVE_CAPACITY, LiveFeed, Writer, attach_live_to};
 
+use super::Meter;
 use super::clock::{Drift, Frame, interpolate};
-use super::{Meter, State};
 
 const WATCH: Duration = Duration::from_millis(50);
 const RETRY: Duration = Duration::from_millis(500);
@@ -157,35 +157,35 @@ fn manage<T: PacketWriter>(
 }
 
 pub(super) struct Sink {
-    index: usize,
-    state: Arc<State>,
+    control: Arc<Control>,
     slot: Arc<AtomicPtr<(u64, CableWriter)>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Sink {
-    pub fn open(index: usize, state: &Arc<State>) -> Result<Self, String> {
+    pub fn open(control: &Arc<Control>, meter: &Arc<Meter>) -> Result<Self, String> {
         let slot = Arc::new(AtomicPtr::default());
         let worker_slot = Arc::clone(&slot);
-        let worker_state = Arc::clone(state);
+        let worker_control = Arc::clone(control);
+        let worker_meter = Arc::clone(meter);
         let (ready, wait) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("LLCable attachment".into())
-            .spawn(move || manage(&worker_state.cables[index], &worker_state.outputs[index], &worker_slot, ready, CableWriter::attach))
+            .spawn(move || manage(&worker_control, &worker_meter, &worker_slot, ready, CableWriter::attach))
             .map_err(|e| e.to_string())?;
-        let sink = Self { index, state: Arc::clone(state), slot, worker: Some(worker) };
+        let sink = Self { control: Arc::clone(control), slot, worker: Some(worker) };
         wait.recv().map_err(|_| "The cable attachment worker ended during startup.".to_owned())??;
         Ok(sink)
     }
 
     pub fn write(&self, samples: &[Frame], meter: &Meter) {
-        write(&self.slot, &self.state.cables[self.index], meter, samples);
+        write(&self.slot, &self.control, meter, samples);
     }
 }
 
 impl Drop for Sink {
     fn drop(&mut self) {
-        self.state.cables[self.index].quit.store(true, Release);
+        self.control.quit.store(true, Release);
         if let Some(t) = self.worker.take() {
             t.thread().unpark();
             let _ = t.join();

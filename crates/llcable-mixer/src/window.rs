@@ -233,7 +233,7 @@ impl Mixer {
 
     fn schedule_observations(&mut self, cx: &ComponentContext<Self>) {
         self.monitor.schedule(self.page == Page::Cables, self.inventory.as_deref(), cx);
-        if self.session.is_some() && self.route_clock.is_none() {
+        if !self.busy && self.session.is_some() && self.route_clock.is_none() {
             self.route_clock = Some(cx.spawn_background(|_| {
                 std::thread::sleep(Duration::from_millis(120));
                 Msg::RouteTick
@@ -683,7 +683,10 @@ impl Component for Mixer {
             }
             Msg::RouteTick => {
                 self.route_clock = None;
-                if let Some(session) = &self.session {
+                // A worker can commit the new destination order before RouteChanged installs its matching labels.
+                if !self.busy
+                    && let Some(session) = &self.session
+                {
                     self.status = Some(session.snapshot());
                 }
             }

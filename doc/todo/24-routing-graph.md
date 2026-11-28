@@ -63,12 +63,39 @@ reattachment. A received all 219,136 source frames bit-exact and consecutive, in
 count stayed at 12. B's recording contained 38,256 exact frames at gain 0.25 before the edit, 38,528 silent frames while
 released, and 38,256 exact frames at gain 0.5 in each of the post-resume and post-reattachment samples.
 
+### Adding and removing destinations during playback, 2026-11-29
+
+The release engine started with only A configured. During a coded stereo clip it added B before A in the output list
+and added an independent WASAPI playback device. It changed the playback gain, then removed both new destinations.
+A received all 201,216 submitted frames in sequence and bit-exact, including the changes. Its driver attachment count
+stayed at 17. B received 38,400 exact quarter-gain frames in the sample window. Both new destinations recorded silence
+before addition and after removal. Switching the external sink from unity to quarter gain produced left/right mean
+ratios of 0.253 and 0.261 on the same device. A preceding deliberately invalid playback selection released its tentative
+B attachment and left A running. In a separate run with B continuous and A joining, B received all 154,880 frames
+bit-exact and its attachment count stayed at 9. These were 128-frame virtual cable readers on the dev VM.
+
+The mixer's Wiring controls were also tested against the installed cables with an isolated settings profile. Starting
+audio, applying the addition and removal of B, then stopping audio produced one attachment and one release per cable.
+A kept its original attachment through both edits.
+
+A source rack can publish an intermediate stage to a new subscriber while its existing consumers keep their DSP history.
+An offline test added and removed a subscriber between Sonora AEC3 and RNNoise mid-hop. The full-chain audio matched an
+uninterrupted reference sample-for-sample, and the intermediate audio matched a separate AEC-only reference. A real-time
+allocation test covered the tapped pair from its first packet. Both branches use the same 480-frame adapter for those
+running stages.
+
+If a live edit extends a previously shorter voice rack with another block-based model, the original branch keeps its
+packet phase. The new tail can use a second adapter, adding 480 frames (10 ms at 48 kHz) on that branch. Starting the
+finished patch together lets compatible stages share one adapter. Removing the last subscriber from a tail stops its
+processing. A retired model's memory, and an idle CLAP helper if present, can remain until the rack is released.
+
 ### Running the probes
 
 To reproduce, take the virtual source's recording and matching playback IDs from `noise-filter-cli devices`.
 With `$capture` and `$playback` holding those IDs, run the following commands on idle virtual endpoints.
-The last command temporarily disables and re-enables the virtual Windows device labelled B. Its duration argument
-and the `switch` duration argument limit the source run time. Both commands stop the source when their checks finish.
+`continuity` temporarily disables and re-enables the virtual Windows device labelled B. `destinations` only edits the live
+patch. Use two idle virtual cable pairs for its optional WASAPI check: one for the source and another for the external
+destination. The duration for `switch`, `continuity` and `destinations` caps the source run. Each stops playback when its checks finish.
 
 ```powershell
 cargo build --release -p llcable-audio --example branch_probe
@@ -80,6 +107,10 @@ foreach ($mode in 'dry','rnnoise','rnnoise','dry','dry','rnnoise') {
 if ($LASTEXITCODE) { throw "Live switching probe failed" }
 cargo build --release -p nf-vmic --bin acx-ll-cable
 & .\target\release\examples\branch_probe.exe continuity $capture $playback A B 60 .\target\release\acx-ll-cable.exe
+& .\target\release\examples\branch_probe.exe destinations $capture $playback A B 20
+# Include a WASAPI output. $externalPlayback and $externalCapture are the playback and recording ends of the other virtual pair.
+& .\target\release\examples\branch_probe.exe destinations $capture $playback A B 20 $externalPlayback $externalCapture
+cargo test -p llcable-mixer apply_wiring_edits_on_installed_cables -- --ignored --nocapture
 ```
 
 ## The owner's intent (2026-11-26)

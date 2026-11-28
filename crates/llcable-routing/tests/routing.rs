@@ -33,6 +33,31 @@ fn dry_split_preserves_stereo_bits_and_merging_never_changes_the_dry_output() {
 }
 
 #[test]
+fn tapping_a_running_stage_keeps_the_input_clock_and_follows_exact_logical_positions() {
+    let source = || rack(0, vec![Effect::Gain(1.), Effect::Gain(0.5), Effect::Gain(2.)]);
+    let mut live = Router::new(48_000, 8, 1, vec![source()]).unwrap();
+    let mut next = Router::new(48_000, 8, 1, vec![source(), Bus { sends: vec![Send::unity(Tap::Stage(0, 1))], effects: vec![] }]).unwrap();
+    live.activate_edit(&mut next, &[(0, 0)]).unwrap();
+    let signal = [[0.125, -0.5]; 7];
+    live.process_stereo(&[&signal]).unwrap();
+    assert_eq!(live.output(0).unwrap(), signal);
+    assert_eq!(live.output(1).unwrap(), [[0.0625, -0.25]; 7]);
+    let mut shorter = Router::new(48_000, 8, 1, vec![rack(0, vec![Effect::Gain(1.), Effect::Gain(1.), Effect::ActivePrefix(2)])]).unwrap();
+    live.activate_edit(&mut shorter, &[(0, 0)]).unwrap();
+    live.process_stereo(&[&signal[..2]]).unwrap();
+    assert_eq!(live.output(0).unwrap(), [[0.0625, -0.25]; 2]);
+    let tap = Tap::Stage(0, 1);
+    assert_eq!(
+        Router::new(48_000, 8, 1, vec![rack(0, vec![Effect::Gain(1.), Effect::Gain(2.), Effect::ActivePrefix(1)]), Bus {
+            sends: vec![Send::unity(tap)],
+            effects: vec![],
+        }])
+        .err(),
+        Some(RoutingError::InvalidTap { bus: 1, tap })
+    );
+}
+
+#[test]
 fn source_bounds_cycles_and_invalid_controls_fail_at_build_time() {
     for (source, expected) in [
         (Tap::Input(1), RoutingError::InvalidTap { bus: 0, tap: Tap::Input(1) }),
@@ -168,6 +193,14 @@ fn late_thread_setup_refuses_the_whole_edit_before_any_rack_moves() {
     next.process_stereo(&input).unwrap();
     assert_eq!(active.output(0).unwrap(), [[3., 1.]]);
     assert_eq!(next.output(0).unwrap(), [[2., 2.]]);
+}
+
+#[test]
+fn a_retained_sidechain_cannot_follow_an_unrelated_rack_into_its_old_bus_index() {
+    let duck = || Effect::Duck { key: Tap::Bus(0), settings: Ducking::default() };
+    let mut running = Router::new(48_000, 128, 1, vec![rack(0, vec![]), rack(0, vec![duck()])]).unwrap();
+    let mut next = Router::new(48_000, 128, 1, vec![rack(0, vec![Effect::Gain(0.)]), rack(0, vec![]), rack(0, vec![duck()])]).unwrap();
+    assert_eq!(running.activate_edit(&mut next, &[(0, 1), (1, 2)]), Err(RoutingError::InvalidRetainedRack { old: 1, new: 2 }));
 }
 
 #[test]

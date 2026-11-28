@@ -2,6 +2,8 @@
 //! sends a finite clip through the production Session and records its direct A and B outputs independently.
 //! `switch` compares six alternating dry and RNNoise windows with both recording clients open. `continuity` takes the path of
 //! `acx-ll-cable.exe` after the duration and temporarily disables and re-enables the designated B cable's devnode.
+//! `destinations` starts with A alone, adds B ahead of A in the output list, then removes B while recording both cables.
+//! Append a separate virtual playback endpoint ID and its paired recording ID to include WASAPI destination churn.
 //! All times are host packet receipts. The input witness is a separate monitoring bus. A and B each subscribe directly to the source.
 #[path = "branch_probe/continuity.rs"]
 mod continuity;
@@ -126,7 +128,11 @@ fn check_rnnoise(rec: &Recording, expected_frames: usize) -> Result<(), String> 
 fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [mode, capture, player, a, b, seconds, extra @ ..] = args.as_slice() else {
-        return Err("Usage: branch_probe dry|rnnoise|switch|continuity <virtual source capture ID> <virtual source playback ID> <A label> <B label> <seconds> [setup executable for continuity]".into());
+        return Err(concat!(
+            "Usage: branch_probe dry|rnnoise|switch|continuity|destinations <source capture ID> <source playback ID> <A label> ",
+            "<B label> <seconds> [continuity: setup executable | destinations: external playback ID and paired capture ID]",
+        )
+        .into());
     };
     let seconds: usize = seconds.parse().map_err(|_| "Invalid duration.")?;
     if !(2..=MAX_SECONDS).contains(&seconds) {
@@ -137,6 +143,14 @@ fn main() -> Result<(), String> {
         let [exe] = extra else { return Err("Continuity needs the path to acx-ll-cable.exe to cycle B's device.".into()) };
         return continuity::run(patch, player, b, exe, seconds);
     }
+    if mode == "destinations" {
+        let output = match extra {
+            [] => None,
+            [render, record] => Some((render.as_str(), record.as_str())),
+            _ => return Err("Destinations optionally takes a separate virtual playback ID and its paired capture ID.".into()),
+        };
+        return continuity::destinations(patch, player, seconds, output);
+    }
     if !extra.is_empty() {
         return Err("Unexpected argument after duration.".into());
     }
@@ -144,7 +158,7 @@ fn main() -> Result<(), String> {
         "dry" => false,
         "rnnoise" => true,
         "switch" => return switch::run(patch, player, seconds),
-        _ => return Err("Choose dry, rnnoise, switch or continuity.".into()),
+        _ => return Err("Choose dry, rnnoise, switch, continuity or destinations.".into()),
     };
     let effects = if wet { vec![llcable_effects::noise_reduction()] } else { vec![] };
     let session = Session::start(patch.config(1., effects))?;

@@ -20,7 +20,9 @@ Open **Mixer** and select the destination you want to hear. Connect a source, th
 
 Source, send and destination racks accept ordered stages. AEC uses a selected reference, ducking lowers one signal in response to another, and a gate can close a branch independently of the denoiser. The stereo EQ has separate low, mid and high gains and works at the incoming packet size. RNNoise, Sonora suppression and the isolated CLAP voice host operate in mono on their own branches. An untouched stereo send preserves left and right.
 
-Select **Apply changes** to change a mix or its effects at the next audio packet. When the same devices stay open, other branches keep playing and unchanged effect racks keep their history. Changing the set of open sources or destinations briefly restarts the route. **Pause feed** releases just the selected cable for ordinary Windows playback. **Resume feed** reconnects it using its current mix. If Windows disables an active destination cable, the mixer reconnects it when it returns. **Stop audio** releases all the devices.
+Select **Apply changes** to add or remove a cable or playback destination while audio runs. If the recording sources stay the same, the other destinations keep playing, their meters keep counting, and a new send can listen between two running effects. A change to which sources are captured briefly restarts the route.
+
+**Pause feed** releases just the selected cable for ordinary Windows playback. **Resume feed** reconnects it using its current mix. If Windows disables an active destination cable, the mixer reconnects it when it returns. **Stop audio** releases all the devices.
 
 ## Try the single-chain settings app
 

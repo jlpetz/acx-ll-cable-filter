@@ -35,7 +35,11 @@ fn voice_processing_makes_no_audio_thread_allocations_or_frees_including_the_fir
         ("AEC3 and RNNoise", vec![echo_cancellation(Tap::Input(0)).unwrap(), noise_reduction()]),
     ] {
         let (effects, meters): (Vec<_>, Vec<_>) = effects.into_iter().map(|fx| fx.observe()).unzip();
-        let mut router = Router::new(48_000, 128, 1, vec![Bus { sends: vec![Send::unity(Tap::Input(0))], effects }]).unwrap();
+        let mut buses = vec![Bus { sends: vec![Send::unity(Tap::Input(0))], effects }];
+        if meters.len() > 1 {
+            buses.push(Bus { sends: vec![Send::unity(Tap::Stage(0, 0))], effects: vec![] });
+        }
+        let mut router = Router::new(48_000, 128, 1, buses).unwrap();
         let count = std::thread::spawn(move || {
             router.prepare_thread();
             let inputs = std::array::from_fn::<_, 128, _>(|i| [(i as f32 * 0.25).sin() * 0.3, (i as f32 * 0.125).cos() * 0.4]);

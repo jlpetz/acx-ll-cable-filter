@@ -154,9 +154,10 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
   whose disable waits for a restart, is refused (exit 2): the re-made device would be enabled, so `enable` it first, switch,
   then `disable` it again.
 
-  `add` and `variant` put back the default roles Windows moved to a new endpoint. For a package update, both setup
-  scripts also remember the invoking user's playback and recording defaults for all three roles. A default assigned
-  to one of our cables follows that cable and role to its new endpoint ID.
+  `add` puts back default roles Windows moved to a new endpoint. For a variant switch or package update, the setup scripts
+  remember the invoking user's playback and recording defaults for all three roles. A cable default follows that cable
+  and endpoint role to its new Windows ID. If a variant removes the default recording output, the surviving output on
+  the same cable takes its place.
 
 `scripts\Install-Driver.ps1` adds the package to the driver store, then:
 - the old driver's devices present (`ROOT\AudioCodec*` as A, `ROOT\NoiseFilterCableB` as B): the migration, once

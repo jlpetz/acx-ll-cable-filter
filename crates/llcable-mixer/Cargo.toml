@@ -18,4 +18,5 @@ windows-reactor.workspace = true
 windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
+nf-vmic.workspace = true
 windows-reactor = { workspace = true, features = ["test"] }

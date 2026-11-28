@@ -85,7 +85,7 @@ if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
     Write-Step 'Move every cable to the new package (acx-ll-cable update)'
     . (Join-Path $PSScriptRoot 'Update-DefaultAudio.ps1')
     $arguments = @('update', $package) + $map
-    $code = Invoke-CablePackageUpdate $tool $arguments
+    $code = Invoke-CableEndpointChange $tool $arguments
     Exit-ForToolCode $code 'the update' $status
     $switchA = $PSBoundParameters.ContainsKey('Variant')
 } else {
@@ -95,11 +95,10 @@ if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
 }
 
 if ($switchA) {
-    # -Variant switched the one device before cables; with cables, it is cable A's (nothing if A has it already). Like the
-    # switch here before, this doesn't restore default roles Windows moves; Cable.ps1 variant A does.
+    # -Variant applies to cable A. Its default assignments must follow the second endpoint change too.
     Write-Step "Cable A's variant: $Variant (acx-ll-cable variant A $Variant)"
     if ($EndpointMap) { Write-Note 'The endpoint map describes the package update. Switching variant can give A new endpoints again.' }
-    $code = Invoke-CableTool $tool @('variant', 'A', $Variant)
+    $code = Invoke-CableEndpointChange $tool @('variant', 'A', $Variant)
     Exit-ForToolCode $code "cable A's variant switch (the update is done)" $status
 }
 

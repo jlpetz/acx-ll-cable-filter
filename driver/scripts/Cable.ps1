@@ -14,6 +14,8 @@
     (not present while it is off), and enable checks they came back as they were. No other cable is touched. A disable
     Windows can't finish now (an app has the cable in use) is made at the next restart (exit 7): until then the cable works,
     list says it is disabled at the next restart, and enable cancels it. variant refuses a disabled cable: enable it first.
+    A variant switch preserves Windows defaults by cable ID and endpoint role. If it removes a default recording endpoint,
+    its role moves to the same cable's surviving recording endpoint.
 
     endpoint <label|id> speakers|microphone|call-microphone (any user) writes the cable's endpoint for that role as Windows has
     it now, found by the cable's identity and the endpoint's pin, never by name: one line, "<id> <state> "<name>"", to the
@@ -89,7 +91,7 @@ if ($Action -eq 'update') {
     $arguments = @('update', $Label)
     if ($EndpointMap) { $arguments += @('--endpoint-map', $EndpointMap) }
     . (Join-Path $PSScriptRoot 'Update-DefaultAudio.ps1')
-    Exit-ForToolCode (Invoke-CablePackageUpdate $tool $arguments) 'the update'
+    Exit-ForToolCode (Invoke-CableEndpointChange $tool $arguments) 'the update'
     exit 0
 }
 if (-not $Label) { throw "'$Action' takes a cable's label: Cable.ps1 $Action B" }
@@ -121,7 +123,13 @@ if ($Action -in 'remove', 'disable', 'enable') {
     exit 0
 }
 
-# add and variant make endpoints: note the default roles and the endpoints there now, and put back any role Windows moved to
+if ($Action -eq 'variant') {
+    . (Join-Path $PSScriptRoot 'Update-DefaultAudio.ps1')
+    Exit-ForToolCode (Invoke-CableEndpointChange $tool $arguments) "switching cable $Label to $To"
+    exit 0
+}
+
+# add makes endpoints: note the default roles and the endpoints there now, and put back any role Windows moved to
 # a new one (Cable-B.ps1's restore, for any cable)
 . (Join-Path $PSScriptRoot 'Set-DefaultAudio.ps1')
 $defaults = @{}

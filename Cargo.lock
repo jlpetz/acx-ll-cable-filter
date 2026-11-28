@@ -320,6 +320,7 @@ dependencies = [
  "llcable-effects",
  "nf-gui",
  "nf-mem",
+ "nf-vmic",
  "serde",
  "serde_json",
  "windows",

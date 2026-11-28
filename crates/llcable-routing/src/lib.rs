@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 pub enum Tap {
     Input(usize),
     Bus(usize),
+    /// Output of a zero-based logical effect on an earlier bus, including effects sharing one block adapter.
+    Stage(usize, usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,12 +96,28 @@ pub trait PacketEffect: std::marker::Send + std::any::Any {
         false
     }
 
+    /// A fused effect must make its intermediate stages available after a later live subscription.
+    /// Returning true also requires `limit_stages` to preserve a shortened live prefix at the current packet position.
+    fn supports_stage_taps(&self) -> bool {
+        false
+    }
+
+    /// Send each intermediate mono span to `publish` with its zero-based stage and packet offset. The final stage writes `stereo`.
+    fn process_tapped(&mut self, stereo: &mut [[f32; 2]], sidechain: Option<Input<'_>>, _publish: &mut dyn FnMut(usize, usize, &[f32])) {
+        self.process(stereo, sidechain);
+    }
+
+    /// Shorten a fused group on the audio thread while preserving its current packet phase. Called only for a partial group.
+    fn limit_stages(&mut self, _active: usize) {}
+
     /// `sidechain` is an aligned, read-only packet when this instance is routed as [`Effect::Sidechain`].
     fn process(&mut self, stereo: &mut [[f32; 2]], sidechain: Option<Input<'_>>);
 }
 
 pub enum Effect {
     Gain(f32),
+    /// Optional trailing rack metadata. Execute only the first `n` logical stages, retaining their DSP history through live shrink.
+    ActivePrefix(usize),
     Duck {
         key: Tap,
         settings: Ducking,
@@ -148,6 +166,16 @@ impl From<&EffectSpec> for Effect {
 pub struct Bus {
     pub sends: Vec<Send>,
     pub effects: Vec<Effect>,
+}
+
+impl Bus {
+    /// Ordered stages that produce audio. A retained rack can keep an inactive suffix until it is retired.
+    pub fn active_effects(&self) -> &[Effect] {
+        match self.effects.split_last() {
+            Some((Effect::ActivePrefix(n), stages)) => &stages[..(*n).min(stages.len())],
+            _ => &self.effects,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +243,7 @@ struct SendMix {
 }
 
 enum Processor {
+    Bypass,
     Gain(f32),
     Duck(Tap, Ducker),
     Custom(Option<Tap>, Box<dyn PacketEffect>),
@@ -222,6 +251,14 @@ enum Processor {
 }
 
 impl Processor {
+    fn key_mut(&mut self) -> Option<&mut Tap> {
+        match self {
+            Self::Duck(key, _) | Self::Custom(Some(key), _) => Some(key),
+            Self::Observed(inner, _) => inner.key_mut(),
+            _ => None,
+        }
+    }
+
     fn ready_on_thread(&self) -> bool {
         match self {
             Self::Custom(_, e) => e.ready_on_thread(),
@@ -240,6 +277,7 @@ impl Processor {
 
     fn process<'a>(&mut self, out: &mut [[f32; 2]], read: &impl Fn(Tap) -> Input<'a>) {
         match self {
+            Self::Bypass => {}
             Self::Gain(gain) => {
                 for frame in out {
                     frame[0] *= *gain;
@@ -262,14 +300,82 @@ impl Processor {
     }
 }
 
+struct Group {
+    first: usize,
+    end: usize,
+    processor: Processor,
+}
+
 struct ActiveBus {
     sends: Vec<SendMix>,
-    effects: Vec<Processor>,
+    effects: Vec<Group>,
     packet: Vec<[f32; 2]>,
+    stage_packets: Vec<Option<Vec<[f32; 2]>>>,
+    active: usize,
+    limit: Option<usize>,
     // A muted/no-op placeholder can declare the sidechain of a retained effect without compiling a processor.
-    keys: Vec<Tap>,
-    // Scratch for validating one-to-one live rack moves at the packet boundary.
-    retained: bool,
+    keys: Vec<(usize, Tap)>,
+    // The opposite router's bus index during a packet-boundary edit. No allocation on the capture thread.
+    retained_as: Option<usize>,
+}
+
+impl ActiveBus {
+    fn remap_effect_keys(&mut self, earlier: &[ActiveBus], active: usize) {
+        for g in self.effects.iter_mut().take_while(|g| g.first < active) {
+            if let Some(Tap::Bus(i) | Tap::Stage(i, _)) = g.processor.key_mut() {
+                *i = earlier[*i].retained_as.unwrap_or(*i);
+            }
+        }
+        for (_, key) in self.keys.iter_mut().take_while(|(i, _)| *i < active) {
+            if let Tap::Bus(i) | Tap::Stage(i, _) = key {
+                *i = earlier[*i].retained_as.unwrap_or(*i);
+            }
+        }
+    }
+
+    fn can_expose(&self, boundary: usize) -> bool {
+        self.effects
+            .iter()
+            .find(|g| boundary < g.end)
+            .is_some_and(|g| boundary + 1 == g.end || matches!(&g.processor, Processor::Custom(_, effect) if effect.supports_stage_taps()))
+    }
+
+    fn set_active(&mut self, active: usize) {
+        self.active = active;
+        if let Some(g) = self.effects.iter_mut().find(|g| g.first < active && active < g.end)
+            && let Processor::Custom(_, effect) = &mut g.processor
+        {
+            effect.limit_stages(active - g.first);
+        }
+    }
+
+    fn run_effects<'a>(&mut self, frames: usize, read: &impl Fn(Tap) -> Input<'a>) {
+        let out = &mut self.packet[..frames];
+        for g in self.effects.iter_mut().take_while(|g| g.first < self.active) {
+            let last = self.active.min(g.end) - 1;
+            if self.stage_packets.is_empty() {
+                g.processor.process(out, read);
+                continue;
+            }
+            if g.first < last
+                && self.stage_packets.get(g.first..last).is_some_and(|p| p.iter().any(Option::is_some))
+                && let Processor::Custom(key, effect) = &mut g.processor
+            {
+                effect.process_tapped(out, key.map(read), &mut |stage, offset, mono| {
+                    if let Some(Some(packet)) = self.stage_packets.get_mut(g.first + stage) {
+                        for (frame, &sample) in packet[offset..offset + mono.len()].iter_mut().zip(mono) {
+                            *frame = [sample; 2];
+                        }
+                    }
+                });
+            } else {
+                g.processor.process(out, read);
+            }
+            if let Some(Some(packet)) = self.stage_packets.get_mut(last) {
+                packet[..frames].copy_from_slice(out);
+            }
+        }
+    }
 }
 
 pub struct Router {
@@ -288,13 +394,35 @@ impl Router {
         if max_frames == 0 {
             return Err(RoutingError::InvalidCapacity);
         }
-        let mut active = Vec::with_capacity(buses.len());
-        for (bus, spec) in buses.into_iter().enumerate() {
+        let mut subscribed: Vec<Vec<bool>> = buses.iter().map(|b| vec![false; b.effects.len()]).collect();
+        for (bus, b) in buses.iter().enumerate() {
+            for tap in b.sends.iter().map(|s| s.from).chain(b.active_effects().iter().filter_map(Effect::key)) {
+                if let Tap::Stage(i, stage) = tap {
+                    let slot = subscribed.get_mut(i).and_then(|s| s.get_mut(stage)).ok_or(RoutingError::InvalidTap { bus, tap })?;
+                    *slot = true;
+                }
+            }
+        }
+        let mut active: Vec<ActiveBus> = Vec::with_capacity(buses.len());
+        for (bus, mut spec) in buses.into_iter().enumerate() {
             let check = |tap| match tap {
                 Tap::Input(i) if i < input_count => Ok(()),
                 Tap::Bus(i) if i < bus => Ok(()),
+                Tap::Stage(i, stage) if i < bus && stage < active[i].active => Ok(()),
                 _ => Err(RoutingError::InvalidTap { bus, tap }),
             };
+            let limit = match spec.effects.last() {
+                Some(Effect::ActivePrefix(n)) => {
+                    let n = *n;
+                    spec.effects.pop();
+                    if n > spec.effects.len() {
+                        return Err(RoutingError::InvalidEffect { bus });
+                    }
+                    Some(n)
+                }
+                _ => None,
+            };
+            let count = limit.unwrap_or(spec.effects.len());
             let mut sends = Vec::with_capacity(spec.sends.len());
             for send in spec.sends {
                 check(send.from)?;
@@ -308,9 +436,9 @@ impl Router {
                     });
                 }
             }
-            let keys = spec.effects.iter().filter_map(Effect::key).collect();
-            let mut effects = Vec::with_capacity(spec.effects.len());
-            for effect in spec.effects {
+            let keys = spec.effects.iter().take(count).enumerate().filter_map(|(i, e)| e.key().map(|key| (i, key))).collect();
+            let mut effects: Vec<Group> = Vec::with_capacity(spec.effects.len());
+            for (index, effect) in spec.effects.into_iter().take(count).enumerate() {
                 let (mut effect, mut meter) = (effect, None);
                 while let Effect::Observed(inner, handle) = effect {
                     effect = *inner;
@@ -318,15 +446,12 @@ impl Router {
                 }
                 let mut processor = match effect {
                     Effect::Gain(g) if !g.is_finite() => return Err(RoutingError::InvalidEffect { bus }),
-                    Effect::Gain(1.0) if meter.is_none() => continue,
+                    Effect::Gain(1.0) if meter.is_none() => Processor::Bypass,
                     Effect::Gain(g) => Processor::Gain(g),
                     Effect::Duck { key, settings } => {
                         check(key)?;
                         let duck = Ducker::new(settings, sample_rate).ok_or(RoutingError::InvalidEffect { bus })?;
-                        if settings.attenuation_db == 0.0 && meter.is_none() {
-                            continue;
-                        }
-                        Processor::Duck(key, duck)
+                        if settings.attenuation_db == 0.0 && meter.is_none() { Processor::Bypass } else { Processor::Duck(key, duck) }
                     }
                     Effect::Custom(effect) => Processor::Custom(None, effect),
                     Effect::Sidechain { key, effect } => {
@@ -334,6 +459,7 @@ impl Router {
                         Processor::Custom(Some(key), effect)
                     }
                     Effect::Observed(_, _) => unreachable!("unwrapped above"),
+                    Effect::ActivePrefix(_) => return Err(RoutingError::InvalidEffect { bus }),
                 };
                 if let Processor::Custom(_, effect) = &processor
                     && let Some(required) = effect.required_sample_rate()
@@ -351,17 +477,29 @@ impl Router {
                     }
                 }
                 if let Processor::Custom(None, next) = &mut processor
-                    && let Some(Processor::Custom(_, previous)) = effects.last_mut()
+                    && let Some(group) = effects.last_mut()
+                    && let Processor::Custom(_, previous) = &mut group.processor
+                    && (previous.supports_stage_taps() || !subscribed[bus][group.first..index].iter().any(|&tap| tap))
                     && previous.append_compatible(next.as_mut())
                 {
+                    group.end = index + 1;
                     continue;
                 }
-                effects.push(processor);
+                effects.push(Group { first: index, end: index + 1, processor });
             }
-            let mut packet = Vec::new();
-            packet.try_reserve_exact(max_frames).map_err(|_| RoutingError::InvalidCapacity)?;
-            packet.resize(max_frames, [0.0; 2]);
-            active.push(ActiveBus { sends, effects, packet, keys, retained: false });
+            let allocate_packet = || {
+                let mut packet = Vec::new();
+                packet.try_reserve_exact(max_frames).map_err(|_| RoutingError::InvalidCapacity)?;
+                packet.resize(max_frames, [0.0; 2]);
+                Ok(packet)
+            };
+            let packet = allocate_packet()?;
+            let stage_packets = if subscribed[bus].iter().take(count).any(|&tap| tap) {
+                subscribed[bus].iter().take(count).map(|&tap| tap.then(allocate_packet).transpose()).collect::<Result<_, RoutingError>>()?
+            } else {
+                Vec::new()
+            };
+            active.push(ActiveBus { sends, effects, packet, keys, stage_packets, active: count, limit, retained_as: None });
         }
         Ok(Self { buses: active, sample_rate, input_count, max_frames, frames: 0 })
     }
@@ -370,13 +508,13 @@ impl Router {
     pub fn prepare_thread(&mut self) {
         for bus in &mut self.buses {
             for stage in &mut bus.effects {
-                stage.prepare_thread();
+                stage.processor.prepare_thread();
             }
         }
     }
 
     /// Activate a replacement built for this stream at a packet boundary. Each `(old, new)` keeps the running rack and
-    /// uses the replacement bus's sends. The caller selects unchanged racks. A malformed mapping, changed sidechain
+    /// uses the replacement bus's sends. A sidechain follows its retained bus if its index moved. A malformed mapping, changed sidechain
     /// or new processor requiring thread setup refuses the whole edit. Destroy the displaced router on a control thread.
     pub fn activate_edit(&mut self, replacement: &mut Router, retained: &[(usize, usize)]) -> Result<(), RoutingError> {
         if self.sample_rate != replacement.sample_rate
@@ -386,24 +524,62 @@ impl Router {
             return Err(RoutingError::IncompatibleStream);
         }
         for bus in self.buses.iter_mut().chain(&mut replacement.buses) {
-            bus.retained = false;
+            bus.retained_as = None;
         }
         for &(old, new) in retained {
             let error = RoutingError::InvalidRetainedRack { old, new };
             let (Some(from), Some(to)) = (self.buses.get_mut(old), replacement.buses.get_mut(new)) else { return Err(error) };
-            if from.retained || to.retained || from.keys != to.keys {
+            if from.retained_as.is_some() || to.retained_as.is_some() {
                 return Err(error);
             }
-            from.retained = true;
-            to.retained = true;
+            from.retained_as = Some(new);
+            to.retained_as = Some(old);
+        }
+        for &(old, new) in retained {
+            let from = &self.buses[old];
+            let to = &replacement.buses[new];
+            let keep = to.limit.unwrap_or(from.active);
+            let same_bus =
+                |i: usize, j: usize| self.buses[i].retained_as.unwrap_or(i) == j && replacement.buses[j].retained_as.unwrap_or(j) == i;
+            let same_key = |before: Tap, after: Tap| match (before, after) {
+                (Tap::Bus(i), Tap::Bus(j)) => same_bus(i, j),
+                (Tap::Stage(i, a), Tap::Stage(j, b)) => a == b && same_bus(i, j),
+                _ => before == after,
+            };
+            let old_keys = &from.keys[..from.keys.partition_point(|(i, _)| *i < keep)];
+            let new_keys = &to.keys[..to.keys.partition_point(|(i, _)| *i < to.active)];
+            // Historical callers use sparse placeholders carrying just the sidechain edges. Publishing intermediate stages
+            // requires full logical positions so that loop validation and the running processors describe the same prefix.
+            let positional = !to.stage_packets.is_empty() || !from.stage_packets.is_empty() || to.limit.is_some();
+            let keys_match = old_keys.len() == new_keys.len()
+                && old_keys.iter().zip(new_keys).all(|((i, a), (j, b))| (!positional || i == j) && same_key(*a, *b));
+            if !keys_match
+                || (positional && to.active != keep)
+                || keep > from.active
+                || (keep < from.active && keep > 0 && !from.can_expose(keep - 1))
+                || to.stage_packets.iter().enumerate().any(|(i, p)| p.is_some() && (i >= keep || !from.can_expose(i)))
+            {
+                return Err(RoutingError::InvalidRetainedRack { old, new });
+            }
         }
         for (bus, b) in replacement.buses.iter().enumerate() {
-            if !b.retained && !b.effects.iter().all(Processor::ready_on_thread) {
+            if b.retained_as.is_none() && !b.effects.iter().all(|g| g.processor.ready_on_thread()) {
                 return Err(RoutingError::EffectNeedsThreadSetup { bus });
             }
         }
         for &(old, new) in retained {
-            std::mem::swap(&mut self.buses[old].effects, &mut replacement.buses[new].effects);
+            let (old_prefix, old_tail) = self.buses.split_at_mut(old);
+            let (new_prefix, new_tail) = replacement.buses.split_at_mut(new);
+            let (from, to) = (&mut old_tail[0], &mut new_tail[0]);
+            let keep = to.limit.unwrap_or(from.active);
+            from.remap_effect_keys(old_prefix, keep);
+            to.remap_effect_keys(new_prefix, to.active);
+            if keep < from.active {
+                from.set_active(keep);
+            }
+            std::mem::swap(&mut from.keys, &mut to.keys);
+            std::mem::swap(&mut from.active, &mut to.active);
+            std::mem::swap(&mut from.effects, &mut to.effects);
         }
         std::mem::swap(self, replacement);
         Ok(())
@@ -436,6 +612,9 @@ impl Router {
             let read = |tap| match tap {
                 Tap::Input(i) => input(i),
                 Tap::Bus(i) => Input::Stereo(&prior[i].packet[..frames]),
+                Tap::Stage(i, stage) => {
+                    Input::Stereo(&prior[i].stage_packets[stage].as_ref().expect("subscribed stage has storage")[..frames])
+                }
             };
             let out = &mut bus.packet[..frames];
             if let Some((first, others)) = bus.sends.split_first() {
@@ -446,9 +625,7 @@ impl Router {
             } else {
                 out.fill([0.0; 2]);
             }
-            for effect in &mut bus.effects {
-                effect.process(out, &read);
-            }
+            bus.run_effects(frames, &read);
         }
         self.frames = frames;
         Ok(())

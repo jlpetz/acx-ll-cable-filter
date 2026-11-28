@@ -1,7 +1,7 @@
 //! Optional Rust voice effects for a 48 kHz [`llcable_routing::Router`]. Consecutive mono voice stages share one 480-frame
 //! packet adapter. Each model retains its own algorithmic delay. A sidechain on a later stage starts a new group, keeping its
-//! reference aligned to the packet supplied by the router. A voice branch duplicates its output to stereo. An empty branch
-//! bypasses both the model and that buffering. The linked stereo gate can operate on a single frame with no lookahead.
+//! reference aligned to the packet supplied by the router. Intermediate taps read the same hop and phase as the group's stereo
+//! output. An empty branch bypasses both the model and that buffering. The linked stereo gate can operate on a single frame with no lookahead.
 //! Construct and destroy effects off the audio callback. Call `router.prepare_thread()` on the thread where audio will run
 //! before starting the stream, since RNNoise's FFT scratch belongs to that thread.
 
@@ -45,19 +45,26 @@ struct VoiceStage {
     model: Box<dyn VoiceModel>,
     mic_dither: Option<Dither>,
     meter: Option<StageMeter>,
+    // Retain the clean result until the next hop. A mid-hop subscriber immediately sees the same phase as the final output.
+    output: Block,
 }
 
 struct Voice {
     stages: Vec<VoiceStage>,
-    blocks: [Block; 2],
-    active: usize,
+    active_stages: usize,
+    input: Block,
     cursor: usize,
 }
 
 impl Voice {
     fn new(model: impl VoiceModel + 'static, mic_dither: bool) -> Self {
-        let stage = VoiceStage { model: Box::new(model), mic_dither: mic_dither.then(|| Dither::new(0x2545_F491)), meter: None };
-        Self { stages: vec![stage], blocks: [[0.0; BLOCK]; 2], active: 0, cursor: 0 }
+        let stage = VoiceStage {
+            model: Box::new(model),
+            mic_dither: mic_dither.then(|| Dither::new(0x2545_F491)),
+            meter: None,
+            output: [0.; BLOCK],
+        };
+        Self { stages: vec![stage], active_stages: 1, input: [0.0; BLOCK], cursor: 0 }
     }
 
     fn effect(model: impl VoiceModel + 'static) -> Effect {
@@ -65,23 +72,54 @@ impl Voice {
     }
 
     fn hop(&mut self) {
-        let [a, b] = &mut self.blocks;
-        let (mut source, mut dest) = if self.active == 0 { (a, b) } else { (b, a) };
-        for stage in &mut self.stages {
+        let mut previous: Option<&Block> = None;
+        for stage in &mut self.stages[..self.active_stages] {
             let peak = |block: &Block| block.iter().fold(0.0f32, |p, &sample| p.max(sample.abs()));
-            let input_peak = stage.meter.as_ref().map(|_| peak(source));
-            // Keep the model out of subnormal arithmetic after speech, as in the legacy microphone chain.
-            if let Some(dither) = &mut stage.mic_dither {
-                dither.apply(source, 1e-9);
-            }
-            stage.model.process(source, dest);
-            dest.iter_mut().for_each(|x| *x = sanitize(*x).clamp(-1.0, 1.0));
+            let input_peak = stage.meter.as_ref().map(|_| peak(previous.unwrap_or(&self.input)));
+            let source = if let Some(dither) = &mut stage.mic_dither {
+                // Reuse the consumed input as scratch. The next model's denormal protection must not change an earlier tap.
+                if let Some(previous) = previous {
+                    self.input.copy_from_slice(previous);
+                }
+                dither.apply(&mut self.input, 1e-9);
+                &self.input
+            } else {
+                previous.unwrap_or(&self.input)
+            };
+            stage.model.process(source, &mut stage.output);
+            stage.output.iter_mut().for_each(|x| *x = sanitize(*x).clamp(-1.0, 1.0));
             if let Some(meter) = &stage.meter {
-                meter.publish(StageReading { input_peak, output_peak: Some(peak(dest)), ..stage.model.reading() });
+                meter.publish(StageReading { input_peak, output_peak: Some(peak(&stage.output)), ..stage.model.reading() });
             }
-            std::mem::swap(&mut source, &mut dest);
+            previous = Some(&stage.output);
         }
-        self.active ^= self.stages.len() % 2;
+    }
+
+    fn process_packet(
+        &mut self, mut frames: &mut [[f32; 2]], key: Option<Input<'_>>, mut emit: impl FnMut(&[VoiceStage], usize, Range<usize>),
+    ) {
+        let mut offset = 0;
+        while !frames.is_empty() {
+            let n = frames.len().min(BLOCK - self.cursor);
+            let (packet, rest) = frames.split_at_mut(n);
+            let span = self.cursor..self.cursor + n;
+            if let Some(key) = key {
+                self.stages[0].model.reference(key, offset, span.clone());
+            }
+            let (last, intermediates) = self.stages[..self.active_stages].split_last().expect("a voice group has an active stage");
+            emit(intermediates, offset, span.clone());
+            for ((stereo, input), &output) in packet.iter_mut().zip(&mut self.input[span.clone()]).zip(&last.output[span]) {
+                *input = 0.5 * (sanitize(stereo[0]) + sanitize(stereo[1]));
+                *stereo = [output; 2];
+            }
+            self.cursor += n;
+            offset += n;
+            if self.cursor == BLOCK {
+                self.hop();
+                self.cursor = 0;
+            }
+            frames = rest;
+        }
     }
 }
 
@@ -109,34 +147,33 @@ impl PacketEffect for Voice {
     fn append_compatible(&mut self, next: &mut dyn PacketEffect) -> bool {
         if let Some(next) = (next as &mut dyn std::any::Any).downcast_mut::<Self>() {
             self.stages.append(&mut next.stages);
+            self.active_stages = self.stages.len();
             true
         } else {
             false
         }
     }
 
-    fn process(&mut self, mut frames: &mut [[f32; 2]], key: Option<Input<'_>>) {
-        let mut offset = 0;
-        while !frames.is_empty() {
-            let n = frames.len().min(BLOCK - self.cursor);
-            let (packet, rest) = frames.split_at_mut(n);
-            let span = self.cursor..self.cursor + n;
-            if let Some(key) = key {
-                self.stages[0].model.reference(key, offset, span.clone());
+    fn process(&mut self, frames: &mut [[f32; 2]], key: Option<Input<'_>>) {
+        self.process_packet(frames, key, |_, _, _| {});
+    }
+
+    fn supports_stage_taps(&self) -> bool {
+        true
+    }
+
+    fn limit_stages(&mut self, active: usize) {
+        assert!((1..=self.active_stages).contains(&active), "only an active voice prefix can survive a live edit");
+        // The old suffix stays allocated until the group is dropped off the audio thread.
+        self.active_stages = active;
+    }
+
+    fn process_tapped(&mut self, frames: &mut [[f32; 2]], key: Option<Input<'_>>, output: &mut dyn FnMut(usize, usize, &[f32])) {
+        self.process_packet(frames, key, |stages, offset, span| {
+            for (i, stage) in stages.iter().enumerate() {
+                output(i, offset, &stage.output[span.clone()]);
             }
-            // Drain the previous result and reuse each consumed slot for the next input hop.
-            for (stereo, slot) in packet.iter_mut().zip(&mut self.blocks[self.active][span]) {
-                let previous = std::mem::replace(slot, 0.5 * (sanitize(stereo[0]) + sanitize(stereo[1])));
-                *stereo = [previous; 2];
-            }
-            self.cursor += n;
-            offset += n;
-            if self.cursor == BLOCK {
-                self.hop();
-                self.cursor = 0;
-            }
-            frames = rest;
-        }
+        });
     }
 }
 
@@ -361,6 +398,79 @@ mod tests {
     impl VoiceModel for Half {
         fn process(&mut self, input: &Block, out: &mut Block) {
             out.iter_mut().zip(input).for_each(|(y, &x)| *y = x * 0.5);
+        }
+    }
+
+    #[test]
+    fn mid_hop_taps_and_prefix_retirement_preserve_samples_dither_phase_and_meters() {
+        let sizes = [313, 200, 1100, 129, 789, 17, 333, 849];
+        let length: usize = sizes.iter().sum();
+        let mic: Vec<_> = (0..length).map(|i| (i as i32 % 71 - 40) as f32 * 1e-9).collect();
+        let key: Vec<_> = (0..length).map(|i| (i as i32 % 29 - 13) as f32 * 1e-9).collect();
+
+        // Each stage has its own dither generator. The prefix tap contains only stage one's dither, including after
+        // the downstream stage has consumed the same hop. Index the expected traces by *delivery* frame.
+        let mut generator1 = Dither::new(0x2545_F491);
+        let mut generator2 = generator1.clone();
+        let mut prefix = vec![0.0; length + 2 * BLOCK];
+        let mut delayed = prefix.clone();
+        for (block, mut hop) in mic.as_chunks::<BLOCK>().0.iter().copied().enumerate() {
+            let first = block * BLOCK;
+            generator1.apply(&mut hop, 1e-9);
+            for (sample, reference) in hop.iter_mut().zip(&key[first..]) {
+                *sample += reference;
+            }
+            prefix[first + BLOCK..first + 2 * BLOCK].copy_from_slice(&hop);
+            generator2.apply(&mut hop, 1e-9);
+            delayed[first + 2 * BLOCK..first + 3 * BLOCK].copy_from_slice(&hop);
+        }
+
+        let mut fused = Voice::new(Reference([0.; BLOCK]), true);
+        let mut delay = Voice::new(Delay([0.; BLOCK]), true);
+        let mut last = Voice::new(Half, false);
+        let meter = StageMeter::default();
+        let tail_meter = StageMeter::default();
+        fused.set_meter(&meter);
+        last.set_meter(&tail_meter);
+        assert!(fused.append_compatible(&mut delay));
+        assert!(fused.append_compatible(&mut last));
+        let mut first = 0;
+        let mut frozen = None;
+        for (index, n) in sizes.into_iter().enumerate() {
+            let mut packet: Vec<_> = mic[first..first + n].iter().map(|&x| [x; 2]).collect();
+            let reference = Some(Input::Mono(&key[first..first + n]));
+            if index == 5 {
+                assert_ne!(first % BLOCK, 0);
+                fused.limit_stages(1);
+                frozen = Some(tail_meter.read());
+            }
+            if index == 2 || index == 4 {
+                // The first subscription starts 33 frames into an already computed hop; a single packet can cross multiple hops.
+                let mut next_offset = [0; 2];
+                fused.process_tapped(&mut packet, reference, &mut |stage, offset, samples| {
+                    assert_eq!(offset, next_offset[stage]);
+                    let start = first + offset;
+                    let expected = if stage == 0 { &prefix } else { &delayed };
+                    assert_eq!(samples, &expected[start..start + samples.len()]);
+                    next_offset[stage] += samples.len();
+                });
+                assert_eq!(next_offset, [n; 2]);
+            } else {
+                fused.process(&mut packet, reference);
+            }
+            for (offset, frame) in packet.iter().enumerate() {
+                let i = first + offset;
+                assert_eq!(*frame, [if index < 5 { delayed[i] * 0.5 } else { prefix[i] }; 2], "frame {i}");
+            }
+            first += n;
+            if first >= BLOCK {
+                let start = first / BLOCK * BLOCK;
+                let expected_peak = prefix[start..start + BLOCK].iter().fold(0.0f32, |p, s| p.max(s.abs()));
+                assert_eq!(meter.read().output_peak, Some(expected_peak));
+            }
+            if let Some(reading) = frozen {
+                assert_eq!(tail_meter.read(), reading);
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-use llcable_routing::{Bus, Effect, Tap};
+use llcable_routing::{Bus, Tap};
 use llcable_sdk::driver::{CableInstance, Resolved, Snapshot};
 use llcable_sdk::{CableId, EndpointKind};
 
@@ -48,23 +48,37 @@ pub(super) fn resolve(selectors: &[String], playback: bool) -> Result<(Vec<Strin
 pub(super) fn check_loops<T: Ord + Clone + std::fmt::Display>(
     inputs: &[Option<T>], targets: &[T], outputs: &[usize], buses: &[Bus],
 ) -> Result<(), String> {
-    let mut origins: Vec<Vec<T>> = Vec::new();
+    let mut origins: Vec<(Vec<T>, Vec<Vec<T>>)> = Vec::new();
     for bus in buses {
         let mut upstream = Vec::new();
-        let keys = bus.effects.iter().filter_map(Effect::key);
-        for tap in bus.sends.iter().map(|s| s.from).chain(keys) {
+        let append = |upstream: &mut Vec<T>, tap| -> Result<(), String> {
             match tap {
                 Tap::Input(i) => upstream.extend(inputs.get(i).ok_or("A send references a missing source.")?.iter().cloned()),
-                Tap::Bus(i) => upstream.extend(origins.get(i).ok_or("A send references a later or missing bus.")?.iter().cloned()),
+                Tap::Bus(i) => upstream.extend(origins.get(i).ok_or("A send references a later or missing bus.")?.0.iter().cloned()),
+                Tap::Stage(i, stage) => {
+                    let prefix = origins.get(i).and_then(|(_, stages)| stages.get(stage)).ok_or("A send references a missing stage.")?;
+                    upstream.extend(prefix.iter().cloned());
+                }
             }
+            upstream.sort_unstable();
+            upstream.dedup();
+            Ok(())
+        };
+        for send in &bus.sends {
+            append(&mut upstream, send.from)?;
         }
-        upstream.sort_unstable();
-        upstream.dedup();
-        origins.push(upstream);
+        let mut stages = Vec::new();
+        for stage in bus.active_effects() {
+            if let Some(key) = stage.key() {
+                append(&mut upstream, key)?;
+            }
+            stages.push(upstream.clone());
+        }
+        origins.push((upstream, stages));
     }
     let mut reachable = vec![vec![false; targets.len()]; targets.len()];
     for (i, &bus) in outputs.iter().enumerate() {
-        let upstream = origins.get(bus).ok_or("A cable references a missing bus.")?;
+        let (upstream, _) = origins.get(bus).ok_or("A cable references a missing bus.")?;
         for (j, cable) in targets.iter().enumerate() {
             reachable[i][j] = upstream.contains(cable);
         }
@@ -87,7 +101,7 @@ pub(super) fn check_loops<T: Ord + Clone + std::fmt::Display>(
 
 #[cfg(test)]
 mod tests {
-    use llcable_routing::Send;
+    use llcable_routing::{Effect, Send};
 
     use super::*;
 
@@ -99,5 +113,19 @@ mod tests {
         assert!(check_loops(&[Some(a), None], &[b, a], &[0, 1], &buses).is_ok());
         assert!(check_loops(&[Some(a), Some(b)], &[b, a], &[0, 1], &buses).is_err());
         assert!(check_loops(&[Some(a), None], &[a], &[0], &buses).is_err());
+    }
+
+    #[test]
+    fn a_stage_tap_only_inherits_the_sidechain_of_effects_already_applied() {
+        let a = CableId(1);
+        let b = CableId(2);
+        let bus = Bus {
+            sends: vec![Send::unity(Tap::Input(0))],
+            effects: vec![Effect::Gain(0.5), Effect::Duck { key: Tap::Input(1), settings: Default::default() }],
+        };
+        let mut buses = [bus, Bus { sends: vec![Send::unity(Tap::Stage(0, 0))], effects: vec![] }];
+        assert!(check_loops(&[None, Some(a)], &[a, b], &[1, 0], &buses).is_ok());
+        buses[1].sends[0].from = Tap::Stage(0, 1);
+        assert!(check_loops(&[None, Some(a)], &[a, b], &[1, 0], &buses).is_err());
     }
 }

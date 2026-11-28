@@ -189,3 +189,105 @@ fn check_windows_effects_from_cable_cards() {
     }
     assert!(total > 0, "Install a cable with an active recording port to run this check");
 }
+
+#[test]
+#[ignore = "drives the mixer against installed idle LLCables A and B using VB-CABLE A as its recording source"]
+fn apply_wiring_edits_on_installed_cables() {
+    use std::time::{Duration, Instant};
+    use std::{env, fs, process, thread};
+
+    use nf_vmic::Device;
+    use nf_vmic::protocol::{STATS_ATTACHED, control_path};
+    use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
+
+    use crate::patch;
+    use crate::window::{Mixer, Page};
+
+    // Exercise normal persistence in a child process so the real roaming profile and parallel tests stay untouched.
+    const CHILD: &str = "LLCABLE_MIXER_WIRING_SMOKE_PROFILE";
+    let Some(profile) = env::var_os(CHILD) else {
+        let dir = env::temp_dir().join(format!("llcable-mixer-wiring-{}", process::id()));
+        fs::create_dir(&dir).unwrap();
+        let result = process::Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "desk::metric_tests::apply_wiring_edits_on_installed_cables", "--nocapture"])
+            .env(CHILD, &dir)
+            .env("APPDATA", &dir)
+            .status();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(result.unwrap().success(), "isolated mixer run failed");
+        return;
+    };
+    assert_eq!(Some(profile), env::var_os("APPDATA"));
+    assert!(!patch::path().unwrap().exists());
+    let inventory = patch::Inventory::read().unwrap();
+    let source = inventory
+        .sources
+        .iter()
+        .find(|s| {
+            let label = s.label.to_ascii_lowercase();
+            s.owner.is_none() && !s.id.starts_with("loopback:") && label.starts_with("cable-a output") && label.contains("vb-audio")
+        })
+        .expect("Install VB-Audio Cable A with its default recording endpoint name");
+    let cables = ["A", "B"].map(|label| {
+        let cable = inventory.cables.iter().find(|c| c.label == label).expect("Install LLCables A and B");
+        let output = inventory.outputs.iter().find(|out| out.cable == Some(cable.id)).unwrap();
+        (output.name.as_str(), Device::open_path(&control_path(&cable.id)).unwrap())
+    });
+    let state = || {
+        cables.each_ref().map(|(_, dev)| {
+            let s = dev.stats().unwrap();
+            (s.ring.attaches, s.ring.detaches, s.flags & STATS_ATTACHED != 0)
+        })
+    };
+    let baseline = state();
+    assert!(baseline.iter().all(|s| !s.2), "Both cables must be available before this smoke test");
+    let mut panel = mount(View::component::<Mixer>(Page::Wiring));
+    let button = |p: &Panel, name: &str| {
+        nodes(p).find(|&id| {
+            p.event_revision(id, EventId::ButtonClick).is_some()
+                && (text_property(p, id, PropertyId::AutomationName) == Some(name)
+                    || p.runtime()
+                        .node(id)
+                        .unwrap()
+                        .children()
+                        .iter()
+                        .any(|&n| text_property(p, n, PropertyId::TextBlockText) == Some(name)))
+        })
+    };
+    let wait = |p: &mut Panel, desc: &str, ready: &dyn Fn(&Panel) -> bool| {
+        let start = Instant::now();
+        while !ready(p) {
+            p.dispatch_components(32).unwrap();
+            let error = nodes(p).filter_map(|id| text_property(p, id, PropertyId::TextBlockText)).find(|s| s.starts_with("Error · "));
+            assert!(error.is_none(), "Mixer reported {error:?} while waiting for {desc}");
+            assert!(start.elapsed() < Duration::from_secs(15), "Timed out waiting for {desc}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let click = |p: &mut Panel, label: &str| {
+        wait(p, label, &|p| button(p, label).is_some());
+        let node = button(p, label).unwrap();
+        assert_ne!(p.runtime().node(node).unwrap().property(PropertyId::ButtonIsEnabled), Some(&PropertyValue::Bool(false)), "{label}");
+        let revision = p.event_revision(node, EventId::ButtonClick).unwrap();
+        p.queue_event(QueuedEvent::new(node, EventId::ButtonClick, revision, EventPayload::Unit));
+        p.dispatch_events().unwrap();
+        p.dispatch_components(32).unwrap();
+    };
+    for (action, output, apply, status, expected) in [
+        ("Connect", 0, "Start audio", "Audio running", [(1, 0, true), (0, 0, false)]),
+        ("Connect", 1, "Apply changes", "Audio running", [(1, 0, true), (1, 0, true)]),
+        ("Disconnect", 1, "Apply changes", "Audio running", [(1, 0, true), (1, 1, false)]),
+        ("", 0, "Stop audio", "Audio stopped", [(1, 1, false), (1, 1, false)]),
+    ] {
+        if !action.is_empty() {
+            click(&mut panel, &format!("{action} {} {}", source.label, cables[output].0));
+        }
+        click(&mut panel, apply);
+        wait(&mut panel, status, &|p| nodes(p).any(|id| text_property(p, id, PropertyId::TextBlockText) == Some(status)));
+        let change = |i: usize, live: (u64, u64, bool)| (live.0 - baseline[i].0, live.1 - baseline[i].1, live.2);
+        let [a, b] = state();
+        let actual = [change(0, a), change(1, b)];
+        println!("{apply} · {status} · A/B (attaches, detaches, attached) = {actual:?}");
+        assert_eq!(actual, expected);
+    }
+}

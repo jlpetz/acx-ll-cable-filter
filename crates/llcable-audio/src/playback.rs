@@ -11,8 +11,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use windows::Win32::Foundation::WAIT_FAILED;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use super::Meter;
 use super::clock::{Follower, Frame};
-use super::{Meter, State};
 
 pub(super) struct External {
     tx: Producer<Frame>,
@@ -21,7 +21,7 @@ pub(super) struct External {
 }
 
 impl External {
-    pub fn open(id: String, state: Arc<State>, index: usize, max_input: usize, input_period: usize) -> Result<Self, String> {
+    pub fn open(id: String, meter: Arc<Meter>, max_input: usize, input_period: usize) -> Result<Self, String> {
         let capacity = (8 * max_input).max(8192);
         let (tx, rx) = RingBuffer::new(capacity);
         let (ready, wait) = mpsc::sync_channel(1);
@@ -30,7 +30,6 @@ impl External {
         let worker = thread::Builder::new()
             .name("LLCable playback".into())
             .spawn(move || {
-                let meter = &state.outputs[index];
                 let setup = || -> Result<_, String> {
                     let com = Com::mta().map_err(|h| format!("Could not initialize the playback thread ({h:#x})."))?;
                     let stream = Playback::open(&id)?;
@@ -43,7 +42,7 @@ impl External {
                         return;
                     }
                 };
-                let result = play(&mut stream, rx, &done, meter, max_input, input_period, &ready);
+                let result = play(&mut stream, rx, &done, &meter, max_input, input_period, &ready);
                 if let Err(error) = result {
                     meter.offline.store(true, Relaxed);
                     meter.update(&[]);

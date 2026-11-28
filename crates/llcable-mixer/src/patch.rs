@@ -249,7 +249,7 @@ impl Inventory {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum RackId {
-    Source(String, usize),       // Shared prefix ending at this boundary.
+    Source(String, usize),       // Shared rack starting at this stage boundary.
     Send(String, String, usize), // Destination, source and occurrence among sends from that source.
     Output(String),
 }
@@ -260,11 +260,29 @@ struct RackEffects {
     muted: bool,
 }
 
+impl RackEffects {
+    fn reusable_as(&self, next: &Self, retained: &[(usize, usize)], may_shorten: bool) -> bool {
+        self.muted == next.muted
+            && (self.stages.len() == next.stages.len() || may_shorten && self.stages.len() > next.stages.len())
+            && self.stages.iter().zip(&next.stages).all(|((old, old_key), (new, new_key))| {
+                let same_key = match (*old_key, *new_key) {
+                    (Some(Tap::Bus(i)), Some(Tap::Bus(j))) => {
+                        retained.iter().find(|&&(from, to)| from == i || to == j).map_or(i == j, |&pair| pair == (i, j))
+                    }
+                    _ => old_key == new_key,
+                };
+                old == new && same_key
+            })
+    }
+}
+
 #[derive(Clone)]
 struct ActiveRack {
     bus: usize,
     effects: RackEffects,
     meters: Range<usize>,
+    // Logical stages in the compiled processor, including a previously used tail that was deactivated live.
+    width: usize,
 }
 
 #[derive(Clone, Default)]
@@ -273,6 +291,7 @@ pub struct Channels {
     pub outputs: Vec<String>,
     pub meters: Vec<(String, StageMeter)>,
     racks: BTreeMap<RackId, ActiveRack>,
+    source_cuts: BTreeMap<String, BTreeSet<usize>>,
 }
 
 pub struct Plan {
@@ -410,14 +429,27 @@ impl PlannedBus {
     ) -> Result<Bus, String> {
         let start = channels.meters.len();
         let mut effects = Vec::new();
+        let active = self.effects.stages.len();
+        let mut width = active;
         if let Some(old) = previous
             && let Some(rack) = old.racks.get(&self.id)
-            && rack.effects == self.effects
+            && rack.effects.reusable_as(&self.effects, retained, matches!(self.id, RackId::Source(..)))
         {
             retained.push((rack.bus, bus));
-            // The live router owns these processors and their meters. Preserve their key edges for the endpoint feedback check.
-            for key in self.effects.stages.iter().filter_map(|(_, key)| *key) {
-                effects.push(Effect::Duck { key, settings: Ducking { attenuation_db: 0.0, ..Ducking::default() } });
+            width = rack.width;
+            // The live router owns the processors. Keep their logical stage indexes and active sidechains in this sparse plan.
+            for (_, key) in &self.effects.stages {
+                effects.push(match *key {
+                    Some(key) => Effect::Duck { key, settings: Ducking { attenuation_db: 0.0, ..Ducking::default() } },
+                    None => Effect::Gain(1.0),
+                });
+            }
+            if self.effects.muted {
+                effects.push(Effect::Gain(1.0));
+            }
+            if active < width {
+                effects.resize_with(width, || Effect::Gain(1.0));
+                effects.push(Effect::ActivePrefix(active));
             }
             channels.meters.extend(self.labels.into_iter().zip(old.meters[rack.meters.clone()].iter().map(|(_, meter)| meter.clone())));
         } else {
@@ -430,7 +462,7 @@ impl PlannedBus {
                 effects.push(Effect::Gain(0.0));
             }
         }
-        channels.racks.insert(self.id, ActiveRack { bus, effects: self.effects, meters: start..channels.meters.len() });
+        channels.racks.insert(self.id, ActiveRack { bus, effects: self.effects, meters: start..channels.meters.len(), width });
         Ok(Bus { sends: self.sends, effects })
     }
 }
@@ -439,24 +471,57 @@ pub fn plan(settings: &Settings, inventory: &Inventory) -> Result<Plan, String> 
     prepare(settings, inventory, None)
 }
 
-/// Reuse the active endpoint order (including the capture clock) and unchanged rack processors when the devices still match.
-/// A change of endpoint set produces a complete plan suitable for starting a new session.
+/// With the same capture sources, keep the clock, surviving destination order and unchanged processors through destination edits.
+/// A different capture set produces a complete plan for a new session.
 pub fn plan_reusing(settings: &Settings, inventory: &Inventory, previous: &Channels) -> Result<Plan, String> {
     prepare(settings, inventory, Some(previous))
+}
+
+fn source_segments(settings: &Settings, inventory: &Inventory, previous: Option<&Channels>) -> BTreeMap<String, BTreeSet<usize>> {
+    let mut depths = BTreeMap::<&str, usize>::new();
+    for send in settings.mixes.values().flat_map(|m| &m.sends) {
+        let depth = send.depth(settings.source_effects.get(&send.source).map_or(0, Vec::len));
+        if depth > 0 {
+            let max = depths.entry(&send.source).or_default();
+            *max = (*max).max(depth);
+        }
+    }
+    let active_outputs: BTreeSet<_> = inventory
+        .outputs
+        .iter()
+        .filter(|o| settings.mixes.get(&o.id).is_some_and(|m| !m.sends.is_empty()))
+        .filter_map(|o| o.cable)
+        .collect();
+    depths
+        .into_iter()
+        .map(|(id, depth)| {
+            // A source that is already running can grow a new tail without replacing its warmed prefix. Subscriber taps
+            // inside an existing segment use its intermediate audio; they do not introduce new processing boundaries.
+            let mut cuts: BTreeSet<_> =
+                previous.and_then(|p| p.source_cuts.get(id)).into_iter().flat_map(|c| c.range(..depth).copied()).collect();
+            cuts.insert(depth);
+            for (i, stage) in settings.source_effects[id][..depth].iter().enumerate().skip(1) {
+                if stage.enabled
+                    && matches!(stage.kind, Kind::Aec | Kind::Duck)
+                    && let Some(key) = &stage.key
+                    && !key.starts_with("loopback:")
+                    && inventory.sources.iter().find(|s| s.id == *key).and_then(|s| s.owner).is_some_and(|c| active_outputs.contains(&c))
+                {
+                    // An earlier tap can even feed the cable that supplies this key. Publish it before this stage.
+                    cuts.insert(i);
+                }
+            }
+            (id.to_owned(), cuts)
+        })
+        .collect()
 }
 
 fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channels>) -> Result<Plan, String> {
     let mut inputs = Vec::new();
     let mut buses = Vec::new();
     let mut outputs = Vec::new();
-    let mut shared_buses: BTreeMap<&str, BTreeMap<usize, Tap>> = BTreeMap::new();
-    let mut boundaries: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
-    for send in settings.mixes.values().flat_map(|m| &m.sends) {
-        let depth = send.depth(settings.source_effects.get(&send.source).map_or(0, Vec::len));
-        if depth > 0 {
-            boundaries.entry(&send.source).or_default().insert(depth);
-        }
-    }
+    let mut shared_buses: BTreeMap<&str, BTreeMap<usize, usize>> = BTreeMap::new();
+    let boundaries = source_segments(settings, inventory, previous);
     let mut published = BTreeMap::new();
     for out in ordered_outputs(settings, inventory)? {
         let mix = &settings.mixes[&out.id];
@@ -471,28 +536,37 @@ fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channel
                 && let Some(cuts) = boundaries.get(send.source.as_str())
             {
                 let taps = shared_buses.entry(&send.source).or_default();
-                let mut previous = 0;
-                for &end in cuts.range(..=send.depth(stages.len())) {
-                    if let Some(&tap) = taps.get(&end) {
-                        from = tap;
-                    } else {
-                        let segment = &stages[previous..end];
-                        if segment.iter().any(|stage| stage.enabled) {
-                            let bus = buses.len();
-                            buses.push(PlannedBus::new(
-                                RackId::Source(send.source.clone(), end),
-                                vec![AudioSend::unity(from)],
-                                segment,
-                                &inventory.label(&send.source),
-                                previous,
-                                false,
-                                &mut input,
-                            )?);
-                            from = Tap::Bus(bus);
-                        }
-                        taps.insert(end, from);
+                let mut start = 0;
+                let depth = send.depth(stages.len());
+                for &end in cuts {
+                    if start >= depth {
+                        break;
                     }
-                    previous = end;
+                    let segment = &stages[start..end];
+                    let count = segment.iter().filter(|s| s.enabled).count();
+                    let take = stages[start..end.min(depth)].iter().filter(|s| s.enabled).count();
+                    if take == 0 {
+                        start = end;
+                        continue;
+                    }
+                    let bus = if let Some(&bus) = taps.get(&end) {
+                        bus
+                    } else {
+                        let bus = buses.len();
+                        buses.push(PlannedBus::new(
+                            RackId::Source(send.source.clone(), start),
+                            vec![AudioSend::unity(from)],
+                            segment,
+                            &inventory.label(&send.source),
+                            start,
+                            false,
+                            &mut input,
+                        )?);
+                        taps.insert(end, bus);
+                        bus
+                    };
+                    from = if take == count { Tap::Bus(bus) } else { Tap::Stage(bus, take - 1) };
+                    start = end;
                 }
             }
             if send.effects.iter().any(|stage| stage.enabled) {
@@ -521,13 +595,10 @@ fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channel
     if outputs.is_empty() {
         return Err("Select an output and add a source before starting audio.".into());
     }
-    let previous = previous.filter(|old| {
-        old.inputs.len() == inputs.len()
-            && inputs.iter().all(|id| old.inputs.contains(id))
-            && old.outputs.len() == outputs.len()
-            && outputs.iter().all(|(out, _)| old.outputs.contains(&out.id))
-    });
     if let Some(old) = previous {
+        if old.inputs.len() != inputs.len() || !inputs.iter().all(|id| old.inputs.contains(id)) {
+            return prepare(settings, inventory, None);
+        }
         let indices: Vec<_> = inputs.iter().map(|id| old.inputs.iter().position(|key| key == id).unwrap()).collect();
         for b in &mut buses {
             for from in b.sends.iter_mut().map(|s| &mut s.from).chain(b.effects.stages.iter_mut().filter_map(|(_, key)| key.as_mut())) {
@@ -537,7 +608,7 @@ fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channel
             }
         }
         inputs.clone_from(&old.inputs);
-        outputs.sort_by_cached_key(|(out, _)| old.outputs.iter().position(|id| id == &out.id).unwrap());
+        outputs.sort_by_cached_key(|(out, _)| old.outputs.iter().position(|id| id == &out.id).unwrap_or(usize::MAX));
     }
     let mut cables = Vec::new();
     let mut output_buses = Vec::new();
@@ -554,6 +625,7 @@ fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channel
     let mut channels = Channels {
         inputs: inputs.clone(),
         outputs: cables.iter().map(ToString::to_string).chain(playback.iter().map(|(id, _)| format!("play:{id}"))).collect(),
+        source_cuts: boundaries,
         ..Channels::default()
     };
     let mut retained = Vec::new();
@@ -654,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_plan_keeps_the_clock_and_rebuilds_racks_whose_sidechain_bus_moved() {
+    fn a_live_plan_keeps_the_clock_and_tracks_the_retained_sidechain_producer() {
         let inv = inventory();
         let [a, b] = [1, 2].map(|n| CableId(n).to_string());
         let mut s = Settings::default();
@@ -673,7 +745,7 @@ mod tests {
         assert_eq!(next.config.buses[0].sends[0].from, Tap::Input(1));
         assert_eq!(next.config.buses[1].sends[1].from, Tap::Input(0));
         assert_eq!(next.config.buses[2].effects[0].key(), Some(Tap::Bus(1)));
-        assert!(!next.retained.iter().any(|&(from, _)| from == 1));
+        assert!(next.retained.contains(&(1, 2)));
 
         s.toggle(&a, "other");
         s.toggle(&b, "other");
@@ -681,6 +753,143 @@ mod tests {
         assert!(restart.retained.is_empty());
         assert_eq!(restart.channels.inputs, ["mic"]);
         assert_eq!(restart.channels.outputs, [a]);
+    }
+
+    #[test]
+    fn opening_another_capture_rebuilds_the_compact_source_rack() {
+        let inv = inventory();
+        let [a, b] = [1, 2].map(|n| CableId(n).to_string());
+        let mut s = Settings::default();
+        s.toggle(&a, "mic");
+        s.mixes.get_mut(&a).unwrap().sends[0].boundary = Some(1);
+        s.source_effects.insert("mic".into(), vec![gain(-3), gain(-6)]);
+        let short = plan(&s, &inv).unwrap();
+        s.toggle(&b, "mic");
+        let grown = plan_reusing(&s, &inv, &short.channels).unwrap();
+        assert_eq!(grown.channels.source_cuts["mic"], BTreeSet::from([1, 2]));
+        s.toggle(&b, "other");
+        let reopened = plan_reusing(&s, &inv, &grown.channels).unwrap();
+        assert_eq!(reopened.channels.source_cuts["mic"], BTreeSet::from([2]));
+        assert!(reopened.retained.is_empty());
+        assert_eq!(reopened.config.buses[0].effects.len(), 2);
+        assert_eq!(reopened.config.buses[1].sends[0].from, Tap::Stage(0, 0));
+    }
+
+    #[test]
+    fn adding_and_removing_cable_and_playback_outputs_preserves_existing_duck_history_and_meter() {
+        let inv = inventory();
+        let [a, b, c] = [1, 2, 3].map(|n| CableId(n).to_string());
+        let mut s = Settings::default();
+        s.toggle(&b, "mic");
+        s.toggle(&c, "mic");
+        s.mixes.get_mut(&c).unwrap().effects.push(Stage { key: Some("out2".into()), ..Stage::new(Kind::Duck) });
+        let old = plan(&s, &inv).unwrap();
+        let mut running = Router::new(48000, 128, 1, old.config.buses).unwrap();
+        let mut reference = Router::new(48000, 128, 1, plan(&s, &inv).unwrap().config.buses).unwrap();
+        let input = [&[[0.75, -0.5]; 128][..]];
+        running.process_stereo(&input).unwrap();
+        reference.process_stereo(&input).unwrap();
+        let old_meter = &old.channels.meters[0].1;
+        let before = old_meter.read();
+
+        s.toggle(&a, "mic");
+        s.mixes.get_mut(&a).unwrap().muted = true;
+        s.toggle("play:speaker", "mic");
+        let added = plan_reusing(&s, &inv, &old.channels).unwrap();
+        assert_eq!(added.channels.outputs, [b.as_str(), c.as_str(), a.as_str(), "play:speaker"]);
+        assert_eq!(added.config.output_buses, [1, 2, 0]);
+        assert_eq!(added.config.playback, [("speaker".into(), 3)]);
+        assert_eq!(added.retained, [(0, 1), (1, 2)]);
+        let mut replacement = Router::new(48000, 128, 1, added.config.buses).unwrap();
+        running.activate_edit(&mut replacement, &added.retained).unwrap();
+        running.process_stereo(&input).unwrap();
+        reference.process_stereo(&input).unwrap();
+        assert_eq!(running.output(0).unwrap(), [[0.; 2]; 128]);
+        assert_eq!(running.output(2), reference.output(1));
+        assert_ne!(old_meter.read(), before, "the old handle still receives the running duck's envelope");
+        assert_eq!(old_meter.read(), added.channels.meters[0].1.read());
+
+        s.toggle(&a, "mic");
+        s.toggle("play:speaker", "mic");
+        let removed = plan_reusing(&s, &inv, &added.channels).unwrap();
+        assert_eq!(removed.channels.outputs, [b, c]);
+        assert_eq!(removed.retained, [(1, 0), (2, 1)]);
+        let mut replacement = Router::new(48000, 128, 1, removed.config.buses).unwrap();
+        running.activate_edit(&mut replacement, &removed.retained).unwrap();
+        running.process_stereo(&input).unwrap();
+        reference.process_stereo(&input).unwrap();
+        assert_eq!(running.output(1), reference.output(1));
+        assert_eq!(old_meter.read(), removed.channels.meters[0].1.read());
+    }
+
+    #[test]
+    fn a_new_subscriber_between_aec_and_rnnoise_preserves_both_running_models_and_hears_the_clean_aec_output() {
+        let inv = inventory();
+        let [a, b] = [1, 2].map(|n| CableId(n).to_string());
+        let mut settings = Settings::default();
+        settings.toggle(&a, "mic");
+        let aec = Stage { key: Some("other".into()), ..Stage::new(Kind::Aec) };
+        settings.source_effects.insert("mic".into(), vec![aec.clone(), Stage::new(Kind::Rnnoise)]);
+        let build = |s: &Settings| {
+            let p = plan(s, &inv).unwrap();
+            let mut router = Router::new(48_000, 191, 2, p.config.buses).unwrap();
+            router.prepare_thread();
+            (router, p.channels)
+        };
+        let (mut running, mut channels) = build(&settings);
+        let meters = channels.meters.clone();
+        let (mut full, _) = build(&settings);
+        let mut short = settings.clone();
+        short.source_effects.insert("mic".into(), vec![aec]);
+        let (mut prefix, _) = build(&short);
+        let mut frame = 0;
+        let mut different = false;
+        for packet in 0..130 {
+            // Add at an irregular packet boundary within a 480-frame hop, remove, then retire just the unused RNNoise tail.
+            if [63, 83, 94, 105, 118].contains(&packet) {
+                assert_ne!(frame % 480, 0);
+                if packet < 105 {
+                    settings.toggle(&b, "mic");
+                    if let Some(send) = settings.mixes.get_mut(&b).unwrap().sends.first_mut() {
+                        send.boundary = Some(1);
+                    }
+                } else {
+                    settings.toggle(&a, "mic");
+                }
+                let updated = plan_reusing(&settings, &inv, &channels).unwrap();
+                assert_eq!(updated.config.inputs, ["mic", "other"]);
+                let mut new = Router::new(48_000, 191, 2, updated.config.buses).unwrap();
+                running.activate_edit(&mut new, &updated.retained).unwrap();
+                channels = updated.channels;
+            }
+            let n = [83, 191, 79, 157][packet % 4];
+            let reference: Vec<_> = (frame..frame + n).map(|i| [(i as f32 * 0.11).sin() * 0.1; 2]).collect();
+            let mic: Vec<_> =
+                (frame..frame + n).map(|i| [(i as f32 * 0.034).sin() * 0.21 + ((i as f32 - 17.) * 0.11).sin() * 0.06; 2]).collect();
+            let inputs = [mic.as_slice(), reference.as_slice()];
+            for r in [&mut running, &mut full, &mut prefix] {
+                r.process_stereo(&inputs).unwrap();
+            }
+            let bus = |id: &str| channels.racks.get(&RackId::Output(id.into())).map(|r| r.bus);
+            if let Some(i) = bus(&a)
+                && packet < 105
+            {
+                assert!(running.output(i) == full.output(1), "sample mismatch on uninterrupted full chain at packet {packet}");
+                for (old, active) in meters.iter().zip(&channels.meters) {
+                    assert_eq!(old.1.read().output_peak, active.1.read().output_peak);
+                }
+            }
+            if let Some(i) = bus(&b) {
+                assert!(running.output(i) == prefix.output(1), "sample mismatch on AEC-only branch at packet {packet}");
+                assert_eq!(meters[0].1.read().output_peak, channels.meters[0].1.read().output_peak);
+                different |= running.output(i) != full.output(1);
+            }
+            if (105..118).contains(&packet) {
+                assert_eq!(channels.meters.len(), 1, "only AEC is active");
+            }
+            frame += n;
+        }
+        assert!(different, "the intermediate output must be distinguishable from the final denoised output");
     }
 
     #[test]
@@ -769,6 +978,21 @@ mod tests {
             assert_eq!(p.config.buses[b].sends.len(), 1);
             assert_eq!(p.config.buses[b].sends[0].from, Tap::Bus(0));
         }
+    }
+    #[test]
+    fn a_shorter_source_tap_can_feed_the_key_of_a_later_shared_stage_without_feedback() {
+        let inv = inventory();
+        let [a, b] = [1, 2].map(|n| CableId(n).to_string());
+        let mut s = Settings::default();
+        s.toggle(&a, "mic");
+        s.toggle(&b, "mic");
+        s.mixes.get_mut(&a).unwrap().sends[0].boundary = Some(1);
+        s.source_effects.insert("mic".into(), vec![gain(-6), Stage { key: Some("out1".into()), ..Stage::new(Kind::Duck) }]);
+        let p = plan(&s, &inv).unwrap();
+        assert_eq!(p.config.inputs, ["mic"]);
+        assert_eq!(p.config.output_buses, [1, 3]);
+        assert_eq!(p.config.buses[2].sends[0].from, Tap::Bus(0));
+        assert_eq!(p.config.buses[2].effects[0].key(), Some(Tap::Bus(1)));
     }
     #[test]
     fn direct_and_indirect_feedback_and_missing_source_are_refused_before_any_plugin_is_loaded() {
