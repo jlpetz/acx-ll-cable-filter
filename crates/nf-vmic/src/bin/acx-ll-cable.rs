@@ -19,14 +19,14 @@ use nf_vmic::setup::{self, Done, SetupError};
 use nf_vmic::variant::{self, Outcome, Variant};
 
 const USAGE: &str = "\
-acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers and microphones)
+acx-ll-cable: ACX-LL-Cable's setup (each cable has its own In and recording outputs)
 
   acx-ll-cable list
       The present cables, their devices and endpoints, the remembered absent ones, and setup errors. A disabled cable's line
       ends \": disabled\"; \": disabled at the next restart\" while a disable Windows couldn't finish waits for one (the
       cable still works); \": disabled, not in every hardware profile\" for a stopped setup run's, or another tool's for this
       profile only (devcon's). Any user.
-  acx-ll-cable endpoint <label|id> speakers|microphone|call-microphone
+  acx-ll-cable endpoint <label|id> In|Out|Out-5ms (also speakers|microphone|call-microphone)
       The cable's endpoint for that role as Windows has it now, found by the cable's identity and the endpoint's pin, never by
       name: one line, its id, its state (active, disabled in the Sound panel, unplugged) and its name in quotes. None now
       (removed, disabled, not working, not made yet, or a role its microphones lack): exit 3, why on stderr. Any user.
@@ -49,15 +49,16 @@ acx-ll-cable: ACX-LL-Cable's setup (any number of cables, each its own Speakers 
   acx-ll-cable variant <label> both|call|low-latency
       Switches the cable's microphones: its device re-created with new endpoints; no other cable is touched. A disabled
       cable is refused (exit 2): `enable` it first, then switch, then `disable` it again to keep it off.
-  acx-ll-cable update <package folder>
+  acx-ll-cable update <package folder> [--endpoint-map <file>]
       Moves every cable to the package in the folder (driver\\out\\Release\\AudioCodec): every cable stops for a few seconds.
       If the old driver image doesn't unload (an app has a cable's control device open), every cable is put back as it was.
+      Windows may replace endpoint IDs. The requested map records the endpoints observed before and after this update.
   acx-ll-cable migrate <package folder> [--a-mics m] [--b-mics m] [--endpoint-map <file>]
       From the old driver's devices (ROOT\\AudioCodec as A, ROOT\\NoiseFilterCableB as B) to cables on the package in the
       folder. A keeps its variant unless --a-mics; B gets --b-mics (default both). Nothing changes unless the package makes
       both; A and B are recorded first, so a run that stops part way is finished by running this again.
 
-  --endpoint-map <file> (migrate, add): writes which new endpoint takes each old one's place (by cable and role, with the
+  --endpoint-map <file> (migrate, add, update): writes which new endpoint takes each old one's place (by cable and role, with the
       names), as JSON, published whole at the end (a new temporary file of its own beside it, flushed, renamed over it) once
       the endpoints before the run were read; a run that publishes none leaves the file as it was. Each run maps the cables
       it makes or checks and those a migration made whose map isn't final; the run that leaves nothing pending maps all of
@@ -78,7 +79,7 @@ enum Cmd {
     Enable { label: Label },
     Endpoint { cable: CableArg, role: EndpointKind },
     Variant { label: Label, target: Variant },
-    Update { folder: PathBuf },
+    Update { folder: PathBuf, map: Option<PathBuf> },
     Migrate { folder: PathBuf, a_mics: Option<Variant>, b_mics: Option<Variant>, map: Option<PathBuf> },
 }
 
@@ -90,7 +91,7 @@ enum CableArg {
 }
 
 fn cable_arg(v: Option<&String>) -> Result<CableArg, String> {
-    let v = v.ok_or("'endpoint' takes a cable's label or id, and a role: speakers, microphone or call-microphone")?;
+    let v = v.ok_or("'endpoint' takes a cable's label or id, and a role: In, Out or Out-5ms")?;
     match v.parse::<CableId>() {
         Ok(id) => Ok(CableArg::Id(id)),
         Err(_) => v.parse().map(CableArg::Label).map_err(|e| format!("{e} (nor a cable's id)")),
@@ -150,9 +151,8 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         "enable" => Cmd::Enable { label: label(positional.first().copied(), "enable")? },
         "endpoint" => {
             let cable = cable_arg(positional.first().copied())?;
-            let role = positional.get(1).ok_or("'endpoint' takes a role after the cable: speakers, microphone or call-microphone")?;
-            let role = EndpointKind::from_arg(role)
-                .ok_or_else(|| format!("'endpoint' takes speakers, microphone or call-microphone, not '{role}'"))?;
+            let role = positional.get(1).ok_or("'endpoint' takes a role after the cable: In, Out or Out-5ms")?;
+            let role = EndpointKind::from_arg(role).ok_or_else(|| format!("'endpoint' takes In, Out or Out-5ms, not '{role}'"))?;
             Cmd::Endpoint { cable, role }
         }
         "variant" => {
@@ -160,7 +160,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             let target = Variant::from_arg(target).ok_or_else(|| format!("'variant' takes both, call or low-latency, not '{target}'"))?;
             Cmd::Variant { label: label(positional.first().copied(), "variant")?, target }
         }
-        "update" => Cmd::Update { folder: positional.first().ok_or("'update' takes the package's folder")?.into() },
+        "update" => Cmd::Update { folder: positional.first().ok_or("'update' takes the package's folder")?.into(), map: map.clone() },
         "migrate" => {
             let folder = positional.first().ok_or("'migrate' takes the package's folder")?.into();
             Cmd::Migrate { folder, a_mics, b_mics, map: map.clone() }
@@ -172,7 +172,8 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     let none = allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none(), no_map]);
     let (max, ok) = match &cmd {
         Cmd::Help | Cmd::List => (0, none),
-        Cmd::Disable { .. } | Cmd::Enable { .. } | Cmd::Update { .. } => (1, none),
+        Cmd::Disable { .. } | Cmd::Enable { .. } => (1, none),
+        Cmd::Update { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), !forget, !all, a_mics.is_none(), b_mics.is_none()])),
         Cmd::Endpoint { .. } | Cmd::Variant { .. } => (2, none),
         Cmd::Add { .. } => (1, allowed(&[!forget, !all, a_mics.is_none(), b_mics.is_none()])),
         Cmd::Remove { .. } => (1, allowed(&[opt_mics.is_none(), adopt.is_none(), a_mics.is_none(), b_mics.is_none(), no_map])),
@@ -297,7 +298,7 @@ fn main() -> ExitCode {
             Outcome::Switched => Done::Changed,
             Outcome::RestartPending { device } => Done::RestartPending { device },
         })),
-        Cmd::Update { folder } => exit_of(setup::update(&folder, &mut out)),
+        Cmd::Update { folder, map } => exit_of(setup::update_with_map(&folder, map.as_deref(), &mut out)),
         Cmd::Migrate { folder, a_mics, b_mics, map } => exit_of(setup::migrate(&folder, a_mics, b_mics, map.as_deref(), &mut out)),
     }
 }
@@ -340,7 +341,8 @@ mod tests {
         );
         let id: CableId = "bbbbbbbb-0000-4000-8000-00000000000b".parse().unwrap();
         assert_eq!(p(&format!("endpoint {id} Speakers")), Ok(Cmd::Endpoint { cable: CableArg::Id(id), role: EndpointKind::Speakers }));
-        assert_eq!(p(r"update C:\pkg"), Ok(Cmd::Update { folder: r"C:\pkg".into() }));
+        assert_eq!(p(r"update C:\pkg"), Ok(Cmd::Update { folder: r"C:\pkg".into(), map: None }));
+        assert_eq!(p(r"update C:\pkg --endpoint-map m.json"), Ok(Cmd::Update { folder: r"C:\pkg".into(), map: Some("m.json".into()) }));
         assert_eq!(p(r"migrate C:\pkg"), Ok(Cmd::Migrate { folder: r"C:\pkg".into(), a_mics: None, b_mics: None, map: None }));
         assert_eq!(
             p(r"migrate C:\pkg --a-mics call --b-mics low-latency --endpoint-map m.json"),
@@ -420,9 +422,9 @@ mod tests {
         );
         let (code, why) = endpoint_answer(&s, &by_label, EndpointKind::CallMicrophone).unwrap_err();
         assert_eq!(code, 3);
-        assert!(why.starts_with("none: ACX-LL-Cable B has no Call Microphone"), "{why}");
+        assert!(why.starts_with("none: ACX-LL-Cable B has no Out-5ms"), "{why}");
         let (code, why) = endpoint_answer(&s, &by_label, EndpointKind::Microphone).unwrap_err();
-        assert!(code == 3 && why.contains("Windows shows no Microphone for it (yet)"), "{why}");
+        assert!(code == 3 && why.contains("Windows shows no Out for it (yet)"), "{why}");
         let (code, why) = endpoint_answer(&s, &CableArg::Label(l("C")), EndpointKind::Speakers).unwrap_err();
         assert!(code == 3 && why.starts_with("none: no cable labelled C is present"), "{why}");
         let gone: CableId = "cccccccc-0000-4000-8000-00000000000c".parse().unwrap();
@@ -454,7 +456,7 @@ mod tests {
             ("list --x", "'list' doesn't take --x"),
             ("migrate C:\\pkg --forget", "'migrate' doesn't take that option"),
             ("migrate C:\\pkg --endpoint-map", "--endpoint-map takes a file"),
-            ("update C:\\pkg --endpoint-map m.json", "'update' doesn't take that option"),
+            ("update C:\\pkg --adopt previous", "'update' doesn't take that option"),
             ("remove B --endpoint-map m.json", "'remove' doesn't take that option"),
             ("disable", "'disable' takes a cable's label"),
             ("enable", "'enable' takes a cable's label"),
@@ -463,7 +465,7 @@ mod tests {
             ("disable B --mics call", "'disable' doesn't take that option"),
             ("endpoint", "'endpoint' takes a cable's label or id"),
             ("endpoint B", "'endpoint' takes a role after the cable"),
-            ("endpoint B mic", "'endpoint' takes speakers, microphone or call-microphone, not 'mic'"),
+            ("endpoint B mic", "'endpoint' takes In, Out or Out-5ms, not 'mic'"),
             ("endpoint B_1 speakers", "isn't a cable label"),
             ("endpoint B speakers x", "'endpoint' takes 2 arguments; 'x' is one more"),
         ] {

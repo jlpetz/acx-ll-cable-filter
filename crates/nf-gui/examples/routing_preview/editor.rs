@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn editor(app: &Preview, cx: &ViewContext<Preview>) -> View {
+pub(super) fn editor(app: &Preview, cx: &ViewContext<Preview>, kinds: &[Kind]) -> View {
     let scope = app.scene.scope;
     let stages = app.scene.stages();
     let header = Grid::new().columns([GridLength::STAR, GridLength::Auto]).column_spacing(8.0).children((
@@ -23,11 +23,11 @@ pub(super) fn editor(app: &Preview, cx: &ViewContext<Preview>) -> View {
             (stage.id, stage_row(stage, index, stages.len(), selected, cx))
         }))
     };
-    card(column(vec![header, scope_label, if app.catalog { catalog(cx) } else { View::empty() }, stack]))
+    card(column(vec![header, scope_label, if app.catalog { catalog(cx, kinds) } else { View::empty() }, stack]))
 }
 
-fn catalog(cx: &ViewContext<Preview>) -> View {
-    let tiles = Kind::ALL.into_iter().enumerate().map(|(i, kind)| {
+fn catalog(cx: &ViewContext<Preview>, kinds: &[Kind]) -> View {
+    let tiles = kinds.iter().copied().enumerate().map(|(i, kind)| {
         let body = StackPanel::new().spacing(1.0).children((
             TextBlock::new().text(kind.name()).font_weight(FontWeight::SEMI_BOLD).font_size(13.0).text_wrapping(TextWrapping::Wrap),
             small(kind.family()),
@@ -44,7 +44,7 @@ fn catalog(cx: &ViewContext<Preview>) -> View {
     });
     Grid::new()
         .columns([GridLength::STAR; 2])
-        .rows([GridLength::Auto; Kind::ALL.len().div_ceil(2)])
+        .rows(vec![GridLength::Auto; kinds.len().div_ceil(2)])
         .column_spacing(4.0)
         .row_spacing(4.0)
         .keyed_children(tiles)
@@ -68,7 +68,7 @@ fn stage_row(stage: &Stage, index: usize, count: usize, selected: bool, cx: &Vie
         .automation_name(format!("Edit stage {}, {}", index + 1, kind.name()))
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
-        .on_click(cx.callback(move |()| Msg::Edit(id)))
+        .on_click(cx.callback(move |()| Msg::StageDetails(id)))
         .content(head);
     let mut parts = vec![button];
     if selected {

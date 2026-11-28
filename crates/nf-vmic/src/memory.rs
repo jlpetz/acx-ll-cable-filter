@@ -7,6 +7,7 @@
 //! keep the fill (`write_frame - read_frame`) at a target by watching `read_frame`, so the writer follows the driver's QPC clock
 //! rather than its own.
 
+use std::cell::Cell;
 use std::io;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -30,6 +31,8 @@ pub struct RingMemory {
     /// [`Device::attach`](crate::Device::attach) sent it to the driver, which may have read it: cleared by [`Self::reset`].
     attached_before: bool,
     mapped: bool,
+    // Handles to one ring all consult this reservation. Only a single app-side mapping writes a broker section.
+    producing: Cell<bool>,
 }
 
 impl RingMemory {
@@ -70,7 +73,13 @@ impl RingMemory {
 
     /// The app's view of an authenticated broker section. Its immutable header was initialized before transfer.
     pub(crate) fn shared_writer(section: HANDLE, capacity: u32) -> io::Result<Self> {
-        let ring = Self { base: Self::map_section(section, capacity)?, capacity, attached_before: true, mapped: true };
+        let ring = Self {
+            base: Self::map_section(section, capacity)?,
+            capacity,
+            attached_before: true,
+            mapped: true,
+            producing: Cell::new(false),
+        };
         // SAFETY: our live section view spans exactly `bytes`. Lock the writer's own working-set view before the audio loop.
         unsafe { VirtualLock(ring.base.as_ptr().cast(), ring.bytes()) }.map_err(crate::device::io_error)?;
         Ok(ring)
@@ -96,7 +105,7 @@ impl RingMemory {
         h.frame_bytes = FRAME_BYTES;
         h.flags = 0;
         h.total_bytes = protocol::ring_bytes(capacity_frames) as u64;
-        Self { base, capacity: capacity_frames, attached_before: false, mapped }
+        Self { base, capacity: capacity_frames, attached_before: false, mapped, producing: Cell::new(false) }
     }
 
     /// Whether the ring went to the driver before (its ATTACH went pending). [`Device::attach`](crate::Device::attach) refuses
@@ -135,6 +144,18 @@ impl RingMemory {
         protocol::ring_bytes(self.capacity)
     }
 
+    /// Read-only observation of the last coherent driver pass, or `None` when a pass is updating the counters.
+    pub fn reader_sample(&self) -> Option<protocol::ReaderSample> {
+        self.header().reader_sample()
+    }
+
+    /// App-side writer for this ring, observing earlier writes even across independent writer handles.
+    pub fn writer(&self) -> Writer<'_> {
+        Writer::new(self)
+    }
+
+    /// Raw driver ABI for engineering tools. Observe the mapped fields. Publish new frames only via [`Writer::produce`],
+    /// and leave the driver-owned counters to the driver. Applications can use [`Self::reader_sample`] and [`Self::writer`].
     pub fn header(&self) -> &RingHeader {
         // SAFETY: `base` holds an initialised RingHeader for as long as `self` lives. Once attached, the driver writes only line 2,
         // which is atomics, and the app writes only `write_frame`, an atomic, so a shared reference stays valid.
@@ -186,18 +207,17 @@ impl Drop for RingMemory {
 /// The app's side of the ring: writes frames from `write_frame` on and publishes them.
 pub struct Writer<'r> {
     ring: &'r RingMemory,
-    write_frame: u64,
 }
 
 impl<'r> Writer<'r> {
     /// Takes up from the header's `write_frame`: 0 for a fresh or reset ring, the pre-fill an earlier writer left before ATTACH,
     /// or where the attachment's previous writer stopped.
     pub fn new(ring: &'r RingMemory) -> Self {
-        Self { ring, write_frame: ring.header().write_frame.load(Relaxed) }
+        Self { ring }
     }
 
     pub fn write_frame(&self) -> u64 {
-        self.write_frame
+        self.ring.header().write_frame.load(Relaxed)
     }
 
     /// The driver's position. Acquire: once this is seen, the driver has finished with the slots before it.
@@ -207,7 +227,7 @@ impl<'r> Writer<'r> {
 
     /// Frames written and not yet read (0 if the driver were ahead, which only a broken writer can cause).
     pub fn fill(&self) -> u64 {
-        self.write_frame.saturating_sub(self.read_frame())
+        self.write_frame().saturating_sub(self.read_frame())
     }
 
     /// Slots free for writing: the capacity less the fill.
@@ -216,18 +236,30 @@ impl<'r> Writer<'r> {
     }
 
     /// Writes up to `count` frames, no more than are free, frame `n` (absolute position) being `f(n)`; then publishes them.
-    /// Returns how many it wrote. Doesn't allocate.
+    /// Returns how many it wrote. A nested `produce` on this ring from inside `f` returns zero. A panicking `f`
+    /// leaves the unpublished slots available to retry. Neither reservation nor normal processing allocates.
     pub fn produce(&mut self, count: u64, mut f: impl FnMut(u64) -> [f32; 2]) -> u64 {
-        let n = count.min(self.free());
+        if self.ring.producing.replace(true) {
+            return 0;
+        }
+        struct Reservation<'a>(&'a Cell<bool>);
+        impl Drop for Reservation<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reservation = Reservation(&self.ring.producing);
+        let start = self.write_frame();
+        let fill = start.saturating_sub(self.read_frame());
+        let n = count.min(u64::from(self.ring.capacity()).saturating_sub(fill)).min(u64::MAX - start);
         let slots = self.ring.slots();
         let capacity = self.ring.capacity();
-        for pos in self.write_frame..self.write_frame + n {
+        for pos in start..start + n {
             // SAFETY: slot() is below the capacity, so inside the allocation. The slot is free: pos < read_frame + capacity
-            // (n <= free), and the driver reads only [read_frame, write_frame), which stops before `self.write_frame` <= pos.
+            // (n <= free), and the driver reads only [read_frame, write_frame), which stops at `start` until publication.
             unsafe { slots.add(slot(pos, capacity)).write(f(pos)) };
         }
-        self.write_frame += n;
-        self.ring.header().write_frame.store(self.write_frame, Release);
+        self.ring.header().write_frame.store(start + n, Release);
         n
     }
 }
@@ -270,6 +302,32 @@ mod tests {
         assert_eq!(broker.frames_for_test()[6], frame(6));
         drop(writer);
         assert_eq!(broker.header().write_frame.load(Acquire), 7);
+    }
+
+    #[test]
+    fn alternate_nested_and_unwinding_writers_never_overwrite_published_frames() {
+        let ring = RingMemory::new(1024).unwrap();
+        let mut first = ring.writer();
+        let mut second = ring.writer();
+        first.produce(16, frame);
+        assert_eq!((second.write_frame(), second.fill()), (16, 16));
+        second.produce(32, |pos| {
+            assert_eq!(first.produce(99, |_| panic!("nested writer unexpectedly ran")), 0);
+            frame(pos)
+        });
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first.produce(20, |pos| {
+                if pos == 50 {
+                    panic!("source interrupted");
+                }
+                [1.0; 2]
+            });
+        }));
+        assert!(failure.is_err());
+        assert_eq!(second.write_frame(), 48, "partial frames were not published");
+        assert_eq!(second.produce(2, frame), 2);
+        assert_eq!(first.write_frame(), 50);
+        assert!(ring.frames_for_test()[..50].iter().enumerate().all(|(i, &sample)| sample == frame(i as u64)));
     }
 
     /// reset() zeroes lines 1 to 3 (write_frame and the driver's line), keeps line 0, and clears the mark.

@@ -26,6 +26,7 @@
 
 use std::fmt::Write as _;
 
+use crate::cables::EndpointKind;
 use crate::identity::Label;
 use crate::sessions::Mic;
 use crate::setup::endpoints::{self, Endpoint, EndpointCheck, Names};
@@ -38,9 +39,9 @@ use crate::setup::{self, Done, Present, SetupError, Want};
 use crate::win_error::WinError;
 
 /// Cable A's low-latency microphone, by the name we expect Windows to give it.
-pub const MICROPHONE: &str = "Microphone (ACX-LL-Cable A)";
+pub const MICROPHONE: &str = "LLCable-A Out (ACX-LL-Cable A)";
 /// Cable A's call microphone, by the name we expect Windows to give it.
-pub const CALL_MICROPHONE: &str = "Call Microphone (ACX-LL-Cable A)";
+pub const CALL_MICROPHONE: &str = "LLCable-A Out-5ms (ACX-LL-Cable A)";
 
 /// One of the driver's three variants, by the hardware ID its cable's node has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,12 +85,12 @@ impl Variant {
         Self::ALL.into_iter().find(|v| v.arg().eq_ignore_ascii_case(s.trim()))
     }
 
-    /// "both microphones", "the call microphone only", "the low-latency microphone only".
+    /// Which recording outputs the variant provides.
     pub fn describe(self) -> &'static str {
         match self {
             Variant::Both => "both microphones",
-            Variant::Call => "the call microphone only",
-            Variant::LowLatency => "the low-latency microphone only",
+            Variant::Call => "Out-5ms only",
+            Variant::LowLatency => "Out only",
         }
     }
 
@@ -107,7 +108,7 @@ impl Variant {
         self.mics().iter().map(|&m| default_name(label, m)).collect()
     }
 
-    /// `"Microphone (ACX-LL-Cable A)" and "Call Microphone (ACX-LL-Cable A)"`.
+    /// The full default endpoint names, quoted for a device picker.
     pub fn microphones_text(self, label: &Label) -> String {
         quoted(self.microphones(label).iter().map(String::as_str))
     }
@@ -116,8 +117,8 @@ impl Variant {
 /// The name Windows gives a microphone of cable `label` (to confirm on the box; the user may rename it).
 pub fn default_name(label: &Label, mic: Mic) -> String {
     match mic {
-        Mic::LowLatency => format!("Microphone ({})", label.friendly_name()),
-        Mic::Call => format!("Call Microphone ({})", label.friendly_name()),
+        Mic::LowLatency => EndpointKind::Microphone.friendly_name(label),
+        Mic::Call => EndpointKind::CallMicrophone.friendly_name(label),
         Mic::Other => label.friendly_name(),
     }
 }
@@ -201,7 +202,7 @@ pub fn precheck(label: &Label, target: Variant, store: &[Entry], nodes: &[Node],
     }
 }
 
-/// A check's endpoints, a line each (`  Call Microphone: "Call Microphone (ACX-LL-Cable A)"`), then a warning for each
+/// A check's endpoints, a line each with the port and the name Windows reports, then a warning for each
 /// disabled in the Sound panel.
 pub fn found_lines(check: &EndpointCheck) -> Vec<String> {
     let mut lines: Vec<String> = check
@@ -209,7 +210,7 @@ pub fn found_lines(check: &EndpointCheck) -> Vec<String> {
         .iter()
         .map(|(kind, e)| {
             let off = if e.state == endpoints::State::Disabled { ", disabled in the Sound panel" } else { "" };
-            format!("  {}: \"{}\"{off}", kind.name(), e.name)
+            format!("  {}: \"{}\"{off}", kind.port(), e.name)
         })
         .collect();
     lines.extend(
@@ -266,8 +267,8 @@ pub fn format_shown(s: &Shown) -> String {
     }
     let _ = writeln!(
         out,
-        "Switch with `noise-filter mic variant both|call|low-latency`: both microphones, the call microphone only (a 5 ms default \
-         period) or the low-latency one only. Windows asks for permission, as the switch re-creates the cable's device, with new \
+        "Switch with `noise-filter mic variant both|call|low-latency`: both outputs, Out-5ms only (a 5 ms default \
+         period) or Out only (the app can request a shorter period). Windows asks for permission, as the switch re-creates the cable's device, with new \
          endpoints."
     );
     out
@@ -353,8 +354,8 @@ mod tests {
         assert_eq!(Variant::from_arg("Low-Latency"), Some(Variant::LowLatency));
         assert_eq!(Variant::from_arg("lowlatency"), None);
         let b = label("B");
-        assert_eq!(Variant::Both.microphones(&b), ["Microphone (ACX-LL-Cable B)", "Call Microphone (ACX-LL-Cable B)"]);
-        assert_eq!(Variant::Call.microphones_text(&b), "\"Call Microphone (ACX-LL-Cable B)\"");
+        assert_eq!(Variant::Both.microphones(&b), ["LLCable-B Out (ACX-LL-Cable B)", "LLCable-B Out-5ms (ACX-LL-Cable B)"]);
+        assert_eq!(Variant::Call.microphones_text(&b), "\"LLCable-B Out-5ms (ACX-LL-Cable B)\"");
         assert_eq!(Variant::Both.microphones(&Label::a()), [MICROPHONE, CALL_MICROPHONE]);
     }
 
@@ -430,16 +431,13 @@ mod tests {
             EndpointKind::of_variant(Variant::Both).into_iter().map(|k| ep(&ac, k, endpoints::State::Active)).collect();
         // B's endpoints not there yet: a switch to its own variant re-creates it
         let Precheck::Switch(Some(note)) = precheck(&label("B"), Variant::LowLatency, &[], &nodes, &Ok(eps.clone())) else { panic!() };
-        assert!(
-            note.starts_with("ACX-LL-Cable B is the low-latency microphone only already, but Windows hasn't made Speakers, Microphone"),
-            "{note}"
-        );
+        assert!(note.starts_with("ACX-LL-Cable B is Out only already, but Windows hasn't made In, Out"), "{note}");
         eps.extend(EndpointKind::of_variant(Variant::LowLatency).into_iter().map(|k| ep(&bc, k, endpoints::State::Active)));
         let Precheck::Nothing(lines) = precheck(&label("B"), Variant::LowLatency, &[], &nodes, &Ok(eps.clone())) else { panic!() };
         assert_eq!(lines, [
-            "ACX-LL-Cable B is the low-latency microphone only already, working: nothing to do.",
-            "  Speakers: \"Speakers (ACX-LL-Cable B)\"",
-            "  Microphone: \"Microphone (ACX-LL-Cable B)\"",
+            "ACX-LL-Cable B is Out only already, working: nothing to do.",
+            "  In: \"LLCable-B In (ACX-LL-Cable B)\"",
+            "  Out: \"LLCable-B Out (ACX-LL-Cable B)\"",
         ]);
         assert_eq!(precheck(&label("B"), Variant::Call, &[], &nodes, &Ok(eps.clone())), Precheck::Switch(None));
         assert_eq!(precheck(&label("C"), Variant::Call, &[], &nodes, &Ok(eps)), Precheck::Refused(PlanError::NotPresent(label("C"))));
@@ -463,10 +461,10 @@ mod tests {
         let text = format_shown(&shown);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "ACX-LL-Cable B: variant call");
-        assert!(lines[1].contains(r"the call microphone only (ROOT\AcxLlCableCall), working"), "{}", lines[1]);
-        assert_eq!(lines[2], "  Speakers: \"Speakers (ACX-LL-Cable B)\"");
-        assert_eq!(lines[3], "  Call Microphone: \"Call Microphone (ACX-LL-Cable B)\", disabled in the Sound panel");
-        assert!(lines[4].starts_with("  warning: \"Call Microphone (ACX-LL-Cable B)\" is disabled in the Sound panel"), "{}", lines[4]);
+        assert!(lines[1].contains(r"Out-5ms only (ROOT\AcxLlCableCall), working"), "{}", lines[1]);
+        assert_eq!(lines[2], "  In: \"LLCable-B In (ACX-LL-Cable B)\"");
+        assert_eq!(lines[3], "  Out-5ms: \"LLCable-B Out-5ms (ACX-LL-Cable B)\", disabled in the Sound panel");
+        assert!(lines[4].starts_with("  warning: \"LLCable-B Out-5ms (ACX-LL-Cable B)\" is disabled in the Sound panel"), "{}", lines[4]);
         assert!(text.contains("Switch with `noise-filter mic variant both|call|low-latency`"));
         let none = Shown { label: label("C"), resolved: None, nodes: vec![], endpoints: Ok(vec![]), legacy: vec![] };
         assert!(format_shown(&none).starts_with("ACX-LL-Cable C isn't present (`acx-ll-cable add C` makes it)."));

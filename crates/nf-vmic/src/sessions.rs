@@ -64,11 +64,11 @@ pub enum Mic {
 }
 
 impl Mic {
-    /// "the Call Microphone", "the Microphone".
+    /// The port to choose when the application asks for a recording endpoint.
     pub fn describe(self) -> &'static str {
         match self {
-            Mic::LowLatency => "the Microphone",
-            Mic::Call => "the Call Microphone",
+            Mic::LowLatency => "Out",
+            Mic::Call => "Out-5ms",
             Mic::Other => "another ACX-LL-Cable microphone",
         }
     }
@@ -86,6 +86,9 @@ impl Mic {
 /// An endpoint's [`Mic`], from its friendly name (when its filter can't be read: [`identify`]). A numbered name
 /// ("Microphone (2- ACX-LL-Cable A)") is still the microphone; a renamed one is [`Mic::Other`].
 pub fn mic_of(endpoint_name: &str) -> Mic {
+    if let Some(kind) = labelled_port(endpoint_name) {
+        return Mic::of_kind(Some(kind));
+    }
     let name = endpoint_name.trim_start().to_ascii_lowercase();
     if name.starts_with("call microphone") {
         Mic::Call
@@ -96,11 +99,23 @@ pub fn mic_of(endpoint_name: &str) -> Mic {
     }
 }
 
+/// A short port name is meaningful only when the endpoint's adapter identifies the same cable. The user's
+/// renamed ports and another adapter's lookalike remain unknown when their KS role isn't available.
+fn labelled_port(name: &str) -> Option<EndpointKind> {
+    let cable = label_of_name(name)?;
+    let (port, _) = name.rsplit_once('(')?;
+    [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone]
+        .into_iter()
+        .find(|kind| port.trim().eq_ignore_ascii_case(&kind.display_name(&cable)))
+}
+
 /// An endpoint's kind from its friendly name, when its filter can't be read: a render endpoint named "Speakers ..." is the
 /// Speakers, a capture one as [`mic_of`] reads it (a numbered name still counts; a renamed one is none).
 fn kind_of_name(endpoint_name: &str, render: bool) -> Option<EndpointKind> {
     if render {
-        endpoint_name.trim_start().to_ascii_lowercase().starts_with("speakers").then_some(EndpointKind::Speakers)
+        (labelled_port(endpoint_name) == Some(EndpointKind::Speakers)
+            || endpoint_name.trim_start().to_ascii_lowercase().starts_with("speakers"))
+        .then_some(EndpointKind::Speakers)
     } else {
         match mic_of(endpoint_name) {
             Mic::LowLatency => Some(EndpointKind::Microphone),
@@ -784,6 +799,24 @@ mod tests {
         assert_eq!(mic_of("Call Microphone (2- ACX-LL-Cable A)"), Mic::Call);
         assert_eq!(mic_of("2- Microphone (ACX-LL-Cable A)"), Mic::Other);
         assert_eq!(mic_of("Studio mic (ACX-LL-Cable A)"), Mic::Other);
+    }
+
+    #[test]
+    fn short_port_fallback_requires_the_same_cable_label_and_flow() {
+        use EndpointKind::{CallMicrophone, Microphone, Speakers};
+        let cases = [
+            ("LLCable-B In (ACX-LL-Cable B)", Some(Speakers)),
+            ("LLCable-B Out (ACX-LL-Cable B)", Some(Microphone)),
+            ("llcable-c7 out-5MS (2- ACX-LL-Cable C7)", Some(CallMicrophone)),
+            ("LLCable-C7 Out (ACX-LL-Cable C)", None),
+            ("LLCable-B Out (USB Audio Device)", None),
+            ("LLCable-B Out-5ms extra (ACX-LL-Cable B)", None),
+        ];
+        for (name, kind) in cases {
+            for render in [true, false] {
+                assert_eq!(identify_endpoint(&[], name, render).0, kind.filter(|k| k.is_render() == render), "{name}");
+            }
+        }
     }
 
     /// The review of N0: an endpoint whose filter wasn't read says its cable only by the label in its name's brackets.

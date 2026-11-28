@@ -122,6 +122,24 @@ pub fn engine_config(args: &EngineArgs, list_devices: impl FnOnce() -> Result<Ve
     if let Some(backend) = args.output_backend {
         cfg.io.output_backend = backend;
     }
+    if let Some(target) = args.direct_cable.as_deref() {
+        if args.output_backend == Some(nf_engine::OutputBackend::Wasapi) || args.output.is_some() {
+            return Err(Failure::usage("--direct-cable selects driver-ring output. Choose one output route."));
+        }
+        cfg.io.output_backend = nf_engine::OutputBackend::DriverRing;
+        let id: nf_vmic::identity::CableId = match target.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                let label = target.parse().map_err(|_| Failure::usage("--direct-cable needs a cable label or stable ID."))?;
+                nf_vmic::roles::Snapshot::read()
+                    .map_err(|e| Failure::error(e.to_string()))?
+                    .cable_labelled(&label)
+                    .map_err(|_| Failure::error("Several installed cables have that label. Supply a cable ID."))?
+                    .ok_or_else(|| Failure::error(format!("No installed cable has label {label}.")))?
+            }
+        };
+        cfg.io.direct_cable = Some(id.to_string());
+    }
     if cfg.io.output_backend == nf_engine::OutputBackend::DriverRing && args.output.is_some() {
         return Err(Failure::usage(
             "--output selects a WASAPI device. Use --output-backend wasapi with it, or omit --output for driver-ring.",

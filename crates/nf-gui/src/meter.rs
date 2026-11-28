@@ -5,7 +5,7 @@
 //! rebuilds on every change (windows-reactor.md, "Meter bars from Borders"). Every width is clamped
 //! and NaN-free: a builder asserts on anything else.
 
-use nf_engine::MeterSnapshot;
+use llcable_control::voice::MeterSnapshot;
 use windows_reactor::*;
 
 use crate::widgets::MIN_TRACK;

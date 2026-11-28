@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "independent-cable-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+llcable-sdk = { path = "../../crates/llcable-sdk" }
+llcable-routing = { path = "../../crates/llcable-routing" }

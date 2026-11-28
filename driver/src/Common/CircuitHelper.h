@@ -86,6 +86,9 @@ TraverseKsAttributeList(
     );
 
 PAGED_CODE_SEG
+EVT_ACX_PIN_RETRIEVE_NAME Codec_EvtBridgePinRetrieveName;
+
+PAGED_CODE_SEG
 NTSTATUS AllocateFormat(
     _In_ KSDATAFORMAT_WAVEFORMATEXTENSIBLE      WaveFormat,
     _In_ ACXCIRCUIT                             Circuit,

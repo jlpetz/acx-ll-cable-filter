@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nf_engine::{EffectConfig, EngineConfig, GateConfig, GateMode, GatePosition, HighBand, IoConfig, LatencyMode, ProcessingConfig};
+use llcable_control::voice::{
+    EffectConfig, EngineConfig, GateConfig, GateMode, GatePosition, HighBand, IoConfig, LatencyMode, ProcessingConfig,
+};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
@@ -162,10 +164,10 @@ const OLD_DEFAULT_MODEL_DEPTH: u32 = 2;
 
 /// Brings an engine config saved in a settings file of `version` up to this version's meaning (the CLI's `--config` reads
 /// the window's file too). Before 1, a model depth of 2 was the default the window saved, not a choice: it becomes
-/// automatic (`nf_engine::AUTO_MODEL_DEPTH`). A depth a later file sets, 2 included, is kept.
+/// automatic (`llcable_control::voice::AUTO_MODEL_DEPTH`). A depth a later file sets, 2 included, is kept.
 pub fn upgrade_engine(version: u32, engine: &mut EngineConfig) {
     if version < 1 && engine.processing.model_depth == OLD_DEFAULT_MODEL_DEPTH {
-        engine.processing.model_depth = nf_engine::AUTO_MODEL_DEPTH;
+        engine.processing.model_depth = llcable_control::voice::AUTO_MODEL_DEPTH;
     }
     if version < 2 && !engine.processing.noise_enabled {
         // Previously, switching the noise filter off bypassed its gate too. Preserve the sound of that saved route.
@@ -311,7 +313,7 @@ impl Default for UiSettings {
 
 impl Settings {
     /// Upgrade still-active Windows IDs from an older settings file as soon as the device picker has its inventory.
-    pub(crate) fn bind_cable_endpoints(&mut self, list: &[nf_engine::DeviceInfo]) -> bool {
+    pub(crate) fn bind_cable_endpoints(&mut self, list: &[llcable_control::voice::DeviceInfo]) -> bool {
         let d = &mut self.engine.devices;
         let mut changed = false;
         for selected in
@@ -632,7 +634,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use nf_engine::GateMode;
+    use llcable_control::voice::GateMode;
 
     use super::*;
 
@@ -734,10 +736,10 @@ mod tests {
     #[test]
     fn old_settings_keep_wasapi_and_direct_output_and_effect_settings_survive_a_relaunch() {
         let mut settings = parse(br#"{"engine":{"devices":{"output":"cable"}}}"#).unwrap();
-        assert_eq!(settings.engine.io.output_backend, nf_engine::OutputBackend::Wasapi);
-        assert_eq!(settings.engine.effect, nf_engine::EffectConfig::default());
-        settings.engine.io.output_backend = nf_engine::OutputBackend::DriverRing;
-        settings.engine.effect = nf_engine::EffectConfig {
+        assert_eq!(settings.engine.io.output_backend, llcable_control::voice::OutputBackend::Wasapi);
+        assert_eq!(settings.engine.effect, llcable_control::voice::EffectConfig::default());
+        settings.engine.io.output_backend = llcable_control::voice::OutputBackend::DriverRing;
+        settings.engine.effect = llcable_control::voice::EffectConfig {
             path: Some("C:/Effects/Studio Gain.clap".into()),
             plugin_id: Some("test.gain".into()),
             bypass: true,
@@ -820,11 +822,11 @@ mod tests {
     #[test]
     fn an_older_file_s_saved_depth_becomes_automatic() {
         let depth = |json: &str| parse(json.as_bytes()).unwrap().engine.processing.model_depth;
-        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 2}}}"#), nf_engine::AUTO_MODEL_DEPTH);
+        assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 2}}}"#), llcable_control::voice::AUTO_MODEL_DEPTH);
         assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 1}}}"#), 1);
         assert_eq!(depth(r#"{"engine": {"processing": {"model_depth": 3}}}"#), 3);
         assert_eq!(depth(r#"{"version": 1, "engine": {"processing": {"model_depth": 2}}}"#), 2);
-        assert_eq!(depth("{}"), nf_engine::AUTO_MODEL_DEPTH);
+        assert_eq!(depth("{}"), llcable_control::voice::AUTO_MODEL_DEPTH);
         let saved: serde_json::Value = serde_json::to_value(Settings::default()).unwrap();
         assert_eq!(saved["version"], SETTINGS_VERSION, "{saved}");
     }

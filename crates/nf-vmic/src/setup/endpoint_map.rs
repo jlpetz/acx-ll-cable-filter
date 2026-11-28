@@ -1,7 +1,7 @@
 //! The endpoint map (TODO 19, the per-cable design, section 9; Astra's review, forwarded by the owner, 2026-11-25): which of a
-//! cable's endpoints takes each old endpoint's place when `migrate` or `add` makes the cable in place of other device nodes, so
-//! a harness can record the migration as a device change and the app's own saved settings can be remapped where the match is
-//! unambiguous. `acx-ll-cable migrate|add ... --endpoint-map <file>` writes it, as JSON (UTF-8, no BOM).
+//! cable's endpoints takes each old endpoint's place when `migrate` or `add` makes the cable, or `update` changes its package.
+//! `acx-ll-cable migrate|add|update ... --endpoint-map <file>` writes it as JSON (UTF-8, no BOM). The app can remap settings
+//! from a completed run where the match by cable and role is unambiguous.
 //!
 //! **Old and new.** A cable's old endpoints are those in the look before the run (NOTPRESENT ones too) on the nodes it replaces:
 //! the old driver's nodes the migration makes it in place of (`ROOT\MEDIA\0003` for A, Cable-B.ps1's for B; recorded in the
@@ -12,6 +12,8 @@
 //! what may differ). Its new endpoints are those on its instance after the run. Each old endpoint is matched to the new one of
 //! the same role (Speakers, render; Microphone and Call Microphone, capture): the old driver's circuits have the cable's
 //! reference strings (Speaker0, Microphone0, Microphone1).
+//! A package update can replace all endpoint IDs on the same node. Its map compares the available endpoints immediately before
+//! and after that update. Historical NOTPRESENT entries from earlier installs are excluded. Use a fresh map path per attempt.
 //!
 //! **`match`:**
 //! - `same`: Windows kept the endpoint (the same MMDevice id): nothing to remap.
@@ -146,7 +148,7 @@ pub struct Gathered {
 pub struct EndpointMap {
     pub format: &'static str,
     pub version: u32,
-    /// `migrate` or `add`.
+    /// `migrate`, `add` or `update`.
     pub command: &'static str,
     /// How the run ended: `done`, `nothing` (nothing needed doing), `restart` (Windows needs one to finish: the new endpoints may
     /// not be there yet), `error` (its message says what changed).

@@ -48,8 +48,8 @@ three times, so ScheduleNextPass and UpdatePosition read the clock three times p
 stream. Each conversion now takes one reading (`QpcToHns`), and GetPresentationPosition reports the position and its QPC
 from the same reading (the sample read it three times in UpdatePosition and once more for the QPC).
 
-Two microphones (TODO 19, the owner's option A): "Microphone" keeps IAudioClient3's small periods (128-480 frames, the
-packet-size constraints) for apps that ask for them, and "Call Microphone" (a second capture circuit, `Microphone1`) has a
+Two recording outputs (TODO 19): `LLCable-A Out` keeps IAudioClient3's small periods (128-480 frames, the
+packet-size constraints) for apps that ask for them, and `LLCable-A Out-5ms` (the second capture circuit, `Microphone1`) has a
 5 ms default engine period from the INF (`PKEY_AudioEngine_OEMPeriod`) for apps that ask for none, as call apps do. Windows
 reads that only when it makes the endpoint (TODO 22). Both play the app's ring and the loopback.
 Three hardware IDs pick the microphones (`Cable.ps1 variant <label> both|call|low-latency`, and `Install-Driver.ps1
@@ -65,7 +65,7 @@ without them (STATUS_DEVICE_CONFIGURATION_ERROR, code 31: devcon and Add legacy 
 has its own app ring and copy, counters, event logs, timer statistics, capture trace and control device,
 `\\.\AcxLlCable_<id>` (the identity in lower case), all in its device's context: removing or re-adding one cable touches no
 other's, and its counters start at zero with each binding (AddDevice). Only the stream serial is driver-wide. The device's
-friendly name is "ACX-LL-Cable <label>", which Windows puts in its endpoints' names ("Microphone (ACX-LL-Cable D)"); each
+friendly name is "ACX-LL-Cable <label>", which Windows can append to each short endpoint name in parentheses. Each
 circuit's component ID is the identity XOR the sample's constant.
 
 **A cable's endpoints, by role (the app's contract, `nf_vmic::roles`).** Windows' endpoint IDs belong to one installation
@@ -107,11 +107,18 @@ before the count is written.
 
 ### Using the cables
 
-Every cable works with the filter app closed. Send audio to a cable's **Speakers** endpoint and select a microphone of the
-same cable in the receiving application: what's played into "Speakers (ACX-LL-Cable A)" comes out of both "Microphone
-(ACX-LL-Cable A)" and "Call Microphone (ACX-LL-Cable A)" (those its variant makes). Each cable has its own playback and
+Every cable works with the filter app closed. Send audio to **LLCable-A In** in a player and select **LLCable-A Out**
+or **LLCable-A Out-5ms** in the receiving application. Both recording ends take the same signal. Substitute the actual
+cable label for A. Older installations list these roles as Speakers, Microphone and Call Microphone. Each cable has its own playback and
 recording pair, loopback memory, format negotiation, app ring and control device, and any cable can be fed directly: a
 direct feed takes over that cable's microphones while attached, and the others carry what is played into them.
+
+In the [Windows Playback panel](../doc/design/llcable-windows-playback.png), the blue socket icon marks a cable input.
+In the [Recording panel](../doc/design/llcable-windows-recording.png), an amber plug marks each cable output. Windows may
+carry an earlier installation's names and stock icons forward. `scripts\Update-CableAppearance.ps1 -Label B -WhatIf`
+previews those factory values for B. Run it without `-WhatIf` from an elevated shell to update them. A custom name and
+a custom icon are each preserved independently. On later upgrades, run it before deleting an older driver package so
+it can verify and update any factory icon that Windows still loads from that package.
 
 **Making, removing and moving cables (S1).** Only the setup tool, `acx-ll-cable` (a bin in `crates\nf-vmic`), makes a
 cable's device node; the scripts run it, and fail if it isn't built (`-Build` builds it: `cargo build --release -p nf-vmic
@@ -147,7 +154,9 @@ cable's device node; the scripts run it, and fail if it isn't built (`-Build` bu
   whose disable waits for a restart, is refused (exit 2): the re-made device would be enabled, so `enable` it first, switch,
   then `disable` it again.
 
-  `add` and `variant` put back the default roles Windows moved to a new endpoint.
+  `add` and `variant` put back the default roles Windows moved to a new endpoint. For a package update, both setup
+  scripts also remember the invoking user's playback and recording defaults for all three roles. A default assigned
+  to one of our cables follows that cable and role to its new endpoint ID.
 
 `scripts\Install-Driver.ps1` adds the package to the driver store, then:
 - the old driver's devices present (`ROOT\AudioCodec*` as A, `ROOT\NoiseFilterCableB` as B): the migration, once
@@ -177,9 +186,11 @@ them; pnputil's own 3010 is 7 too); 2 the tool's error (its steps say what chang
 couldn't delete; 3 `endpoint` only, no endpoint for that role now; 1 a usage error or a script's own check (not elevated,
 test signing, no package, no tool).
 
-**The endpoint map.** `Install-Driver.ps1 -EndpointMap <file>` (the migration, or the first `add A`) and `Cable.ps1 add
-<label> -EndpointMap <file>` pass `--endpoint-map <file>` to the tool, which writes, as JSON, which new endpoint takes each
-old one's place, by cable and role (Speakers, Microphone, Call Microphone), with the ids and names. The old driver's
+**The endpoint map.** `Install-Driver.ps1 -EndpointMap <file>`, `Cable.ps1 add <label> -EndpointMap <file>` and
+`Cable.ps1 update <package-folder> -EndpointMap <file>` pass `--endpoint-map <file>` to the tool. The JSON identifies
+each old and new endpoint by cable and role (Speakers, Microphone, Call Microphone), with IDs and names. A package
+update can change endpoint IDs on the same device node. Each update attempt maps the available endpoints immediately
+before and after it, so use a fresh path per attempt. The old driver's
 endpoints map to A's and B's; a re-added cable's to its own. Each old endpoint's `match` is `same` (Windows kept the
 endpoint), `moved` (one new endpoint of that role: remap the id), `gone`, `ambiguous` or, for a new endpoint without an old
 one, `added`; only `same` and `moved` are remapped. B's one microphone maps to its low-latency Microphone, and its Call
@@ -202,21 +213,21 @@ migration again to publish it.
 
 The settings window saves an ACX-LL-Cable device choice by cable ID and role. To recover choices that still refer to
 old Windows endpoint IDs after a migration, close the window and run `noise-filter-cli remap-devices <map.json>` as
-the user who owns the settings. Use the map from the completed `migrate` or `add` command. `--config <file>` selects
+the user who owns the settings. Use the map from the completed `migrate`, `add` or `update` command. `--config <file>` selects
 a particular settings file. The command reports any ambiguous choices and leaves them available for manual selection.
 
 **Feeding a cable (N0, interim until discovery: D2 and N1).** nf-vmic-test takes a cable's control device with `--path
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker
 always, take the cable labelled A, else the only cable. Each mode records or plays that cable's own endpoints, found by the
 instance ID in their KS filter's path. `\\.\NoiseFilterVmic` is gone: a tool that opens it gets ERROR_FILE_NOT_FOUND. The
-control device allows interactive users to read aggregate diagnostics. Direct feeds and full engineering statistics require write access. The dev box migrated both cables
+control device allows an interactive user to read aggregate diagnostics. Full engineering statistics and direct attachments require a write-capable handle. The dev box migrated both cables
 in the first install trial on 2026-11-26.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
-on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device "Speakers (ACX-LL-Cable B)"`), with
+on each cable input (`--device "LLCable-A In (ACX-LL-Cable A)"` and `--device "LLCable-B In (ACX-LL-Cable B)"`), with
 `--start 100000` on A and `--start 4000000` on B. While both renderers play, run
-`nf-vmic-test open --exclusive --format float --seconds 3 --device "Microphone (ACX-LL-Cable A)"` and the equivalent on
-`Microphone (ACX-LL-Cable B)` concurrently. Each capture's decoded marker range should remain inside its own renderer's
+`nf-vmic-test open --exclusive --format float --seconds 3 --device "LLCable-A Out (ACX-LL-Cable A)"` and the equivalent on
+`LLCable-B Out (ACX-LL-Cable B)` concurrently. Use the full names from `acx-ll-cable list`. Each capture's decoded marker range should remain inside its own renderer's
 range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440` (with N0's
 `--path` to A's control device) in place of A's renderer to verify an attached A ring coexists with B, and the same on B
 with A attached.
@@ -257,10 +268,11 @@ or process exiting, or the handle closed) or ERROR_DEVICE_REMOVED (the device is
 handle, since an open handle on the control device keeps the driver loaded). `src/Shared/nf_vmic.h` has the protocol, every
 ATTACH outcome and the ring's rules; `crates/nf-vmic` mirrors it, and its `nf-vmic-test` feeds, verifies, prints the
 statistics and kills feeders. The statistics IOCTL also carries each stream kind's timer lateness histogram (spike check 5).
-`NF_VMIC_IOCTL_DIAGNOSTICS` accepts a read-only handle. Its 10 ms per-cable snapshot contains aggregate counters and omits process IDs
-and audio. It sums capture underrun frames across readers and counts missing playback packets once at the source. A 40-byte buffer
-receives the v1 layout. A buffer of at least 48 bytes receives v2, which adds the missing playback packet count. Engineering tools
-must be rebuilt for the read/write statistics IOCTL (0x0022E004). Close nf-vmic-test before reinstalling.
+The `llcable-status` panel and SDK can read the independent `NF_VMIC_IOCTL_DIAGNOSTICS` on a read-only handle. Its snapshot is cached per cable for 10 ms and contains no process ID or audio. `NF_VMIC_IOCTL_STATS` now encodes read and write access (0x0022E004). Pre-release engineering tools must be rebuilt. A session-approved `llcable-broker.exe` can feed several selected cables, retaining the driver handles in the helper. Close nf-vmic-test before reinstalling, for the same reason as above.
+
+The panel reports capture underrun frames summed across readers and missing playback packets counted once at the source.
+The latter is unavailable on an older driver. A 40-byte diagnostics buffer still receives the original v1 reply. A buffer
+of at least 48 bytes receives v2 with the additional packet counter. The shared audio ring ABI is independent.
 
 Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
 others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, the cable's) on the same QPC

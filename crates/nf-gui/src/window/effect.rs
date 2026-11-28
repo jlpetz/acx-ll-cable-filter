@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use nf_engine::{EffectInfo, EngineState};
+use llcable_control::voice::{EffectInfo, EngineState};
 use windows_reactor::*;
 
 use super::{Msg, NOT_RUN, Window};

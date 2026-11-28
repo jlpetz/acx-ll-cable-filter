@@ -96,6 +96,7 @@ pub struct IoOptions {
 pub struct EngineArgs {
     pub config: Option<PathBuf>,
     pub output_backend: Option<nf_engine::OutputBackend>,
+    pub direct_cable: Option<String>,
     /// Allow one UAC prompt for the direct driver connection in this invocation.
     pub allow_driver: bool,
     /// Device ids or name substrings, resolved against the device list at start.
@@ -519,6 +520,7 @@ impl EngineArgs {
             "--config" => self.config = Some(PathBuf::from(text(flag, p.value(flag, inline)?)?)),
             "--mic" => self.mic = Some(text(flag, p.value(flag, inline)?)?),
             "--output" => self.output = Some(text(flag, p.value(flag, inline)?)?),
+            "--direct-cable" => self.direct_cable = Some(text(flag, p.value(flag, inline)?)?),
             "--output-backend" => {
                 self.output_backend = Some(match p.value(flag, inline)? {
                     "wasapi" => nf_engine::OutputBackend::Wasapi,
@@ -1047,8 +1049,8 @@ Usage:
                                  ACX-LL-Cable's), and which microphone suits each
   noise-filter mic variant [both|call|low-latency]
                                  Say which microphones the AudioCodec driver has, or switch it to
-                                 both, the call microphone only (a 5 ms default period, for call
-                                 apps) or the low-latency one only (IAudioClient3's small periods).
+                                 both recording outputs, Out-5ms only (5 ms default period)
+                                 or Out only (an app can request a shorter period).
                                  A switch re-creates the device: it asks for elevation, and the
                                  microphones are gone for a few seconds. The variant already there
                                  is re-created too if it doesn't run the driver store's newest
@@ -1072,6 +1074,7 @@ OPTIONS (run, latency, quality):
   --config FILE      Settings JSON: the window's settings.json, or an engine config
   --mic DEV          Microphone (default: the system default)
   --output-backend B Send audio through wasapi (default) or directly to our driver with driver-ring
+  --direct-cable ID  Direct destination by cable label or stable ID. Selects driver-ring output.
   --allow-driver     Allow one administrator prompt for direct output in this invocation
   --output DEV       Playback device for wasapi, e.g. \"CABLE Input\"
   --reference DEV    Speakers whose sound AEC removes (default: the default playback device)
@@ -1287,6 +1290,7 @@ mod tests {
                 engine: EngineArgs {
                     config: Some("s.json".into()),
                     output_backend: None,
+                    direct_cable: None,
                     allow_driver: false,
                     mic: Some("Headset Mic".into()),
                     output: Some("CABLE Input".into()),

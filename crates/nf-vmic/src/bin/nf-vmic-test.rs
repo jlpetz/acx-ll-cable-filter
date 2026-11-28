@@ -4,7 +4,7 @@
 //! slice): `--path \\.\AcxLlCable_<id>`, its control device, or without it the cable labelled A, else the only cable, as Plug
 //! and Play lists the cables' device nodes ([`cables::present`]). The endpoint a mode records or plays is that cable's own,
 //! found by the instance ID its KS filter names ([`sessions::pick`]), never by its name: its Microphone (Microphone0), with
-//! `--mic call` its Call Microphone (Microphone1), or for `open --render` its Speakers. `--device NAME` names an endpoint instead,
+//! `--mic call` its Out-5ms (Microphone1), or for `open --render` its Speakers. `--device NAME` names an endpoint instead,
 //! which must be that cable's (open's may be any).
 //!
 //! - `feed` attaches a ring and writes the test signal, paced by the driver's `read_frame`, until Ctrl+C.
@@ -107,8 +107,8 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
   Every mode works on one cable (ACX-LL-Cable, the per-cable driver): --path \\\\.\\AcxLlCable_<id>, the cable's control
   device (its identity, the GUID in its instance ID ROOT\\MEDIA\\ACXLLCABLE_<label>_<id>_<n>, as `acx-ll-cable list` shows it),
   or without --path the cable labelled A, else the only cable. kill-test gives its feed children the same path. The endpoint a
-  mode records is that cable's own, found by the instance ID its KS filter names, not by its name: its Microphone
-  (Microphone0), or with --mic call its Call Microphone (Microphone1). --device NAME (the endpoint's name, as Sound settings
+  mode records is that cable's own, found by the instance ID its KS filter names, not by its name: its Out
+  (Microphone0), or with --mic call its Out-5ms (Microphone1). --device NAME (the endpoint's name, as Sound settings
   shows it) names one instead, which must be that cable's: by its filter's instance ID, or where that can't be read, by the
   label its name ends with, (ACX-LL-Cable A), held by that cable alone. open's --device may be any endpoint.
 
@@ -518,7 +518,7 @@ fn mic_kind(o: &Opts) -> Result<EndpointKind, String> {
     match mic.as_deref() {
         None | Some("low-latency") => Ok(EndpointKind::Microphone),
         Some("call") => Ok(EndpointKind::CallMicrophone),
-        Some(other) => Err(format!("--mic {other:?}: low-latency (the Microphone) or call (the Call Microphone)")),
+        Some(other) => Err(format!("--mic {other:?}: low-latency (Out) or call (Out-5ms)")),
     }
 }
 
@@ -548,14 +548,14 @@ fn cable_endpoint(listed: &[CableEndpoint], target: &Target, kind: EndpointKind)
         Pick::Found(e) => Ok(Endpoint { id: e.id.clone(), name: e.name.clone() }),
         Pick::NotActive(on_cable) => {
             let hint = match kind {
-                EndpointKind::Microphone => " (a cable of the call variant has only the Call Microphone: --mic call)",
-                EndpointKind::CallMicrophone => " (a cable of the low-latency variant has only the Microphone: leave out --mic)",
+                EndpointKind::Microphone => " (a cable of the call variant has only Out-5ms: --mic call)",
+                EndpointKind::CallMicrophone => " (a cable of the low-latency variant has only Out: leave out --mic)",
                 EndpointKind::Speakers => "",
             };
             Err(format!(
                 "cable {} has no active {} ({}){hint}; its endpoints Windows lists: {}",
                 target.id,
-                kind.name(),
+                kind.port(),
                 kind.reference(),
                 listing(&on_cable)
             ))
@@ -563,7 +563,7 @@ fn cable_endpoint(listed: &[CableEndpoint], target: &Target, kind: EndpointKind)
         Pick::Several(active) => Err(format!(
             "cable {} has more than one active {} (two of its device nodes at once?): {}; name one with --device",
             target.id,
-            kind.name(),
+            kind.port(),
             listing(&active)
         )),
     }
@@ -6396,7 +6396,7 @@ mod tests {
         assert_eq!(kind(&["--mic", "low-latency"]), Ok(EndpointKind::Microphone));
         assert_eq!(kind(&["--mic", "call"]), Ok(EndpointKind::CallMicrophone));
         assert_eq!(kind(&["--device", "Mic (X)"]), Ok(EndpointKind::Microphone), "--device decides, not the kind");
-        assert!(kind(&["--mic", "speakers"]).unwrap_err().contains("low-latency (the Microphone) or call"));
+        assert!(kind(&["--mic", "speakers"]).unwrap_err().contains("low-latency (Out) or call (Out-5ms)"));
         assert!(kind(&["--mic", "call", "--device", "M"]).unwrap_err().contains("give one"));
     }
 
@@ -6432,11 +6432,11 @@ mod tests {
         assert_eq!(cable_endpoint(&list, &a, Microphone), found("{a-mic}", "Studio mic (ACX-LL-Cable A)"));
         assert_eq!(cable_endpoint(&list, &a, Speakers), found("{a-spk}", "Speakers (ACX-LL-Cable A)"));
         let e = cable_endpoint(&list, &a, CallMicrophone).unwrap_err();
-        assert!(e.contains("has no active Call Microphone (Microphone1)") && e.contains("disabled in the Sound panel"), "{e}");
+        assert!(e.contains("has no active Out-5ms (Microphone1)") && e.contains("disabled in the Sound panel"), "{e}");
         let b = Target::of_path(&format!(r"\\.\AcxLlCable_{OTHER_ID}")).unwrap();
         assert_eq!(cable_endpoint(&list, &b, Microphone), found("{b-mic}", "Microphone (ACX-LL-Cable B)"));
         let e = cable_endpoint(&list, &b, CallMicrophone).unwrap_err();
-        assert!(e.contains("the low-latency variant has only the Microphone: leave out --mic"), "{e}");
+        assert!(e.contains("the low-latency variant has only Out: leave out --mic"), "{e}");
         // By name: A's is taken, B's refused for A, another vendor's and a disabled one not found. The cables present aren't
         // asked for an endpoint whose filter was read.
         let unasked = || -> Result<Vec<PresentCable>, String> { panic!("the cables present were asked for") };

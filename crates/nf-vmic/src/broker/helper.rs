@@ -1,11 +1,18 @@
 //! Elevated side. Its entire input after authentication is START or STOP; its only transfer is an anonymous ring into the
 //! kernel-identified parent process. No command can supply a path, a handle, a capacity or a duplication target.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::DuplicateHandle;
-use windows::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
+use windows::Win32::Foundation::{DuplicateHandle, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandleEx, SECURITY_ANONYMOUS,
+    SECURITY_SQOS_PRESENT,
+};
 use windows::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE};
 use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState};
 use windows::Win32::System::RemoteDesktop::{
@@ -36,6 +43,27 @@ fn session_id(pid: u32) -> io::Result<u32> {
     // SAFETY: one live output word.
     unsafe { ProcessIdToSessionId(pid, &mut session) }.map_err(io_error)?;
     Ok(session)
+}
+
+fn same_installation(caller: &Path, helper: &Path) -> io::Result<bool> {
+    fn directory(exe: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(exe.parent().ok_or(io::ErrorKind::InvalidInput)?)
+    }
+    fn identity(file: &File) -> io::Result<FILE_ID_INFO> {
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: live handle to the opened Windows directory and a suitably sized, writable info structure.
+        unsafe { GetFileInformationByHandleEx(raw(file), FileIdInfo, (&raw mut info).cast(), size_of::<FILE_ID_INFO>() as u32) }
+            .map_err(io_error)?;
+        Ok(info)
+    }
+    // Kernel paths may use different case, verbatim prefixes or aliases. Directory object identity also distinguishes
+    // genuinely different directories, including those in case-sensitive Windows directories.
+    let caller = directory(caller)?;
+    let helper = directory(helper)?;
+    Ok(identity(&caller)? == identity(&helper)?)
 }
 
 /// The microphone is machine-global. Grant access only while the requester is the sole logged-in interactive session.
@@ -88,20 +116,25 @@ fn connect_parent(pipe: &File, expected: u32) -> io::Result<(OwnedHandle, u32)> 
     // SAFETY: OpenProcess handed us ownership.
     let process = unsafe { OwnedHandle::from_raw_handle(h.0) };
     let session = session_id(peer)?;
-    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for this image query.
-    if session != session_id(std::process::id())? || !alive(&process) || image(h)? != image(unsafe { GetCurrentProcess() })? {
+    let caller = PathBuf::from(OsString::from_wide(&image(h)?));
+    let helper_path = std::env::current_exe()?;
+    // Only a peer from this installation directory; both absolute image paths are supplied by Windows.
+    if session != session_id(std::process::id())? || !alive(&process) || !same_installation(&caller, &helper_path)? {
         return Err(denied());
     }
     check_sessions(session)?;
     Ok((process, session))
 }
 
-fn start_feed(parent: &OwnedHandle, active: &mut Option<Attachment>) -> io::Result<u64> {
-    if active.is_some() {
+fn start_feed(parent: &OwnedHandle, active: &mut BTreeMap<CableId, Attachment>, id: CableId) -> io::Result<u64> {
+    if active.contains_key(&id) {
         return Err(io::Error::from_raw_os_error(ERROR_BUSY.0 as i32));
     }
+    if !crate::cables::present().map_err(io::Error::other)?.iter().any(|c| c.cable.id == id) {
+        return Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND.0 as i32));
+    }
     let (ring, section) = RingMemory::shared(LIVE_CAPACITY)?;
-    let attachment = Device::open_default()?.attach_live(ring).map_err(|e| e.error)?;
+    let attachment = Device::open_path(&protocol::control_path(&id))?.attach_live(ring).map_err(|e| e.error)?;
     let mut remote = HANDLE::default();
     // SAFETY: fresh anonymous pagefile section only; verified, live recipient. Limit access to the two view rights and disallow inheritance.
     unsafe {
@@ -116,7 +149,7 @@ fn start_feed(parent: &OwnedHandle, active: &mut Option<Attachment>) -> io::Resu
         )
     }
     .map_err(io_error)?;
-    *active = Some(attachment);
+    active.insert(id, attachment);
     Ok(remote.0 as usize as u64)
 }
 
@@ -133,11 +166,12 @@ pub(super) fn serve(pid: u32, nonce: &str) -> io::Result<()> {
         Err(e) => return reply(&mut pipe, Err(e)),
     };
     reply(&mut pipe, Ok(0))?;
-    let mut active = None;
+    let mut active = BTreeMap::new();
     let mut checked = Instant::now();
     while alive(&parent) {
         if checked.elapsed() >= Duration::from_millis(200) {
             check_sessions(session)?;
+            active.retain(|_, a: &mut Attachment| !a.finished());
             checked = Instant::now();
         }
         let pending = match available(&pipe) {
@@ -145,21 +179,47 @@ pub(super) fn serve(pid: u32, nonce: &str) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
             Err(e) => return Err(e),
         };
-        if pending == 0 {
+        if pending < 17 {
             std::thread::sleep(POLL);
             continue;
         }
-        let mut command = [0];
+        let mut command = [0; 17];
         pipe.read_exact(&mut command)?;
+        let id = CableId(u128::from_le_bytes(command[1..].try_into().unwrap()));
         let result = match command[0] {
-            START => check_sessions(session).and_then(|()| start_feed(&parent, &mut active)),
-            STOP => match active.take() {
+            START => {
+                if let Err(e) = check_sessions(session) {
+                    // Revoke the whole approved session. Even the reply cannot leave a previous cable feeding.
+                    drop(active);
+                    reply(&mut pipe, Err(e))?;
+                    return Ok(());
+                }
+                // A newly enabled/re-added cable can arrive before the next sweep.
+                if active.get(&id).is_some_and(Attachment::finished) {
+                    active.remove(&id);
+                }
+                start_feed(&parent, &mut active, id)
+            }
+            STOP => match active.remove(&id) {
                 Some(attachment) => attachment.detach().map(|_| 0),
                 None => Ok(0),
             },
-            _ => return Err(io::ErrorKind::InvalidData.into()),
+            _ => Err(io::Error::from_raw_os_error(ERROR_INVALID_DATA.0 as i32)),
         };
         reply(&mut pipe, result)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parent_image_directory_matches_windows_verbatim_and_rejects_a_different_directory() {
+        let image = std::env::current_exe().unwrap();
+        let verbatim = std::fs::canonicalize(&image).unwrap().with_file_name("llcable-broker.exe");
+        assert!(same_installation(&image, &verbatim).unwrap());
+        let unrelated = image.parent().unwrap().parent().unwrap().join("llcable-broker.exe");
+        assert!(!same_installation(&image, &unrelated).unwrap());
+    }
 }

@@ -17,10 +17,11 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 mod devices;
-mod effect_picker;
+pub mod effect_picker;
 mod format;
 mod live;
 mod meter;
+pub mod mixer_meter;
 mod screen;
 mod settings;
 mod widgets;
@@ -29,7 +30,8 @@ mod window;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nf_engine::Engine;
+pub use devices::picker_name;
+use llcable_control::voice::Engine;
 use windows_reactor::{App, ComponentTask, ComponentTaskStatus};
 
 /// Opens the window and runs until it closes. `settings_path` is the JSON settings file (created on
@@ -68,7 +70,7 @@ pub fn run(engine: Arc<Engine>, settings_path: PathBuf) -> Result<(), String> {
 
 /// Brings the engine config of a settings file of `version` (its top-level `"version"`, 0 without one) up to this version's
 /// meaning, as the window does when it loads one: for the CLI's `--config`, which reads the window's file too.
-pub fn upgrade_saved_engine(version: u32, engine: &mut nf_engine::EngineConfig) {
+pub fn upgrade_saved_engine(version: u32, engine: &mut llcable_control::voice::EngineConfig) {
     settings::upgrade_engine(version, engine);
 }
 

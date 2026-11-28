@@ -4,7 +4,7 @@
 //! Numbers come from atomics the audio thread writes, so any of them can be NaN or infinite. They
 //! print as "—" (or "-∞" for a silent level), never as "NaN", and -0.0 prints as "0".
 
-use nf_engine::{
+use llcable_control::voice::{
     EngineState, EngineStatus, LatencyBudget, LatencyReport, MeterSnapshot, REFERENCE_TARGET_HIGH_MS, StreamInfo, TelemetrySnapshot,
 };
 
@@ -266,7 +266,7 @@ pub(crate) fn clocks(t: &TelemetrySnapshot) -> String {
     }
     // The echo-path guard's mic hold (nf-engine echo_guard.rs): the lead above is the echo path's, less it.
     if t.echo_hold_ms > 0.0 {
-        let trial = if t.echo_guard == nf_engine::ECHO_GUARD_TRIAL { ", on a trial" } else { "" };
+        let trial = if t.echo_guard == llcable_control::voice::ECHO_GUARD_TRIAL { ", on a trial" } else { "" };
         s.push_str(&format!(" · Mic held for the echo: {} ms{trial}", fixed(t.echo_hold_ms, 1)));
     }
     s
@@ -425,7 +425,7 @@ pub(crate) fn report(r: &LatencyReport) -> Vec<String> {
         lines.push(format!("Its budget (means over the test): {}", budget_parts(b)));
     }
     // What the mic and the output did meanwhile (TODO 9): a spread these don't explain is the devices' own.
-    let mic = r.mic_glitches.map(|n| nf_engine::mic_events_text(n, r.mic_stalls.unwrap_or(0)));
+    let mic = r.mic_glitches.map(|n| llcable_control::voice::mic_events_text(n, r.mic_stalls.unwrap_or(0)));
     match (mic, &r.output) {
         (Some(m), Some(e)) => lines.push(format!("During the test: {m}; output: {}", e.text())),
         (None, Some(e)) => lines.push(format!("Output during the test: {}", e.text())),
@@ -754,10 +754,10 @@ mod tests {
 
     #[test]
     fn the_report_lines() {
-        let corrections = nf_engine::OutputEvents { underruns: 1, deficits: 1, zero_frames: 480, ..Default::default() };
-        let sweep = |repetition| nf_engine::SweepDisturbance { repetition, ..Default::default() };
+        let corrections = llcable_control::voice::OutputEvents { underruns: 1, deficits: 1, zero_frames: 480, ..Default::default() };
+        let sweep = |repetition| llcable_control::voice::SweepDisturbance { repetition, ..Default::default() };
         // Sweeps 4 and 5 after the deficit's block (sweep 2's).
-        let after = |repetition| nf_engine::SweepDisturbance { events_before: 1, ..sweep(repetition) };
+        let after = |repetition| llcable_control::voice::SweepDisturbance { events_before: 1, ..sweep(repetition) };
         let mut r = LatencyReport {
             repetitions: 5,
             valid: 4,
@@ -770,7 +770,7 @@ mod tests {
             delivery_ms_median: None,
             reader_period_ms: None,
             budget: Some(LatencyBudget { mic_ms: 10.5, wait_ms: 0.0, chain_ms: 10.0, queue_ms: 22.0, render_ms: 5.0, delivery_ms: 0.0 }),
-            output: Some(nf_engine::OutputEvents {
+            output: Some(llcable_control::voice::OutputEvents {
                 underruns: 1,
                 deficits: 1,
                 zero_frames: 480,
@@ -780,7 +780,7 @@ mod tests {
             }),
             mic_glitches: Some(2),
             mic_stalls: Some(1),
-            disturbances: vec![sweep(1), nf_engine::SweepDisturbance { output: corrections, ..sweep(2) }, after(4), after(5)],
+            disturbances: vec![sweep(1), llcable_control::voice::SweepDisturbance { output: corrections, ..sweep(2) }, after(4), after(5)],
             clean_ms_median: Some(12.2),
             clean_ms_spread: Some(0.8),
             chain_ms: 10.0,

@@ -350,12 +350,31 @@ pub fn install_all<O: Ops>(
 
 /// `update`, once the package is staged and the plan made: the checks, the unload, the installs (the module's docs).
 pub fn run_update<O: Ops>(
-    ops: &mut O, nodes: &[Node], plan: &UpdatePlan, published: &str, say: &mut dyn FnMut(&str),
+    ops: &mut O, nodes: &[Node], plan: &UpdatePlan, published: &str, gathered: Option<&mut Gathered>, say: &mut dyn FnMut(&str),
 ) -> Result<Done, SetupError> {
     let drivers = staged(ops, &plan.install, published, say)?;
-    let before = endpoints_before(ops, &[], say).unwrap_or_default();
+    let before = if let Some(gathered) = gathered {
+        // Never disable a cable before the requested baseline is readable. NOTPRESENT entries from previous installs can
+        // share these same device nodes; they were not available endpoints at the start of this update.
+        let mut before = ops.endpoints_before(&[]).map_err(SetupError::Endpoints)?;
+        before.retain(|e| e.state != endpoints::State::NotPresent);
+        for n in plan.install.iter().map(|&i| &nodes[i]) {
+            if let (Some(c), Some(v)) = (&n.cable, n.variant()) {
+                if gathered.cables.iter().any(|m| m.cable.id == c.id) {
+                    return Err(SetupError::EndpointMap(format!(
+                        "multiple present device nodes for cable identity {}: update not started",
+                        c.id
+                    )));
+                }
+                gathered.cables.push(endpoint_map::Made::new(c.clone(), v, &[]));
+            }
+        }
+        gathered.before.insert(before).as_slice()
+    } else {
+        &endpoints_before(ops, &[], say).unwrap_or_default()
+    };
     let disabled = unload(ops, nodes, &plan.disable, &plan.reenable, say)?;
-    let (problems, restart) = install_all(ops, nodes, &drivers, &disabled, &before, say);
+    let (problems, restart) = install_all(ops, nodes, &drivers, &disabled, before, say);
     ended(restart, problems)
 }
 
@@ -1232,7 +1251,7 @@ mod tests {
     fn update(fake: &mut Fake, nodes: &[Node]) -> (Result<Done, SetupError>, Vec<String>) {
         let mut said = Vec::new();
         let plan = plan_update(nodes).unwrap();
-        let r = run_update(fake, nodes, &plan, PUBLISHED, &mut |s: &str| said.push(s.to_string()));
+        let r = run_update(fake, nodes, &plan, PUBLISHED, None, &mut |s: &str| said.push(s.to_string()));
         (r, said)
     }
 
@@ -1250,6 +1269,75 @@ mod tests {
         let at = |c: &str| fake.calls.iter().position(|x| x == c).unwrap();
         assert!(at("clear 1") < at("install 1") && fake.calls[at("enable 1") - 1] == "clear 1");
         assert!(fake.disabled.is_empty());
+    }
+
+    #[test]
+    fn update_map_pairs_current_endpoints_by_identity_and_role_across_all_cables() {
+        use EndpointKind::{CallMicrophone, Microphone, Speakers};
+        use endpoint_map::Match::{Moved, Same};
+        use endpoints::State::{Active, Disabled, NotPresent};
+        let nodes = three();
+        let ep = |i: usize, kind: EndpointKind, id: &str, state| Endpoint {
+            id: id.into(),
+            name: kind.name().into(),
+            kind,
+            state,
+            instance_id: nodes[i].instance_id.clone(),
+        };
+        let before = vec![
+            ep(0, Speakers, "a-speaker", Active),
+            ep(0, Microphone, "a-mic", Active),
+            ep(0, Microphone, "a-stale", NotPresent),
+            ep(1, Microphone, "b-mic", Active),
+            ep(2, CallMicrophone, "c-call", Disabled),
+        ];
+        let after = vec![
+            ep(1, Microphone, "b-new", Active),
+            ep(2, CallMicrophone, "c-call", Disabled),
+            ep(0, Microphone, "a-new", Active),
+            ep(0, Speakers, "a-play", Active),
+        ];
+        let mut fake = Fake { before, ..Fake::default() };
+        let mut gathered = Gathered::default();
+        let result = run_update(&mut fake, &nodes, &plan_update(&nodes).unwrap(), PUBLISHED, Some(&mut gathered), &mut |_| {});
+        assert_eq!(result, Ok(Done::Changed));
+        let map = endpoint_map::map("update", &result, &gathered.cables, &gathered.before.unwrap(), &after);
+        assert_eq!((map.command, map.result), ("update", "done"));
+        let rows: Vec<_> = map
+            .cables
+            .iter()
+            .flat_map(|c| {
+                c.endpoints.iter().map(|p| {
+                    (c.label.as_str(), p.role, p.old.as_ref().unwrap().id.as_str(), p.new.as_ref().unwrap().id.as_str(), p.matched)
+                })
+            })
+            .collect();
+        assert_eq!(rows, [
+            ("A", Speakers.name(), "a-speaker", "a-play", Moved),
+            ("A", Microphone.name(), "a-mic", "a-new", Moved),
+            ("B", Microphone.name(), "b-mic", "b-new", Moved),
+            ("C", CallMicrophone.name(), "c-call", "c-call", Same),
+        ]);
+    }
+
+    #[test]
+    fn update_map_rejects_an_unreadable_baseline_before_disabling_and_reports_partial_results() {
+        let nodes = three();
+        let plan = plan_update(&nodes).unwrap();
+        let mut fake = Fake { before_fails: true, ..Fake::default() };
+        let mut gathered = Gathered::default();
+        let result = run_update(&mut fake, &nodes, &plan, PUBLISHED, Some(&mut gathered), &mut |_| {});
+        assert!(matches!(result, Err(SetupError::Endpoints(_))));
+        assert!(gathered.before.is_none() && fake.only(&["disable", "install"]).is_empty());
+
+        let failed = Fake { install_fails: Some(1), ..Fake::default() };
+        let restart = Fake { install_restart: Some(0), ..Fake::default() };
+        for (mut fake, expected) in [(failed, "error"), (restart, "restart")] {
+            let mut gathered = Gathered::default();
+            let result = run_update(&mut fake, &nodes, &plan, PUBLISHED, Some(&mut gathered), &mut |_| {});
+            let map = endpoint_map::map("update", &result, &gathered.cables, &gathered.before.unwrap(), &[]);
+            assert_eq!((map.result, map.cables.len()), (expected, 3));
+        }
     }
 
     /// A veto at the second of three cables: the first enabled again, nothing installed.

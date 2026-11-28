@@ -10,8 +10,10 @@ mod scene;
 #[cfg(test)]
 mod scene_tests;
 mod strips;
+mod widgets;
 
 use scene::*;
+use widgets::*;
 use windows_reactor::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,7 +34,7 @@ enum Msg {
     Sends(usize),
     Catalog,
     Add(Kind),
-    Edit(u32),
+    StageDetails(u32),
     Move(u32, i8),
     Remove(u32),
     Bypass(u32),
@@ -107,7 +109,7 @@ impl Preview {
                 self.selected_stage = Some(self.scene.add(kind));
                 self.catalog = false;
             }
-            Msg::Edit(id) => self.selected_stage = (self.selected_stage != Some(id)).then_some(id),
+            Msg::StageDetails(id) => self.selected_stage = (self.selected_stage != Some(id)).then_some(id),
             Msg::Move(id, step) => self.scene.move_stage(id, step),
             Msg::Remove(id) => {
                 self.scene.remove(id);
@@ -169,7 +171,7 @@ impl Preview {
             .into_iter()
             .map(|(choice, label)| action(label, cx.callback(move |()| Msg::Concept(choice)), self.concept == choice))
             .collect());
-        column(vec![title_row, navigation, muted("Play audio into a Cable Input. Record from a Cable Output.").into()])
+        column(vec![title_row, navigation, muted("For example, play into LLCable-C In and record from LLCable-A Out.").into()])
     }
 
     fn routing(&self, cx: &ViewContext<Self>) -> View {
@@ -219,7 +221,7 @@ impl Preview {
     }
 
     fn inspector(&self, cx: &ViewContext<Self>) -> View {
-        let mut items = vec![editor::editor(self, cx)];
+        let mut items = vec![editor::editor(self, cx, &Kind::ALL)];
         if let Scope::Send(s, d) = self.scene.scope {
             items.push(self.send_controls(cx, s, d));
         }
@@ -278,40 +280,6 @@ impl Component for Preview {
             StackPanel::new().margin(Thickness::xy(22.0, 16.0)).max_width(1150.0).spacing(18.0).children((self.header(cx), content));
         ScrollViewer::new().vertical_scroll_bar_visibility(ScrollBarVisibility::Auto).content(layout)
     }
-}
-
-fn heading(label: &str) -> TextBlock {
-    TextBlock::new().text(label).font_weight(FontWeight::SEMI_BOLD).font_size(18.0)
-}
-
-fn muted(label: &str) -> TextBlock {
-    TextBlock::new().text(label).font_size(13.0).opacity(0.76).text_wrapping(TextWrapping::Wrap)
-}
-
-fn small(label: &str) -> TextBlock {
-    TextBlock::new().text(label).font_size(12.0).opacity(0.77)
-}
-
-fn row(items: Vec<View>) -> View {
-    StackPanel::new().orientation(Orientation::Horizontal).spacing(6.0).keyed_children(items.into_iter().enumerate())
-}
-
-fn column(items: Vec<View>) -> View {
-    StackPanel::new().spacing(8.0).keyed_children(items.into_iter().enumerate())
-}
-
-fn card(body: View) -> View {
-    Border::new()
-        .padding(13.0)
-        .background(ThemeBrush::CardBackground)
-        .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(1.0)
-        .corner_radius(8.0)
-        .content(body)
-}
-
-fn action(label: &str, callback: Callback<()>, accent: bool) -> View {
-    Button::new().style(if accent { ButtonStyle::Accent } else { ButtonStyle::Default }).on_click(callback).content(label)
 }
 
 fn meter(level: f64) -> View {

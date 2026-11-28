@@ -4,9 +4,11 @@
 //! A selected device that isn't in the list (unplugged, or a list that failed to load) shows as
 //! "(missing) <id>" and stays selected, so the config keeps it until the user picks another.
 
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use nf_engine::{DeviceInfo, Flow};
+use llcable_control::Label;
+use llcable_control::voice::{DeviceInfo, Flow};
 
 /// One ComboBox's items. Choosing `labels[i]` stores `ids[i]` (`None` = the system default).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -27,6 +29,26 @@ impl DeviceChoices {
     }
 }
 
+/// Direct targets are cable identities. An unplugged selection stays visible until the owner chooses another.
+pub(crate) fn direct_choices(devices: &[DeviceInfo], selected: Option<&str>) -> DeviceChoices {
+    let mut labels = vec!["Automatic (A or the only cable)".to_owned()];
+    let mut ids = vec![None];
+    for device in devices.iter().filter(|d| d.flow == Flow::Render) {
+        if let Some(id) = device.cable_id() {
+            labels.push(picker_name(device).to_owned());
+            ids.push(Some(id.to_string()));
+        }
+    }
+    let selected = ids.iter().position(|id| id.as_deref() == selected).unwrap_or_else(|| {
+        labels.push(format!("(missing) {}", selected.unwrap_or_default()));
+        ids.push(selected.map(str::to_owned));
+        labels.len() - 1
+    });
+    let mut hasher = DefaultHasher::new();
+    labels.hash(&mut hasher);
+    ids.hash(&mut hasher);
+    DeviceChoices { labels, ids, selected: Some(selected), key: hasher.finish() }
+}
 /// How one picker lists its devices.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Picker<'a> {
@@ -50,6 +72,20 @@ impl Picker<'_> {
     }
 }
 
+/// Shorten only the complete factory name on a known cable. A user alias or another manufacturer's device keeps its Windows name.
+pub fn picker_name(device: &DeviceInfo) -> &str {
+    if let Some(role) = device.cable_role()
+        && let Some((short, adapter)) = device.name.strip_suffix(')').and_then(|s| s.rsplit_once(" ("))
+        && let Some((_, label)) = adapter.rsplit_once(' ')
+        && let Ok(label) = label.parse::<Label>()
+        && device.name == role.friendly_name(&label)
+    {
+        short
+    } else {
+        &device.name
+    }
+}
+
 /// The items for `picker` from `devices`, with `selected` (a stored endpoint id) chosen.
 pub(crate) fn choices(devices: &[DeviceInfo], picker: Picker<'_>, selected: Option<&str>) -> DeviceChoices {
     let listed: Vec<&DeviceInfo> = devices
@@ -63,15 +99,18 @@ pub(crate) fn choices(devices: &[DeviceInfo], picker: Picker<'_>, selected: Opti
         // Name the current default too: "Default microphone (USB Mic)"
         let default = devices.iter().find(|d| d.flow == picker.flow && d.is_default);
         labels.push(match default {
-            Some(d) => format!("{label} ({})", d.name),
+            Some(d) => format!("{label} ({})", picker_name(d)),
             None => label.to_owned(),
         });
         ids.push(None);
     }
-    for (i, d) in listed.iter().enumerate() {
-        // Two endpoints can share a friendly name (two identical USB mics): number the later ones.
-        let same = listed.iter().take(i).filter(|e| e.name == d.name).count();
-        labels.push(if same == 0 { d.name.clone() } else { format!("{} #{}", d.name, same + 1) });
+    let mut counts = HashMap::new();
+    for &d in &listed {
+        let name = picker_name(d);
+        // Count the labels people see; a different device or a user alias can match a shortened cable name.
+        let count = counts.entry(name).or_insert(0);
+        *count += 1;
+        labels.push(if *count == 1 { name.to_owned() } else { format!("{name} #{count}") });
         ids.push(Some(d.selection().to_owned()));
     }
     let selected = match selected {
@@ -159,7 +198,7 @@ mod tests {
     #[test]
     fn cable_selections_follow_the_role_across_endpoint_replacement() {
         let mut endpoint = device("old", "Studio", Flow::Render, false);
-        let key = nf_engine::cable_endpoint_selection(nf_vmic::identity::CableId(17), nf_vmic::cables::EndpointKind::Speakers);
+        let key = llcable_control::voice::cable_endpoint_selection(llcable_control::CableId(17), llcable_control::EndpointKind::Speakers);
         endpoint.cable_selection = Some(key.clone());
         let mut settings = crate::settings::Settings::default();
         settings.engine.devices.output = Some("old".into());
@@ -207,6 +246,46 @@ mod tests {
         let c = choices(&list, Picker::CAPTURE, Some("mic2"));
         assert_eq!(labels(&c), ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)", "Microphone (USB Mic) #2"]);
         assert_eq!(c.selected, Some(2));
+    }
+
+    #[test]
+    fn only_known_factory_cable_names_are_shortened_and_aliases_keep_their_ids() {
+        use llcable_control::{CableId, EndpointKind};
+
+        let id = CableId(17);
+        let roles = [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone];
+        for role in roles {
+            let flow = if role.is_render() { Flow::Render } else { Flow::Capture };
+            let short = format!("LLCable-STUDIO2 {}", role.port());
+            let full = format!("{short} (ACX-LL-Cable STUDIO2)");
+            let key = llcable_control::voice::cable_endpoint_selection(id, role);
+            let mut ours = device("cable-mm-id", &full, flow, true);
+            ours.cable_selection = Some(key.clone());
+            let third_party = device("foreign-mm-id", &full, flow, false);
+            let alias = device("alias-mm-id", &short, flow, false);
+            let picker = Picker { flow, default_label: Some("Default"), exclude: None };
+            let choices = choices(&[ours.clone(), third_party, alias], picker, Some("cable-mm-id"));
+            assert_eq!(choices.labels, [format!("Default ({short})"), short.clone(), full, format!("{short} #2")]);
+            assert_eq!(choices.selected, Some(1));
+            assert_eq!(choices.id_at(1), Some(Some(key)));
+            ours.name = "Studio voice (ACX-LL-Cable STUDIO2)".into();
+            assert_eq!(picker_name(&ours), ours.name);
+            ours.name = format!("{short} (ACX-LL-Cable B)");
+            assert_eq!(picker_name(&ours), ours.name);
+        }
+    }
+
+    #[test]
+    fn direct_picker_keeps_destination_identity_separately_from_wasapi() {
+        let mut list = devices();
+        let id = llcable_control::CableId(4);
+        list[3].cable_selection = Some(llcable_control::voice::cable_endpoint_selection(id, llcable_control::EndpointKind::Speakers));
+        let choices = direct_choices(&list, Some(&id.to_string()));
+        assert_eq!(choices.selected, Some(1));
+        assert_eq!(choices.id_at(1), Some(Some(id.to_string())));
+        assert_eq!(choices.id_at(0), Some(None));
+        let missing = direct_choices(&[], Some(&id.to_string()));
+        assert_eq!(missing.id_at(missing.selected.unwrap()), Some(Some(id.to_string())));
     }
 
     #[test]

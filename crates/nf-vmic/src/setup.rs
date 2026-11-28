@@ -296,7 +296,7 @@ impl fmt::Display for SetupError {
                 f,
                 "{package} doesn't make {} for {hardware_id}, by its INF: nothing was changed. Build the package again \
                  (driver\\scripts\\Build-Driver.ps1) and move the cables to it (`acx-ll-cable update`).",
-                missing.iter().map(|k| k.name()).collect::<Vec<_>>().join(" and ")
+                missing.iter().map(|k| k.port()).collect::<Vec<_>>().join(" and ")
             ),
             SetupError::RestartFirst { device } => {
                 write!(f, "Windows will finish removing {device} when it restarts: restart Windows, then run this again")
@@ -998,7 +998,13 @@ pub fn stage_package(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<String,
 
 /// `update <package folder>` (the module's docs; the sequence is [`steps::run_update`]).
 pub fn update(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
+    update_with_map(folder, None, say)
+}
+
+/// Update in place and, when requested, publish the observed endpoint ID changes by cable and role.
+pub fn update_with_map(folder: &Path, map: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Done, SetupError> {
     let _lock = SetupLock::take(&LOCK, LOCK_WAIT, say)?;
+    endpoint_map::start(map)?;
     let present = Present::read()?;
     let plan: UpdatePlan = plan::plan_update(&present.nodes)?;
     for &i in &plan.unidentified {
@@ -1011,7 +1017,9 @@ pub fn update(folder: &Path, say: &mut dyn FnMut(&str)) -> Result<Done, SetupErr
         ));
     }
     let published = stage_package(folder, say)?;
-    steps::run_update(&mut Real { present: &present }, &present.nodes, &plan, &published, say)
+    let mut gathered = endpoint_map::Gathered::default();
+    let result = steps::run_update(&mut Real { present: &present }, &present.nodes, &plan, &published, map.map(|_| &mut gathered), say);
+    endpoint_map::finish(map, "update", gathered, result, &mut endpoints::all, say).0
 }
 
 /// `migrate <package folder> [--a-mics m] [--b-mics m] [--endpoint-map file]`: today's devices (the old driver's A, Cable-B.ps1's
@@ -1103,7 +1111,7 @@ pub fn format_list(r: &Report) -> String {
                 let check: EndpointCheck = endpoints::check(cable, v, eps, Names::Any);
                 for (kind, e) in &check.found {
                     let state = if e.state == endpoints::State::Active { String::new() } else { format!(", {:?}", e.state).to_lowercase() };
-                    line(format!("    {}: \"{}\"{state}", kind.name(), e.name));
+                    line(format!("    {}: \"{}\"{state}", kind.port(), e.name));
                 }
                 if !check.is_done() && n.health == Health::Working {
                     line(format!("    note: {check}"));
@@ -1226,8 +1234,8 @@ pub(crate) mod tests {
             "{}",
             lines[1]
         );
-        assert_eq!(lines[2], "    Speakers: \"Speakers (ACX-LL-Cable A)\"");
-        assert_eq!(lines[4], "    Call Microphone: \"Call Microphone (ACX-LL-Cable A)\"");
+        assert_eq!(lines[2], "    In: \"LLCable-A In (ACX-LL-Cable A)\"");
+        assert_eq!(lines[4], "    Out-5ms: \"LLCable-A Out-5ms (ACX-LL-Cable A)\"");
         assert_eq!(lines[5], format!(r"  control device: \\.\AcxLlCable_{A_ID}"));
         assert_eq!(lines[6], format!("ACX-LL-Cable B (id {B_ID})"));
         assert!(lines[7].contains("refused by the driver's crash breaker"), "{}", lines[7]);

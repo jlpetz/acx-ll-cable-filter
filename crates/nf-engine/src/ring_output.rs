@@ -43,48 +43,11 @@ pub(crate) struct ReaderLine {
     missing: u64,
 }
 
-/// One capture pass's fields of the header's driver line.
-#[derive(Clone, Copy, Debug)]
-struct Line {
-    state: u32,
-    packet: u32,
-    moved: u64,
-    underrun_frames: u64,
-}
-
-/// Tries at a read inside the sequence before a block goes on with the last one's. The driver holds the sequence odd for a
-/// few stores under its spin lock, so a try fails mostly where this thread was preempted between its loads; the counters
-/// are cumulative, so what a block misses the next one reads.
-const READ_TRIES: usize = 4;
-
-/// The header's driver line as one pass left it, or `None` where every try overlapped a pass. A sequence of 0 is a ring no
-/// pass has reached since ATTACH (its line as ATTACH left it); a reader's stop (AppRingReaderStop) stores the state and
-/// packet outside the sequence, and changes no counter. Real-time: a few loads a try, no wait.
-fn read_line(h: &RingHeader) -> Option<Line> {
-    for _ in 0..READ_TRIES {
-        let seq = h.clock_sequence.load(Ordering::Acquire);
-        if seq & 1 == 0 {
-            let line = Line {
-                state: h.state.load(Ordering::Relaxed),
-                packet: h.packet_frames.load(Ordering::Relaxed),
-                moved: h.read_frame.load(Ordering::Relaxed).wrapping_sub(h.frames_copied.load(Ordering::Relaxed)),
-                underrun_frames: h.underrun_frames.load(Ordering::Relaxed),
-            };
-            fence(Ordering::Acquire);
-            if h.clock_sequence.load(Ordering::Relaxed) == seq {
-                return Some(line);
-            }
-        }
-        std::hint::spin_loop();
-    }
-    None
-}
-
 impl ReaderLine {
     /// The reader at this block, from one read of the header. Where the read failed, the last block's packet with no news:
     /// its underruns and any restart come with the next read.
     pub(crate) fn read(&mut self, h: &RingHeader) -> DriverReader {
-        let Some(line) = read_line(h) else { return DriverReader { packet: self.packet, restarted: false } };
+        let Some(line) = h.reader_sample() else { return DriverReader { packet: self.packet, restarted: false } };
         let restarted = self.moved.is_some_and(|m| m != line.moved);
         self.moved = Some(line.moved);
         self.underrun_frames = line.underrun_frames;
@@ -115,14 +78,14 @@ impl ReaderLine {
 }
 
 impl RingOutput {
-    pub(crate) fn open() -> Result<Self, StartFailure> {
-        let attachment = broker::attach_live(LIVE_CAPACITY).map_err(open_error)?;
+    pub(crate) fn open(cable: &nf_vmic::identity::CableInstance) -> Result<Self, StartFailure> {
+        let attachment = broker::attach_live_to(cable.id, LIVE_CAPACITY).map_err(open_error)?;
         Ok(Self {
             attachment,
             qpc: Qpc::new(),
             reader: ReaderLine::default(),
             info: OpenInfo {
-                name: "Noise Filter virtual microphone (direct driver ring)".into(),
+                name: format!("LLCable-{} (direct driver ring)", cable.label),
                 sample_rate: SAMPLE_RATE,
                 channels: 2,
                 period_frames: 0,

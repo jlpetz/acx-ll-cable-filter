@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nf_engine::{
+use llcable_control::voice::{
     DeviceInfo, EffectConfig, EffectInfo, Engine, EngineConfig, EngineError, EngineState, EngineStatus, GateMode, LatencyProgress,
     LatencyReport, LatencyTest, LatencyTestRequest, OutputBackend, Remedy,
 };
@@ -41,7 +41,7 @@ use crate::{SharedEngine, format, screen, waiting};
 mod effect;
 mod presets;
 
-use nf_engine::GatePosition;
+use llcable_control::voice::GatePosition;
 use presets::{PresetAction, PresetPicker};
 
 /// The status waiter's period: the status line and the diagnostics change slowly.
@@ -128,6 +128,7 @@ pub(crate) enum Msg {
     Mic(Option<usize>),
     OutputBackend(Option<usize>),
     Output(Option<usize>),
+    DirectCable(Option<usize>),
     Reference(Option<usize>),
     // Processing
     Noise(bool),
@@ -282,6 +283,7 @@ impl WarningsBar {
 struct Choices {
     mic: DeviceChoices,
     output: DeviceChoices,
+    direct: DeviceChoices,
     reference: DeviceChoices,
     probe: DeviceChoices,
     capture: DeviceChoices,
@@ -294,6 +296,7 @@ impl Choices {
         Self {
             mic: devices::choices(list, Picker::MIC, d.mic.as_deref()),
             output: devices::choices(list, Picker::OUTPUT, d.output.as_deref()),
+            direct: devices::direct_choices(list, settings.engine.io.direct_cable.as_deref()),
             reference: devices::choices(
                 list,
                 Picker::reference(if settings.engine.io.output_backend == OutputBackend::Wasapi { d.output.as_deref() } else { None }),
@@ -538,7 +541,7 @@ impl Window {
         }
         self.refreshing = true;
         context.spawn_background_with_rejection(
-            |_| Msg::Devices(nf_engine::list_devices(), Some(nf_engine::models::available_noise_models())),
+            |_| Msg::Devices(llcable_control::voice::list_devices(), Some(llcable_control::voice::models::available_noise_models())),
             Msg::Devices(Err(EngineError(NOT_RUN.to_owned())), None),
         );
     }
@@ -586,7 +589,7 @@ impl Window {
                 },
                 Msg::Stopped,
             );
-        } else if self.settings.engine.io.output_backend == OutputBackend::DriverRing && !self.elevated && !nf_vmic::broker::authorized() {
+        } else if self.settings.engine.io.output_backend == OutputBackend::DriverRing && !self.elevated && !llcable_control::authorized() {
             self.notice = Some(Notice::new(
                 InfoBarSeverity::Warning,
                 "Allow direct output first",
@@ -805,7 +808,7 @@ impl Component for Window {
             Msg::AllowDriver if !self.granting_driver => {
                 self.granting_driver = true;
                 context.spawn_background_with_rejection(
-                    |_| Msg::DriverAllowed(nf_vmic::broker::authorize().map_err(|e| e.to_string())),
+                    |_| Msg::DriverAllowed(llcable_control::authorize().map_err(|e| e.to_string())),
                     Msg::DriverAllowed(Err(NOT_RUN.to_owned())),
                 );
             }
@@ -836,6 +839,11 @@ impl Component for Window {
                 _ => {}
             },
             Msg::OutputBackend(_) => {}
+            Msg::DirectCable(index) => {
+                if let Some(id) = index.and_then(|i| self.choices.direct.id_at(i)) {
+                    self.configure(|c| c.io.direct_cable = id);
+                }
+            }
             Msg::Output(index) => {
                 if let Some(id) = index.and_then(|i| self.choices.output.id_at(i)) {
                     self.configure(|c| c.devices.output = id);
@@ -1080,7 +1088,7 @@ impl Window {
             StackPanel::new().spacing(12.0).children((
                 device_combo("Microphone", &self.choices.mic, placeholder("Choose a microphone"), enabled, context.callback(Msg::Mic)),
                 secondary(
-                    "To use a plain cable, play to its Speakers endpoint and record from a microphone on the same cable. \
+                    "To use a plain cable, play to its In endpoint and record from its Out or Out-5ms. Older drivers show Speakers, Microphone and Call Microphone. \
                      You can leave this app closed or run filters on a different cable.",
                 ),
                 combo(
@@ -1092,11 +1100,9 @@ impl Window {
                 ),
                 if ring {
                     StackPanel::new().spacing(6.0).children((
-                        secondary(
-                            "Direct output feeds ACX-LL-Cable A, or the only installed cable. \
-                             In your recording or call app, select a microphone on that cable.",
-                        ),
-                        if self.elevated || nf_vmic::broker::authorized() {
+                        device_combo("Direct cable", &self.choices.direct, placeholder("Choose a cable"), enabled, context.callback(Msg::DirectCable)),
+                        secondary("In your recording app, select this cable’s Out or Out-5ms."),
+                        if self.elevated || llcable_control::authorized() {
                             View::empty()
                         } else {
                             Button::new()
@@ -1620,11 +1626,11 @@ mod tests {
 
     #[test]
     fn choices_follow_the_settings() {
-        let list = vec![nf_engine::DeviceInfo {
+        let list = vec![llcable_control::voice::DeviceInfo {
             id: "cable-in".to_owned(),
             cable_selection: None,
             name: "CABLE Input".to_owned(),
-            flow: nf_engine::Flow::Render,
+            flow: llcable_control::voice::Flow::Render,
             is_default: false,
             is_default_communications: false,
             sample_rate: 48_000,

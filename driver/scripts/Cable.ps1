@@ -1,16 +1,14 @@
 <#
 .SYNOPSIS
-    Lists, adds, removes, disables, enables or switches the variant of an ACX-LL-Cable (any number of cables: A, B, C...), or
-    finds a cable's endpoint by role.
+    Manages ACX-LL-Cables (A, B, C...), resolves endpoints by role and updates the driver package.
 
 .DESCRIPTION
     TODO 19, the per-cable design (doc/todo/19-per-cable-design.md, section 9). Replaces Cable-B.ps1. Every action runs the
-    setup tool, acx-ll-cable (crates\nf-vmic), which holds the setup's lock and does the work; this script only adds the
-    restore of Windows' default playback and recording roles around add and variant (Windows may make a new endpoint the
-    default; only roles moved to an endpoint that wasn't there before are put back).
+    setup tool, acx-ll-cable (crates\nf-vmic), which holds the setup lock. The script restores the user's Windows default
+    playback and recording roles around add, variant and update.
 
-    A cable is added on the driver package the other cables run. Only Install-Driver.ps1 (the tool's update) changes the
-    package, and moves every cable together.
+    A cable is added on the driver package the other cables run. update <package folder> moves all installed cables together.
+    Pass -EndpointMap <file> to record which endpoints kept or changed IDs in this package update.
 
     disable <label> keeps the cable installed but off, across restarts too, until enable <label>; its endpoints keep their ids
     (not present while it is off), and enable checks they came back as they were. No other cable is touched. A disable
@@ -36,6 +34,8 @@
 .EXAMPLE
     .\Cable.ps1 add B -EndpointMap C:\temp\b-map.json
 .EXAMPLE
+    .\Cable.ps1 update C:\packages\AudioCodec -EndpointMap C:\temp\update-map.json
+.EXAMPLE
     .\Cable.ps1 add D -Mics call
 .EXAMPLE
     .\Cable.ps1 variant B low-latency
@@ -51,7 +51,7 @@
     .\Cable.ps1 -Build list
 #>
 param(
-    [Parameter(Position = 0)][ValidateSet('list', 'add', 'remove', 'variant', 'disable', 'enable', 'endpoint')][string]$Action = 'list',
+    [Parameter(Position = 0)][ValidateSet('list', 'add', 'remove', 'variant', 'disable', 'enable', 'endpoint', 'update')][string]$Action = 'list',
     [Parameter(Position = 1)][string]$Label,
     # variant's microphones (both, call, low-latency), or endpoint's role (speakers, microphone, call-microphone): the tool checks it
     [Parameter(Position = 2)][string]$To,
@@ -63,7 +63,7 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
-if ($EndpointMap -and $Action -ne 'add') { throw "-EndpointMap goes with add: Cable.ps1 add B -EndpointMap <file>" }
+if ($EndpointMap -and $Action -notin 'add', 'update') { throw "-EndpointMap goes with add or update" }
 if ($To -and $Action -notin 'variant', 'endpoint') { throw "'$Action' takes no third argument ('$To')" }
 if (($Mics -or $Adopt) -and $Action -ne 'add') { throw "-Mics and -Adopt go with add" }
 if ($Forget -and $Action -ne 'remove') { throw "-Forget goes with remove" }
@@ -84,6 +84,14 @@ if ($Action -eq 'endpoint') {
 }
 
 Assert-Admin
+if ($Action -eq 'update') {
+    if (-not $Label) { throw 'update takes the package folder: Cable.ps1 update <folder> [-EndpointMap <file>]' }
+    $arguments = @('update', $Label)
+    if ($EndpointMap) { $arguments += @('--endpoint-map', $EndpointMap) }
+    . (Join-Path $PSScriptRoot 'Update-DefaultAudio.ps1')
+    Exit-ForToolCode (Invoke-CablePackageUpdate $tool $arguments) 'the update'
+    exit 0
+}
 if (-not $Label) { throw "'$Action' takes a cable's label: Cable.ps1 $Action B" }
 $arguments = switch ($Action) {
     'add' {

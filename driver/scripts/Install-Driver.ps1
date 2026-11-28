@@ -22,9 +22,9 @@
       4. The status.
 
     -Variant keeps its meaning, for cable A: both microphones (the default), the call one, or the low-latency one. Other
-    cables come with Cable.ps1 add. -BuildTool builds the setup tool first. -EndpointMap <file>: the migration (and the first
-    add of A) writes which new endpoint takes each old one's place there, as JSON (acx-ll-cable's --endpoint-map), published
-    whole (a temporary file renamed over it); an update keeps the endpoints and writes none, leaving the file as it was.
+    cables come with Cable.ps1 add. -BuildTool builds the setup tool first. -EndpointMap <file> writes a JSON map for
+    the migration, update or first add. During an update Windows may assign new endpoint IDs even on the same device node.
+    The update map covers the package update; a subsequent -Variant change can replace A's endpoints again.
 
     Exit codes: 0 done; 7 Windows wants a restart to finish, with or without other errors beside it (stop there: restart, then
     run this again, which finishes what is left and says what is still wrong); 2 the setup tool's error (its steps above say
@@ -83,11 +83,9 @@ if ((Test-Present $LegacyHardwareIds) -or $pending.Count -gt 0) {
     Exit-ForToolCode $code 'the migration' $status
 } elseif (Test-Present @($HardwareIds.Values)) {
     Write-Step 'Move every cable to the new package (acx-ll-cable update)'
-    if ($EndpointMap) {
-        # As the tool does with a run that publishes none: the file is left as it was (the migration's map, say)
-        Write-Note 'an update keeps every endpoint: no endpoint map is written (a file there is an earlier run''s, left as it is)'
-    }
-    $code = Invoke-CableTool $tool @('update', $package)
+    . (Join-Path $PSScriptRoot 'Update-DefaultAudio.ps1')
+    $arguments = @('update', $package) + $map
+    $code = Invoke-CablePackageUpdate $tool $arguments
     Exit-ForToolCode $code 'the update' $status
     $switchA = $PSBoundParameters.ContainsKey('Variant')
 } else {
@@ -100,6 +98,7 @@ if ($switchA) {
     # -Variant switched the one device before cables; with cables, it is cable A's (nothing if A has it already). Like the
     # switch here before, this doesn't restore default roles Windows moves; Cable.ps1 variant A does.
     Write-Step "Cable A's variant: $Variant (acx-ll-cable variant A $Variant)"
+    if ($EndpointMap) { Write-Note 'The endpoint map describes the package update. Switching variant can give A new endpoints again.' }
     $code = Invoke-CableTool $tool @('variant', 'A', $Variant)
     Exit-ForToolCode $code "cable A's variant switch (the update is done)" $status
 }

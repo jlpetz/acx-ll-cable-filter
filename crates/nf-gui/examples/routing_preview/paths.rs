@@ -100,8 +100,7 @@ fn send_branch(app: &Preview, cx: &ViewContext<Preview>, s: usize, d: usize, las
         [stage] => stage.kind.name().to_owned(),
         [first, rest @ ..] => format!("{} +{}", first.kind.name(), rest.len()),
     };
-    let send = &app.scene.sends[s][d];
-    let summary = if send.tap == Tap::Raw { format!("Dry tap · {local_fx}") } else { local_fx };
+    let summary = if app.scene.source_stages_for_send(s, d).is_empty() { format!("Dry tap · {local_fx}") } else { local_fx };
     // Both strokes meet at the centre of the row. The final branch stops there.
     let connector = Grid::new().rows([GridLength::STAR; 2]).children((
         Border::new()

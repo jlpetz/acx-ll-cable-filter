@@ -50,16 +50,16 @@ fn dispatch(pump: &mut PreviewPump, id: NodeId, event: EventId, payload: EventPa
 fn two_cables_can_mix_into_a_third_and_split_to_a_second_destination() {
     let mut pump = Pump::new(RecordingRuntime::default());
     pump.mount_view(View::component::<Preview>(Concept::Matrix)).unwrap();
-    click(&mut pump, "Disconnect Hardware mic from Cable A Output");
-    click(&mut pump, "Send Cable D Input to Cable A Output");
-    button(&pump, "Disconnect Cable C Input from Cable A Output");
-    button(&pump, "Disconnect Cable D Input from Cable A Output");
-    click(&mut pump, "Send Cable C Input to Cable B Output");
-    click(&mut pump, "Edit processing for the Cable C Input to Cable B Output send");
+    click(&mut pump, "Disconnect Hardware mic from LLCable-A Out");
+    click(&mut pump, "Send LLCable-D In to LLCable-A Out");
+    button(&pump, "Disconnect LLCable-C In from LLCable-A Out");
+    button(&pump, "Disconnect LLCable-D In from LLCable-A Out");
+    click(&mut pump, "Send LLCable-C In to LLCable-B Out");
+    click(&mut pump, "Edit processing for the LLCable-C In to LLCable-B Out send");
     click(&mut pump, "+ Add stage");
     click(&mut pump, "Add Equalizer");
     button(&pump, "Edit stage 1, Equalizer");
-    click(&mut pump, "Edit processing for the Cable C Input to Cable A Output send");
+    click(&mut pump, "Edit processing for the LLCable-C In to LLCable-A Out send");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Dry signal · no stages")));
 }
 
@@ -108,9 +108,9 @@ fn a_clap_voice_effect_can_be_reordered_tuned_bypassed_and_removed_from_one_bran
     dispatch(&mut pump, slider, EventId::SliderValueChanged, EventPayload::F64(-7.0));
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Pitch  ·  -7 semitones")));
 
-    click(&mut pump, "Edit processing for the Hardware mic to Cable A Output send");
+    click(&mut pump, "Edit processing for the Hardware mic to LLCable-A Out send");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Dry signal · no stages")));
-    click(&mut pump, "Edit processing for the Hardware mic to Cable B Output send");
+    click(&mut pump, "Edit processing for the Hardware mic to LLCable-B Out send");
     click(&mut pump, "Edit stage 2, Voice tone");
     button(&pump, "Enable");
     assert!(nodes(&pump).any(|n| text_is(&pump, n, PropertyId::TextBlockText, "Pitch  ·  -7 semitones")));

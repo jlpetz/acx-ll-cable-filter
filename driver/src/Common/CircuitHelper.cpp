@@ -24,12 +24,31 @@ Environment:
 #include "private.h"
 #include "public.h"
 #include "CircuitHelper.h"
+#include "StreamEngine.h"
 
 #ifndef __INTELLISENSE__
 #include "CircuitHelper.tmh"
 #endif
 
 const ULONG _DSP_STREAM_PROPERTY_UI4_VALUE = 1;
+
+// A render bridge is a source pin. Both capture bridges are sink pins and have their role set before pin creation.
+PAGED_CODE_SEG
+_Use_decl_annotations_
+NTSTATUS
+Codec_EvtBridgePinRetrieveName(ACXPIN Pin, PUNICODE_STRING Name)
+{
+    PAGED_CODE();
+
+    const ACXCIRCUIT circuit = AcxPinGetCircuit(Pin);
+    const NF_CABLE* cable = CableOfCircuit(circuit);
+    if (cable == nullptr)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    const PCWSTR role = AcxPinGetType(Pin) == AcxPinTypeSource ? L"In" : GetCaptureCircuitContext(circuit)->EndpointRole;
+    return RtlUnicodeStringPrintf(Name, L"LLCable-%ws %ws", cable->Label, role);
+}
 
 PAGED_CODE_SEG
 NTSTATUS AllocateFormat(

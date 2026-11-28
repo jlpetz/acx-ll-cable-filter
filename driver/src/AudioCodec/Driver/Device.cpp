@@ -1084,13 +1084,11 @@ Return Value:
     cable->Microphones = NfReadMicrophones(device);
     if (cable->Microphones & NF_MIC_LOW_LATENCY)
     {
-        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->CaptureComponentId, &MIC_CUSTOM_NAME, &captureCircuitName,
-                                                          L"Microphone"));
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->CaptureComponentId, &captureCircuitName, L"Out"));
     }
     if (cable->Microphones & NF_MIC_CALL)
     {
-        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->Capture2ComponentId, &MIC2_CUSTOM_NAME, &capture2CircuitName,
-                                                          L"Call Microphone"));
+        RETURN_NTSTATUS_IF_FAILED(CodecC_AddStaticCapture(device, &cable->Capture2ComponentId, &capture2CircuitName, L"Out-5ms"));
     }
 
     DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_INFO_LEVEL, "AudioCodec: cable %ws added (instance %lu, microphones %lu, feed 0x%08X)\n",

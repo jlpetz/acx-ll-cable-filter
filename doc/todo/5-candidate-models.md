@@ -129,6 +129,12 @@ Mean noise cut in the pauses (dB, the noise as mixed against the output a latenc
 
 ## Sonora noise suppression comparison
 
+The live mixer's `llcable-effects` crate now provides `sonora_noise_reduction()` and `noise_reduction()` as separate native Rust stages.
+Sonora uses Moderate at 48 kHz with AEC and automatic gain disabled. Each mono voice stage preserves its branch's two-channel output
+layout by duplicating the processed voice into both channels. Dry routes preserve stereo. The packet adapter warms the enabled processors
+before capture. Its offline allocation test covers speech and silence from the first packet. The head-to-head listening and Lab runs below
+are still open.
+
 The owner requested Sonora's WebRTC noise suppressor as a comparison point (2026-11-20). Our AEC3 stage disables
 `noise_suppression`. The pinned Sonora 0.3.0 offers four strengths. Start with its default, `Moderate`.
 [Sonora's suppression settings](https://github.com/dignifiedquire/sonora/blob/sonora-v0.3.0/crates/sonora/src/config.rs#L188-L216)

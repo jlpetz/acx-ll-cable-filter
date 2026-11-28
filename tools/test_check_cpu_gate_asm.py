@@ -131,7 +131,8 @@ class Walk(unittest.TestCase):
         no_app_main = [line.replace(APP_MAIN, "_RNvCskE2adrfNma9_12noise_filter9real_main") for line in program()]
         failures, out = run(no_app_main)
         self.assertEqual(failures, 2, out)  # and the walk goes on into the renamed function's v3 code
-        self.assertIn("never reached noise_filter::app_main", out)
+        self.assertIn("never reached", out)
+        self.assertIn("noise_filter::app_main", out)
         self.assertIn("FAIL: noise_filter::real_main", out)
         no_refuse = [line.replace(REFUSE, "_RNvNtCskE2adrfNma9_12noise_filter9cpu_check4tell") for line in program()]
         failures, out = run(no_refuse)

@@ -22,6 +22,9 @@
     <None Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="EndpointIcons.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="Control.cpp" />
     <ClCompile Include="Device.cpp" />
     <ClCompile Include="Driver.cpp" />

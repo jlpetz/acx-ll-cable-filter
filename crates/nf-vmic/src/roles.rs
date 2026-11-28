@@ -76,7 +76,7 @@ impl fmt::Display for NoEndpoint {
                 f,
                 "{} has no {}: it has {} (`acx-ll-cable variant {label} both` gives it both microphones)",
                 label.friendly_name(),
-                role.name(),
+                role.port(),
                 variant.describe()
             ),
             NoEndpoint::Disabled { label } => write!(
@@ -88,7 +88,7 @@ impl fmt::Display for NoEndpoint {
                 write!(f, "{} isn't working ({}): `acx-ll-cable add {label}` repairs it", label.friendly_name(), health.describe())
             }
             NoEndpoint::NotMade { label, role } => {
-                write!(f, "{} works, but Windows shows no {} for it (yet): look again", label.friendly_name(), role.name())
+                write!(f, "{} works, but Windows shows no {} for it (yet): look again", label.friendly_name(), role.port())
             }
         }
     }
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(found(&s.resolve(cid(B_ID), EndpointKind::CallMicrophone)), Some(("{1}.{b-call}", State::Disabled)));
         let r = s.resolve(cid(A_ID), EndpointKind::CallMicrophone);
         let e = r.endpoint().unwrap();
-        assert_eq!((e.name.as_str(), e.instance_id.clone()), ("Call Microphone (ACX-LL-Cable A)", a.instance_id().to_lowercase()));
+        assert_eq!((e.name.as_str(), e.instance_id.clone()), ("LLCable-A Out-5ms (ACX-LL-Cable A)", a.instance_id().to_lowercase()));
         assert_eq!(s.cable_labelled(&label("b")), Ok(Some(cid(B_ID))));
         assert_eq!(s.cable_labelled(&label("C")), Ok(None));
     }
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(why, &NoEndpoint::NoSuchRole { label: label("B"), variant: Variant::LowLatency, role: EndpointKind::CallMicrophone });
         assert_eq!(
             why.to_string(),
-            "ACX-LL-Cable B has no Call Microphone: it has the low-latency microphone only (`acx-ll-cable variant B both` gives it \
+            "ACX-LL-Cable B has no Out-5ms: it has Out only (`acx-ll-cable variant B both` gives it \
              both microphones)"
         );
         // Disabled: its endpoints NOTPRESENT (read without them), so none, by the disable

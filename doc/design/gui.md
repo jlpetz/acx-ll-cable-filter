@@ -4,21 +4,44 @@ A windows-reactor 0.100.0 window (patterns: `TMR-APP/crates/tmr-gui`, and
 `doc/dev/api/windows-reactor.md`). Single process for v0: closing the window exits. The owner said
 minimise for now; the tray comes later (TODO #15, #16).
 
+## V2 mixer prototype
+
+`cargo run -p nf-gui --example mixer_v2` opens the native prototype. At desk width outputs stack on the left and the selected output’s
+sources on the right. The levels read horizontally along each row. On narrow windows the two panes stack. Selecting an output again
+closes its sources and leaves the output meters visible. Right-click an output or use **…** for its diagnostics or output effects.
+**All sends** shows the whole routing matrix. **Wiring** draws the same sends with their split points, ordered effects and mix junctions. The opening scene
+feeds **LLCable-A Out** before mic noise reduction and **LLCable-B Out** after it. Adding **LLCable-C In** to B makes the merge visible. A send can
+also tap a particular shared stage by name. Every effect has its own node. Use its chevron to remove that instance. Select a wire and choose
+**Disconnect**, or choose the individual connection from its split or mix junction. Crossing wires have small breaks and the selected
+wire is highlighted. The three-output prototype compares output orders to minimise crossings while keeping sources in their familiar order.
+[Mixer screenshot](mixer-v2-mixer.png) · [Routing matrix](mixer-v2-matrix.png) · [Wiring with a split and a mix](mixer-v2-wiring.png).
+
+New profiles start with compact spacing and blue bands below −36 dBFS. The meter reads sample peaks in dBFS. Mono display shows the loudest channel. Auto shows separate channels at normal spacing and the
+loudest channel at compact spacing. Selecting Stereo keeps both channels visible at either density.
+The wider-channel example in **Appearance** keeps the highest peak across all channels visible even when only channels 1 and 2 are expanded
+into bars. A full-scale reading on channel 15 demonstrates that behaviour. Theme, density, colours and meter layout are saved per user.
+Routing is an in-memory example. Switch **Demo signal** off to see silence across every source and output. **Diagnostics** follows the
+selected output through its tapped stages, shows gate state using the example peak model, and links to the exact stage’s controls. The
+driver timing reference is labelled with its test conditions. **Open live settings** opens the actual engine’s meters, gate controls and latency tools.
+
+The aligned sends draw on Weir's routing strips, and the per-output mix and alternate matrix on Faderust. Their designs also informed the
+optional colour scheme and compact meter layout. [Weir](https://github.com/Mourty/Weir) · [Faderust](https://github.com/Niklas970/faderust).
+
 ## Routing and effects design review
 
 The owner wants visible split and mix controls and a single ordered list for built-ins and CLAP effects. Three native
 Reactor mockups are available for choosing the layout. The current settings window is documented below.
 [Compare the concepts](routing-preview.png). Run `cargo run -p nf-gui --example routing_preview` to try them.
 
-All three layouts edit one in-memory example. **Hardware mic** represents a physical microphone. It feeds **Cable A Output**
-dry for OBS and **Cable B Output** through AEC and RNNoise for Discord. Audio played into **Cable C Input** joins the mic
-on A at −9 dB. To try a two-cable mix, turn on **Cable D Input → Cable A Output** and turn off **Hardware mic → Cable A Output**.
+All three layouts edit one in-memory example. **Hardware mic** represents a physical microphone. It feeds **LLCable-A Out**
+dry for OBS and **LLCable-B Out** through AEC and RNNoise for Discord. Audio played into **LLCable-C In** joins the mic
+on A at −9 dB. To try a two-cable mix, turn on **LLCable-D In → LLCable-A Out** and turn off **Hardware mic → LLCable-A Out**.
 Both C and D now feed A. B keeps its own mic chain. The meters, devices and plugin catalog are examples.
 
-**Input** and **Output** name the two ends from the cable's perspective. Windows currently lists the playback end as **Speakers**
-and its recording ends as **Microphone** (low latency) and **Call Microphone** (communications). Both recording ends carry the
-same cable signal. A preview destination represents that signal. The recording app chooses the endpoint. **Source** and
-**destination** describe a pipeline connection, so a cable output used downstream keeps its Output name.
+**In** is the playback end of a cable. **Out** and **Out-5ms** are recording ends carrying the same signal. **Out** lets a recording app
+request a short period. **Out-5ms** has a 5 ms default engine period for apps that leave timing to Windows. A preview destination represents
+the cable's signal. The recording app chooses its endpoint. **Source** and **destination** describe a pipeline connection, so
+**LLCable-B Out** keeps that name when it feeds another stage.
 
 - **Signal paths** shows where each source goes. Choose **Edit sends** on the source to connect another destination.
 - **Routing matrix** shows all source/destination pairs. Each active cell in a row is a copy, and each active cell in a column contributes to the mix.
@@ -30,6 +53,18 @@ Open **Send** to pick the original input, the output of a particular shared stag
 **Reuse this pipeline** copies stage instances and their settings onto a different route for the duration of the preview.
 
 The proposed first view is Signal paths, with the matrix available for larger setups. The owner is choosing the layout.
+The owner prefers a device-and-wire view with inputs at the top and outputs at the bottom. Draw one wire out of a source and
+fork it at a visible junction when another destination uses the same signal. Align parallel branches and join signals before
+their destination with a mix junction. The editor creates and removes those junctions as sends change. A plain wire is a route
+with no effects. Dropping an effect on one branch processes that branch.
+
+Proposed shortcut: pick a device or playback source on its mixer strip and toggle its aligned destination buttons. Each send
+shows where it takes its signal (original, after an effect, or end of chain). A route reached through another mix is labelled
+**Via…** and opens that path for inspection. Dragging a wire, using **Connect to…**, and toggling a direct send all edit the same
+connection. Moving a device card changes only its position on screen. Recording apps choose their cable output separately.
+Another entry point to prototype is selecting a cable output first. Its **What should this output hear?** picker lists the
+available sources and named signals such as **Original mic** and **Clean mic**. Checking Music adds its send and draws the mix
+junction immediately. The picker and graph can share one screen, with **Show wiring** available from the output's mixer strip.
 Live split and mix depend on the engine work in [TODO 24](../todo/24-routing-graph.md) and multiple live effect instances
 in [TODO 17](../todo/17-post-effects.md). The product's existing plain-cable use remains available with the app closed.
 Voicemeeter Banana's per-input sends and separate output meters informed the matrix and strips.

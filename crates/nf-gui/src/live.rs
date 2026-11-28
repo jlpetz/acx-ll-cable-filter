@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nf_engine::{Engine, EngineState, MeterSnapshot, TelemetrySnapshot};
+use llcable_control::voice::{Engine, EngineState, MeterSnapshot, TelemetrySnapshot};
 use windows_reactor::*;
 
 use crate::meter::{self, CLIP_RED};

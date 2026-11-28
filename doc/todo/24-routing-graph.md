@@ -1,5 +1,20 @@
 # TODO 24: a routing graph (groundwork for a mixer)
 
+## Working implementation on the development box, 2026-11-27
+
+`llcable-routing` processes the frames delivered in each capture packet. `llcable-audio` captures each selected endpoint once and feeds independent direct rings. A separately clocked playback destination has a bounded queue and its own worker. The legacy voice application also uses the shared Windows conversion and scheduling code. The [build and quick start](../../README.md) covers both windows and the independent SDK client.
+
+With one virtual stereo source, two recording clients verified 236,703 consecutive frames at unity and 236,575 at quarter gain after joining, with every checked sample exact. A separate two-input test played distinct tones into each input and checked all four tones in each output recording. With direct and external playback enabled together, all 283,775 direct frames matched. The Windows shared playback branch through VB-CABLE matched 275,918 of 275,950 frames at quarter gain. These checks exercise identity, channel preservation and gain. They do not measure acoustic or end-to-end latency.
+
+The driver's first pass after a fresh reader joins discards pre-existing ring contents and can deliver a packet of silence. The live runtime reports startup silence and subsequent underruns separately. The passive panel shows the raw cumulative counters.
+
+The release mixer passed a separate check through its WinUI controls. All three cable-only sweeps matched on A.
+A player then sent 600 Hz on the left and 1 kHz on the right into A. With a −12 dB destination stage on B, an
+independent WASAPI recorder measured 0.08038 left and 0.04019 right, the expected amplitudes for inputs of 0.32
+and 0.16. The mixer's stage diagnostics read −9.9 dBFS in and −21.9 dBFS out. Both feeds were idle after Stop.
+
+On the recorded speech-and-fan fixture, RNNoise cut stationary fan level by 47.9 dB and Sonora Moderate by 14.8 dB. The aligned speech projection changed by −0.5 and −3.7 dB respectively. Wall-clock p99 on the dev VM was 39.8 and 9.3 µs per 128-frame callback. The [comparison example](../../crates/llcable-effects/examples/compare_noise.rs) reproduces the procedure. Real speech, double-talk, other noise types and physical-device timing remain important release checks.
+
 ## The owner's intent (2026-11-26)
 "Our app is a low latency driver for an audio cable with pluggable filters that can be added into the input/output
 pipeline of the cable. But if I want multiple pipelines off the same feed ..." and, on Voicemeeter (VB-Audio's mixer
@@ -8,14 +23,10 @@ Having a low latency path for that in the driver or user land filters would be a
 add ... I don't want to build a Voice Meter app just yet, but this driver and user component should have the ground work
 for it."
 
-So: no mixer app now; the per-cable driver (TODO 19's step 1) and the engine's fan-out (TODO 19's E1, Astra's) are built
-so that one can be added without redoing either.
-
-The owner chose mono and stereo for the first routing implementation. Surround layouts such as 5.1 and 7.1 can come later.
-Today the app averages capture channels to mono and the direct writer repeats that sample on left and right. E1 should
-keep both channels of a stereo source through the split. A dry recording gets the original left and right. A branch
-using a mono voice effect downmixes at that effect's input. A mono signal stays mono until a stereo output needs the
-same sample on both channels.
+The initial scope was driver and engine groundwork. The owner subsequently asked for the destination-focused v2 mixer.
+The owner chose mono and stereo for its first routing implementation. The mixer preserves both channels on dry routes.
+A mono voice stage downmixes at its input, and its output can feed either channel or both. The legacy single-chain app
+still averages the capture channels for its voice processing.
 
 ## Why in the app (the owner, 2026-11-26)
 One capture feeding every destination lets the physical microphone be opened in exclusive mode, which admits a single
@@ -37,6 +48,20 @@ A routing graph evaluated block by block on the engine's real-time thread, in to
   mix: off for a mic and a separate music feed, on for a dry and a processed copy of one voice).
 - **Channel map:** split stereo into two monos, merge monos, route channels across feeds.
 - **Sinks:** a cable's app ring (the direct route, lowest latency) or a WASAPI output.
+
+### Routing with no effects
+
+The owner wants routing to work with no effects and to pay only for the processing enabled on each path.
+A standalone cable already connects its Windows playback and recording endpoints with the app closed. An app-managed
+route should also start with an empty chain. Forward each available packet on a dry branch, preserving its channels.
+Schedule effect calls and their buffering only on branches that pass through those effects. A user can explicitly enable
+time alignment where branches meet. Device periods, ring headroom and any required clock adaptation still apply.
+
+Acceptance check for E1 and the [short-packet path](../dev/short-packet-path.md): split one stereo source to A and B.
+With empty chains, verify both outputs against the source and record A's marker arrival times. Enable RNNoise on B and
+repeat with the same device periods and headroom. A should keep its stereo samples and gain no 10 ms processing wait.
+An empty route should start no plugin worker. Today's app still assembles 480-frame blocks. A loaded CLAP effect's live
+bypass keeps its worker and delay. The packet-forwarding behaviour above is a target for the routing engine.
 
 ## Clocks (the part that decides latency)
 - Our cables use the same QPC time base at the same nominal rate. Each reader starts independently and has its own
@@ -73,6 +98,8 @@ others.
   every cable's ring while the attachments live on a thread that outlives them.
 - Settings describe the graph by stable ids (cables by CableId), versioned; presets for the simple routes.
 
-## Not now
-The mixer window, per-channel routing in the GUI, multichannel cables, the render tap itself, mixing inputs on different
-clocks beyond the adapters the WASAPI output already has.
+## Remaining work
+
+Surround cables, arbitrary per-channel mapping in the GUI, the direct render tap and optional delay compensation for
+merging paths with different processing delays remain open. Separately clocked Windows sources can already feed one mix.
+Long-duration clock-drift and acoustic tests on physical devices remain release checks.

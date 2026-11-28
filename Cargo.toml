@@ -1,9 +1,5 @@
-# noise-filter: a low-latency mic noise filter and echo canceller for Windows 11.
-# Crates: nf-core (pure DSP and the stage interface, no Windows deps), nf-mem (locked and large-page
-# memory, the real-time allocator), nf-stages (RNNoise, AEC3), nf-ort (ONNX model packs through ONNX
-# Runtime: the only crate that links it, TODO 5), nf-engine (WASAPI, threads, clocks, latency), nf-gui
-# (the Reactor window), nf-app (the exe: window by default, CLI subcommands).
-# nf-vmic (the virtual mic driver's app-feed protocol, and nf-vmic-test, its spike tool: TODO 19).
+# The llcable crates provide the public cable SDK, routing, effects, Windows audio host, control panel API and live mixer.
+# The nf crates contain the driver protocol, real-time memory, speech stages, isolated plug-in host and single-chain app.
 [workspace]
 resolver = "3"
 members = [
@@ -16,8 +12,9 @@ members = [
     "crates/nf-app",
     "crates/nf-vmic",
     "crates/nf-fx",
+    "crates/llcable-*",
 ]
-default-members = ["crates/nf-app"]
+default-members = ["crates/nf-app", "crates/llcable-mixer", "crates/llcable-control", "crates/llcable-sdk", "crates/nf-fx"]
 # The vendored crate is a patch, not a member: excluded, so cargo runs inside it (its own tests) instead of refusing
 # ("believes it's in a workspace").
 exclude = ["vendor"]
@@ -38,6 +35,12 @@ nf-ort = { path = "crates/nf-ort" }
 nf-engine = { path = "crates/nf-engine" }
 nf-gui = { path = "crates/nf-gui" }
 nf-vmic = { path = "crates/nf-vmic" }
+llcable-sdk = { path = "crates/llcable-sdk" }
+llcable-control = { path = "crates/llcable-control" }
+llcable-routing = { path = "crates/llcable-routing" }
+llcable-wasapi = { path = "crates/llcable-wasapi" }
+llcable-audio = { path = "crates/llcable-audio" }
+llcable-effects = { path = "crates/llcable-effects" }
 # Preview or fast-moving crates are pinned exactly (CLAUDE.md, "Real-time rules").
 nnnoiseless = { version = "=0.5.2", default-features = false }
 # Patched below (vendor/README.md): its per-call FTZ/DAZ is the `denormal-guard` feature, off unless nf-stages'

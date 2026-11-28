@@ -36,11 +36,6 @@ Environment:
 #include "captureCircuit.tmh"
 #endif
 
-//
-// Controls how the custom name of the bridge pin is read.
-//
-BOOL g_UseCustomInfName = TRUE;
-
 PAGED_CODE_SEG
 NTSTATUS
 CodecC_EvtAcxPinSetDataFormat(
@@ -187,36 +182,6 @@ Return Value:
     return status;
 }
 
-PAGED_CODE_SEG
-NTSTATUS
-CodecC_EvtAcxPinRetrieveName(
-    _In_    ACXPIN              Pin,
-    _Out_   PUNICODE_STRING     Name
-)
-/*++
-
-Routine Description:
-
-    If g_UseCustomInfName is false then the ACX
-    pin callback EvtAcxPinRetrieveName calls this
-    function in order to retrieve the pin name. 
-
-Return Value:
-
-    NTSTATUS
-
---*/
-{
-    PCODEC_CAPTURE_CIRCUIT_CONTEXT circuitCtx;
-
-    PAGED_CODE();
-
-    // noise-filter (TODO 19): the circuit's own endpoint name (two capture circuits; the sample returned "CustomName2").
-    circuitCtx = GetCaptureCircuitContext(AcxPinGetCircuit(Pin));
-    return RtlUnicodeStringPrintf(Name, L"%ws",
-                                  (circuitCtx != nullptr && circuitCtx->EndpointName != nullptr) ? circuitCtx->EndpointName : L"Microphone");
-}
-
 VOID
 CodecC_EvtPinContextCleanup(
     _In_ WDFOBJECT      WdfPin
@@ -245,9 +210,8 @@ NTSTATUS
 CodecC_AddStaticCapture(
     _In_ WDFDEVICE              Device,
     _In_ const GUID *           ComponentGuid,
-    _In_ const GUID *           MicCustomName,
     _In_ const UNICODE_STRING * CircuitName,
-    _In_ PCWSTR                 EndpointName
+    _In_ PCWSTR                 EndpointRole
 )
 /*++
 
@@ -307,7 +271,7 @@ Return Value:
     //
     // Create a capture circuit associated with this child device.
     //
-    RETURN_NTSTATUS_IF_FAILED(CodecC_CreateCaptureCircuit(Device, ComponentGuid, MicCustomName, CircuitName, EndpointName, &captureCircuit));
+    RETURN_NTSTATUS_IF_FAILED(CodecC_CreateCaptureCircuit(Device, ComponentGuid, CircuitName, EndpointRole, &captureCircuit));
 
     if (devCtx->Capture == nullptr)
     {
@@ -386,9 +350,8 @@ NTSTATUS
 CodecC_CreateCaptureCircuit(
     _In_     WDFDEVICE              Device,
     _In_     const GUID *           ComponentGuid,
-    _In_     const GUID *           MicCustomName,
     _In_     const UNICODE_STRING * CircuitName,
-    _In_     PCWSTR                 EndpointName,
+    _In_     PCWSTR                 EndpointRole,
     _Out_    ACXCIRCUIT*            Circuit
 )
 /*++
@@ -487,7 +450,7 @@ Return Value:
 
         circuitCtx = GetCaptureCircuitContext(circuit);
         ASSERT(circuitCtx);
-        circuitCtx->EndpointName = EndpointName;
+        circuitCtx->EndpointRole = EndpointRole;
     }
 
     //
@@ -555,21 +518,13 @@ Return Value:
         // Create capture endpoint pin. 
         //
         ACX_PIN_CALLBACKS_INIT(&pinCallbacks);
+        pinCallbacks.EvtAcxPinRetrieveName = Codec_EvtBridgePinRetrieveName;
         ACX_PIN_CONFIG_INIT(&pinCfg);
 
         pinCfg.Type = AcxPinTypeSink;
         pinCfg.Communication = AcxPinCommunicationNone;
         pinCfg.Category = &KSNODETYPE_MICROPHONE;
         pinCfg.PinCallbacks = &pinCallbacks;
-
-        //
-        // The bridge pin's name, which names the endpoint: the circuit's EndpointName, through EvtAcxPinRetrieveName.
-        // (noise-filter, TODO 19: the sample alternated this with a name GUID through a global flipped at every circuit made,
-        // so with two circuits, or a device made again, the names depended on how many had been made; a GUID's name would
-        // need an HKLM MediaCategories entry, which a driver package may not write, InfVerif error 1321.)
-        //
-        UNREFERENCED_PARAMETER(MicCustomName);
-        pinCallbacks.EvtAcxPinRetrieveName = CodecC_EvtAcxPinRetrieveName;
 
         WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
         attributes.ParentObject = circuit;

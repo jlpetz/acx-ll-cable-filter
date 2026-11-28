@@ -16,12 +16,12 @@ use windows::Win32::UI::Shell::{
 use windows::core::{HRESULT, w};
 
 /// The active window on the GUI thread. An HWND is valid across threads in this process.
-pub(crate) fn owner() -> usize {
+pub fn owner() -> usize {
     // SAFETY: GetActiveWindow has no preconditions.
     unsafe { GetActiveWindow().0 as usize }
 }
 
-pub(crate) fn choose(owner: usize) -> Result<Option<PathBuf>, String> {
+pub fn choose(owner: usize) -> Result<Option<PathBuf>, String> {
     std::thread::Builder::new()
         .name("nf-effect-picker".into())
         .spawn(move || {

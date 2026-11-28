@@ -118,9 +118,6 @@ fn cpu_box(text: &CStr) {
 /// saves XMM registers with VEX moves, which a CPU without AVX can't run (cpu_check.rs).
 #[inline(never)]
 fn app_main() -> ExitCode {
-    if let Some(code) = nf_vmic::broker::helper_entry() {
-        return ExitCode::from(code);
-    }
     if let Some(code) = nf_fx::worker_entry() {
         return ExitCode::from(code);
     }

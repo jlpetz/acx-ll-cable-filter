@@ -1,0 +1,3 @@
+// Windows Sound loads these icon groups as data from the installed driver. AudioCodec.inf selects one per endpoint.
+101 ICON "icons/llcable-in.ico"
+102 ICON "icons/llcable-out.ico"

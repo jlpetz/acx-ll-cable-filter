@@ -1,4 +1,4 @@
-//! Imports cable choices from `acx-ll-cable migrate|add --endpoint-map`. Run once as the owner of the settings.
+//! Imports cable choices from `acx-ll-cable migrate|add|update --endpoint-map`. Run once as the owner of the settings.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -53,8 +53,8 @@ impl Map {
         if self.format != endpoint_map::FORMAT || self.version != endpoint_map::VERSION {
             return Err("Unrecognized endpoint map format or version.".into());
         }
-        if !matches!(self.command.as_str(), "migrate" | "add") || !matches!(self.result.as_str(), "done" | "nothing") {
-            return Err("Use an endpoint map from a completed migration or add.".into());
+        if !matches!(self.command.as_str(), "migrate" | "add" | "update") || !matches!(self.result.as_str(), "done" | "nothing") {
+            return Err("Use an endpoint map from a completed migration, add or update.".into());
         }
         let mut by_old = HashMap::new();
         for cable in &self.cables {
@@ -218,5 +218,20 @@ mod tests {
         map.version += 1;
         assert!(apply(&map, &mut settings).is_err());
         assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn a_package_update_can_remap_choices_only_after_it_finished() {
+        let mut map = map(json!([row(EndpointKind::Microphone, Some("mic-before-update"), Some("replacement"), Match::Moved)]));
+        map.command = "update".into();
+        let mut settings = json!({"devices": {"mic": "mic-before-update"}});
+        for partial in ["error", "restart"] {
+            map.result = partial.into();
+            assert!(apply(&map, &mut settings).is_err());
+            assert_eq!(settings["devices"]["mic"], "mic-before-update");
+        }
+        map.result = "done".into();
+        assert_eq!(apply(&map, &mut settings).unwrap().fields, ["/devices/mic"]);
+        assert_eq!(settings["devices"]["mic"], nf_engine::cable_endpoint_selection(ID.parse().unwrap(), EndpointKind::Microphone));
     }
 }

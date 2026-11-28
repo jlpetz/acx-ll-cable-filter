@@ -16,6 +16,7 @@ live-probe = []
 onnx = ["dep:nf-ort"]
 
 [dependencies]
+llcable-wasapi = { path = "../llcable-wasapi" }
 nf-core.workspace = true
 nf-vmic.workspace = true
 nf-fx = { path = "../nf-fx" }

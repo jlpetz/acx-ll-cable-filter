@@ -1,5 +1,5 @@
-"""Whether what a CPU runs before the CPU gate refuses it keeps to the target's baseline, read from both exes' post-LTO
-asm. crates/nf-app/src/cpu_check.rs's module doc asks for this check after a change to it, to either `main` or to the
+"""Whether what a CPU runs before the CPU gate refuses it keeps to the target's baseline, read from each gated exe's post-LTO
+asm. crates/nf-app/src/cpu_check.rs's module doc asks for this check after a change to it, to a gated `main` or to the
 toolchain, and doc/todo/18-release.md makes it a release step (doc/dev/build-report.md section 11).
 
 Why. The build is x86-64-v3, so a CPU without AVX faults on the first VEX instruction, which at v3 includes every SSE
@@ -36,9 +36,10 @@ says it may. Code outside the asm (the C runtime's `memcpy`, Windows' DLLs) is l
 Build the asm (the exes are linked as usual, next to it), then run this from any directory:
     cargo rustc --release -p nf-app --bin noise-filter -- --emit asm
     cargo rustc --release -p nf-app --bin noise-filter-cli -- --emit asm
-    python tools/check_cpu_gate_asm.py [noise_filter.s noise_filter_cli.s] [--list]
-With no files it reads the newest `noise_filter.s` and `noise_filter_cli.s` that have a `main`, from any target dir
-(`target/[NAME/]release/build/nf-app/<hash>/out/`). It exits 1 on a flagged instruction that `ALLOWED` doesn't cover, and
+    cargo rustc --release -p llcable-mixer --bin llcable-mixer -- --emit asm
+    python tools/check_cpu_gate_asm.py [noise_filter.s noise_filter_cli.s llcable_mixer.s] [--list]
+With no files it reads the newest asm of each executable that has a `main`, from any target dir
+(`target/[NAME/]release/build/<package>/<hash>/out/`). It exits 1 on a flagged instruction that `ALLOWED` doesn't cover, and
 when the walk no longer finds the gate's refusal or the code after the gate (the names have drifted). `--list` prints every
 function reached, with its instruction count. Its tests: python tools/test_check_cpu_gate_asm.py
 """
@@ -56,14 +57,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXES = {
     "noise_filter.s": "cargo rustc --release -p nf-app --bin noise-filter -- --emit asm",
     "noise_filter_cli.s": "cargo rustc --release -p nf-app --bin noise-filter-cli -- --emit asm",
+    "llcable_mixer.s": "cargo rustc --release -p llcable-mixer --bin llcable-mixer -- --emit asm",
 }
 # Where the build leaves each bin's asm, relative to the repo: Cargo's build-dir layout, then the old one, each in the
 # default target dir or another (CARGO_TARGET_DIR=target/NAME)
-ASM_DIRS = ["target/release/build/nf-app/*/out", "target/*/release/build/nf-app/*/out"]
+ASM_DIRS = [f"{target}/release/build/{package}/*/out"
+            for target in ("target", "target/*") for package in ("nf-app", "llcable-mixer")]
 OLD_ASM = ["target/release/deps", "target/*/release/deps"]
 
 # The code after the gate, where the walk stops, by demangled name
-STOP = {"noise_filter::app_main", "noise_filter_cli::launch_and_exit"}
+STOP = {"noise_filter::app_main", "noise_filter_cli::launch_and_exit", "llcable_mixer::app_main"}
 # The gate's refusal: the walk must reach it, or it isn't walking the gate's path
 REFUSE = "cpu_check::refuse"
 

@@ -1,0 +1,22 @@
+[package]
+name = "llcable-effects"
+description = "Native Rust voice and dynamics stages for the LLCable audio graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+llcable-routing.workspace = true
+nf-core.workspace = true
+nf-stages.workspace = true
+sonora.workspace = true
+nf-fx = { path = "../nf-fx", optional = true }
+
+[features]
+clap = ["dep:nf-fx"]
+
+[[example]]
+name = "verify_clap"
+required-features = ["clap"]

@@ -54,7 +54,15 @@ fn listener(name: &str) -> io::Result<File> {
 }
 
 fn elevate(pid: u32, nonce: &str) -> io::Result<OwnedHandle> {
-    let exe = std::env::current_exe()?;
+    // A fixed sibling, never a PATH lookup or the external application's own executable.
+    let client = std::env::current_exe()?;
+    let exe = client.with_file_name("llcable-broker.exe");
+    if !exe.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "install llcable-broker.exe beside the application to approve direct cable feeds",
+        ));
+    }
     let directory = HSTRING::from(exe.parent().ok_or(io::ErrorKind::InvalidInput)?);
     let exe = HSTRING::from(exe.as_path());
     let args = HSTRING::from(format!("{} {pid} {nonce}", helper::FLAG));
@@ -70,7 +78,7 @@ fn elevate(pid: u32, nonce: &str) -> io::Result<OwnedHandle> {
     };
     // SAFETY: a control thread, never the audio thread. Balance either successful initialization; an existing MTA stays in place.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    // SAFETY: every buffer in info lives through the call. Only the current image with fixed-format arguments is requested.
+    // SAFETY: every buffer lives through the call. The helper path is absolute and the arguments contain only a PID and nonce.
     let result = unsafe { ShellExecuteExW(&mut info) };
     if com.is_ok() {
         // SAFETY: balances the initialization on this same thread.
@@ -123,7 +131,7 @@ fn accept(pipe: File, child: OwnedHandle) -> io::Result<Session> {
             return Err(denied());
         }
     }
-    let session = Session { child, pipe: Mutex::new(Some(pipe)) };
+    let session = Session { child, pipe: Mutex::new(Some(pipe)), connected: true.into(), leases: Mutex::default() };
     session.exchange(None)?;
     Ok(session)
 }
@@ -170,17 +178,19 @@ mod tests {
             .spawn()
             .unwrap();
         let session = accept(pipe, child.into()).unwrap();
+        let cables = crate::cables::present().unwrap();
+        let id = crate::cables::choose_default(&cables).unwrap().cable.id;
         for _ in 0..2 {
-            let dup = session.exchange(Some(START)).unwrap();
+            let dup = session.exchange(Some((START, id))).unwrap();
             // SAFETY: a fresh section handle transferred to this process by the authenticated running helper.
             let section = unsafe { Owned::new(HANDLE(dup as usize as _)) };
             let ring = RingMemory::shared_writer(*section, LIVE_CAPACITY).unwrap();
             assert_ne!(ring.header().state.load(Ordering::Acquire) & protocol::STATE_ATTACHED, 0);
-            assert_eq!(session.exchange(Some(START)).unwrap_err().raw_os_error(), Some(ERROR_BUSY.0 as i32));
+            assert_eq!(session.exchange(Some((START, id))).unwrap_err().raw_os_error(), Some(ERROR_BUSY.0 as i32));
             let mut writer = crate::Writer::new(&ring);
             assert_eq!(writer.write_frame(), 0);
             assert_eq!(writer.produce(128, |_| [0.0; 2]), 128);
-            session.exchange(Some(STOP)).unwrap();
+            session.exchange(Some((STOP, id))).unwrap();
             assert_eq!(ring.header().state.load(Ordering::Acquire) & protocol::STATE_ATTACHED, 0);
         }
         drop(session.pipe);

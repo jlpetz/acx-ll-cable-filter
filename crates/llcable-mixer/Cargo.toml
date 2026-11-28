@@ -1,0 +1,21 @@
+[package]
+name = "llcable-mixer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+llcable-audio.workspace = true
+llcable-control = { workspace = true, features = ["voice"] }
+llcable-effects = { workspace = true, features = ["clap"] }
+nf-gui.workspace = true
+nf-mem.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+windows-reactor.workspace = true
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+windows-reactor = { workspace = true, features = ["test"] }

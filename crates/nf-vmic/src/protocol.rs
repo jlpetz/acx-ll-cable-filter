@@ -5,7 +5,7 @@
 //! one (the owner, 2026-11-23). Live ATTACH and its header use [`LIVE_VERSION`]; ordinary ATTACH and STATS retain [`VERSION`].
 
 use std::mem::{offset_of, size_of};
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::identity::CableId;
 
@@ -348,6 +348,39 @@ pub struct RingHeader {
     /// Even sequence for a coherent read of the live driver clock; odd while a reader updates it. Zero for ordinary attachments.
     pub clock_sequence: AtomicU64,
     pub reserved3: [u8; 64],
+}
+
+/// One capture pass's coherent state. `moved` changes when a new reader discarded stale data or the ring resynced.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReaderSample {
+    pub state: u32,
+    pub packet: u32,
+    pub moved: u64,
+    pub underrun_frames: u64,
+}
+
+impl RingHeader {
+    /// Read the live driver's counters from the same pass. A stop stores state and period outside the sequence, without
+    /// changing any counters. On overlap keep using the previous sample; counters are cumulative. No locks or waits.
+    pub fn reader_sample(&self) -> Option<ReaderSample> {
+        for _ in 0..4 {
+            let seq = self.clock_sequence.load(Ordering::Acquire);
+            if seq & 1 == 0 {
+                let sample = ReaderSample {
+                    state: self.state.load(Ordering::Relaxed),
+                    packet: self.packet_frames.load(Ordering::Relaxed),
+                    moved: self.read_frame.load(Ordering::Relaxed).wrapping_sub(self.frames_copied.load(Ordering::Relaxed)),
+                    underrun_frames: self.underrun_frames.load(Ordering::Relaxed),
+                };
+                fence(Ordering::Acquire);
+                if self.clock_sequence.load(Ordering::Relaxed) == seq {
+                    return Some(sample);
+                }
+            }
+            std::hint::spin_loop();
+        }
+        None
+    }
 }
 
 /// `NF_VMIC_ATTACH_IN`: ATTACH's input buffer. Magic and Version are its first 8 bytes, and the ring header's, in every version:

@@ -568,10 +568,15 @@ Return Value:
         // Create Device Bridge Pin.
         //
 
+        ACX_PIN_CALLBACKS_INIT(&pinCallbacks);
+        pinCallbacks.EvtAcxPinRetrieveName = Codec_EvtBridgePinRetrieveName;
         ACX_PIN_CONFIG_INIT(&pinCfg);
         pinCfg.Type = AcxPinTypeSource;
         pinCfg.Communication = AcxPinCommunicationNone;
-        pinCfg.Category = &KSNODETYPE_SPEAKER;
+        // Endpoint Builder supplies "Speakers" for a speaker bridge even when its ACX pin reports the cable name.
+        // A line-level render bridge represents the virtual cable input and is enabled by default.
+        pinCfg.Category = &KSNODETYPE_LINE_CONNECTOR;
+        pinCfg.PinCallbacks = &pinCallbacks;
 
         WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, CODEC_PIN_CONTEXT);
         attributes.EvtCleanupCallback = CodecR_EvtPinContextCleanup;

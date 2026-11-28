@@ -28,6 +28,17 @@ fn cable_role(selection: &str) -> Option<(CableId, EndpointKind)> {
     Some((id.parse().ok()?, EndpointKind::from_arg(role)?))
 }
 
+impl DeviceInfo {
+    pub fn cable_id(&self) -> Option<CableId> {
+        self.cable_selection.as_deref().and_then(cable_role).map(|(id, _)| id)
+    }
+
+    /// The endpoint's role when enumeration identified it as one of our cables.
+    pub fn cable_role(&self) -> Option<EndpointKind> {
+        self.cable_selection.as_deref().and_then(cable_role).map(|(_, role)| role)
+    }
+}
+
 pub(crate) fn is_cable_selection(selection: Option<&str>) -> bool {
     selection.and_then(cable_role).is_some()
 }

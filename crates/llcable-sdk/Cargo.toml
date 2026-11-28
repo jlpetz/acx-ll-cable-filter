@@ -1,0 +1,11 @@
+[package]
+name = "llcable-sdk"
+description = "Windows virtual cable discovery, passive diagnostics and direct stereo feeds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+nf-vmic.workspace = true

@@ -298,6 +298,8 @@ pub enum OutputBackend {
 #[serde(default)]
 pub struct IoConfig {
     pub output_backend: OutputBackend,
+    /// Persistent driver cable identity. Earlier settings choose A, or the only installed cable.
+    pub direct_cable: Option<String>,
     /// Try IAudioClient3's smallest shared-mode period on the mic (falls back to the default).
     pub low_latency_periods: bool,
     /// Open the mic in RAW mode where the device supports it (no OEM effects ahead of AEC3).
@@ -335,6 +337,7 @@ impl Default for IoConfig {
     fn default() -> Self {
         Self {
             output_backend: OutputBackend::Wasapi,
+            direct_cable: None,
             low_latency_periods: true,
             raw_mic: true,
             output_margin_ms: 2.0,

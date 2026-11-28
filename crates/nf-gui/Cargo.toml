@@ -7,8 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-nf-engine.workspace = true
-nf-vmic.workspace = true
+llcable-control = { workspace = true, features = ["voice"] }
 # The "Enable large pages..." button: the user's SID and the elevated `setup-large-pages` helper.
 nf-mem.workspace = true
 windows-reactor.workspace = true

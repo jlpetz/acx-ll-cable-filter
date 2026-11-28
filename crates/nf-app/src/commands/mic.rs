@@ -302,31 +302,22 @@ mod tests {
         let text = format_sessions(&[call.clone(), low]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], CALL_MICROPHONE);
-        assert_eq!(lines[1], "  Discord.exe (pid 1234), active: a call app; the Call Microphone suits it.");
+        assert_eq!(lines[1], "  Discord.exe (pid 1234), active: a call app; Out-5ms suits it.");
         assert!(
-            lines[2].starts_with("  reaper.exe (pid 1234), inactive: a low-latency recorder; the Microphone suits it better (it keeps"),
+            lines[2].starts_with("  reaper.exe (pid 1234), inactive: a low-latency recorder; Out suits it better (it keeps"),
             "{}",
             lines[2]
         );
         assert_eq!(lines[3], "  notepad.exe (pid 1234), expired: unknown, no suggestion.");
         assert_eq!(lines[4], MICROPHONE);
-        assert!(
-            lines[5].starts_with("  ms-teams.exe (pid 1234), active: a call app; the Call Microphone suits it better (its 5 ms"),
-            "{}",
-            lines[5]
-        );
-        assert!(
-            lines[6].starts_with("  chrome.exe (pid 1234), active: a browser (web calls, probably); the Call Microphone suits it better")
-        );
+        assert!(lines[5].starts_with("  ms-teams.exe (pid 1234), active: a call app; Out-5ms suits it better (its 5 ms"), "{}", lines[5]);
+        assert!(lines[6].starts_with("  chrome.exe (pid 1234), active: a browser (web calls, probably); Out-5ms suits it better"));
         assert!(!text.contains("isn't active now"), "both microphones are there");
         assert!(text.trim_end().ends_with("has no session, so it isn't listed."));
 
         // The call microphone alone: a recorder's better microphone isn't there
         let text = format_sessions(&[call]);
-        assert!(
-            text.contains("the Microphone suits it better") && text.contains("It isn't active now: `noise-filter mic variant`"),
-            "{text}"
-        );
+        assert!(text.contains("Out suits it better") && text.contains("It isn't active now: `noise-filter mic variant`"), "{text}");
         // Nothing open, nothing of ours, and sessions without a known program
         let empty = endpoint(MICROPHONE, vec![]);
         assert!(format_sessions(&[empty]).contains("  no app has it open"));
@@ -342,7 +333,7 @@ mod tests {
         assert!(text.contains("  Windows' system sounds, inactive: unknown, no suggestion."), "{text}");
         // A renamed endpoint: what suits the app, without saying it's the wrong one
         let renamed = endpoint("Studio mic (ACX-LL-Cable A)", vec![session("zoom.exe", SessionState::Active)]);
-        assert!(format_sessions(&[renamed]).contains("  zoom.exe (pid 1234), active: a call app; the Call Microphone suits it."));
+        assert!(format_sessions(&[renamed]).contains("  zoom.exe (pid 1234), active: a call app; Out-5ms suits it."));
     }
 
     #[test]

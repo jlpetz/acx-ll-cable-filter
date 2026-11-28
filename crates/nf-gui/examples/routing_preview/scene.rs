@@ -1,11 +1,12 @@
 //! In-memory signal graph for comparing the three editors against exactly the same session.
 use std::collections::BTreeMap;
 
-pub(super) const SOURCES: [&str; 3] = ["Hardware mic", "Cable C Input", "Cable D Input"];
+pub(super) const SOURCES: [&str; 3] = ["Hardware mic", "LLCable-C In", "LLCable-D In"];
 pub(super) const SOURCE_INFO: [&str; 3] =
-    ["Example physical microphone", "Audio apps play into Speakers (ACX-LL-Cable C)", "Audio apps play into Speakers (ACX-LL-Cable D)"];
-pub(super) const DESTS: [&str; 3] = ["Cable A Output", "Cable B Output", "Headphones"];
-pub(super) const DEST_INFO: [&str; 3] = ["Recorded by OBS", "Recorded by Discord", "Physical listening device"];
+    ["Example physical microphone", "Playback endpoint · apps play into LLCable-C In", "Playback endpoint · apps play into LLCable-D In"];
+pub(super) const DESTS: [&str; 3] = ["LLCable-A Out", "LLCable-B Out", "Headphones"];
+pub(super) const DEST_INFO: [&str; 3] =
+    ["Recording endpoint · used by OBS", "Recording endpoint · used by Discord", "Physical listening device"];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Scope {
@@ -86,8 +87,9 @@ impl Kind {
     pub(super) fn range(self) -> (i32, i32) {
         match self {
             Self::Echo => (0, 2),
-            Self::Noise => (0, 60),
-            Self::Gate | Self::Compressor => (-80, 0),
+            Self::Noise => (-60, 0),
+            Self::Gate => (-80, -10),
+            Self::Compressor => (-80, 0),
             Self::Equalizer | Self::Voice => (-12, 12),
             Self::Pan => (-100, 100),
             Self::Gain => (-36, 12),
@@ -98,7 +100,7 @@ impl Kind {
         match self {
             Self::Gate => -50,
             Self::Compressor => -18,
-            Self::Noise => 36,
+            Self::Noise => -60,
             Self::Voice => -3,
             _ => 0,
         }
@@ -110,6 +112,7 @@ impl Kind {
             Self::Pan => format!("{}% {}", value.abs(), if value < 0 { "left" } else { "right" }),
             Self::Voice => format!("{value:+} semitones"),
             Self::Gate | Self::Compressor => format!("{value} dBFS"),
+            Self::Noise if value == -60 => "Unlimited".into(),
             Self::Noise => format!("{value} dB"),
             _ => format!("{value:+} dB"),
         }
@@ -148,7 +151,7 @@ pub(super) struct Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        let mut scene = Self { scope: Scope::Send(0, 1), sends: Default::default(), chains: BTreeMap::new(), next_id: 1 };
+        let mut scene = Self::empty(Scope::Send(0, 1));
         for (s, d) in [(0, 0), (0, 1), (1, 0)] {
             scene.sends[s][d].connected = true;
         }
@@ -161,12 +164,25 @@ impl Default for Scene {
 }
 
 impl Scene {
+    pub(super) fn empty(scope: Scope) -> Self {
+        Self { scope, sends: Default::default(), chains: BTreeMap::new(), next_id: 1 }
+    }
+
     pub(super) fn connected(&self, s: usize, d: usize) -> bool {
         self.sends[s][d].connected
     }
 
     pub(super) fn at(&self, scope: Scope) -> &[Stage] {
         self.chains.get(&scope).map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn source_stages_for_send(&self, s: usize, d: usize) -> &[Stage] {
+        let chain = self.at(Scope::Source(s));
+        match self.sends[s][d].tap {
+            Tap::Raw => &[],
+            Tap::End => chain,
+            Tap::Stage(id) => &chain[..chain.iter().position(|stage| stage.id == id).map_or(0, |i| i + 1)],
+        }
     }
 
     pub(super) fn stages(&self) -> &[Stage] {
@@ -206,10 +222,14 @@ impl Scene {
     }
 
     pub(super) fn remove(&mut self, id: u32) {
-        if let Some(stages) = self.chains.get_mut(&self.scope)
+        self.remove_from(self.scope, id);
+    }
+
+    pub(super) fn remove_from(&mut self, scope: Scope, id: u32) {
+        if let Some(stages) = self.chains.get_mut(&scope)
             && let Some(index) = stages.iter().position(|s| s.id == id)
         {
-            if let Scope::Source(source) = self.scope {
+            if let Scope::Source(source) = scope {
                 // A send tapped after this stage stays at the preceding boundary if its stage is removed.
                 let before = index.checked_sub(1).map_or(Tap::Raw, |i| Tap::Stage(stages[i].id));
                 for send in &mut self.sends[source] {

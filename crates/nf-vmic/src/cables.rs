@@ -81,13 +81,32 @@ impl EndpointKind {
         }
     }
 
-    /// "Speakers", "Microphone", "Call Microphone": the part of the endpoint's name before the brackets, as Windows names it.
+    /// The stable role string used by endpoint-map files and by packages with the original friendly names.
     pub fn name(self) -> &'static str {
         match self {
             EndpointKind::Speakers => "Speakers",
             EndpointKind::Microphone => "Microphone",
             EndpointKind::CallMicrophone => "Call Microphone",
         }
+    }
+
+    /// The endpoint's direction as seen from the cable. Out-5ms carries the same samples with a 5 ms default engine period.
+    pub fn port(self) -> &'static str {
+        match self {
+            Self::Speakers => "In",
+            Self::Microphone => "Out",
+            Self::CallMicrophone => "Out-5ms",
+        }
+    }
+
+    /// The endpoint's default display label, before Windows adds the adapter name in parentheses.
+    pub fn display_name(self, cable: &Label) -> String {
+        format!("LLCable-{cable} {}", self.port())
+    }
+
+    /// The complete default MMDevice name, with the existing cable adapter in parentheses.
+    pub fn friendly_name(self, cable: &Label) -> String {
+        format!("{} ({})", self.display_name(cable), cable.friendly_name())
     }
 
     /// `speakers`, `microphone`, `call-microphone`: the role on a command line (`acx-ll-cable endpoint`).
@@ -105,7 +124,7 @@ impl EndpointKind {
         let s = s.trim();
         [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone]
             .into_iter()
-            .find(|k| s.eq_ignore_ascii_case(k.arg()) || s.eq_ignore_ascii_case(k.name()))
+            .find(|k| s.eq_ignore_ascii_case(k.arg()) || s.eq_ignore_ascii_case(k.name()) || s.eq_ignore_ascii_case(k.port()))
     }
 
     /// Render (the Speakers) or capture (a microphone).
@@ -336,6 +355,7 @@ mod tests {
         for k in [EndpointKind::Speakers, EndpointKind::Microphone, EndpointKind::CallMicrophone] {
             assert_eq!(EndpointKind::from_arg(k.arg()), Some(k));
             assert_eq!(EndpointKind::from_arg(&k.name().to_uppercase()), Some(k));
+            assert_eq!(EndpointKind::from_arg(&k.port().to_uppercase()), Some(k));
         }
         assert_eq!(EndpointKind::from_arg(" Call-Microphone "), Some(EndpointKind::CallMicrophone));
         for none in ["", "call", "mic", "speaker", "microphone0", "callmicrophone"] {

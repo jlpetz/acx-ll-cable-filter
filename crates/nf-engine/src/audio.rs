@@ -404,8 +404,9 @@ fn open_session(
     let mic_cable = endpoint_cable(&mic_dev);
     let default_mic = config.devices.mic.is_none();
     let direct = config.io.output_backend == nf_core::config::OutputBackend::DriverRing;
-    let out_dev = if direct {
-        if let Some(refusal) = direct_feed_check(&mic_cable, feed_cable().as_ref(), default_mic) {
+    let destination = if direct { Some(feed_cable(config.io.direct_cable.as_deref())?) } else { None };
+    let out_dev = if let Some(cable) = &destination {
+        if let Some(refusal) = direct_feed_check(&mic_cable, Some(cable), default_mic) {
             return Err(refusal);
         }
         None
@@ -471,7 +472,7 @@ fn open_session(
     let (mut out, out_warning) = match out_dev {
         Some(device) => Output::open(&device, out_exclusive.is_ok_and(|e| e), RENDER_BUFFER_HNS, at_least(out_floor))
             .map_err(open(StreamRole::Output))?,
-        None => (Output::Driver(crate::ring_output::RingOutput::open()?), None),
+        None => (Output::Driver(crate::ring_output::RingOutput::open(destination.as_ref().expect("direct cable resolved"))?), None),
     };
     let mic_name = mic.info.stream_info().device_name;
     for (role, floor, device) in [(StreamRole::Mic, mic_floor, mic_name), (StreamRole::Output, out_floor, out_name)] {
@@ -644,12 +645,26 @@ fn endpoint_cable(endpoint: &wasapi::Device) -> EndpointCable {
     }
 }
 
-/// The cable the direct feed goes to: the default one, labelled A or else the only cable, as the ring's open chooses it
-/// (`nf_vmic::device::Device::open_default`, directly or through the broker). `None` where it can't be chosen: the open then
-/// fails and says why.
-fn feed_cable() -> Option<CableInstance> {
-    let present = nf_vmic::cables::present().ok()?;
-    nf_vmic::cables::choose_default(&present).ok().map(|c| c.cable.clone())
+/// Resolve the destination once, so the feedback guard and the ring open always use the same identity.
+fn feed_cable(selection: Option<&str>) -> Result<CableInstance, StartFailure> {
+    let present = nf_vmic::cables::present().map_err(|e| StartFailure::DriverRing { message: e.to_string(), retry: true })?;
+    select_feed(&present, selection)
+}
+
+fn select_feed(present: &[nf_vmic::cables::PresentCable], selection: Option<&str>) -> Result<CableInstance, StartFailure> {
+    if let Some(selection) = selection {
+        let id = selection
+            .parse()
+            .map_err(|_| StartFailure::DriverRing { message: "Choose a valid direct output cable.".into(), retry: false })?;
+        return present.iter().find(|c| c.cable.id == id).map(|c| c.cable.clone()).ok_or_else(|| StartFailure::DriverRing {
+            message: "The selected direct output cable is unavailable. Enable it or choose another cable.".into(),
+            retry: true,
+        });
+    }
+    nf_vmic::cables::choose_default(present).map(|c| c.cable.clone()).map_err(|e| StartFailure::DriverRing {
+        message: format!("{e}. Choose a direct output cable or select WASAPI output."),
+        retry: true,
+    })
 }
 
 /// The direct feed's check on the input (the owner's input guard, 2026-11-24): a microphone of the cable it feeds (`feed`)
@@ -1021,6 +1036,22 @@ mod tests {
 
     /// TODO 19 (the owner's input guard, 2026-11-24; the review of N0): direct output refuses a microphone of the cable it
     /// feeds, by identity, and allows another cable's; one of ours whose cable isn't known is refused.
+    #[test]
+    fn direct_target_is_sticky_when_another_cable_is_available() {
+        use nf_vmic::cables::PresentCable;
+        use nf_vmic::identity::CableId;
+        let present = |label: &str, id| PresentCable {
+            cable: CableInstance { id: CableId(id), label: label.parse().unwrap(), n: 1 },
+            instance_id: String::new(),
+            health: nf_vmic::setup::plan::Health::Working,
+        };
+        let (a, b) = (present("A", 1), present("B", 2));
+        let id = b.cable.id.to_string();
+        assert_eq!(select_feed(&[a.clone(), b.clone()], Some(&id)).unwrap(), b.cable);
+        assert!(select_feed(std::slice::from_ref(&a), Some(&id)).unwrap_err().transient());
+        assert_eq!(select_feed(&[a.clone(), b], None).unwrap(), a.cable);
+    }
+
     #[test]
     fn direct_output_refuses_its_own_cables_microphone() {
         let cable = |label: &str, id: u128| CableInstance { label: label.parse().unwrap(), id: nf_vmic::identity::CableId(id), n: 1 };

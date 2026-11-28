@@ -1,0 +1,16 @@
+[package]
+name = "llcable-control"
+description = "Shared control API for cable panels, command line clients and voice processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+voice = ["dep:nf-engine"]
+
+[dependencies]
+llcable-sdk.workspace = true
+llcable-routing.workspace = true
+nf-engine = { workspace = true, optional = true }

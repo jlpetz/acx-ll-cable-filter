@@ -277,6 +277,75 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "llcable-audio"
+version = "0.1.0"
+dependencies = [
+ "llcable-routing",
+ "llcable-sdk",
+ "llcable-wasapi",
+ "rtrb",
+ "wasapi",
+ "windows",
+]
+
+[[package]]
+name = "llcable-control"
+version = "0.1.0"
+dependencies = [
+ "llcable-routing",
+ "llcable-sdk",
+ "nf-engine",
+]
+
+[[package]]
+name = "llcable-effects"
+version = "0.1.0"
+dependencies = [
+ "llcable-routing",
+ "nf-core",
+ "nf-fx",
+ "nf-stages",
+ "sonora",
+]
+
+[[package]]
+name = "llcable-mixer"
+version = "0.1.0"
+dependencies = [
+ "llcable-audio",
+ "llcable-control",
+ "llcable-effects",
+ "nf-gui",
+ "nf-mem",
+ "serde",
+ "serde_json",
+ "windows",
+ "windows-reactor",
+]
+
+[[package]]
+name = "llcable-routing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "llcable-sdk"
+version = "0.1.0"
+dependencies = [
+ "nf-vmic",
+]
+
+[[package]]
+name = "llcable-wasapi"
+version = "0.1.0"
+dependencies = [
+ "wasapi",
+ "windows",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -379,6 +448,7 @@ name = "nf-engine"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "llcable-wasapi",
  "log",
  "nf-core",
  "nf-fx",
@@ -407,10 +477,9 @@ dependencies = [
 name = "nf-gui"
 version = "0.1.0"
 dependencies = [
+ "llcable-control",
  "log",
- "nf-engine",
  "nf-mem",
- "nf-vmic",
  "serde",
  "serde_json",
  "windows",

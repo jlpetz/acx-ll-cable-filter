@@ -340,9 +340,8 @@ NTSTATUS
 CodecC_AddStaticCapture(
     _In_ WDFDEVICE              Device,
     _In_ const GUID *           ComponentGuid,
-    _In_ const GUID  *          MicCustomName,
     _In_ const UNICODE_STRING * CircuitName,
-    _In_ PCWSTR                 EndpointName    // noise-filter (TODO 19): the endpoint's name (a literal, kept)
+    _In_ PCWSTR                 EndpointRole    // A static literal, kept for the lifetime of the circuit.
 );
 
 PAGED_CODE_SEG

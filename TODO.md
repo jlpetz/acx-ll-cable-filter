@@ -64,7 +64,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - DeepFilterNet3: standard weights plausibly open; _ll is a bigger model (9.7M params) with weaker evidence. Opt-in only.
 - Open (owner): does dropping GTCRN over its patent filings also cover UL-UNAS, which probably shares the family? Until answered, UL-UNAS stays the next integration.
 - RNNoise (#4) is the fallback. Choose by #13 and #14 on the owner's own mic, not by paper scores.
-- Compare Sonora's WebRTC noise suppressor with RNNoise and UL-UNAS on the same Lab clips (#14), one denoiser per run (owner request, 2026-11-20).
+- Sonora's native WebRTC noise suppressor is available in the packet mixer. Compare Moderate with RNNoise and UL-UNAS on the same Lab clips (#14), one denoiser per run.
 - Live A/B on the cables (8cb6913): 8-19 dB more noise cut in pauses, speech alike, app path 64.5 ms at depth 1 (auto with the exclusive mic, b53a965) against RNNoise's 34.4. The Lab (357 clips, e374c2c): DNSMOS OVRL +0.26 [+0.12, +0.41], SIGMOS OVRL +0.68 [+0.54, +0.82].
 **Next**: the owner's patent answer and a listen (WAVs in the VM's `Downloads\nf-quality\ab-*`); a lower-latency candidate (FastEnhancer, or our 10 ms-hop retrain, #7).
 **Detail**: `doc/todo/5-candidate-models.md`; `doc/research-2026-10.md` (Noise models), `doc/todo/7-retraining.md`
@@ -169,11 +169,11 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 15. [gui] Settings window (Reactor)
-**Priority**: High for v0.1 | **Status**: settings window implemented. Stopped and running acceptance passed on the virtual dev box.
+**Priority**: High for v0.1 | **Status**: the live v2 mixer and single-chain window use the shared control and audio components. Both run on the virtual dev box.
 - The window selects the mic, echo reference and output route. It controls AEC, the noise model, gate position and one CLAP effect, shows meters and latency, and saves named processing presets independently of the route.
 - Settings survive close and reopen. Minimise keeps the process alive. Closing stops the engine. The tray and background engine are TODO 16.
-- Three native design previews let the owner compare visible splits, mixes and an ordered built-in/CLAP pipeline. They use simulated audio.
-**Next**: choose the routing layout, then connect its controls to TODO 24 and TODO 17. The standard-user grant, physical Windows 11 and the quality Lab page remain open.
+- V2 has passive cable diagnostics, output-centric mixing, shared/source/send/output effects, routing presets and live wiring. The design previews remain available separately.
+**Next**: trial the mixer on physical hardware and with a standard user. The quality Lab page remains open.
 **Detail**: `doc/todo/15-gui-tray.md`
 
 ---
@@ -193,8 +193,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - The published spec = a CLAP host profile (48 kHz, 480-frame blocks, port layout per role, supported and our own extensions) + the model-pack format (#3). VST3 hosting later; no VST2.
 - EQ, voice changers and automatic gain control are in scope (owner, 2026-11-20). Evaluate Sonora AGC2 as an optional app effect that can run with AEC and denoising off.
 - Exact mute (not built; detail, "Exact mute"): an end stage writing exact zeros, the owner's (agreed 2026-11-22, for later; TODO 10); as an explicit output guarantee, triggered once the mic as captured has been exact zeros for longer than the chain's latency plus a tail, ours (2026-11-23, the owner's to confirm). The filters don't get there alone: with the far end playing, AEC3 puts out -75 to -89 dBFS from a silent mic, and no gate after AEC3 brings that to 24-bit zero.
-- The app hosts one external `.clap` after the built-ins. A restricted worker processes the audio, the GUI edits its parameters and bypass, and offline WAV rendering uses the same effect. An independent gain plugin exercises the public ABI.
-**Next**: test more third-party effects. Extend named presets and the GUI to an ordered stage list with per-instance parameters and bypass. Recheck CLAP's headers before exporting the built-in stages.
+- The legacy app hosts one external CLAP. V2 can stack isolated mono CLAP stages in a rack with independent parameters. The example gain passed through one and two actual workers; aligned dry fallback covers missed deadlines.
+**Next**: test more third-party effects and review CLAP headers before exporting built-in stages.
 **Detail**: `doc/todo/17-post-effects.md`
 
 ---
@@ -212,7 +212,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 19. [driver] Our own virtual mic
-**Priority**: High | **Status**: the app feeds A directly or through WASAPI. A's call and low-latency mics share one signal. Optional Cable B is independent. Both work standalone. Simultaneous routes passed on the dev VM. Setup: `driver/README.md`. Baseline: VB-CABLE.
+**Priority**: High | **Status**: all installed cables are discoverable. A and B run independently with two outputs each. Both GUIs can select a direct target and v2 can feed several. Setup: `driver/README.md`.
 - Owner's criteria: latency and quality at least VB-CABLE's; controllable from inside the app; open source others can reuse.
 - Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
 - Base (study 2026-10-28): Microsoft's ACX AudioCodec sample (MS-PL), cut down, borrowing microsoft/low-latency-audio's (MIT) packet-size code and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
@@ -220,8 +220,9 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 - The spike (the VM, 2026-11-20 to 22): checks 1-7 passed. float32 then 24-in-32 on both endpoints; the app-fed ring (`nf_vmic.h`, `crates/nf-vmic`) bit-exact into shared and exclusive recordings, two capture streams at once, a counted one-time skip at a reader handoff (the owner: keep it); hour soaks at 128 and 96 frames with no timer glitch; Driver Verifier clean after one fix to the sample's removal path (1a0353d). Open: forced PCM, mixed formats, physical Windows 11.
 - Latency (2026-11-23): speakers to mic by the device stamps 1.91 ms, Call Microphone 1.62, VB-CABLE 50-62; the ring to the recorder in the spike file's table.
 - Per-cable step 1 is installed under Verifier and merged (6a9cc7e). With the ed38955 tools, A recorded bit-exactly across B's disable/enable and removal/re-add. All three IDs survived the disable, all three changed on uninstall, and both replacement microphones opened by CableId and role. Setup restored the six default audio roles.
+- Windows Sound on the dev box shows `LLCable-<label> In`, `Out` and `Out-5ms` with directional icons. An in-place package update also changed the Windows endpoint IDs. The per-cable design records the upgrade and audio checks.
 - Fixed the 415-frame Media Player startup loss on the dev VM. The installed driver passed 100 restarts and 16 full plays. Release checks require zero unexplained loss, including clip edges (spike notes).
-**Next**: Per-cable discovery and diagnostics (D2/N1/T1), then the broker, routing and GUI. At the owner's next planned reboot, observe removed Z endpoints before re-adding Z and check reuse separately. Standard-user UAC, Sound-panel disable, the variant switch cases and physical latency/CPU comparisons are outstanding. Keep Driver Verifier on and add code integrity at the owner's next Verifier round. The packet restamped by Windows at Stop is in TODO 22.
+**Next**: real standard-user UAC, Sound-panel disable, variant switches and physical latency/CPU tests. Aggregate diagnostics and restricted-token permissions passed on both cables. At the owner’s next planned reboot, check Z endpoint reuse and the scheduled Verifier settings. The Windows packet restamp remains in TODO 22.
 **Detail**: `doc/todo/19-per-cable-design.md`, `doc/todo/19-virtual-mic-ude.md`, `doc/todo/19-driver-base-2026-10-28.md`, `doc/todo/19-spike-2026-11-20.md`
 
 ---
@@ -255,10 +256,10 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 24. [engine] Routing graph: split and merge feeds (groundwork for a mixer)
-**Priority**: Medium (groundwork now, the mixer later) | **Status**: the owner's intent (2026-11-26): the driver and the engine lay the groundwork for Voicemeeter-style routing (split a feed at any point, merge and split channels and cables) at low latency, without a mixer app yet.
-- Model (ours): a graph on the engine's real-time thread: sources, stages, split (a shared block, copy-on-write, no queue), mix (gains, latency alignment), channel map, sinks (a cable's ring or WASAPI).
+**Priority**: High | **Status**: reusable packet graph and live WinUI mixer built. Separate virtual recorders verified stereo fan-out at unity and quarter gain, a two-source sum and simultaneous external playback.
+- The graph runs shared stages once and splits, sums, balances and ducks native packets. Consecutive compatible speech stages share a 480-frame buffer. Direct branches keep the source clock. Independent WASAPI sinks have their own bounded queue.
 - The owner chose mono and stereo for the first routing implementation. Preserve left and right on stereo routes. Surround is a later feature.
 - The cables use the same QPC time base. A split can write each ring in one pass. Each reader keeps its own packet timing and headroom. External clocks need drift control and heavy stages get a worker with a deadline.
 - Driver groundwork: a stereo ring per cable (TODO 19, step 1), a render tap per cable (to design), mixing in user mode.
-**Next**: E1 (TODO 19, Astra's) built as a small graph core with inline branches for our cables; the render tap designed.
+**Next**: validate sustained multi-device clock behavior on hardware, evaluate latency alignment for mixes, and design the driver render tap. The current speaker-reference source uses WASAPI loopback.
 **Detail**: `doc/todo/24-routing-graph.md`

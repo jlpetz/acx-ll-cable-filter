@@ -1,0 +1,17 @@
+[package]
+name = "llcable-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+llcable-routing.workspace = true
+llcable-wasapi.workspace = true
+llcable-sdk.workspace = true
+rtrb.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+wasapi.workspace = true

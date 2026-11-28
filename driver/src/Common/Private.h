@@ -425,7 +425,7 @@ typedef struct _CODEC_CAPTURE_CIRCUIT_CONTEXT {
     ACXVOLUME           BoostElement;
     ACXVOLUME           VolumeElement;
     ACXKEYWORDSPOTTER   KeywordSpotter;
-    PCWSTR              EndpointName;       // noise-filter (TODO 19): the bridge pin's name, which names the endpoint (a literal)
+    PCWSTR              EndpointRole;       // Static role suffix for the Windows name: "Out" or "Out-5ms".
 } CODEC_CAPTURE_CIRCUIT_CONTEXT, * PCODEC_CAPTURE_CIRCUIT_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CODEC_CAPTURE_CIRCUIT_CONTEXT, GetCaptureCircuitContext)
@@ -452,7 +452,6 @@ EVT_ACX_VOLUME_ASSIGN_LEVEL         CodecC_EvtBoostAssignLevelCallback;
 EVT_ACX_VOLUME_RETRIEVE_LEVEL       CodecC_EvtBoostRetrieveLevelCallback;
 EVT_ACX_STREAM_GET_CAPTURE_PACKET   CodecC_EvtStreamGetCapturePacket;
 EVT_ACX_PIN_SET_DATAFORMAT          CodecC_EvtAcxPinSetDataFormat;
-EVT_ACX_PIN_RETRIEVE_NAME           CodecC_EvtAcxPinRetrieveName;
 EVT_WDF_DEVICE_CONTEXT_CLEANUP      CodecC_EvtPinContextCleanup;
 EVT_ACX_KEYWORDSPOTTER_RETRIEVE_ARM     CodecC_EvtAcxKeywordSpotterRetrieveArm;
 EVT_ACX_KEYWORDSPOTTER_ASSIGN_ARM       CodecC_EvtAcxKeywordSpotterAssignArm;
@@ -464,9 +463,8 @@ NTSTATUS
 CodecC_CreateCaptureCircuit(
     _In_     WDFDEVICE              Device,
     _In_     const GUID *           ComponentGuid,
-    _In_     const GUID *           MicCustomName,
     _In_     const UNICODE_STRING * CircuitName,
-    _In_     PCWSTR                 EndpointName,
+    _In_     PCWSTR                 EndpointRole,
     _Out_    ACXCIRCUIT *           Circuit
 );
 

@@ -1,11 +1,15 @@
 ## TODO 19 design: any number of cables, each with its own feed and diagnostics
 
+**Implementation update, 2026-11-27.** The driver, setup tool, discovery SDK, per-cable feed broker and both apps use the stable cable identity. The shipped-in-source diagnostics layout differs from the original proposal below. Public `DIAGNOSTICS` is a fixed 40-byte aggregate response with its own version and per-cable 10 ms cache. Full engineering `STATS` requires a handle with both read and write access (0x0022E004). The previous read-only engineering code is unhandled. A restricted interactive token passed the public read and failed all protected requests on both installed cables. The real standard-user consent and multi-session exercises remain open.
+
+### Original design record
+
 **Status: the owner answered its questions (2026-11-24, with Astra; below), and asked for three revisions before it is
 built: discovery without hard-coded cables, diagnostics reset when a cable is re-created, and no compatibility promise
 (pre-release). Revised to those (ours, 2026-11-24, 3af523c), then again for a review of that revision (ours, 2026-11-24):
 STATS redacted for every reader, the identity and label carried in a fixed instance ID that no other cable can take, one
 package for every cable, an update that puts the cables back when it can't finish, and the runs re-ordered so each can
-run at its slot. For the owner's review; nothing built.**
+run at its slot. This records the proposal before the first install.**
 
 **The owner's decisions (2026-11-24, with Astra):**
 - **Any number of cables, discovered.** Adding a cable (C, D, E...) is a setup action: another instance of the same
@@ -25,9 +29,20 @@ run at its slot. For the owner's review; nothing built.**
 - **Identity and generations:** a cable keeps a stable identity across removal and re-adding; each binding gets a fresh
   generation, with its counters and logs reset (so "how many frames has this instance lost" is unambiguous); A's continue.
   The diagnostics view may keep history across generations, marking each restart.
-- **Names:** the product's short name is **ACX-LL-Cable** (from the repository's acx-ll-cable-filter): endpoints like
-  "Microphone (ACX-LL-Cable A)" and "Speakers (ACX-LL-Cable B)"; in docs and the GUI, "ACX-LL-Cable B" beside "VB-CABLE B".
+- **Names (owner, revised 2026-11-27).** Windows and the mixer use **LLCable-B In** for playback, **LLCable-B Out** for
+  recording with an app-selected period, and **LLCable-B Out-5ms** for the same feed with a 5 ms default engine period.
+  Substitute the actual cable label for B. ACX-LL-Cable remains the product and adapter name. Windows can append the adapter
+  in parentheses. The number describes the default engine period, not measured end-to-end latency.
   `\\.\NoiseFilterVmicB` style names and `--cable b` are aliases; the CLI lists installed cables and takes a stable id too.
+- **Installed appearance, 2026-11-27.** The Server 2025 Sound panel showed the new short names and directional icons for all
+  six endpoints of A and B. A fresh cable picked them up directly from the signed package. Independent playback-to-capture
+  trials on that cable delivered 144,480 consecutive numbered frames on Out and 144,000 on Out-5ms. During a package
+  update, Windows assigned new endpoint IDs on the same device instances and carried the old names and icons forward.
+  The setup scripts can map old IDs by cable and role. `Update-CableAppearance.ps1` refreshes the old factory values
+  individually, preserving a user-chosen name or icon. Reinstalling the signed package mapped all six changed IDs to the
+  correct roles and restored all six playback and recording defaults. On the reinstalled package, A Out and B Out-5ms
+  each delivered 144,000 consecutive numbered frames from their respective playback inputs. Compare the
+  [Playback](../design/llcable-windows-playback.png) and [Recording](../design/llcable-windows-recording.png) tabs.
 - **Writers:** one independent writer per cable, two feeds from the one broker included; stopping or removing B leaves A
   running; the broker resolves the requested cable from the driver's discovered devices; the session approval's scope made
   clear. A user running only plain cables needs neither the broker nor the app.
@@ -75,8 +90,8 @@ ID* is the device node's, fixed by the setup tool from the label, the identity a
   for every reader. A write-access IOCTL gives the elevated tools a fresh, unredacted one.
 - **Access.** The SDDL adds read for interactive users. Feeding still needs write access, held only by SYSTEM and
   Administrators, so it goes through the elevated broker.
-- **Names.** Every model's description is "ACX-LL-Cable", and each instance's friendly name is "ACX-LL-Cable D", so its
-  endpoints read "Microphone (ACX-LL-Cable D)". The three microphone-variant hardware IDs are shared by every cable.
+- **Names.** Every model's description is "ACX-LL-Cable", and each instance's adapter name includes the label. The short
+  endpoint names carry the label and direction as well. The three microphone-variant hardware IDs are shared by every cable.
 - **Setup.** One Rust implementation (nf-vmic's `setup`, a small `acx-ll-cable` tool) behind `Cable.ps1`,
   `Install-Driver.ps1` and the variant switch. A cable is added on the package the others run. Only `update` changes the
   package; it moves every cable together, and puts them back if it can't finish.
@@ -463,9 +478,9 @@ user, image or handle, and STATS carries no audio samples, only positions and co
     `WdfDeviceAssignProperty` (<= APC [V: wdfdevice.h]). That is re-applied at every binding, before the endpoints are
     made. Learn names no forbidden keys, but we haven't seen a driver set this one. The tool's write stays as a second
     layer.
-- **The pin-name callback is unchanged.** It names "Microphone" and "Call Microphone", the render pin's category gives
-  "Speakers", and the letter is in the adapter part. So: "Speakers (ACX-LL-Cable A)", "Microphone (ACX-LL-Cable A)", "Call
-  Microphone (ACX-LL-Cable A)", "Speakers (ACX-LL-Cable B)" and so on.
+- **Endpoint labels.** The first per-cable package reported "Speakers", "Microphone" and "Call Microphone", with the cable
+  letter in the adapter name. The owner subsequently chose `LLCable-<label> In`, `Out` and `Out-5ms` for the short endpoint
+  names. A saved route identifies its cable and circuit role independently of Windows' display name.
 - **Component IDs per cable:** the identity XOR each circuit's constant (today's `CODEC_*_COMPONENT_GUID`s), kept in the
   context; the `CABLE_B_*` GUIDs go. B got its own in 09e5520 and the sample says the ID "uniquely identifies the circuit
   instance" [V: DriverSettings.h]; with any number of cables, only a derived ID scales [C: nothing objects to derived IDs].
