@@ -1,11 +1,11 @@
 use llcable_audio::Level;
-use llcable_control::Diagnostics;
 use llcable_control::routing::StageReading;
+use llcable_control::{CaptureEffects, Diagnostics};
 use windows_reactor::test::{Command, NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, ThemeStyle};
 use windows_reactor::{HorizontalAlignment, TextBlock, ThemeBrush, View};
 
-use super::FeedState;
 use super::metrics::{cable_losses, effect, route_levels};
+use super::{EffectsCheck, FeedState, windows_effects_result};
 
 type Panel = Pump<RecordingRuntime>;
 
@@ -107,4 +107,85 @@ fn an_effect_worker_miss_is_visible_and_named_for_its_stage() {
     let missed = StageReading { worker_misses: Some(12_345), ..Default::default() };
     let panel = mount(effect("Voice effect", missed));
     assert_alert(&panel, "! 12,345", "Voice effect", "miss");
+}
+
+#[test]
+fn windows_effects_show_each_endpoint_and_mode_even_if_one_query_fails() {
+    let check = EffectsCheck::Complete(vec![
+        (
+            "LLCable-B Out".into(),
+            Ok(CaptureEffects { ordinary: Ok(vec![]), communications: Ok(vec!["Noise suppression".into(), "Echo cancellation".into()]) }),
+        ),
+        (
+            "LLCable-B Out-5ms".into(),
+            Ok(CaptureEffects { ordinary: Ok(vec!["Equalizer".into()]), communications: Err(std::io::Error::other("Unsupported mode")) }),
+        ),
+    ]);
+    let panel = mount(windows_effects_result(&check));
+    for label in [
+        "LLCable-B Out",
+        "LLCable-B Out-5ms",
+        "Standard · No effects reported",
+        "Communications · Noise suppression, Echo cancellation",
+        "Standard · Equalizer",
+        "Error · Communications · Unavailable · Unsupported mode",
+    ] {
+        cell(&panel, label);
+    }
+}
+
+#[test]
+#[ignore = "checks the installed Windows cable endpoints through the mixer"]
+fn check_windows_effects_from_cable_cards() {
+    use std::time::{Duration, Instant};
+
+    use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
+
+    use crate::window::{Mixer, Page, recording_ports};
+
+    fn wait(panel: &mut Panel, ready: impl Fn(&Panel) -> bool) {
+        let start = Instant::now();
+        while !ready(panel) {
+            panel.dispatch_components(32).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(15), "Timed out waiting for the cable panel");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let cables = llcable_control::cables().unwrap();
+    let mut panel = mount(View::component::<Mixer>(Page::Cables));
+    let rows = |panel: &Panel| {
+        nodes(panel)
+            .filter_map(|id| text_property(panel, id, PropertyId::TextBlockText))
+            .filter(|s| {
+                let mode = s.strip_prefix("Error · ").unwrap_or(s);
+                mode.starts_with("Standard · ")
+                    || mode.starts_with("Communications · ")
+                    || mode.starts_with("Windows effects unavailable · ")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let mut total = 0;
+    for cable in cables.iter().filter(|c| recording_ports(c).next().is_some()) {
+        let action = format!("Check Windows effects for LLCable-{}", cable.label);
+        let button = |p: &Panel| nodes(p).find(|&id| text_property(p, id, PropertyId::AutomationName) == Some(&action));
+        wait(&mut panel, |p| button(p).is_some());
+        assert_eq!(rows(&panel).len(), total, "Effects should appear only after checking a cable");
+        let id = button(&panel).unwrap();
+        let revision = panel.event_revision(id, EventId::ButtonClick).unwrap();
+        panel.queue_event(QueuedEvent::new(id, EventId::ButtonClick, revision, EventPayload::Unit));
+        panel.dispatch_events().unwrap();
+        wait(&mut panel, |p| {
+            recording_ports(cable)
+                .all(|port| nodes(p).any(|id| text_property(p, id, PropertyId::TextBlockText) == Some(port.name.as_str())))
+        });
+        let previous = total;
+        total += 2 * recording_ports(cable).count();
+        let displayed = rows(&panel);
+        assert_eq!(displayed.len(), total, "Unexpected Windows effects response for LLCable-{}", cable.label);
+        assert!(!displayed.iter().any(|s| s.starts_with("Error · ")), "{displayed:?}");
+        println!("LLCable-{}: {:?}", cable.label, &displayed[previous..]);
+    }
+    assert!(total > 0, "Install a cable with an active recording port to run this check");
 }

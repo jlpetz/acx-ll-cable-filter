@@ -1,12 +1,13 @@
 mod monitor;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use llcable_audio::{RouteConfig, RouteStatus, Session};
-use llcable_control::CableId;
+use llcable_control::{CableId, CableInfo, CaptureEffects, EndpointKind, Port};
 use monitor::{CableMonitor, Samples};
 use nf_gui::mixer_meter::{MeterMode, MeterPalette};
 use windows_reactor::*;
@@ -74,6 +75,8 @@ pub enum Msg {
     Refresh,
     Monitor(bool),
     ResetCableCounters,
+    CheckWindowsEffects(CableId),
+    WindowsEffectsChecked(CableId, u64, EffectsCheck),
     Measure(CableId),
     CancelMeasurement,
     Measured(CableId, Result<String, String>),
@@ -92,6 +95,16 @@ pub enum Msg {
     ChoosePlugin(Scope, usize),
     Chosen(Scope, usize, Result<Option<Box<Plugin>>, String>),
     Width(f64),
+}
+
+pub enum EffectsCheck {
+    Checking,
+    Complete(Vec<(String, std::io::Result<CaptureEffects>)>),
+    Unavailable,
+}
+
+pub fn recording_ports(cable: &CableInfo) -> impl Iterator<Item = &Port> {
+    cable.ports.iter().filter(|p| p.active && p.role != EndpointKind::Speakers)
 }
 
 // Reactor can reject delivery after a background job has already run. Both completion and rejection take the same result,
@@ -138,6 +151,8 @@ pub struct Mixer {
     path: Option<PathBuf>,
     pub inventory: Option<Arc<Inventory>>,
     pub monitor: CableMonitor,
+    pub effects_checks: BTreeMap<CableId, EffectsCheck>,
+    effects_generation: u64,
     pub status: Option<RouteStatus>,
     pub channels: Channels,
     session: Option<Arc<Session>>,
@@ -186,11 +201,34 @@ impl Mixer {
     fn refresh(&mut self, cx: &ComponentContext<Self>) {
         if !self.refreshing {
             self.refreshing = true;
+            // Even the same cable ID can have new Windows recording endpoints after a reinstall.
+            self.effects_generation = self.effects_generation.wrapping_add(1);
+            self.effects_checks.clear();
             cx.spawn_background_with_rejection(
                 |_| Msg::Discovered(Inventory::read()),
                 Msg::Discovered(Err("The device list is busy. Refresh to try again.".into())),
             );
         }
+    }
+
+    fn check_windows_effects(&mut self, id: CableId, cx: &ComponentContext<Self>) {
+        if self.refreshing || matches!(self.effects_checks.get(&id), Some(EffectsCheck::Checking)) {
+            return;
+        }
+        let Some(cable) = self.inventory.iter().flat_map(|i| &i.cables).find(|c| c.id == id) else { return };
+        let ports: Vec<_> = recording_ports(cable).map(|p| (p.name.clone(), p.id.clone())).collect();
+        if ports.is_empty() {
+            return;
+        }
+        self.effects_checks.insert(id, EffectsCheck::Checking);
+        let generation = self.effects_generation;
+        cx.spawn_background_with_rejection(
+            move |_| {
+                let results = ports.into_iter().map(|(name, endpoint)| (name, llcable_control::capture_effects(&endpoint))).collect();
+                Msg::WindowsEffectsChecked(id, generation, EffectsCheck::Complete(results))
+            },
+            Msg::WindowsEffectsChecked(id, generation, EffectsCheck::Unavailable),
+        );
     }
 
     fn schedule_observations(&mut self, cx: &ComponentContext<Self>) {
@@ -382,6 +420,8 @@ impl Component for Mixer {
             path,
             inventory: None,
             monitor: CableMonitor::default(),
+            effects_checks: BTreeMap::new(),
+            effects_generation: 0,
             status: None,
             channels: Channels::default(),
             session: None,
@@ -485,8 +525,13 @@ impl Component for Mixer {
             Msg::Refresh => self.refresh(cx),
             Msg::Monitor(enabled) => self.monitor.set_enabled(enabled),
             Msg::ResetCableCounters => self.monitor.reset(),
+            Msg::CheckWindowsEffects(id) => self.check_windows_effects(id, cx),
+            Msg::WindowsEffectsChecked(id, generation, result) => {
+                if generation == self.effects_generation {
+                    self.effects_checks.insert(id, result);
+                }
+            }
             Msg::Measure(id) if !self.busy && self.measuring.is_none() && !self.running() => {
-                use llcable_control::EndpointKind;
                 use llcable_control::voice::{CableLatencyRequest, cable_latency_test};
                 let Some(c) = self.inventory.iter().flat_map(|i| &i.cables).find(|c| c.id == id) else { return };
                 let endpoint = |role| c.ports.iter().find(|p| p.active && p.role == role).map(|p| p.id.clone());

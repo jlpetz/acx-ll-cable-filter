@@ -297,6 +297,7 @@ dependencies = [
  "llcable-routing",
  "llcable-sdk",
  "nf-engine",
+ "windows",
 ]
 
 [[package]]

@@ -12,6 +12,8 @@ In Windows Sound, a blue arrow points **into** the playback socket and an amber 
 
 Open `target\v3\release\llcable-mixer.exe`. **Cables** lists installed cables. Turn on **Monitor cables** to read driver statistics once a second while viewing the panel. Monitoring starts off. **Reset cable counters** starts a new count of underrun frames and missing playback packets from the next reading. A red `!` marks a loss since that reset. The **Device total** column keeps the history since the cable device started. Live route counters start over each time you start audio.
 
+Select **Check Windows effects** on a cable to see which effects Windows reports for each active recording output in **Standard** and **Communications** mode. This one-time check works with monitoring off and audio stopped. Windows reports effect types such as noise suppression. For processing applied by the mixer itself, see **Live route diagnostics**.
+
 For playback and recording in other applications, choose **LLCable-A In** and **LLCable-A Out** and leave the mixer stopped.
 
 Open **Mixer** and select the destination you want to hear. Connect a source, then select **Start audio**. To try this with two virtual cables, play a clip to **LLCable-A In**, connect **LLCable-A Out** to destination **LLCable-B Out**, and record **LLCable-B Out**. Use **Output effects** to add RNNoise to B. Use a physical microphone or a third virtual source to feed both A and B, leaving A dry. Each send can take the original source, its output after a particular stage, or the result of its whole rack. **Wiring** shows the selected point. Playback devices can also serve as destinations.

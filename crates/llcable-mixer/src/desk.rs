@@ -9,7 +9,7 @@ use nf_gui::mixer_meter::{self, MeterMode, MeterPalette};
 use windows_reactor::*;
 
 use crate::patch::{Destination, Inventory, Kind, Source, Stage, Theme};
-use crate::window::{Edit, Mixer, Msg, Page, Scope, StageEdit};
+use crate::window::{Edit, EffectsCheck, Mixer, Msg, Page, Scope, StageEdit, recording_ports};
 
 fn title(label: impl Into<String>, size: f64) -> View {
     TextBlock::new().text(label).font_size(size).font_weight(FontWeight::SEMI_BOLD).text_wrapping(TextWrapping::Wrap).into()
@@ -170,6 +170,31 @@ fn cable_controls(app: &Mixer, cx: &ViewContext<Mixer>) -> View {
     }
 }
 
+fn windows_effects_result(check: &EffectsCheck) -> View {
+    let reports = match check {
+        EffectsCheck::Checking => return caption("Checking Windows capture effects…"),
+        EffectsCheck::Unavailable => return issue("Couldn't schedule the Windows effects check. Try again."),
+        EffectsCheck::Complete(reports) => reports,
+    };
+    let mut rows = vec![title("Windows capture effects · last check", 14.0)];
+    for (endpoint, result) in reports {
+        rows.push(title(endpoint, 13.0));
+        match result {
+            Ok(effects) => {
+                for (mode, result) in [("Standard", &effects.ordinary), ("Communications", &effects.communications)] {
+                    rows.push(match result {
+                        Ok(types) if types.is_empty() => caption(format!("{mode} · No effects reported")),
+                        Ok(types) => caption(format!("{mode} · {}", types.join(", "))),
+                        Err(error) => issue(format!("{mode} · Unavailable · {error}")),
+                    });
+                }
+            }
+            Err(error) => rows.push(issue(format!("Windows effects unavailable · {error}"))),
+        }
+    }
+    col(rows)
+}
+
 fn diagnostics(app: &Mixer, cx: &ViewContext<Mixer>) -> View {
     let mut content = vec![
         title("Cable control panel", 22.0),
@@ -218,18 +243,36 @@ fn diagnostics(app: &Mixer, cx: &ViewContext<Mixer>) -> View {
             None => {}
         }
         let id = c.id;
+        let effects = app.effects_checks.get(&id);
+        let has_recording_port = recording_ports(c).next().is_some();
+        let mut actions = vec![
+            Button::new()
+                .is_enabled(has_recording_port && !app.refreshing && !matches!(effects, Some(EffectsCheck::Checking)))
+                .automation_name(format!("Check Windows effects for LLCable-{}", c.label))
+                .on_click(cx.callback(move |()| Msg::CheckWindowsEffects(id)))
+                .content("Check Windows effects")
+                .tooltip(if has_recording_port {
+                    "Check the effects Windows reports for each recording mode without starting audio."
+                } else {
+                    "Enable a recording endpoint on this cable, then refresh devices."
+                }),
+        ];
         if app.measuring.as_ref().is_some_and(|(c, _)| *c == id) {
-            items.push(button(cx, "Cancel latency test", false, true, || Msg::CancelMeasurement));
+            actions.push(button(cx, "Cancel latency test", false, true, || Msg::CancelMeasurement));
         } else if [EndpointKind::Speakers, EndpointKind::Microphone]
             .into_iter()
             .all(|role| c.ports.iter().any(|p| p.active && p.role == role))
         {
             let attached = app.monitor.enabled() && matches!(diag, Some(Ok(d)) if d.attached);
             let available = !app.running() && !app.busy && app.measuring.is_none() && !attached;
-            items.push(
+            actions.push(
                 button(cx, "Measure cable latency", false, available, move || Msg::Measure(id))
                     .tooltip("Play three test sweeps through this cable. Stop its direct feed before measuring."),
             );
+        }
+        items.push(row(actions));
+        if let Some(check) = effects {
+            items.push(windows_effects_result(check));
         }
         if let Some((_, report)) = app.measured.as_ref().filter(|(c, _)| *c == id) {
             items.push(feedback(report));

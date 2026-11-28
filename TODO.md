@@ -172,8 +172,8 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 **Priority**: High for v0.1 | **Status**: the live v2 mixer and single-chain window use the shared control and audio components. Both run on the virtual dev box.
 - The window selects the mic, echo reference and output route. It controls AEC, the noise model, gate position and one CLAP effect, shows meters and latency, and saves named processing presets independently of the route.
 - Settings survive close and reopen. Minimise keeps the process alive. Closing stops the engine. The tray and background engine are TODO 16.
-- V2 has passive cable diagnostics, output-centric mixing, shared/source/send/output effects, routing presets and live wiring. The design previews remain available separately.
-**Next**: trial the mixer on physical hardware and with a standard user. The quality Lab page remains open.
+- V2 has passive cable diagnostics, an on-demand Windows capture effects check, output-centric mixing, shared/source/send/output effects, routing presets and live wiring. The design previews remain available separately.
+**Next**: trial the mixer on physical Windows 11 and with a standard user. Compare the effects Windows reports for Standard and Communications on both cable outputs. The quality Lab page remains open.
 **Detail**: `doc/todo/15-gui-tray.md`
 
 ---

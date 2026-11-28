@@ -14,3 +14,11 @@ voice = ["dep:nf-engine"]
 llcable-sdk.workspace = true
 llcable-routing.workspace = true
 nf-engine = { workspace = true, optional = true }
+windows = { workspace = true, features = [
+    "Media_Capture",
+    "Media_Effects",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_WinRT",
+] }
