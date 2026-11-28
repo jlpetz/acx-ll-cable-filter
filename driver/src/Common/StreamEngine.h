@@ -516,6 +516,12 @@ protected:
     __drv_maxIRQL(DISPATCH_LEVEL)
     VOID BeginRunClock() override;
 
+    // On the first Run of an event-driven render pin, establish the clock and publish the pre-roll in one DPC.
+    KDPC                m_FirstRunDpc;
+    KEVENT              m_FirstRunDone;
+    BOOLEAN             m_FirstRunPending = FALSE;
+    static KDEFERRED_ROUTINE FirstRunDpc;
+
     // noise-filter (TODO 19): the render half of the loopback pair.
     ULONGLONG           m_LbNextPacket;     // the next render packet to copy into the ring (on m_CurrentPacket's count)
     volatile LONG64     m_LbReleased;       // atomic two-slot generation tags and EOS seal (LoopbackReleasePacket)

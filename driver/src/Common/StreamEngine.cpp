@@ -1337,6 +1337,8 @@ CRenderStreamEngine::CRenderStreamEngine(
     m_LbRunBegan(FALSE)
 {
     PAGED_CODE();
+    KeInitializeEvent(&m_FirstRunDone, SynchronizationEvent, FALSE);
+    KeInitializeDpc(&m_FirstRunDpc, FirstRunDpc, this);
 }
 
 _Use_decl_annotations_
@@ -1360,7 +1362,13 @@ CRenderStreamEngine::PrepareHardware()
     // noise-filter (TODO 19): the render data goes to the device's loopback ring (LoopbackRenderPass), so the sample's
     // SaveData sink is no longer set up (m_SaveData.SetDataFormat, Initialize, SetMaxWriteSize).
     //
-    return CStreamEngine::PrepareHardware();
+    const BOOLEAN newLifetime = m_CurrentState == AcxStreamStateStop;
+    NTSTATUS status = CStreamEngine::PrepareHardware();
+    if (NT_SUCCESS(status) && newLifetime)
+    {
+        m_FirstRunPending = TRUE;
+    }
+    return status;
 }
 
 _Use_decl_annotations_
@@ -1756,7 +1764,36 @@ _Use_decl_annotations_
 VOID
 CRenderStreamEngine::BeginRunClock()
 {
+    // ACX invokes Run at PASSIVE_LEVEL. A passive acquisition of the loopback spin lock can take several ms under
+    // Force IRQL checking. If the first completion slips relative to the shared engine's clock, it can submit different
+    // audio twice for one future WaveRT packet. Keep the initial clock and pre-roll together under the existing lock.
+    const BOOLEAN first = m_FirstRunPending;
+    m_FirstRunPending = FALSE;
+    if (first && m_PacketsCount == MAX_PACKET_COUNT && m_LbFormat.Valid && KeGetCurrentIrql() == PASSIVE_LEVEL)
+    {
+        // Only one initial Run per prepared hardware lifetime; no loopback locks held while waiting. The SynchronizationEvent
+        // is consumed by this wait, including when the DPC finished before the wait began. Run arms its timer only afterwards.
+        // FALSE means this same per-stream DPC is already queued. Its completion is still the one to wait for.
+        const BOOLEAN queued = KeInsertQueueDpc(&m_FirstRunDpc, NULL, NULL);
+        NT_ASSERT(queued);
+        UNREFERENCED_PARAMETER(queued);
+        (void)KeWaitForSingleObject(&m_FirstRunDone, Executive, KernelMode, FALSE, NULL);
+        return;
+    }
     LoopbackRenderPass(TRUE);
+}
+
+_Use_decl_annotations_
+VOID
+CRenderStreamEngine::FirstRunDpc(KDPC* Dpc, PVOID Context, PVOID Arg1, PVOID Arg2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+    CRenderStreamEngine* engine = static_cast<CRenderStreamEngine*>(Context);
+    engine->LoopbackRenderPass(TRUE);
+    // Last stream access. ReleaseHardware subsequently flushes queued DPCs before the stream object can be deleted.
+    KeSetEvent(&engine->m_FirstRunDone, IO_NO_INCREMENT, FALSE);
 }
 
 _Use_decl_annotations_
