@@ -328,6 +328,10 @@ public:
         );
 
 protected:
+    // Start the packet timeline before arming its first timer. Render also publishes any pre-roll at this anchor.
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    virtual VOID BeginRunClock();
+
     PVOID               m_Packets[MAX_PACKET_COUNT];
     ULONG               m_PacketsCount;
     ULONG               m_PacketSize;
@@ -488,6 +492,12 @@ public:
         _In_    ULONG           EosPacketLength
         );
 
+    // The owner remains alive while the capture pass holds the loopback lock.
+    ULONGLONG PauseEndPlusOne() { return (ULONGLONG)ReadNoFence64(&m_LbPauseEndPlusOne); }
+    ULONGLONG AbsoluteEosEndPlusOne();
+    VOID CopyReleasedPackets(ULONGLONG DemandEnd);
+    VOID RefreshReissuedPackets();
+
     virtual
     __drv_maxIRQL(PASSIVE_LEVEL)
     PAGED_CODE_SEG
@@ -503,16 +513,25 @@ public:
 protected:
     CSaveData m_SaveData;
 
+    __drv_maxIRQL(DISPATCH_LEVEL)
+    VOID BeginRunClock() override;
+
     // noise-filter (TODO 19): the render half of the loopback pair.
     ULONGLONG           m_LbNextPacket;     // the next render packet to copy into the ring (on m_CurrentPacket's count)
-    volatile LONG64     m_LbReleased;       // newest packet the client released (SetRenderPacket, on m_CurrentPacket's count)
-                                            // plus one; 0: none since Stop
-
-    __drv_maxIRQL(DISPATCH_LEVEL)
-    BOOLEAN
-    LoopbackReleased(
-        _In_    ULONGLONG       Packet
-        );
+    volatile LONG64     m_LbReleased;       // atomic two-slot generation tags and EOS seal (LoopbackReleasePacket)
+    // A repeated literal release can replace a DMA payload we already copied ahead. Each slot's notification word holds
+    // its exact packet generation and a revision; only the ring lock's holder changes the corresponding publication.
+    volatile LONG64     m_LbReissue[MAX_PACKET_COUNT]{};
+    LONG64              m_LbPausedReissue[MAX_PACKET_COUNT]{};
+    LONG64              m_LbAppliedReissue[MAX_PACKET_COUNT]{};
+    ULONGLONG           m_LbPublishedPlusOne[MAX_PACKET_COUNT]{}; // zero for an absent or implicit DMA packet
+    ULONGLONG           m_LbRetiredPlusOne{}; // render marks its completion under the ring lock before ACX can reclaim its slot
+    volatile LONG64     m_LbPauseEndPlusOne; // absolute demand cutoff, published at Pause entry before waiting on the timer
+    ULONGLONG           m_LbPausedPacket;   // current packet and its release snapshot at the cutoff, published by m_LbPauseEndPlusOne
+    LONG64              m_LbPausedReleases;
+    volatile LONG       m_LbRunBegan;       // true from render Run entry through completion of Pause, including the startup lock wait
+    BOOLEAN CopyReleasedPacket();
+    PBYTE LoopbackPacketBuffer(ULONG Slot) { return (PBYTE)m_Packets[Slot] + (Slot == 0 ? m_FirstPacketOffset : 0); }
 
     // noinline: called from PAGE code (Run, Pause, ReleaseHardware, the destructor) and takes the ring's spin lock. Inlined
     // into a PAGE function, its locked region would be pageable code running at DISPATCH_LEVEL (a bugcheck once paged out,
@@ -598,7 +617,6 @@ protected:
     // noise-filter (TODO 19): the capture half of the loopback pair.
     ULONG           m_LbLagFrames;      // LOOPBACK_LAG_HNS in frames, rounded up, plus one
     ULONG           m_LbAnchorLead;     // the render lead it reads behind (LOOPBACK_RING.RenderLeadFrames at its latest pass)
-    ULONGLONG       m_LbReadBase;       // ring frame read for this stream's byte position 0
 
     // noise-filter (TODO 19, spike check 4): its cable's app-fed ring (Cable.h, m_Cable->Ring).
     BOOLEAN         m_AppFormatOk;      // 48 kHz float32 stereo, whole frames (snapshotted at Run): the app ring may be copied

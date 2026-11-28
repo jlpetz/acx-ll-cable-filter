@@ -209,7 +209,7 @@ a particular settings file. The command reports any ambiguous choices and leaves
 \\.\AcxLlCable_<id>` (the id as `Cable.ps1 list` shows it); without it, and the app's **Direct driver ring** and the broker
 always, take the cable labelled A, else the only cable. Each mode records or plays that cable's own endpoints, found by the
 instance ID in their KS filter's path. `\\.\NoiseFilterVmic` is gone: a tool that opens it gets ERROR_FILE_NOT_FOUND. The
-control device admits SYSTEM and Administrators only, so the audio tools run elevated. The dev box migrated both cables
+control device allows interactive users to read aggregate diagnostics. Direct feeds and full engineering statistics require write access. The dev box migrated both cables
 in the first install trial on 2026-11-26.
 
 To check isolation on the dev box, run `nf-vmic-test open --render --exclusive --format float --signal --seconds 15`
@@ -220,6 +220,22 @@ on each Speakers endpoint (`--device "Speakers (ACX-LL-Cable A)"` and `--device 
 range, with zero corrupt frames. Repeat with `nf-vmic-test feed --seconds 15 --start 100000 --target 1440` (with N0's
 `--path` to A's control device) in place of A's renderer to verify an attached A ring coexists with B, and the same on B
 with A attached.
+
+To check a playback start on Cable A, run the recorder and start the player in a second terminal while the recorder is active.
+For another cable, add its `--path` to both commands.
+
+```powershell
+nf-vmic-test open --shared --mode raw --format float --seconds 8 --check-signal --expect-first 0 --mic call
+```
+
+```powershell
+nf-vmic-test open --render --exclusive --mode raw --format float --seconds 2 --period-frames 128 --signal
+```
+
+The recorder checks the first marker and the entire sequence for dropped,
+repeated, silent or corrupt frames. Add `--expect-last N` for a producer that submits a known final marker and drains it.
+The cable's diagnostics separately count missing playback packets at the source and capture underrun frames per reader.
+Record both counter deltas. A flat counter alone cannot verify sample continuity.
 
 **Latency: two figures, measured at different points** (the Server 2025 VM, 2026-11-20 to 23;
 doc/todo/19-spike-2026-11-20.md):
@@ -241,8 +257,10 @@ or process exiting, or the handle closed) or ERROR_DEVICE_REMOVED (the device is
 handle, since an open handle on the control device keeps the driver loaded). `src/Shared/nf_vmic.h` has the protocol, every
 ATTACH outcome and the ring's rules; `crates/nf-vmic` mirrors it, and its `nf-vmic-test` feeds, verifies, prints the
 statistics and kills feeders. The statistics IOCTL also carries each stream kind's timer lateness histogram (spike check 5).
-Only SYSTEM and Administrators may open it for the spike: letting unelevated users in first needs attachments tied to a
-session (`Control.cpp` says why). Close nf-vmic-test before reinstalling, for the same reason as above.
+`NF_VMIC_IOCTL_DIAGNOSTICS` accepts a read-only handle. Its 10 ms per-cable snapshot contains aggregate counters and omits process IDs
+and audio. It sums capture underrun frames across readers and counts missing playback packets once at the source. A 40-byte buffer
+receives the v1 layout. A buffer of at least 48 bytes receives v2, which adds the missing playback packet count. Engineering tools
+must be rebuilt for the read/write statistics IOCTL (0x0022E004). Close nf-vmic-test before reinstalling.
 
 Every capture stream running in 48 kHz float32 stereo hears the ring. The first to run reads it and sets the pace. The
 others play a driver-owned copy of what the reader delivered (256 KiB, non-paged, the cable's) on the same QPC

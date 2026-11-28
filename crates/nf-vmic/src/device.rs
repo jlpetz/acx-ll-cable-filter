@@ -78,22 +78,16 @@ pub struct Device {
 impl Device {
     /// Opens the control device at `path`, read and write. `ERROR_FILE_NOT_FOUND`: there is no such control device (no cable
     /// has that identity, or its device is disabled, removed or being updated, or the driver running isn't the per-cable one);
-    /// `ERROR_ACCESS_DENIED`: the control device admits SYSTEM and Administrators only, so the caller isn't elevated.
+    /// `ERROR_ACCESS_DENIED`: full access requires SYSTEM or Administrators. A signed-in user can call [`Self::diagnostics`].
     pub fn open_path(path: &str) -> io::Result<Self> {
+        Self::open_with_access(path, (GENERIC_READ | GENERIC_WRITE).0)
+    }
+
+    fn open_with_access(path: &str, access: u32) -> io::Result<Self> {
         let path = HSTRING::from(path);
         // SAFETY: `path` is NUL-terminated and outlives the call; no security attributes, no template.
-        let h = unsafe {
-            CreateFileW(
-                &path,
-                (GENERIC_READ | GENERIC_WRITE).0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                None,
-            )
-        }
-        .map_err(io_error)?;
+        let h = unsafe { CreateFileW(&path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None) }
+            .map_err(io_error)?;
         // SAFETY: a valid handle that nothing else owns; Owned closes it once.
         Ok(Self { handle: Rc::new(unsafe { Owned::new(h) }) })
     }
@@ -109,7 +103,23 @@ impl Device {
     /// The driver's statistics (NF_VMIC_IOCTL_STATS), checked for the protocol's magic, version and size. `ERROR_BAD_COMMAND`:
     /// this handle's control device was deleted ([`crate::protocol::QUEUE_PURGED`]): drop this Device and open a new one.
     pub fn stats(&self) -> io::Result<Stats> {
-        let mut stats = Stats::default();
+        let (stats, returned): (Stats, _) = self.read_reply(IOCTL_STATS)?;
+        if returned != size_of::<Stats>() || stats.magic != MAGIC || stats.version != VERSION || stats.stats_bytes as usize != returned {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "incompatible engineering statistics layout"));
+        }
+        Ok(stats)
+    }
+
+    pub fn diagnostics(id: crate::identity::CableId) -> io::Result<crate::protocol::Diagnostics> {
+        use crate::protocol::{DiagnosticReply, IOCTL_DIAGNOSTICS, control_path};
+        let device = Self::open_with_access(&control_path(&id), GENERIC_READ.0)?;
+        let (reply, returned): (DiagnosticReply, _) = device.read_reply(IOCTL_DIAGNOSTICS)?;
+        reply.decode(returned).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "incompatible cable diagnostics layout"))
+    }
+
+    // Called only with repr(C) integer-only ABI replies. No audio thread issues diagnostic requests.
+    fn read_reply<T: Default>(&self, code: u32) -> io::Result<(T, usize)> {
+        let mut stats = T::default();
         let event = new_event()?;
         let mut overlapped = OVERLAPPED { hEvent: *event, ..Default::default() };
         // Raw pointers only from here until the request has completed: the system writes both behind Rust's back.
@@ -120,11 +130,11 @@ impl Device {
         let r = unsafe {
             DeviceIoControl(
                 **self.handle,
-                IOCTL_STATS,
+                code,
                 None,
                 0,
                 Some(stats_ptr.cast()),
-                size_of::<Stats>() as u32,
+                size_of::<T>() as u32,
                 Some(&raw mut bytes),
                 Some(overlapped_ptr),
             )
@@ -136,20 +146,7 @@ impl Device {
         }
         // SAFETY: our handle and this request's OVERLAPPED; waits for it to complete.
         unsafe { GetOverlappedResult(**self.handle, overlapped_ptr, &raw mut bytes, true) }.map_err(io_error)?;
-        if bytes as usize != size_of::<Stats>()
-            || stats.magic != MAGIC
-            || stats.version != VERSION
-            || stats.stats_bytes as usize != size_of::<Stats>()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "the driver's statistics aren't this tool's ({bytes} bytes, magic {:#x}, version {}, size {}): rebuild one",
-                    stats.magic, stats.version, stats.stats_bytes
-                ),
-            ));
-        }
-        Ok(stats)
+        Ok((stats, bytes as usize))
     }
 
     /// Hands `ring` to the driver (NF_VMIC_IOCTL_ATTACH). On success the request stays pending and the driver reads the ring
@@ -357,6 +354,83 @@ impl Drop for Attachment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses the installed driver and an interactive logon. No endpoint is opened and no valid attachment is submitted.
+    #[test]
+    #[ignore = "live driver access check; requires an elevated interactive logon and at least one enabled cable"]
+    fn interactive_read_only_diagnostics_and_feeder_rights() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION};
+        use windows::Win32::Security::{
+            CheckTokenMembership, CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser, PSID, RevertToSelf,
+            SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, WinBuiltinAdministratorsSid, WinInteractiveSid,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        use windows::core::BOOL;
+
+        use crate::protocol::control_path;
+        use crate::setup::lock::well_known_sid;
+        use crate::setup::plan::Health;
+
+        let cables = cables::present().unwrap().into_iter().filter(|c| c.health == Health::Working).collect::<Vec<_>>();
+        assert!(!cables.is_empty(), "this test needs a working cable");
+        // Check the full statistics path in its own authorized handle, then drop it before restricting this thread.
+        for c in &cables {
+            let authorized = Device::open_path(&control_path(&c.cable.id)).expect("run this test elevated");
+            authorized.stats().unwrap_or_else(|e| panic!("{}: authorized engineering stats: {e}", c.cable.label));
+        }
+        // All remaining handles are opened after impersonating. The process token and other threads are untouched.
+        let mut process_token = HANDLE::default();
+        // SAFETY: the pseudo handle refers to this process. The output is an owned token handle.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE, &mut process_token) }.unwrap();
+        // SAFETY: OpenProcessToken succeeded and transferred this handle to the caller.
+        let process_token = unsafe { Owned::new(process_token) };
+        let mut admins = well_known_sid(WinBuiltinAdministratorsSid).unwrap();
+        let disabled = [SID_AND_ATTRIBUTES { Sid: PSID(admins.as_mut_ptr().cast()), Attributes: 0 }];
+        let mut restricted = HANDLE::default();
+        // SAFETY: the SID and token are live during this call. The returned token belongs to this thread.
+        unsafe { CreateRestrictedToken(*process_token, DISABLE_MAX_PRIVILEGE, Some(&disabled), None, None, &mut restricted) }.unwrap();
+        // SAFETY: CreateRestrictedToken succeeded and transferred the new token handle to the caller.
+        let restricted = unsafe { Owned::new(restricted) };
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: this scope began impersonation on this thread. Revert even if an assertion failed.
+                unsafe { RevertToSelf() }.expect("restore the test thread token");
+            }
+        }
+        // SAFETY: the restricted token is live, unshared, and impersonated only on this thread.
+        unsafe { ImpersonateLoggedOnUser(*restricted) }.unwrap();
+        let _revert = Revert;
+        for (sid, expected) in [(WinBuiltinAdministratorsSid, false), (WinInteractiveSid, true)] {
+            let mut sid = well_known_sid(sid).unwrap();
+            let mut member = BOOL(0);
+            // SAFETY: a null token tests this thread's effective token, using a live well-known SID and output.
+            unsafe { CheckTokenMembership(None, PSID(sid.as_mut_ptr().cast()), &mut member) }.unwrap();
+            assert_eq!(member.as_bool(), expected, "requires an interactive, non-administrative effective token");
+        }
+        for c in cables {
+            let path = control_path(&c.cable.id);
+            let label = c.cable.label;
+            let denied = Some(ERROR_ACCESS_DENIED.0 as i32);
+            assert_eq!(Device::open_path(&path).err().and_then(|e| e.raw_os_error()), denied, "{label}: writable open");
+            Device::diagnostics(c.cable.id).unwrap_or_else(|e| panic!("{label}: read-only diagnostics: {e}"));
+            let reader = Device::open_with_access(&path, GENERIC_READ.0).unwrap();
+            let (legacy, bytes) = reader.read_reply::<[u64; 5]>(crate::protocol::IOCTL_DIAGNOSTICS).unwrap();
+            assert_eq!((bytes, legacy[0] as u32, legacy[0] >> 32), (40, 1, 40), "{label}: v1 panel reply");
+            // Deliberately omit both the valid header and the ring. Should authorization ever regress, this cannot install a feed.
+            let attach = reader.read_reply::<u32>(IOCTL_ATTACH);
+            assert_eq!(attach.err().and_then(|e| e.raw_os_error()), denied, "{label}: attachment IOCTL");
+            let engineering = reader.stats().err();
+            assert_eq!(engineering.as_ref().and_then(io::Error::raw_os_error), denied, "{label}: engineering STATS error {engineering:?}");
+            let old = reader.read_reply::<Stats>(0x0022_6004).err();
+            assert_eq!(
+                old.as_ref().and_then(io::Error::raw_os_error),
+                Some(ERROR_INVALID_FUNCTION.0 as i32),
+                "{label}: retired STATS {old:?}"
+            );
+            eprintln!("Cable {label}: engineering stats readable when authorized; diagnostics only under the restricted interactive token");
+        }
+    }
 
     /// attach refuses a ring marked attached-before without any I/O (so a Device that isn't the driver's will do), and hands it
     /// back; reset() makes it acceptable again.

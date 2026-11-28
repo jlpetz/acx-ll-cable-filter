@@ -49,11 +49,9 @@ Environment:
 #include "AppRing.h"
 
 //
-// Only SYSTEM and Administrators can open a cable's control device. For a standard user, nf-vmic's explicitly approved broker
-// owns the handle, checks the interactive session and transfers only the live ring pages to its parent. STATS stays privileged
-// (the per-cable design's IU read comes with D2's redacted statistics).
+// Interactive users may read aggregate diagnostics. ATTACH and the legacy engineering trace require write access.
 //
-DECLARE_CONST_UNICODE_STRING(g_NfVmicSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+DECLARE_CONST_UNICODE_STRING(g_NfVmicSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)");
 
 //
 // Each control-device file object's context (zeroed by the framework). CleanedUp: its EvtFileCleanup has run, so no ring may be
@@ -74,6 +72,9 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(NF_VMIC_FILE_CONTEXT, NfVmicGetFileContext);
 typedef struct _NF_CONTROL_CONTEXT {
     EX_RUNDOWN_REF  Rundown;
     PNF_CABLE       Cable;
+    FAST_MUTEX      SnapshotLock; // passive callers only; never taken on the audio path
+    ULONGLONG       SnapshotAt;
+    NF_VMIC_DIAGNOSTICS Snapshot;
 } NF_CONTROL_CONTEXT, *PNF_CONTROL_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(NF_CONTROL_CONTEXT, NfVmicGetControlContext);
@@ -668,6 +669,59 @@ NfVmic_Stats(
 }
 
 //
+// Serve all panel readers from one per-cable snapshot for 10 ms. The timer never takes SnapshotLock.
+static VOID NfVmic_Diagnostics(_In_ PNF_CONTROL_CONTEXT Control, _In_ WDFREQUEST Request)
+{
+    PVOID buffer;
+    size_t capacity;
+    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, NF_VMIC_DIAGNOSTICS_V1_BYTES, &buffer, &capacity);
+    if (!NT_SUCCESS(status))
+    {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    ExAcquireFastMutex(&Control->SnapshotLock);
+    const ULONGLONG now = KeQueryInterruptTime();
+    NF_VMIC_DIAGNOSTICS* snapshot = &Control->Snapshot;
+    if (snapshot->Version == 0 || now - Control->SnapshotAt >= 100000)
+    {
+        PNF_APP_RING ring = &Control->Cable->Ring;
+        KIRQL oldIrql;
+        NF_VMIC_STREAM_STATS streams[NF_VMIC_KINDS];
+        NfVmicCopyStreamStats(Control->Cable, streams);
+        snapshot->Version = NF_VMIC_DIAGNOSTICS_VERSION;
+        snapshot->Bytes = sizeof(*snapshot);
+        snapshot->TimerLateMaxUs = streams[NF_VMIC_KIND_CAPTURE].LatenessMaxHns / 10;
+        KeAcquireSpinLock(&ring->Lock, &oldIrql);
+        snapshot->Attached = ring->Header != NULL;
+        snapshot->PacketFrames = ring->Header && ring->Reader ? ring->ReaderPacketFrames : 0;
+        snapshot->UnderrunFrames = ring->Stats.UnderrunFrames + ring->SecondaryUnderrunFrames;
+        snapshot->CaptureStreams = 0;
+        snapshot->RenderLostPackets = 0;
+        if (ring->Loopback)
+        {
+            KeAcquireSpinLockAtDpcLevel(&ring->Loopback->Lock);
+            snapshot->UnderrunFrames += ring->Loopback->UnderrunFrames;
+            snapshot->RenderLostPackets = ring->Loopback->RenderLostPackets;
+            for (ULONG i = 0; i < LOOPBACK_OPEN_FORMATS; ++i)
+                snapshot->CaptureStreams += ring->Loopback->CaptureOpen[i].Count;
+            KeReleaseSpinLockFromDpcLevel(&ring->Loopback->Lock);
+        }
+        KeReleaseSpinLock(&ring->Lock, oldIrql);
+        Control->SnapshotAt = now;
+    }
+    const size_t bytes = capacity >= sizeof(*snapshot) ? sizeof(*snapshot) : NF_VMIC_DIAGNOSTICS_V1_BYTES;
+    RtlCopyMemory(buffer, snapshot, bytes);
+    ExReleaseFastMutex(&Control->SnapshotLock);
+    if (bytes == NF_VMIC_DIAGNOSTICS_V1_BYTES)
+    {
+        NF_VMIC_DIAGNOSTICS* reply = (NF_VMIC_DIAGNOSTICS*)buffer;
+        reply->Version = 1;
+        reply->Bytes = NF_VMIC_DIAGNOSTICS_V1_BYTES;
+    }
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, bytes);
+}
+
 // Every IOCTL reaches its cable through the queue's control device. Refused rundown protection (the cable is gone; the purged
 // queue refuses requests before this, so the order should keep any from meeting it), it completes the request with
 // STATUS_INVALID_DEVICE_STATE, as the purged queue's are.
@@ -698,7 +752,12 @@ NfVmic_EvtIoDeviceControl(
         break;
 
     case NF_VMIC_IOCTL_STATS:
+        // Windows checks the read and write access encoded in the IOCTL before dispatch.
         NfVmic_Stats(control->Cable, Request);
+        break;
+
+    case NF_VMIC_IOCTL_DIAGNOSTICS:
+        NfVmic_Diagnostics(control, Request);
         break;
 
     default:
@@ -780,6 +839,7 @@ NfVmic_CreateControlDevice(
     // The guard, before anything can open the device: I/O is refused until WdfControlFinishInitializing, below.
     control = NfVmicGetControlContext(device);
     ExInitializeRundownProtection(&control->Rundown);
+    ExInitializeFastMutex(&control->SnapshotLock);
     control->Cable = Cable;
 
     // The symbolic link by hand (the header says why). Only this binding deletes it, and only if it made it.

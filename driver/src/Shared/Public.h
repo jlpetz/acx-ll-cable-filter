@@ -102,6 +102,8 @@ typedef struct _LOOPBACK_RING {
                                             // counted one-time skip (LoopbackCapturePass, LeadSkips)
     ULONGLONG       ValidFrom;              // [ValidFrom, WritePos) is the current run's audio (only its last RingFrames held)
     ULONGLONG       WritePos;
+    ULONGLONG       EosEndPlusOne;          // exclusive last frame on this owner's timeline plus one; zero until an explicit EOS
+    ULONGLONG       PausedEndPlusOne;       // final demand from a previously active run, retained after its owner closes
 
     // Written at stream creation and destruction (LoopbackStreamOpen, LoopbackStreamClose): the formats open on each circuit,
     // so a stream in a format other than one open on the other circuit is refused (STATUS_NOT_SUPPORTED). The capture
@@ -122,7 +124,7 @@ typedef struct _LOOPBACK_RING {
     ULONG           RenderRestarts;         // render runs started (claim, or a time line jump too long to zero), so it numbers them
     ULONG           RenderGapFills;         // render time line moved by a short gap (resume, glitch adjustment), zeroed
     ULONG           RenderLatePackets;      // render packets copied as they completed: the client released them too late
-    ULONG           RenderLostPackets;      // render packets gone from the buffer before they were copied (zeroed; not expected)
+    ULONG           RenderLostPackets;      // source packets missed before copying, including notified slots never submitted; zeroed
     ULONG           RenderNotOwner;         // passes of a second render stream (not looped back)
     ULONG           LeadSkips;              // capture reads moved on at once by a fall in the render lead: a one-time skip
     ULONGLONG       LeadSkippedFrames;      // the ring's audio such skips passed over (the difference in leads at most)

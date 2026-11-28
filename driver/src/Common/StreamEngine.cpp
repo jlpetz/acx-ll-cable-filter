@@ -37,6 +37,9 @@ Environment:
 #include "streamengine.tmh"
 #endif
 
+// Only an explicitly enabled verbose ETW session samples the first four render packets. Keep sample values out of traces.
+#define NF_LOOPBACK_TRACE_ENABLED() (WPP_CHECK_INIT WPP_LEVEL_FLAGS_ENABLED(LEVEL_VERBOSE, FLAG_STREAM))
+
 _Use_decl_annotations_
 PAGED_CODE_SEG
 CStreamEngine::CStreamEngine(
@@ -432,7 +435,6 @@ NTSTATUS
 CStreamEngine::Run()
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
-    LARGE_INTEGER qpcStart;
 
     PAGED_CODE();
 
@@ -455,33 +457,29 @@ CStreamEngine::Run()
         m_pCircuitPeakmeter->StartStream();
     }
 
-    //
-    // Pause to Run.
-    //
-    // Save the time and position - if we ran and paused previously, the StartTime and StartPosition will allow
-    // us to continue scheduling packet completions correctly, while still reporting absolute position from the
-    // start of the stream.
-    //
-    qpcStart = KeQueryPerformanceCounter(NULL);
-    m_StartTime = QpcToHns(qpcStart);
-    m_StartPosition = m_Position;
-
-    // Reset time we've lost to glitches
-    m_GlitchAdjust = 0;
-
-    ScheduleNextPass();
-
     // noise-filter (TODO 19, spike check 5): counted per stream kind (NF_VMIC_IOCTL_STATS), in the stream's cable.
     if (m_Cable != NULL)
     {
         NfVmicRecordRun(m_Cable, m_StatsKind);
     }
 
+    BeginRunClock();
     m_CurrentState = AcxStreamStateRun;
+    ScheduleNextPass();
     status = STATUS_SUCCESS;
 
 exit:
     return status;
+}
+
+_Use_decl_annotations_
+VOID
+CStreamEngine::BeginRunClock()
+{
+    // A fresh QPC anchor at the saved byte position makes the first deadline relative to this Run, including after Pause.
+    m_StartTime = QpcToHns(KeQueryPerformanceCounter(NULL));
+    m_StartPosition = m_Position;
+    m_GlitchAdjust = 0;
 }
 
 _Use_decl_annotations_
@@ -1332,7 +1330,11 @@ CRenderStreamEngine::CRenderStreamEngine(
 )
     : CStreamEngine(Stream, StreamFormat, Offload, CircuitPeakmeter),
     m_LbNextPacket(0),
-    m_LbReleased(0)
+    m_LbReleased(0),
+    m_LbPauseEndPlusOne(0),
+    m_LbPausedPacket(0),
+    m_LbPausedReleases(0),
+    m_LbRunBegan(FALSE)
 {
     PAGED_CODE();
 }
@@ -1378,6 +1380,14 @@ CRenderStreamEngine::ReleaseHardware()
 
     LoopbackRenderStop(TRUE);
     InterlockedExchange64(&m_LbReleased, 0);
+    InterlockedExchange(&m_LbRunBegan, FALSE);
+    m_LbRetiredPlusOne = 0;
+    for (ULONG i = 0; i < MAX_PACKET_COUNT; ++i)
+    {
+        InterlockedExchange64(&m_LbReissue[i], 0);
+        m_LbAppliedReissue[i] = 0;
+        m_LbPublishedPlusOne[i] = 0;
+    }
     m_LbNextPacket = 0;
     m_LbAnchorValid = FALSE;
 
@@ -1441,6 +1451,156 @@ CRenderStreamEngine::AssignDrmContentId(
     return STATUS_SUCCESS;
 }
 
+// The two DMA slots can contain only the newest release and its immediate predecessor. Pack both generation tags in one
+// atomic word: (newest + 1) * 2 + previousWasReleased, zero means no notices. EOS encodes the final length with the tags.
+// With two notifications this preserves a skipped packet exactly, even when the client submits the following packet before
+// the skipped one's deadline. A separate field would let the DPC observe the new generation with the old slot's valid bit.
+static_assert(MAX_PACKET_COUNT == 2);
+// Returns ordinary (positive) release tags and the exclusive end frame plus one (zero for an open stream). For a sealed
+// final packet its length is 0..PacketFrames, so a stride of PacketFrames+1 also represents an empty final packet.
+static LONG64
+LoopbackDecodeEos(LONG64 State, ULONG PacketFrames, ULONGLONG* EndPlusOne)
+{
+    *EndPlusOne = 0;
+    if (State >= 0)
+    {
+        return State;
+    }
+    ULONGLONG bits = ~(ULONGLONG)State;
+    ULONGLONG packed = bits >> 1;
+    ULONGLONG packet = packed / ((ULONGLONG)PacketFrames + 1);
+    ULONGLONG valid = packed - packet * ((ULONGLONG)PacketFrames + 1);
+    *EndPlusOne = packet * PacketFrames + valid + 1;
+    return (LONG64)(((packet + 1) << 1) | (bits & 1));
+}
+
+static BOOLEAN
+LoopbackHasPacket(LONG64 State, ULONGLONG Packet)
+{
+    ULONGLONG bits = (ULONGLONG)State;
+    ULONGLONG newestPlusOne = bits >> 1;
+    return newestPlusOne == Packet + 1 || ((bits & 1) != 0 && newestPlusOne == Packet + 2);
+}
+
+static NTSTATUS
+LoopbackReleasePacket(volatile LONG64* Released, ULONGLONG Packet, BOOLEAN SinglePreroll, BOOLEAN* Repeated,
+                      ULONG PacketFrames = 0, ULONG ValidFrames = 0)
+{
+    *Repeated = FALSE;
+    BOOLEAN eos = PacketFrames != 0;
+    LONG64 observed = InterlockedCompareExchange64(Released, 0, 0);
+    for (;;)
+    {
+        if (observed < 0)
+        {
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        ULONGLONG newestPlusOne = (ULONGLONG)observed >> 1;
+        // WASAPI can announce P+1 while paused with just P's buffer filled; it announces P+1 again after Start. The explicit
+        // KS pre-roll of P then P+1, including a partial/empty final P+1, unambiguously identifies both. Once P was submitted,
+        // a second P+1 is literal. EOS always names its literal packet.
+        ULONGLONG next = SinglePreroll && !LoopbackHasPacket(observed, Packet - 1) ? Packet : Packet + 1;
+        if (eos && newestPlusOne > next)
+        {
+            return STATUS_DATA_LATE_ERROR;
+        }
+        ULONGLONG bits;
+        if (next > newestPlusOne)
+        {
+            // Carry forward only a genuinely submitted predecessor. A first notice for packet 1 also covers the implicit
+            // initial packet 0 of a WASAPI shared stream that began in cyclic DMA mode. This applies only to the first pair.
+            BOOLEAN previous = (newestPlusOne != 0 && next - newestPlusOne == 1) ||
+                               (newestPlusOne == 0 && next == 2 && !eos);
+            bits = (next << 1) | (previous ? 1u : 0u);
+        }
+        else if (next == newestPlusOne)
+        {
+            bits = (ULONGLONG)observed;
+        }
+        else if (newestPlusOne - next == 1)
+        {
+            // A delayed normal notification can still authenticate its own slot, never a later generation in the same half.
+            bits = (ULONGLONG)observed | 1;
+        }
+        else
+        {
+            return STATUS_SUCCESS;
+        }
+        LONG64 updated = (LONG64)bits;
+        if (eos)
+        {
+            ULONGLONG stride = (ULONGLONG)PacketFrames + 1;
+            if (Packet > (((ULONGLONG)MAXLONGLONG >> 1) - ValidFrames) / stride)
+            {
+                return STATUS_INTEGER_OVERFLOW;
+            }
+            updated = (LONG64)~(((Packet * stride + ValidFrames) << 1) | (bits & 1));
+        }
+        if (updated == observed)
+        {
+            *Repeated = next == Packet + 1 && LoopbackHasPacket(observed, Packet);
+            return STATUS_SUCCESS;
+        }
+        LONG64 previous = InterlockedCompareExchange64(Released, updated, observed);
+        if (previous == observed)
+        {
+            *Repeated = next == Packet + 1 && LoopbackHasPacket(observed, Packet);
+            return STATUS_SUCCESS;
+        }
+        observed = previous;
+    }
+}
+
+// A slot needs just one pending revision. The generation tag prevents a delayed callback from altering a newer packet
+// occupying the same physical half. Sixteen bits distinguish repeat publications until the ring next observes this slot.
+static VOID
+LoopbackReissue(volatile LONG64* Slot, ULONGLONG Packet)
+{
+    ULONGLONG generation = (Packet + 1) << 16;
+    LONG64 observed = ReadNoFence64(Slot);
+    for (;;)
+    {
+        ULONGLONG prior = (ULONGLONG)observed & ~0xffffull;
+        if (prior > generation)
+        {
+            return;
+        }
+        LONG64 updated = (LONG64)(generation | (prior == generation ? ((ULONG)observed + 1) & 0xffffu : 1u));
+        LONG64 previous = InterlockedCompareExchange64(Slot, updated, observed);
+        if (previous == observed)
+        {
+            return;
+        }
+        observed = previous;
+    }
+}
+
+// Trace metadata for one optional startup diagnostic. Report frame indices only (-1: entirely zero).
+static VOID
+LoopbackTraceEdges(const BYTE* Bytes, ULONG Frames, ULONG Align, LONG* First, LONG* Last)
+{
+    *First = *Last = -1;
+    if (Bytes == NULL)
+    {
+        return;
+    }
+    for (ULONG i = 0; i < Frames; ++i)
+    {
+        for (ULONG j = 0; j < Align; ++j)
+        {
+            if (Bytes[(SIZE_T)i * Align + j] != 0)
+            {
+                if (*First < 0)
+                {
+                    *First = (LONG)i;
+                }
+                *Last = (LONG)i;
+                break;
+            }
+        }
+    }
+}
+
 _Use_decl_annotations_
 PAGED_CODE_SEG
 NTSTATUS
@@ -1454,10 +1614,17 @@ CRenderStreamEngine::SetRenderPacket(
     ULONGLONG currentPacket;
     LONG ahead;
 
-    UNREFERENCED_PARAMETER(Flags);
-    UNREFERENCED_PARAMETER(EosPacketLength);
-
     PAGED_CODE();
+
+    if ((m_CurrentState != AcxStreamStatePause && m_CurrentState != AcxStreamStateRun) ||
+        ReadNoFence64(&m_LbReleased) < 0)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    if ((Flags & ~KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     currentPacket = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
 
@@ -1467,7 +1634,8 @@ CRenderStreamEngine::SetRenderPacket(
     //
     ahead = (LONG)(Packet - (ULONG)currentPacket);
 
-    if (ahead <= 0)
+    // In Pause the current packet can be pre-rolled before the first Run or a resume. In Run it is already transferring.
+    if (ahead < 0 || (ahead == 0 && m_CurrentState != AcxStreamStatePause))
     {
         //ASSERT(FALSE);
         status = STATUS_DATA_LATE_ERROR;
@@ -1478,20 +1646,69 @@ CRenderStreamEngine::SetRenderPacket(
         status = STATUS_DATA_OVERRUN;
     }
 
+    if ((currentPacket < 4 || (Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) != 0) && NF_LOOPBACK_TRACE_ENABLED())
+    {
+        DoTraceMessage(FLAG_STREAM, "render release stream=%lu state=%lu current=%I64u offered=%lu flags=0x%lx eosBytes=%lu window=0x%lx",
+                       m_Serial, (ULONG)m_CurrentState, currentPacket, Packet, Flags, EosPacketLength, (ULONG)status);
+    }
+
     //
     // noise-filter (TODO 19): remember the newest packet the client has finished writing, for the loopback's look-ahead
-    // (LoopbackRenderPass). A late one (Packet <= currentPacket, e.g. a pre-roll of packet 0 before Run) counts too: its data
-    // is in the buffer. One writer: the client's property calls on this stream (inference: ACX serialises them).
+    // (LoopbackRenderPass). A late one counts too if its data is still in the buffer.
     //
     // Kept on the 64-bit count, plus one (0: none); a late packet from before the stream's first (no such packet) is ignored.
     if (status != STATUS_DATA_OVERRUN && (ahead >= 0 || (ULONGLONG)(-(LONGLONG)ahead) <= currentPacket))
     {
-        LONG64      released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
         ULONGLONG   packet = currentPacket + (ULONGLONG)(LONGLONG)ahead;
+        BOOLEAN     repeated;
 
-        if (released == 0 || packet + 1 > (ULONGLONG)released)
+        if ((Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) != 0)
         {
-            InterlockedExchange64(&m_LbReleased, (LONG64)(packet + 1));
+            // A rejected packet cannot terminate the stream or invalidate previously released data.
+            if (!NT_SUCCESS(status))
+            {
+                return status;
+            }
+            ULONG align = AcxDataFormatGetBlockAlign(m_StreamFormat);
+            if (align == 0 || m_PacketSize == 0 || m_PacketSize % align != 0 ||
+                EosPacketLength > m_PacketSize || EosPacketLength % align != 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            status = LoopbackReleasePacket(&m_LbReleased, packet, FALSE, &repeated, m_PacketSize / align, EosPacketLength / align);
+            if (NT_SUCCESS(status) && repeated && m_PacketsCount == MAX_PACKET_COUNT)
+            {
+                LoopbackReissue(&m_LbReissue[packet % MAX_PACKET_COUNT], packet);
+            }
+            if (NF_LOOPBACK_TRACE_ENABLED())
+            {
+                DoTraceMessage(FLAG_STREAM, "render EOS stream=%lu packet=%I64u bytes=%lu result=0x%lx",
+                               m_Serial, packet, EosPacketLength, (ULONG)status);
+            }
+            return status;
+        }
+
+        // A first P+1 before Run can be WASAPI's announcement of its single pre-filled P. Inside Run, even before the
+        // stream has acquired its ring lock and changed state to Run, the shared engine can already be submitting P+1.
+        BOOLEAN singlePreroll = ahead == 1 && m_PacketsCount == MAX_PACKET_COUNT && m_CurrentState == AcxStreamStatePause &&
+                                ReadAcquire(&m_LbRunBegan) == FALSE;
+        if (currentPacket == 1 && packet == 2 && m_PacketsCount == MAX_PACKET_COUNT && m_LbFormat.Valid && NF_LOOPBACK_TRACE_ENABLED())
+        {
+            LONG first, last;
+            LoopbackTraceEdges(LoopbackPacketBuffer(0), m_LbPacketFrames, m_LbFormat.BlockAlign, &first, &last);
+            DoTraceMessage(FLAG_STREAM, "render packet2 offer stream=%lu qpc=%I64d frames=%lu firstNonzero=%ld lastNonzero=%ld",
+                           m_Serial, KeQueryPerformanceCounter(NULL).QuadPart, m_LbPacketFrames, first, last);
+        }
+        NTSTATUS release = LoopbackReleasePacket(&m_LbReleased, packet, singlePreroll, &repeated);
+        if (!NT_SUCCESS(release))
+        {
+            return release;
+        }
+        if (repeated && ahead >= 0 && m_PacketsCount == MAX_PACKET_COUNT)
+        {
+            // Still report STATUS_DATA_LATE_ERROR for the transferring packet. Its already delivered frames cannot be
+            // recalled; a reader that has not reached it can still hear the replacement before ACX returns the slot.
+            LoopbackReissue(&m_LbReissue[packet % MAX_PACKET_COUNT], packet);
         }
     }
 
@@ -1513,27 +1730,33 @@ PAGED_CODE_SEG
 NTSTATUS
 CRenderStreamEngine::Run()
 {
-    NTSTATUS status;
-
     PAGED_CODE();
 
     if (m_CurrentState == AcxStreamStatePause)
     {
+        InterlockedExchange(&m_LbRunBegan, TRUE);
         // The timer is stopped in Pause, so no pass reads these while they change. The packets exist by now (inference: ACX
         // normally allocates them before PrepareHardware, Learn acx-streaming, and a client cannot start without them).
         LoopbackSetFormat();
+        if (NF_LOOPBACK_TRACE_ENABLED())
+        {
+            DoTraceMessage(FLAG_STREAM, "render Run stream=%lu packetFrames=%lu packetCount=%lu", m_Serial, m_LbPacketFrames, m_PacketsCount);
+        }
     }
 
-    status = CStreamEngine::Run();
-
-    if (NT_SUCCESS(status))
+    NTSTATUS status = CStreamEngine::Run();
+    if (!NT_SUCCESS(status))
     {
-        // Copy the packet the client pre-rolled before Start, if it released it, so the first packet is in the ring before
-        // its presentation time too. Serialised with the first timer pass by the ring's lock.
-        LoopbackRenderPass(TRUE);
+        InterlockedExchange(&m_LbRunBegan, FALSE);
     }
-
     return status;
+}
+
+_Use_decl_annotations_
+VOID
+CRenderStreamEngine::BeginRunClock()
+{
+    LoopbackRenderPass(TRUE);
 }
 
 _Use_decl_annotations_
@@ -1545,26 +1768,203 @@ CRenderStreamEngine::Pause()
 
     PAGED_CODE();
 
+    if (m_CurrentState == AcxStreamStateRun && m_LbFormat.Valid)
+    {
+        // ACX can deliver a packet just before Pause without another render tick. Freeze its complete publication (including
+        // any EOS length) before announcing the cutoff; subsequent releases cannot authenticate bytes for the stopped run.
+        // The capture reader observes the cutoff with acquire ordering. The next Run clears it under the same reader lock.
+        m_LbPausedPacket = (ULONGLONG)ReadNoFence64((LONG64*)&m_CurrentPacket);
+        m_LbPausedReleases = ReadAcquire64(&m_LbReleased);
+        for (ULONG i = 0; i < MAX_PACKET_COUNT; ++i)
+        {
+            m_LbPausedReissue[i] = ReadAcquire64(&m_LbReissue[i]);
+        }
+        LARGE_INTEGER pauseQpc = KeQueryPerformanceCounter(NULL);
+        ULONGLONG end = LoopbackHnsToFrames(QpcToHns(pauseQpc), m_LbFormat.SampleRate);
+        InterlockedExchange64(&m_LbPauseEndPlusOne, (LONG64)(end + 1));
+        if (NF_LOOPBACK_TRACE_ENABLED())
+        {
+            DoTraceMessage(FLAG_STREAM, "render Pause stream=%lu qpc=%I64d end=%I64u", m_Serial, pauseQpc.QuadPart, end);
+        }
+    }
     status = CStreamEngine::Pause();
 
     if (NT_SUCCESS(status))
     {
         // The timer has stopped (WdfTimerStop waits for its callback): the capture side reads what is left, then idles.
         LoopbackRenderStop(FALSE);
+        InterlockedExchange(&m_LbRunBegan, FALSE);
     }
 
     return status;
 }
 
-_Use_decl_annotations_
-BOOLEAN
-CRenderStreamEngine::LoopbackReleased(
-    ULONGLONG Packet
-)
+ULONGLONG
+CRenderStreamEngine::AbsoluteEosEndPlusOne()
 {
-    LONG64 released = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+    // Called with the ring lock held. A PASSIVE_LEVEL EOS publisher never has to acquire it: its CAS made the final slot
+    // and the precise valid length visible together. Until Run establishes the anchor, there is no absolute frame address.
+    ULONGLONG eos;
+    LONG64 releases = ReadAcquire64(&m_LbPauseEndPlusOne) != 0 ? m_LbPausedReleases : ReadNoFence64(&m_LbReleased);
+    (void)LoopbackDecodeEos(releases, m_LbPacketFrames, &eos);
+    return eos != 0 && m_LbAnchorValid ? m_LbAnchor + eos : 0;
+}
 
-    return (released != 0 && (ULONGLONG)released - 1 >= Packet) ? TRUE : FALSE;
+// Repair a release revised while ACX still owns that generation. This runs under the ring lock before capture reads,
+// before render returns a completed slot, and while Pause drains. Already-delivered frames stay with their reader;
+// changing the existing ring bytes neither changes a reader's position nor publishes any new time.
+VOID
+CRenderStreamEngine::RefreshReissuedPackets()
+{
+    for (ULONG slot = 0; slot < MAX_PACKET_COUNT; ++slot)
+    {
+        LONG64 revision = ReadAcquire64(&m_LbReissue[slot]);
+        if (revision == m_LbAppliedReissue[slot])
+        {
+            continue;
+        }
+        ULONGLONG generation = (ULONGLONG)revision >> 16;
+        if (generation == 0 || m_LbPublishedPlusOne[slot] != generation || !m_LbAnchorValid || m_LbAnchor != LoopbackAnchor())
+        {
+            continue;
+        }
+        ULONGLONG packet = generation - 1;
+        ULONGLONG current = (ULONGLONG)ReadNoFence64((LONG64*)&m_CurrentPacket);
+        ULONGLONG eos;
+        LONG64 released = LoopbackDecodeEos(ReadAcquire64(&m_LbReleased), m_LbPacketFrames, &eos);
+        if (packet < m_LbRetiredPlusOne || packet < current || packet - current > 1 || !LoopbackHasPacket(released, packet))
+        {
+            continue;
+        }
+        ULONGLONG pause = (ULONGLONG)ReadAcquire64(&m_LbPauseEndPlusOne);
+        ULONGLONG from = m_LbAnchor + packet * m_LbPacketFrames;
+        if (pause != 0)
+        {
+            LONG64 frozen = LoopbackDecodeEos(m_LbPausedReleases, m_LbPacketFrames, &eos);
+            if (revision != m_LbPausedReissue[slot] || packet < m_LbPausedPacket || packet - m_LbPausedPacket > 1 ||
+                !LoopbackHasPacket(frozen, packet) || from >= pause - 1)
+            {
+                continue;
+            }
+        }
+        if (from < m_Loopback->ValidFrom || from >= m_Loopback->WritePos || m_Loopback->WritePos - from > m_LbRingFrames)
+        {
+            continue;
+        }
+        ULONG frames = (ULONG)MIN((ULONGLONG)m_LbPacketFrames, m_Loopback->WritePos - from);
+        if (eos != 0)
+        {
+            ULONGLONG end = m_LbAnchor + eos - 1;
+            frames = from < end ? (ULONG)MIN((ULONGLONG)frames, end - from) : 0;
+        }
+        LoopbackRingWrite(m_Loopback->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, from, LoopbackPacketBuffer(slot), frames);
+        m_LbAppliedReissue[slot] = revision;
+    }
+}
+
+// Publish only the contiguous released slots reached by this reader's demand (or the Pause cutoff). Both the current slot
+// and the next remain owned until their completion notifications. A delayed render tick can leave the read deadline just
+// inside the next packet. The shared lock serialises this copy with the normal timer and all other readers.
+VOID
+CRenderStreamEngine::CopyReleasedPackets(ULONGLONG DemandEnd)
+{
+    for (ULONG slots = 0; slots < MAX_PACKET_COUNT && m_Loopback->WritePos < DemandEnd; ++slots)
+    {
+        if (!CopyReleasedPacket())
+        {
+            break;
+        }
+    }
+}
+
+BOOLEAN
+CRenderStreamEngine::CopyReleasedPacket()
+{
+    ULONGLONG current = (ULONGLONG)ReadNoFence64((LONG64*)&m_CurrentPacket);
+    ULONGLONG packet = m_LbNextPacket;
+    if (m_PacketsCount != MAX_PACKET_COUNT || packet < m_LbRetiredPlusOne || packet < current || packet - current > 1 || !m_LbAnchorValid)
+    {
+        return FALSE;
+    }
+    ULONGLONG pause = (ULONGLONG)ReadAcquire64(&m_LbPauseEndPlusOne);
+    if (pause != 0 && (packet < m_LbPausedPacket || packet - m_LbPausedPacket > 1))
+    {
+        return FALSE;
+    }
+    ULONGLONG eos;
+    LONG64 released = LoopbackDecodeEos(InterlockedCompareExchange64(&m_LbReleased, 0, 0), m_LbPacketFrames, &eos);
+    if (released == 0 || !LoopbackHasPacket(released, packet) || m_LbAnchor != LoopbackAnchor())
+    {
+        return FALSE;
+    }
+    if (pause != 0)
+    {
+        // Only a generation already released at Pause whose playback had begun belongs to this run. Drain its full valid
+        // packet just as a look-ahead copy would; a future or genuinely absent packet remains silent. The live tag above also
+        // confirms the same slot has not since been reclaimed. A pre-roll EOS for the next run cannot truncate the old one.
+        LONG64 frozen = LoopbackDecodeEos(m_LbPausedReleases, m_LbPacketFrames, &eos);
+        if (!LoopbackHasPacket(frozen, packet) || m_Loopback->WritePos >= pause - 1)
+        {
+            return FALSE;
+        }
+    }
+    ULONGLONG from = packet * m_LbPacketFrames;
+    if (m_Loopback->WritePos != m_LbAnchor + from || (eos != 0 && eos - 1 <= from))
+    {
+        return FALSE;
+    }
+    ULONG frames = eos != 0 ? (ULONG)MIN((ULONGLONG)m_LbPacketFrames, eos - 1 - from) : m_LbPacketFrames;
+    ULONG slot = (ULONG)(packet % MAX_PACKET_COUNT);
+    LONG64 revision = ReadAcquire64(&m_LbReissue[slot]);
+    if (pause != 0 && revision != m_LbPausedReissue[slot])
+    {
+        return FALSE;
+    }
+    LoopbackRingWrite(m_Loopback->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, m_Loopback->WritePos,
+                      LoopbackPacketBuffer(slot), frames);
+    m_LbAppliedReissue[slot] = revision;
+    m_LbPublishedPlusOne[slot] = packet + 1;
+    m_Loopback->WritePos += frames;
+    m_LbNextPacket++;
+    if (packet == current)
+    {
+        m_Loopback->RenderLatePackets++;
+    }
+    return TRUE;
+}
+
+// These payload classifications are for an explicitly enabled short startup trace only. They reveal no sample values.
+static ULONG
+LoopbackTraceNonzero(_In_reads_bytes_opt_(Bytes) const BYTE* Buffer, SIZE_T Bytes)
+{
+    if (Buffer != NULL)
+    {
+        for (SIZE_T i = 0; i < Bytes; ++i)
+        {
+            if (Buffer[i] != 0)
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static ULONG
+LoopbackTraceZeroMask(_In_reads_bytes_opt_(Bytes) const BYTE* Buffer, SIZE_T Bytes)
+{
+    if (Bytes < sizeof(ULONG))
+    {
+        return 4;
+    }
+    if (Buffer == NULL)
+    {
+        return 3;
+    }
+    ULONG first, last;
+    RtlCopyMemory(&first, Buffer, sizeof(first));
+    RtlCopyMemory(&last, Buffer + Bytes - sizeof(last), sizeof(last));
+    return (first == 0 ? 1u : 0u) | (last == 0 ? 2u : 0u);
 }
 
 _Use_decl_annotations_
@@ -1575,18 +1975,46 @@ CRenderStreamEngine::LoopbackRenderPass(
 {
     PLOOPBACK_RING  ring = m_Loopback;
     KIRQL           oldIrql;
-    ULONGLONG       current;
+    ULONGLONG       current, completingPlusOne = 0;
     ULONGLONG       endPacket;
     ULONGLONG       anchor;
+    ULONGLONG       eos;
+    ULONGLONG       pauseCutoff;
+    LONG64          releaseState;
+    LONG64          releases;
     BOOLEAN         lookAhead;
     BOOLEAN         copied = FALSE;
+    struct {
+        ULONG Packet, Slot, ZeroMask, Nonzero;
+        LONG FirstNonzero, LastNonzero;
+        ULONGLONG RingFrame;
+        LONG64 Released;
+    } trace[MAX_PACKET_COUNT];
+    ULONG traceCount = 0;
+    struct {
+        ULONG Frames, ZeroMask, Nonzero, PublishedNonzero;
+        ULONGLONG Anchor;
+    } slot1 = {};
+    BOOLEAN traceCompletion = FALSE;
 
     if (ring == NULL || !m_LbFormat.Valid)
     {
+        if (AtRun)
+        {
+            CStreamEngine::BeginRunClock();
+        }
         return;
     }
 
     KeAcquireSpinLock(&ring->Lock, &oldIrql);
+    if (AtRun)
+    {
+        // Acquire before sampling QPC. A long passive lock acquisition (notably with Driver Verifier) must not consume
+        // the first render period while Start is still on the stack. The first DPC cannot pass this pre-roll or copy the
+        // client's second DMA slot before Start returns just because this lock was delayed.
+        CStreamEngine::BeginRunClock();
+        InterlockedExchange64(&m_LbPauseEndPlusOne, 0);
+    }
 
     if (ring->Buffer == NULL)
     {
@@ -1601,12 +2029,26 @@ CRenderStreamEngine::LoopbackRenderPass(
         ring->RenderActive = FALSE;
         ring->ValidFrom = 0;
         ring->WritePos = 0;
+        ring->EosEndPlusOne = 0;
+        ring->PausedEndPlusOne = 0;
         m_LbAnchorValid = FALSE;
     }
     else if (ring->Owner != this)
     {
         ring->RenderNotOwner++;
         goto exit;
+    }
+
+    if (AtRun)
+    {
+        ring->PausedEndPlusOne = 0;
+        RtlZeroMemory(m_LbPublishedPlusOne, sizeof(m_LbPublishedPlusOne));
+    }
+    else
+    {
+        // After this pass ACX is free to overwrite the completing DMA slot.
+        completingPlusOne = (ULONGLONG)ReadNoFence64((LONG64*)&m_CurrentPacket) + 1;
+        RefreshReissuedPackets();
     }
 
     //
@@ -1616,17 +2058,65 @@ CRenderStreamEngine::LoopbackRenderPass(
     // k, packet k is final and k+1 is final once released: copying it now puts it in the ring a period before it is
     // presented. Without SetRenderPacket in this run (or in one-packet mode) each packet is copied as it completes.
     //
-    lookAhead = (m_PacketsCount == MAX_PACKET_COUNT && InterlockedCompareExchange64(&m_LbReleased, 0, 0) != 0) ? TRUE : FALSE;
     current = (ULONGLONG)InterlockedCompareExchange64((LONG64*)&m_CurrentPacket, -1, -1);
+    pauseCutoff = (ULONGLONG)ReadAcquire64(&m_LbPauseEndPlusOne);
+    releaseState = InterlockedCompareExchange64(&m_LbReleased, 0, 0);
+    if (!AtRun && pauseCutoff != 0 && (releaseState != 0 || m_LbPausedReleases != 0))
+    {
+        // An in-flight DPC must not promote a post-Pause release into this run, nor consume a future slot. An already
+        // completed or reclaimed current generation cannot be used a second time. Commit only the frozen current packet
+        // (if due and still valid); the base timer independently finishes its ACX notification and retires.
+        CopyReleasedPackets(pauseCutoff - 1);
+        goto exit;
+    }
+    releases = LoopbackDecodeEos(releaseState, m_LbPacketFrames, &eos);
+    if (!AtRun && current == 1 && m_PacketsCount == MAX_PACKET_COUNT && m_LbAnchorValid && NF_LOOPBACK_TRACE_ENABLED())
+    {
+        // Packet 1 is still owned by the driver until the timer notifies ACX after this pass. A previous pass (or an
+        // underfilled capture read) may already have published it. Compare the exact ring bytes with the slot as it is now.
+        traceCompletion = TRUE;
+        slot1.Anchor = m_LbAnchor;
+        slot1.Frames = eos == 0 ? m_LbPacketFrames : (eos - 1 > m_LbPacketFrames ?
+            (ULONG)MIN((ULONGLONG)m_LbPacketFrames, eos - 1 - m_LbPacketFrames) : 0);
+        SIZE_T bytes = (SIZE_T)slot1.Frames * m_LbFormat.BlockAlign;
+        PBYTE source = LoopbackPacketBuffer(1);
+        slot1.ZeroMask = LoopbackTraceZeroMask(source, bytes);
+        slot1.Nonzero = LoopbackTraceNonzero(source, bytes);
+        slot1.PublishedNonzero = 2; // unavailable at the time of this snapshot
+        ULONGLONG first = m_LbAnchor + m_LbPacketFrames;
+        if (m_LbNextPacket > 1 && first >= ring->ValidFrom && first <= ring->WritePos &&
+            ring->WritePos - first <= m_LbRingFrames && slot1.Frames <= ring->WritePos - first)
+        {
+            ULONG index = (ULONG)(first % m_LbRingFrames);
+            SIZE_T head = (SIZE_T)MIN(slot1.Frames, m_LbRingFrames - index) * m_LbFormat.BlockAlign;
+            slot1.PublishedNonzero = LoopbackTraceNonzero(ring->Buffer + (SIZE_T)index * m_LbFormat.BlockAlign, head) ||
+                                     LoopbackTraceNonzero(ring->Buffer, bytes - head);
+        }
+    }
+    lookAhead = (m_PacketsCount == MAX_PACKET_COUNT && releases != 0) ? TRUE : FALSE;
     if (AtRun)
     {
         // Before the first pass only the current packet is in play: the client's pre-roll.
-        endPacket = (lookAhead && LoopbackReleased(current)) ? current + 1 : current;
+        endPacket = (lookAhead && LoopbackHasPacket(releases, current)) ? current + 1 : current;
     }
     else
     {
         // ProcessPacket runs before the packet count moves on, so current is the completing packet.
-        endPacket = (lookAhead && LoopbackReleased(current + 1)) ? current + 2 : current + 1;
+        endPacket = (lookAhead && LoopbackHasPacket(releases, current + 1)) ? current + 2 : current + 1;
+    }
+
+    if (eos != 0)
+    {
+        // The stream timer and ACX notifications keep their normal cadence. The cable stops reading the circular DMA slots
+        // once every valid frame is copied, and retains the last run's anchor while its capture clients drain the tail.
+        ULONGLONG frames = eos - 1;
+        ULONGLONG packets = frames / m_LbPacketFrames + (frames % m_LbPacketFrames != 0);
+        if (m_LbAnchorValid && m_LbNextPacket >= packets)
+        {
+            goto exit;
+        }
+        current = MIN(current, packets);
+        endPacket = MIN(endPacket, packets);
     }
 
     //
@@ -1672,9 +2162,19 @@ CRenderStreamEngine::LoopbackRenderPass(
     {
         ULONGLONG   lost = current - m_LbNextPacket;
         ULONGLONG   lostFrames = lost * m_LbPacketFrames;
+        if (eos != 0)
+        {
+            lostFrames = MIN(lostFrames, (eos - 1) - m_LbNextPacket * m_LbPacketFrames);
+        }
 
         LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, NULL,
                           MIN(lostFrames, (ULONGLONG)m_LbRingFrames));
+        ULONGLONG pause = PauseEndPlusOne();
+        if (pause != 0)
+        {
+            ULONGLONG due = pause - 1 > ring->WritePos ? MIN(lostFrames, pause - 1 - ring->WritePos) : 0;
+            lost = due / m_LbPacketFrames + (due % m_LbPacketFrames != 0);
+        }
         ring->WritePos += lostFrames;
         ring->RenderLostPackets += (ULONG)MIN(lost, (ULONGLONG)MAXULONG);
         m_LbNextPacket = current;
@@ -1686,13 +2186,9 @@ CRenderStreamEngine::LoopbackRenderPass(
     while (endPacket > m_LbNextPacket)
     {
         ULONG   packetIndex = (ULONG)(m_LbNextPacket % m_PacketsCount);
-        PBYTE   packetBuffer = (PBYTE)m_Packets[packetIndex];
-
-        // Packet 0 starts at an offset if the size isn't a multiple of page_size
-        if (packetIndex == 0)
-        {
-            packetBuffer += m_FirstPacketOffset;
-        }
+        PBYTE   packetBuffer = LoopbackPacketBuffer(packetIndex);
+        ULONG   frames = m_LbPacketFrames;
+        LONG64  revision = ReadAcquire64(&m_LbReissue[packetIndex]);
 
         if (lookAhead && !AtRun && m_LbNextPacket == current)
         {
@@ -1700,8 +2196,43 @@ CRenderStreamEngine::LoopbackRenderPass(
             ring->RenderLatePackets++;
         }
 
-        LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, packetBuffer, m_LbPacketFrames);
-        ring->WritePos += m_LbPacketFrames;
+        if (eos != 0)
+        {
+            frames = (ULONG)MIN((ULONGLONG)frames, (eos - 1) - m_LbNextPacket * m_LbPacketFrames);
+        }
+        // At its deadline a notified stream's absent generation is lost. The physical slot may still contain an earlier
+        // packet or an unsubmitted future payload. Publish silence and count the missing source packet exactly once.
+        if (lookAhead && !LoopbackHasPacket(releases, m_LbNextPacket))
+        {
+            packetBuffer = NULL;
+            ULONGLONG pause = PauseEndPlusOne();
+            if (pause == 0 || ring->WritePos < pause - 1)
+            {
+                ring->RenderLostPackets++;
+            }
+        }
+        LoopbackRingWrite(ring->Buffer, m_LbRingFrames, m_LbFormat.BlockAlign, ring->WritePos, packetBuffer, frames);
+        m_LbAppliedReissue[packetIndex] = revision;
+        m_LbPublishedPlusOne[packetIndex] = lookAhead && packetBuffer != NULL ? m_LbNextPacket + 1 : 0;
+        if (m_LbNextPacket < 4 && traceCount < RTL_NUMBER_OF(trace) && NF_LOOPBACK_TRACE_ENABLED())
+        {
+            // Bit 0: the first sample word is zero; bit 1: the last sample word is zero; bit 2: too short to sample.
+            // Read only words that belong to this packet (a partial EOS is possible). Publish after releasing the ring lock.
+            SIZE_T bytes = (SIZE_T)frames * m_LbFormat.BlockAlign;
+            trace[traceCount].Packet = (ULONG)m_LbNextPacket;
+            trace[traceCount].Slot = packetIndex;
+            trace[traceCount].ZeroMask = LoopbackTraceZeroMask(packetBuffer, bytes);
+            trace[traceCount].Nonzero = m_LbNextPacket == 1 ? LoopbackTraceNonzero(packetBuffer, bytes) : 2;
+            trace[traceCount].FirstNonzero = trace[traceCount].LastNonzero = -2; // only the second post-start slot is probed
+            if (m_LbNextPacket == 2)
+            {
+                LoopbackTraceEdges(packetBuffer, frames, m_LbFormat.BlockAlign, &trace[traceCount].FirstNonzero, &trace[traceCount].LastNonzero);
+            }
+            trace[traceCount].RingFrame = ring->WritePos;
+            trace[traceCount].Released = releases >> 1;
+            traceCount++;
+        }
+        ring->WritePos += frames;
         m_LbNextPacket++;
         copied = TRUE;
     }
@@ -1719,7 +2250,23 @@ CRenderStreamEngine::LoopbackRenderPass(
     }
 
 exit:
+    if (completingPlusOne != 0)
+    {
+        // Close the slot to capture-side DMA reads before unlocking, including the interval between ProcessPacket
+        // returning and the base timer incrementing m_CurrentPacket and notifying ACX. The ring copy remains readable.
+        m_LbRetiredPlusOne = completingPlusOne;
+    }
     KeReleaseSpinLock(&ring->Lock, oldIrql);
+    if (traceCompletion)
+    {
+        DoTraceMessage(FLAG_STREAM, "render slot1 complete stream=%lu anchor=%I64u frames=%lu zeroMask=%lu anyNonzero=%lu publishedNonzero=%lu",
+                       m_Serial, slot1.Anchor, slot1.Frames, slot1.ZeroMask, slot1.Nonzero, slot1.PublishedNonzero);
+    }
+    for (ULONG i = 0; i < traceCount; ++i)
+    {
+        DoTraceMessage(FLAG_STREAM, "render copy stream=%lu packet=%lu slot=%lu atRun=%lu releasedPlusOne=%I64d ringFrame=%I64u zeroMask=%lu anyNonzero=%lu firstNonzero=%ld lastNonzero=%ld",
+                       m_Serial, trace[i].Packet, trace[i].Slot, (ULONG)AtRun, trace[i].Released, trace[i].RingFrame, trace[i].ZeroMask, trace[i].Nonzero, trace[i].FirstNonzero, trace[i].LastNonzero);
+    }
 }
 
 _Use_decl_annotations_
@@ -1730,6 +2277,10 @@ CRenderStreamEngine::LoopbackRenderStop(
 {
     PLOOPBACK_RING  ring = m_Loopback;
     KIRQL           oldIrql;
+    LARGE_INTEGER   inactiveQpc = {};
+    ULONGLONG       writePos = 0, anchor = 0, nextPacket = 0, nextBeforeDrain = 0, currentAtPause = 0;
+    LONG64          released = 0;
+    LONG64          frozenReleases = 0;
 
     if (ring == NULL)
     {
@@ -1740,16 +2291,53 @@ CRenderStreamEngine::LoopbackRenderStop(
 
     if (ring->Owner == this)
     {
+        if (!ReleaseOwnership && ring->RenderActive && PauseEndPlusOne() != 0)
+        {
+            if (NF_LOOPBACK_TRACE_ENABLED())
+            {
+                nextBeforeDrain = m_LbNextPacket;
+                currentAtPause = m_LbPausedPacket;
+                frozenReleases = m_LbPausedReleases;
+            }
+            // No capture DPC is required to wake during Stop. Make the same frozen, still-owned slot available for a later
+            // reader before clearing RenderActive. The timer has stopped; the remaining frames then drain from the ring.
+            RefreshReissuedPackets();
+            CopyReleasedPackets(PauseEndPlusOne() - 1);
+        }
+        if (ring->RenderActive && NF_LOOPBACK_TRACE_ENABLED())
+        {
+            inactiveQpc = KeQueryPerformanceCounter(NULL);
+            writePos = ring->WritePos;
+            anchor = m_LbAnchor;
+            nextPacket = m_LbNextPacket;
+            ULONGLONG ignoredEnd;
+            released = LoopbackDecodeEos(ReadNoFence64(&m_LbReleased), m_LbPacketFrames, &ignoredEnd) >> 1;
+        }
+        if (ring->RenderActive)
+        {
+            ring->PausedEndPlusOne = PauseEndPlusOne();
+        }
         ring->RenderActive = FALSE;
 
         if (ReleaseOwnership)
         {
             // RenderFormat and the valid range stay, so the capture side can still read the tail; the next claim resets them.
+            ring->EosEndPlusOne = AbsoluteEosEndPlusOne();
             ring->Owner = NULL;
         }
     }
 
     KeReleaseSpinLock(&ring->Lock, oldIrql);
+    if (inactiveQpc.QuadPart != 0)
+    {
+        DoTraceMessage(FLAG_STREAM, "render inactive stream=%lu qpc=%I64d writePos=%I64u anchor=%I64u nextPacket=%I64u releasedPlusOne=%I64d",
+                       m_Serial, inactiveQpc.QuadPart, writePos, anchor, nextPacket, released);
+        if (!ReleaseOwnership)
+        {
+            DoTraceMessage(FLAG_STREAM, "render pause snapshot stream=%lu currentAtPause=%I64u nextBeforeDrain=%I64u frozenReleaseState=%I64d",
+                           m_Serial, currentAtPause, nextBeforeDrain, frozenReleases);
+        }
+    }
 }
 
 
@@ -1763,7 +2351,6 @@ CCaptureStreamEngine::CCaptureStreamEngine(
     m_EnableWaveCapture(0),
     m_LbLagFrames(0),
     m_LbAnchorLead(0),
-    m_LbReadBase(0),
     m_AppFormatOk(FALSE),
     m_AppEnd(0),
     m_AppEndAttach(0),
@@ -1964,6 +2551,8 @@ CCaptureStreamEngine::LoopbackCapturePass(
     ULONGLONG       anchor;
     ULONGLONG       readStart;
     ULONGLONG       readEnd;
+    ULONGLONG       dueEnd;
+    ULONGLONG       eosEnd;
     ULONGLONG       validLo;
     ULONGLONG       validHi;
     ULONGLONG       copyLo;
@@ -2015,6 +2604,20 @@ CCaptureStreamEngine::LoopbackCapturePass(
     // shorter lead's read underruns too (a client that released a packet too late to go early, RenderLatePackets).
     //
 
+    anchor = LoopbackAnchor();
+    lead = ring->RenderLeadFrames;
+    readStart = anchor - m_LbLagFrames - lead + Packet * m_LbPacketFrames;
+    readEnd = readStart + m_LbPacketFrames;
+    if (ring->RenderActive && ring->Owner != NULL)
+    {
+        CRenderStreamEngine* owner = static_cast<CRenderStreamEngine*>(ring->Owner);
+        owner->RefreshReissuedPackets();
+        if (readEnd > ring->WritePos)
+        {
+            owner->CopyReleasedPackets(readEnd);
+        }
+    }
+
     // The audio the ring still holds of the current render run.
     validHi = ring->WritePos;
     validLo = ring->ValidFrom;
@@ -2022,9 +2625,12 @@ CCaptureStreamEngine::LoopbackCapturePass(
     {
         validLo = validHi - m_LbRingFrames;
     }
+    eosEnd = ring->Owner != NULL ? static_cast<CRenderStreamEngine*>(ring->Owner)->AbsoluteEosEndPlusOne() : ring->EosEndPlusOne;
+    if (eosEnd != 0)
+    {
+        validHi = MIN(validHi, eosEnd - 1);
+    }
 
-    anchor = LoopbackAnchor();
-    lead = ring->RenderLeadFrames;
     if (m_LbAnchorValid && lead < m_LbAnchorLead)
     {
         // This pass's read at the old lead, and at the new one: what the ring holds between them never reaches this stream.
@@ -2060,13 +2666,9 @@ CCaptureStreamEngine::LoopbackCapturePass(
     {
         m_LbAnchor = anchor;
         m_LbAnchorLead = lead;
-        m_LbReadBase = anchor - m_LbLagFrames - m_LbAnchorLead;
         m_LbAnchorValid = TRUE;
         ring->CaptureAnchors++;
     }
-
-    readStart = m_LbReadBase + (ULONGLONG)Packet * m_LbPacketFrames;
-    readEnd = readStart + m_LbPacketFrames;
 
     copyLo = MAX(readStart, validLo);
     copyHi = MIN(readEnd, validHi);
@@ -2090,16 +2692,30 @@ CCaptureStreamEngine::LoopbackCapturePass(
         RtlZeroMemory(PacketBuffer + (SIZE_T)(copyHi - readStart) * blockAlign, (SIZE_T)(readEnd - copyHi) * blockAlign);
     }
 
-    if (readEnd > validHi && ring->RenderActive)
+    // An explicit EOS is an exclusive end. Charge every unavailable frame due before it, including in a partial last packet.
+    // Bytes past a late EOS may already be in the ring; the copy above also clips them. Without EOS the whole read is due.
+    dueEnd = eosEnd != 0 ? MIN(readEnd, eosEnd - 1) : readEnd;
+    if (dueEnd > MAX(readStart, validHi))
     {
-        ULONGLONG under = readEnd - MAX(readStart, validHi);
+        // A capture callback can run while Pause waits for the render timer, or drain an earlier packet after it stops.
+        // Bound demand on the two streams' common timeline. Already-published look-ahead audio still drains in full.
+        ULONGLONG pauseEnd = ring->RenderActive && ring->Owner != NULL ?
+            static_cast<CRenderStreamEngine*>(ring->Owner)->PauseEndPlusOne() : ring->PausedEndPlusOne;
+        if (pauseEnd != 0)
+        {
+            dueEnd = MIN(dueEnd, pauseEnd - 1);
+        }
+    }
+    if (dueEnd > MAX(readStart, validHi) && (ring->RenderActive || ring->PausedEndPlusOne != 0))
+    {
+        ULONGLONG under = dueEnd - MAX(readStart, validHi);
 
         ring->UnderrunPackets++;
         ring->UnderrunFrames += under;
 
         // The underrun log: one entry a run of underrunning passes, extended while it lasts.
         if (m_EvLbUnderrun == 0 ||
-            !NfVmicLogExtend(&ring->UnderrunLog, m_EvLbUnderrun, (ULONG)MIN(under, (ULONGLONG)MAXULONG), readEnd, 0))
+            !NfVmicLogExtend(&ring->UnderrunLog, m_EvLbUnderrun, (ULONG)MIN(under, (ULONGLONG)MAXULONG), dueEnd, 0))
         {
             NF_VMIC_EVENT event;
 
@@ -2108,7 +2724,7 @@ CCaptureStreamEngine::LoopbackCapturePass(
             event.Stream = m_Serial;
             event.PacketFrames = m_LbPacketFrames;
             event.Frames = (UINT32)MIN(under, (ULONGLONG)MAXULONG);
-            event.SpanFrom = readEnd - under;
+            event.SpanFrom = dueEnd - under;
             event.SpanFrames = event.Frames;
             m_EvLbUnderrun = NfVmicLogEvent(&ring->UnderrunLog, &event);
         }

@@ -69,7 +69,8 @@ Abstract:
             ERROR_FILE_NOT_FOUND (2).
         Either way the driver unpublishes the ring before it completes the request, and never touches the ring after.
 
-    NF_VMIC_IOCTL_STATS (METHOD_BUFFERED, read access). No input. Output: an NF_VMIC_STATS.
+    NF_VMIC_IOCTL_STATS (METHOD_BUFFERED, read and write access). No input. Output: an NF_VMIC_STATS.
+    NF_VMIC_IOCTL_DIAGNOSTICS (METHOD_BUFFERED, read access). No input. Output: a versioned NF_VMIC_DIAGNOSTICS.
 
     Include it after the platform headers (kernel: ntddk.h; user mode: windows.h and winioctl.h), which give CTL_CODE, the
     UINT8-UINT64 types, C_ASSERT and FIELD_OFFSET.
@@ -276,8 +277,9 @@ update or a re-add starts them at zero; times in 100 ns units):
     two rings of NF_VMIC_EVENT, its own, and its STATS copies them.
     The skip log holds every event in which a capture stream never got some of the audio it was due, one entry an event:
     HANDOFF_SKIP, SECONDARY_SKIP, SECONDARY_JUMP, LATE_READ, RESYNC, LIVE_DISCARD and LOOPBACK_LEAD_SKIP. The underrun log
-    holds the silence a stream got with nothing lost (READER_UNDERRUN, SECONDARY_UNDERRUN, LOOPBACK_UNDERRUN), one entry a
-    run of a stream's passes that each had some, logged at the run's first pass and extended in place while it lasts, so
+    records silence delivered when source frames were unavailable (READER_UNDERRUN, SECONDARY_UNDERRUN, LOOPBACK_UNDERRUN).
+    A producer can deliver those frames after their capture deadline, so this log alone cannot establish whether audio was
+    lost. Each entry covers a run of passes with such silence, logged at the first pass and extended in place while it lasts, so
     silence can't flood it, and kept apart so that it can't push skips out of theirs. A run is of one attachment and one
     source: it ends at a pass without such silence, at the stream's Run, at a pass of another attachment or with none, and
     (the loopback's) at a pass the app ring served or the loopback zero-filled idle. Each log numbers its events from 1
@@ -345,9 +347,27 @@ update or a re-add starts them at zero; times in 100 ns units):
 #define NF_VMIC_SYMLINK_PREFIX          L"\\DosDevices\\AcxLlCable_"
 #define NF_VMIC_USER_PREFIX             L"\\\\.\\AcxLlCable_"
 
-// 0x0022E002 and 0x00226004.
+// 0x0022E002 and 0x0022E004.
 #define NF_VMIC_IOCTL_ATTACH            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define NF_VMIC_IOCTL_STATS             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define NF_VMIC_IOCTL_STATS             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+// Passive control panels. No process identifiers, individual stream records, sample data or handles.
+#define NF_VMIC_IOCTL_DIAGNOSTICS       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define NF_VMIC_DIAGNOSTICS_V1_BYTES    40u
+#define NF_VMIC_DIAGNOSTICS_VERSION     2u
+typedef struct _NF_VMIC_DIAGNOSTICS {
+    UINT32 Version;
+    UINT32 Bytes;
+    UINT32 Attached;
+    UINT32 PacketFrames;     // direct reader's selected packet, zero until a reader exists
+    UINT64 UnderrunFrames;   // ring, other readers, and plain loopback combined
+    UINT64 TimerLateMaxUs;   // capture timer since this cable instance started
+    UINT32 CaptureStreams;   // open capture KS streams, including paused streams
+    UINT32 Reserved;
+    UINT64 RenderLostPackets; // v2: missing source packets on the playback side, once per packet regardless of the number of readers
+} NF_VMIC_DIAGNOSTICS;
+// A caller with room only for v1 still receives Version=1 and Bytes=40. Larger callers check both the header and returned byte count.
+C_ASSERT(FIELD_OFFSET(NF_VMIC_DIAGNOSTICS, RenderLostPackets) == NF_VMIC_DIAGNOSTICS_V1_BYTES);
+C_ASSERT(sizeof(NF_VMIC_DIAGNOSTICS) == 48);
 
 // The ring's format: the capture endpoint's device format (spike check 3).
 #define NF_VMIC_SAMPLE_RATE             48000u
@@ -611,6 +631,6 @@ C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryJumps) == 6848);
 C_ASSERT(FIELD_OFFSET(NF_VMIC_STATS, SecondaryJumpFrames) == 6856);
 C_ASSERT(sizeof(NF_VMIC_STATS) == 6864);
 C_ASSERT(NF_VMIC_IOCTL_ATTACH == 0x0022E002);
-C_ASSERT(NF_VMIC_IOCTL_STATS == 0x00226004);
+C_ASSERT(NF_VMIC_IOCTL_STATS == 0x0022E004);
 
 #endif // NF_VMIC_H

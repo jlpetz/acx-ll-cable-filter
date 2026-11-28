@@ -41,8 +41,61 @@ const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> 
 /// while attached. [`ATTACH_REFUSALS`], [`ATTACH_FAILURES_AT_ONCE`] and [`ATTACH_ENDINGS`] list how it completes.
 pub const IOCTL_ATTACH: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 /// `NF_VMIC_IOCTL_STATS`: no input; output a [`Stats`].
-pub const IOCTL_STATS: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS);
-const _: () = assert!(IOCTL_ATTACH == 0x0022_E002 && IOCTL_STATS == 0x0022_6004);
+pub const IOCTL_STATS: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
+pub(crate) const IOCTL_DIAGNOSTICS: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS);
+/// The passive control panel ABI. No process identities or sample data.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct DiagnosticReply {
+    pub version: u32,
+    pub bytes: u32,
+    pub attached: u32,
+    pub packet_frames: u32,
+    pub underrun_frames: u64,
+    pub timer_late_max_us: u64,
+    pub capture_streams: u32,
+    pub reserved: u32,
+    pub render_lost_packets: u64,
+}
+const DIAGNOSTICS_V1_BYTES: usize = 40;
+const _: () = assert!(offset_of!(DiagnosticReply, render_lost_packets) == DIAGNOSTICS_V1_BYTES && size_of::<DiagnosticReply>() == 48);
+const _: () = assert!(IOCTL_DIAGNOSTICS == 0x0022_6008);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub attached: bool,
+    /// Direct reader period. Zero when no ring is being read.
+    pub packet_frames: u32,
+    /// Frames unavailable when a capture stream needed them, accumulated across readers.
+    pub underrun_frames: u64,
+    /// Source packets missing from plain cable playback, counted once before fan-out. Older drivers do not expose this.
+    pub render_lost_packets: Option<u64>,
+    pub timer_late_max_us: u64,
+    /// Open capture streams, including paused clients.
+    pub capture_streams: u32,
+}
+
+impl DiagnosticReply {
+    pub(crate) fn decode(self, returned: usize) -> Option<Diagnostics> {
+        if self.bytes as usize != returned {
+            return None;
+        }
+        let render_lost_packets = match (self.version, returned) {
+            (1, DIAGNOSTICS_V1_BYTES) => None,
+            (2, n) if n == size_of::<Self>() => Some(self.render_lost_packets),
+            _ => return None,
+        };
+        Some(Diagnostics {
+            attached: self.attached != 0,
+            packet_frames: self.packet_frames,
+            underrun_frames: self.underrun_frames,
+            render_lost_packets,
+            timer_late_max_us: self.timer_late_max_us,
+            capture_streams: self.capture_streams,
+        })
+    }
+}
+const _: () = assert!(IOCTL_ATTACH == 0x0022_E002 && IOCTL_STATS == 0x0022_E004);
 
 /// The ring's format: the capture endpoint's device format (spike check 3).
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -694,6 +747,26 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_diagnostics_distinguish_missing_packets_from_capture_underruns_and_an_older_driver() {
+        let reply = |version, bytes, lost| DiagnosticReply {
+            version,
+            bytes,
+            underrun_frames: 17,
+            render_lost_packets: lost,
+            ..DiagnosticReply::default()
+        };
+        let legacy = reply(1, 40, 99).decode(40).unwrap();
+        assert_eq!((legacy.underrun_frames, legacy.render_lost_packets), (17, None));
+        for lost in [0, 1, u64::MAX] {
+            let current = reply(2, 48, lost).decode(48).unwrap();
+            assert_eq!((current.underrun_frames, current.render_lost_packets), (17, Some(lost)));
+        }
+        for (version, bytes, returned) in [(1, 48, 48), (2, 40, 40), (1, 40, 39), (2, 48, 40), (3, 48, 48)] {
+            assert!(reply(version, bytes, 0).decode(returned).is_none());
+        }
+    }
 
     #[test]
     fn capacities() {

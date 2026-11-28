@@ -23,7 +23,7 @@
 //!   IsFormatSupported and Initialize returned by name, and holds the stream for N seconds: the format-refusal tests in either
 //!   open order, and a small-period helper. A refusal is the driver's only where its RefusedCaptureOpens rose (exit 1); any
 //!   other exits 4. A float render stream can play the test signal (`--signal`), so a float capture of the microphone, which
-//!   decodes it and counts its gaps and repeats, checks the loopback bit-exact.
+//!   decodes it and counts its gaps and repeats. `--check-signal` makes the capture verdict depend on bit-exact continuity.
 //! - `latency` attaches a ring, feeds it at a fill target and records the capture endpoint in the same process, timing each
 //!   frame from the feed's publication to its receipt (the host's QPC when GetBuffer returned its packet, and the frame's
 //!   device time: GetBuffer's device QPC position plus its place in the packet), and checks that its own stream read the
@@ -163,7 +163,7 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       client: without one the result is INCONCLUSIVE.
   nf-vmic-test open [--path PATH] [--render] [--mic low-latency|call | --device NAME] (--exclusive | --shared)
                     --format float|pcm24 [--period-frames N] [--mode raw|default|communications] [--seconds N]
-                    [--signal [--start N]]
+                    [--signal [--start N] | --check-signal [--expect-first N] [--expect-last N]]
       Open the endpoint (the cable's microphone, or its Speakers with --render; --device NAME any endpoint, capture, or
       render with --render) in that format, event-driven: 48 kHz stereo float32, or 24-in-32 PCM (a 32-bit container with 24
       valid bits). Print IsFormatSupported's result and Initialize's HRESULT by name (or that of the call after it that
@@ -179,7 +179,10 @@ nf-vmic-test: the driver's app-fed capture ring (TODO 19, spike check 4). Run it
       expected result in some tests. 4: refused, but not shown to be by that rule: the outcome line names the call and its
       HRESULT, and says whether the counter rules the driver's ring rule out (another client holding the device, a bad
       period, the engine) or can't tell (no driver statistics, or a render endpoint). 3: it opened and started, then stopped
-      running.
+      running. For float capture, --check-signal requires a continuous bit-exact sequence from a marker source. Silence
+      before and after is allowed. An interior zero, missing, repeated or changed code fails (exit 1); no marker is
+      inconclusive (exit 3). --expect-first and --expect-last name inclusive source frame numbers. Supply both to check
+      the entire length of a finite clip, including its edges and any wrap of the marker code.
   nf-vmic-test latency [--path PATH] [--seconds N] [--target FRAMES] [--capacity FRAMES] [--period-frames N]
                        [--mode raw|default|communications] [--mic low-latency|call | --device NAME] [--exclusive]
       In one process: attach a ring, write the test signal at the fill target (default 960 frames; capacity default 8192) as
@@ -3345,11 +3348,13 @@ struct OpenArgs {
     seconds: u64,
     /// A render stream's test signal: the first frame's number (`--signal`, `--start`); `None` writes silence.
     signal: Option<u64>,
+    check_signal: Option<MarkerCheck>,
 }
 
 fn open_args(args: &[String]) -> Result<OpenArgs, String> {
-    let valued = ["--path", "--mic", "--device", "--format", "--period-frames", "--mode", "--seconds", "--start"];
-    let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared", "--signal"])?;
+    let valued =
+        ["--path", "--mic", "--device", "--format", "--period-frames", "--mode", "--seconds", "--start", "--expect-first", "--expect-last"];
+    let o = Opts::parse(args, &valued, &["--render", "--exclusive", "--shared", "--signal", "--check-signal"])?;
     let name: Option<String> = o.optional("--device")?;
     let path: Option<String> = o.optional("--path")?;
     let render = o.flag("--render");
@@ -3376,7 +3381,61 @@ fn open_args(args: &[String]) -> Result<OpenArgs, String> {
         (true, _) if !render || format != Format::Float => return Err("--signal needs --render and --format float".into()),
         (true, start) => Some(start.unwrap_or(0)),
     };
-    Ok(OpenArgs { name, path, kind, render, spec, seconds, signal })
+    let expected = MarkerCheck { first: o.optional("--expect-first")?, last: o.optional("--expect-last")? };
+    let check_signal = if o.flag("--check-signal") {
+        if render || format != Format::Float {
+            return Err("--check-signal needs float capture (--format float, without --render)".into());
+        }
+        if expected.first.zip(expected.last).is_some_and(|(first, last)| last < first) {
+            return Err("--expect-last must be at or after --expect-first (source frame numbers)".into());
+        }
+        Some(expected)
+    } else if expected.first.is_some() || expected.last.is_some() {
+        return Err("--expect-first and --expect-last require --check-signal".into());
+    } else {
+        None
+    };
+    Ok(OpenArgs { name, path, kind, render, spec, seconds, signal, check_signal })
+}
+
+/// Optional source-frame bounds for a float capture of the known, uninterrupted marker. Outside silence is allowed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MarkerCheck {
+    first: Option<u64>,
+    last: Option<u64>,
+}
+
+impl MarkerCheck {
+    fn assess(self, r: &CheckReport) -> (Verdict, String) {
+        let (Some(first), Some(last)) = (r.first_code, r.last_code) else {
+            return (Verdict::Inconclusive, "INCONCLUSIVE: no marker was decoded".into());
+        };
+        if !r.is_clean() || r.zeros_inside != 0 {
+            return (
+                Verdict::Fail,
+                format!(
+                    "FAIL: {} interior silent frames, {} missing frames, {} repeated frames, {} corrupt frames",
+                    r.zeros_inside, r.gap_frames, r.repeat_frames, r.corrupt_frames
+                ),
+            );
+        }
+        for (edge, expected, got) in [("first", self.first, first), ("last", self.last, last)] {
+            if let Some(n) = expected
+                && signal::code(n) != got
+            {
+                return (Verdict::Fail, format!("FAIL: expected {edge} source frame {n} (code {}), received code {got}", signal::code(n)));
+            }
+        }
+        if let (Some(begin), Some(end)) = (self.first, self.last) {
+            let count = u128::from(end) - u128::from(begin) + 1;
+            if u128::from(r.signal_frames) != count {
+                return (Verdict::Fail, format!("FAIL: expected {count} marked frames, received {}", r.signal_frames));
+            }
+        } else if r.signal_frames < 2 {
+            return (Verdict::Inconclusive, "INCONCLUSIVE: only one marker frame; no transition to check".into());
+        }
+        (Verdict::Pass, format!("PASS: {} bit-exact consecutive marker frames (codes {first} to {last})", r.signal_frames))
+    }
 }
 
 /// open's endpoint and the cable whose statistics it reads. With `--device NAME`, that endpoint (any vendor's), and the cable
@@ -3448,6 +3507,7 @@ struct OpenRun {
     elapsed: Duration,
     events: u64,
     error: Option<String>,
+    marker_result: Option<(Verdict, String)>,
 }
 
 fn open(args: &[String]) -> Result<Verdict, String> {
@@ -3485,7 +3545,7 @@ fn open(args: &[String]) -> Result<Verdict, String> {
             println!("note: {note}");
         }
         println!("{}: S_OK; {}", opened.init_call, opened.describe());
-        if a.render { run_render(opened, a.seconds, a.signal) } else { run_capture(opened, a.spec.format, a.seconds) }
+        if a.render { run_render(opened, a.seconds, a.signal) } else { run_capture(opened, a.spec.format, a.seconds, a.check_signal) }
     });
     let after = stats();
     if let Err(r) = &run {
@@ -3501,6 +3561,12 @@ fn open(args: &[String]) -> Result<Verdict, String> {
         }
     };
     let secs = run.elapsed.as_secs_f64();
+    if let Some((verdict, message)) = run.marker_result
+        && (verdict == Verdict::Fail || run.error.is_none())
+    {
+        println!("OUTCOME: {message}");
+        return Ok(verdict);
+    }
     match run.error {
         None => {
             println!("OUTCOME: OPENED: the {kind} stream ran for {secs:.1} s");
@@ -3645,12 +3711,12 @@ impl PcmCounts {
 
 /// open's capture: reads for `seconds` (or until Ctrl+C), counting what the packets carry, with a status line a second. A call
 /// that fails before the stream runs (SetEventHandle, GetService, Start) is a refusal.
-fn run_capture(opened: Opened, format: Format, seconds: u64) -> Result<OpenRun, Refusal> {
+fn run_capture(opened: Opened, format: Format, seconds: u64, check_signal: Option<MarkerCheck>) -> Result<OpenRun, Refusal> {
     let mut capture = Capture::new(opened, None)?;
-    capture.start_stream()?;
-    let _pro_audio = ProAudio::join();
     let mut checker = SequenceChecker::new();
     let mut pcm = PcmCounts::default();
+    let _pro_audio = ProAudio::join();
+    capture.start_stream()?;
     let (t0, mut last) = (Instant::now(), Instant::now());
     let (mut error, mut events) = (None, 0);
     while t0.elapsed() < Duration::from_secs(seconds) && !STOP.load(Relaxed) {
@@ -3739,7 +3805,7 @@ fn run_capture(opened: Opened, format: Format, seconds: u64) -> Result<OpenRun, 
             pcm.sound_frames, pcm.silent_frames, pcm.nonzero_padding
         ),
     }
-    Ok(OpenRun { elapsed, events, error })
+    Ok(OpenRun { elapsed, events, error, marker_result: check_signal.map(|expected| expected.assess(checker.report())) })
 }
 
 /// open's render: writes silence, or the test signal from frame `signal`, for `seconds` (or until Ctrl+C), the first buffer
@@ -3748,8 +3814,8 @@ fn run_render(opened: Opened, seconds: u64, signal: Option<u64>) -> Result<OpenR
     let mut render = Render::new(opened, signal)?;
     // An event-driven stream wants its first buffer before it starts.
     render.fill()?;
-    render.opened.client.start_stream().map_err(|e| Refusal::at("Start", e))?;
     let _pro_audio = ProAudio::join();
+    render.opened.client.start_stream().map_err(|e| Refusal::at("Start", e))?;
     let (t0, mut last) = (Instant::now(), Instant::now());
     let (mut error, mut events) = (None, 0);
     while t0.elapsed() < Duration::from_secs(seconds) && !STOP.load(Relaxed) {
@@ -3774,7 +3840,7 @@ fn run_render(opened: Opened, seconds: u64, signal: Option<u64>) -> Result<OpenR
         signal.filter(|_| render.frames > 0).map(|first| format!(" (frames {first} to {})", first + render.frames - 1)).unwrap_or_default(),
         render.longest_wait.as_secs_f64() * 1000.0
     );
-    Ok(OpenRun { elapsed, events, error })
+    Ok(OpenRun { elapsed, events, error, marker_result: None })
 }
 
 // ---- latency ----
@@ -6164,7 +6230,16 @@ mod tests {
         let a = open(&["--device", "Mic (X)", "--exclusive", "--format", "pcm24"]).unwrap();
         let spec = StreamSpec { exclusive: true, format: Format::Pcm24, period_frames: None, mode: Mode::Default };
         let mic = EndpointKind::Microphone;
-        let want = OpenArgs { name: Some("Mic (X)".into()), path: None, kind: mic, render: false, spec, seconds: 10, signal: None };
+        let want = OpenArgs {
+            name: Some("Mic (X)".into()),
+            path: None,
+            kind: mic,
+            render: false,
+            spec,
+            seconds: 10,
+            signal: None,
+            check_signal: None,
+        };
         assert_eq!(a, want);
         let a = open(&[
             "--render", "--shared", "--device", "Speakers", "--format", "float", "--period-frames", "128", "--mode", "raw", "--seconds",
@@ -6173,7 +6248,16 @@ mod tests {
         .unwrap();
         let spec = StreamSpec { exclusive: false, format: Format::Float, period_frames: Some(128), mode: Mode::Raw };
         let speakers = EndpointKind::Speakers;
-        let want = OpenArgs { name: Some("Speakers".into()), path: None, kind: speakers, render: true, spec, seconds: 3, signal: None };
+        let want = OpenArgs {
+            name: Some("Speakers".into()),
+            path: None,
+            kind: speakers,
+            render: true,
+            spec,
+            seconds: 3,
+            signal: None,
+            check_signal: None,
+        };
         assert_eq!(a, want);
         // Without --device, the cable's own endpoint: its Speakers with --render, else its Microphone or (--mic call) its Call
         // Microphone; --path the cable, else the default one.
@@ -6184,10 +6268,16 @@ mod tests {
         assert_eq!((a.name, a.path, a.kind), (None, None, EndpointKind::CallMicrophone));
         let a = open(&["--render", "--shared", "--format", "float", "--signal"]).unwrap();
         assert_eq!((a.kind, a.render, a.signal), (EndpointKind::Speakers, true, Some(0)));
+        let a = open(&["--shared", "--format", "float", "--check-signal", "--expect-first", "5", "--expect-last", "8"]).unwrap();
+        assert_eq!(a.check_signal, Some(MarkerCheck { first: Some(5), last: Some(8) }));
         for (list, why) in [
             (&["--render", "--mic", "call", "--shared", "--format", "float"][..], "--mic is a microphone's"),
             (&["--mic", "call", "--device", "M", "--shared", "--format", "float"], "--mic and --device both"),
-            (&["--mic", "speakers", "--shared", "--format", "float"], "low-latency (the Microphone) or call"),
+            (&["--mic", "speakers", "--shared", "--format", "float"], "--mic \"speakers\": low-latency"),
+            (&["--shared", "--format", "float", "--expect-first", "0"], "require --check-signal"),
+            (&["--render", "--shared", "--format", "float", "--check-signal"], "needs float capture"),
+            (&["--shared", "--format", "pcm24", "--check-signal"], "needs float capture"),
+            (&["--shared", "--format", "float", "--check-signal", "--expect-first", "2", "--expect-last", "1"], "at or after"),
         ] {
             let e = open(list).unwrap_err();
             assert!(e.contains(why), "{list:?}: {e}");
@@ -6216,6 +6306,49 @@ mod tests {
             let e = open(list).unwrap_err();
             assert!(e.contains(why), "{list:?}: {e}");
         }
+    }
+
+    #[test]
+    fn open_marker_verdict_requires_contiguous_audio_even_when_all_codes_are_received() {
+        let expected = MarkerCheck { first: Some(0), last: Some(255) };
+        let check = |middle: &[[f32; 2]]| {
+            let mut checker = SequenceChecker::new();
+            for frame in [[0.0; 2]]
+                .into_iter()
+                .chain((0..128).map(signal::frame))
+                .chain(middle.iter().copied())
+                .chain((128..256).map(signal::frame))
+                .chain([[0.0; 2]])
+            {
+                checker.feed(frame);
+            }
+            expected.assess(checker.report()).0
+        };
+        assert_eq!(check(&[]), Verdict::Pass);
+        assert_eq!(check(&[[0.0; 2]; 128]), Verdict::Fail); // All codes are consecutive: 127, 128 zero frames, 128.
+        assert_eq!(check(&[signal::frame(127)]), Verdict::Fail);
+        assert_eq!(check(&[[0.0, 0.25]]), Verdict::Fail);
+        let mut gap = SequenceChecker::new();
+        [126, 127, 129, 130].into_iter().map(signal::frame).for_each(|f| gap.feed(f));
+        assert_eq!(MarkerCheck::default().assess(gap.report()).0, Verdict::Fail);
+    }
+
+    #[test]
+    fn open_marker_verdict_checks_clip_edges_and_length_across_a_code_wrap() {
+        let mut c = SequenceChecker::new();
+        c.feed([0.0; 2]);
+        assert_eq!(MarkerCheck::default().assess(c.report()).0, Verdict::Inconclusive);
+        let first = signal::CODE_MODULUS - 1;
+        let expected = |begin, end| MarkerCheck { first: Some(begin), last: Some(end) };
+        c.feed(signal::frame(first));
+        assert_eq!(MarkerCheck::default().assess(c.report()).0, Verdict::Inconclusive);
+        assert_eq!(expected(first, first).assess(c.report()).0, Verdict::Pass);
+        c.feed(signal::frame(first + 1));
+        c.feed([0.0; 2]);
+        assert_eq!(expected(first, first + 1).assess(c.report()).0, Verdict::Pass);
+        assert_eq!(expected(first - 1, first + 1).assess(c.report()).0, Verdict::Fail);
+        assert_eq!(expected(first, first + 2).assess(c.report()).0, Verdict::Fail);
+        assert_eq!(expected(first, first + 1 + signal::CODE_MODULUS).assess(c.report()).0, Verdict::Fail);
     }
 
     const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
