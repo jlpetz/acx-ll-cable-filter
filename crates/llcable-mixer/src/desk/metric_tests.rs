@@ -4,6 +4,7 @@ use llcable_control::routing::StageReading;
 use windows_reactor::test::{Command, NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, ThemeStyle};
 use windows_reactor::{HorizontalAlignment, TextBlock, ThemeBrush, View};
 
+use super::FeedState;
 use super::metrics::{cable_losses, effect, route_levels};
 
 type Panel = Pump<RecordingRuntime>;
@@ -68,7 +69,11 @@ fn wide_and_narrow_route_tables_keep_the_exact_counts_and_distinguish_startup_si
     let mic = Level { frames: 4_294_967_296, dropped_frames: 23, underrun_frames: 3, startup_silent_frames: 128, ..Default::default() };
     let cable = Level { frames: 19_284, ..Default::default() };
     let other = Level { frames: 57_421, ..Default::default() };
-    let rows = [("Input", "Studio mic", &mic, false), ("Output", "LLCable-A", &cable, false), ("Output", "LLCable-B", &other, false)];
+    let rows = [
+        ("Input", "Studio mic", &mic, FeedState::Active),
+        ("Output", "LLCable-A", &cable, FeedState::Paused),
+        ("Output", "LLCable-B", &other, FeedState::Offline),
+    ];
     let mut panel = mount(route_levels(&rows, 1000.0));
     for (width, wide) in [(1000.0, true), (560.0, false)] {
         panel.update_view(route_levels(&rows, width)).unwrap();
@@ -85,6 +90,10 @@ fn wide_and_narrow_route_tables_keep_the_exact_counts_and_distinguish_startup_si
         assert_eq!(tables.iter().map(|columns| columns - 1).sum::<usize>(), rows.len());
         assert_alert(&panel, "! 23", "Studio mic", "drop");
         assert_alert(&panel, "! 3", "Studio mic", "underrun");
+        let paused = cell(&panel, "Output · LLCable-A · Paused");
+        assert_ne!(panel.runtime().node(paused).unwrap().theme_style(), critical_style());
+        assert_eq!(text_property(&panel, paused, PropertyId::AutomationName), Some("Output · LLCable-A, feed paused"));
+        assert_eq!(panel.runtime().node(cell(&panel, "! Output · LLCable-B · Offline")).unwrap().theme_style(), critical_style());
         for value in ["128", "4,294,967,296", "19,284", "57,421"] {
             let n = panel.runtime().node(cell(&panel, value)).unwrap();
             assert_eq!(n.property(PropertyId::HorizontalAlignment), Some(&PropertyValue::HorizontalAlignment(HorizontalAlignment::Right)));

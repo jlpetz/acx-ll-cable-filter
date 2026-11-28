@@ -4,8 +4,10 @@
 //! Each external playback device consumes from its own bounded lock-free queue on a separate MMCSS thread.
 
 mod clock;
+mod edits;
 mod inputs;
 mod playback;
+mod sinks;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
@@ -13,11 +15,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use clock::{Drift, Follower, Frame, interpolate};
+use clock::{Follower, Frame};
 use llcable_routing::{Bus, Router};
 pub use llcable_sdk::CableId;
-use llcable_sdk::driver::{ReaderSample, STATE_ATTACHED, STATE_FORMAT_MISMATCH, STATE_LIVE_HANDOFF, STATE_READING};
-use llcable_sdk::{LIVE_CAPACITY, LiveFeed, Writer, attach_live_to};
 use llcable_wasapi::sched::{Com, Mmcss, MmcssPriority};
 use llcable_wasapi::{Capture, Packet};
 use windows::Win32::Foundation::{HANDLE, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0};
@@ -109,6 +109,7 @@ impl Meter {
 }
 
 struct State {
+    cables: Vec<sinks::Control>,
     inputs: Vec<Meter>,
     outputs: Vec<Meter>,
     stop: AtomicBool,
@@ -119,12 +120,27 @@ struct State {
 pub struct Session {
     thread: Option<JoinHandle<()>>,
     state: Arc<State>,
+    inputs: Vec<String>,
+    playback: Vec<String>,
+    format: edits::StreamFormat,
+    edits: edits::Control,
 }
 
 impl Session {
     /// Opens on a worker thread and returns once all sources and cable attachments are ready.
     /// A regular Windows user can first call `llcable_sdk::authorize` in response to an explicit action.
     pub fn start(config: RouteConfig) -> Result<Self, String> {
+        Self::start_with_initializer(config, || {})
+    }
+
+    /// Run an optional effect library's thread-local initialisation once before starting capture.
+    pub fn start_with_initializer(config: RouteConfig, init: fn()) -> Result<Self, String> {
+        Self::start_with_paused(config, init, &[])
+    }
+
+    /// Start with the selected direct destinations paused and unattached. IDs absent from this patch are ignored.
+    /// Resume any selected cable with [`Self::set_cable_enabled`]; all initially enabled cables must attach during startup.
+    pub fn start_with_paused(config: RouteConfig, init: fn(), paused: &[CableId]) -> Result<Self, String> {
         if !(1..=MAX_SOURCES).contains(&config.inputs.len())
             || (config.cables.is_empty() && config.playback.is_empty())
             || config.cables.len() != config.output_buses.len()
@@ -135,6 +151,7 @@ impl Session {
             return Err("Each destination cable can receive one bus. Combine its sources into that bus.".into());
         }
         let state = Arc::new(State {
+            cables: config.cables.iter().map(|&id| sinks::Control::new(id, !paused.contains(&id))).collect(),
             inputs: (0..config.inputs.len()).map(|_| Meter::default()).collect(),
             outputs: (0..config.cables.len() + config.playback.len()).map(|_| Meter::default()).collect(),
             stop: false.into(),
@@ -142,11 +159,14 @@ impl Session {
             error: Mutex::default(),
         });
         let (tx, rx) = mpsc::sync_channel(1);
+        let (edits, audio) = edits::channel();
+        let inputs = config.inputs.clone();
+        let playback = config.playback.iter().map(|(id, _)| id.clone()).collect();
         let worker = Arc::clone(&state);
         let thread = thread::Builder::new()
             .name("LLCable routing".into())
             .spawn(move || {
-                let failure = run(config, &worker, &tx).err();
+                let failure = run(config, &worker, &tx, init, audio).err();
                 if let Some(error) = failure {
                     *worker.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
                     let _ = tx.try_send(Err(error));
@@ -154,12 +174,51 @@ impl Session {
                 worker.running.store(false, Relaxed);
             })
             .map_err(|e| e.to_string())?;
-        let mut session = Self { thread: Some(thread), state };
-        if let Err(error) = rx.recv().unwrap_or_else(|_| Err("The routing worker ended before startup.".into())) {
-            session.stop();
-            return Err(error);
+        match rx.recv().unwrap_or_else(|_| Err("The routing worker ended before startup.".into())) {
+            Ok(format) => Ok(Self { thread: Some(thread), state, inputs, playback, format, edits }),
+            Err(error) => {
+                state.stop.store(true, Relaxed);
+                let _ = thread.join();
+                Err(error)
+            }
         }
-        Ok(session)
+    }
+
+    /// A live edit keeps the clock source, capture endpoints, playback workers and cable attachments in place.
+    pub fn can_reconfigure(&self, config: &RouteConfig) -> bool {
+        self.state.running.load(Relaxed)
+            && self.inputs == config.inputs
+            && self.state.cables.iter().map(|c| c.id).eq(config.cables.iter().copied())
+            && self.playback.iter().eq(config.playback.iter().map(|(id, _)| id))
+    }
+
+    /// Replace processing and routing at the next packet boundary. Call on a control thread.
+    pub fn reconfigure(&self, config: RouteConfig) -> Result<(), String> {
+        self.reconfigure_retaining(config, Vec::new())
+    }
+
+    /// For each `(old, new)` pair, keep that running rack (including its meters and DSP history), using the new bus's sends.
+    /// The caller identifies unchanged racks; the host checks that their sidechain taps remain compatible.
+    pub fn reconfigure_retaining(&self, config: RouteConfig, retained: Vec<(usize, usize)>) -> Result<(), String> {
+        if !self.can_reconfigure(&config) || config.cables.len() != config.output_buses.len() {
+            return Err("A change to the open endpoints requires restarting audio.".into());
+        }
+        self.edits.apply(&self.format, config, retained)
+    }
+
+    /// Pauses or resumes one direct destination. Its attachment worker performs the detach or reopen asynchronously.
+    pub fn set_cable_enabled(&self, id: CableId, enabled: bool) -> Result<(), String> {
+        if !self.state.running.load(Relaxed) {
+            return Err("The routing session has stopped.".into());
+        }
+        let control = self.state.cables.iter().find(|c| c.id == id).ok_or_else(|| format!("Cable {id} is not a direct destination."))?;
+        control.set_enabled(enabled);
+        Ok(())
+    }
+
+    /// The user's requested state, including while an enabled destination waits for its device to return.
+    pub fn cable_enabled(&self, id: CableId) -> Option<bool> {
+        self.state.cables.iter().find(|c| c.id == id).map(sinks::Control::enabled)
     }
 
     pub fn snapshot(&self) -> RouteStatus {
@@ -212,83 +271,10 @@ impl Source {
     }
 }
 
-struct Sink {
-    feed: LiveFeed,
-    bus: usize,
-    active: bool,
-    drift: Drift,
-    previous_reader: usize,
-    line: ReaderSample,
-}
-
-impl Sink {
-    fn write(&mut self, samples: &[Frame], meter: &Meter) {
-        if meter.offline.load(Relaxed) {
-            return;
-        }
-        let ring = self.feed.ring();
-        let h = ring.header();
-        let state = h.state.load(std::sync::atomic::Ordering::Acquire);
-        if state & STATE_ATTACHED == 0 || state & STATE_FORMAT_MISMATCH != 0 || self.feed.finished() {
-            meter.offline.store(true, Relaxed);
-            meter.update(&[]);
-            return;
-        }
-        meter.update(samples);
-        let line = h.reader_sample().unwrap_or(self.line);
-        let moved = line.moved != self.line.moved;
-        let missing = line.underrun_frames.saturating_sub(self.line.underrun_frames);
-        self.line = line;
-        let measured = line.packet as usize;
-        let reader = if line.state & STATE_READING != 0 {
-            measured
-        } else if line.state & STATE_LIVE_HANDOFF != 0 {
-            self.previous_reader
-        } else {
-            0
-        };
-        self.previous_reader = reader;
-        meter.period.store(reader as u32, Relaxed);
-        if !self.active || moved {
-            meter.startup.fetch_add(missing, Relaxed);
-        } else {
-            meter.underrun.fetch_add(missing, Relaxed);
-        }
-        if reader == 0 {
-            self.active = false;
-            return;
-        }
-        if reader > ring.capacity() as usize {
-            meter.offline.store(true, Relaxed);
-            return;
-        }
-        let mut writer = Writer::new(ring);
-        let n = samples.len();
-        let period = n.max(reader);
-        if !self.active || moved {
-            let prime = (period as u64).saturating_sub(writer.fill());
-            writer.produce(prime, |_| [0.; 2]);
-            self.active = true;
-            self.drift = Drift::default();
-        }
-        let fill = writer.fill() as usize;
-        let adjustment = self.drift.correction(fill, period / 3, 2 * period, n);
-        let send = n.saturating_add_signed(-(adjustment as isize)).max(1);
-        let start = writer.write_frame();
-        let wrote = if send == n || n <= 1 || send <= 1 {
-            writer.produce(send as u64, |pos| samples[((pos - start) as usize).min(n - 1)])
-        } else {
-            writer.produce(send as u64, |pos| {
-                let offset = (pos - start) as usize * (n - 1);
-                let lo = offset / (send - 1);
-                interpolate(samples[lo], samples[(lo + 1).min(n - 1)], (offset % (send - 1)) as f32 / (send - 1) as f32)
-            })
-        };
-        meter.lost.fetch_add(send as u64 - wrote, Relaxed);
-    }
-}
-
-fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Result<(), String>>) -> Result<(), String> {
+fn run(
+    config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Result<edits::StreamFormat, String>>, init: fn(),
+    mut edits: edits::Audio,
+) -> Result<(), String> {
     let _com = Com::mta().map_err(|h| format!("Could not initialize the Windows audio thread ({h:#x})."))?;
     let (ids, origins) = inputs::resolve(&config.inputs, false)?;
     let (play_ids, play_origins) = if config.playback.is_empty() {
@@ -301,7 +287,7 @@ fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Resul
     if target_ids.iter().enumerate().any(|(i, id)| target_ids[..i].contains(id)) {
         return Err("This cable is already selected as a destination. Choose one output route per cable.".into());
     }
-    let indices: Vec<_> = config.output_buses.iter().copied().chain(config.playback.iter().map(|(_, i)| *i)).collect();
+    let mut indices: Vec<_> = config.output_buses.iter().copied().chain(config.playback.iter().map(|(_, i)| *i)).collect();
     inputs::check_loops(&origins, &target_ids, &indices, &config.buses)?;
     let mut sources = Vec::with_capacity(ids.len());
     for (id, meter) in ids.iter().zip(&state.inputs) {
@@ -312,16 +298,16 @@ fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Resul
     }
     let max_frames = sources[0].capture.capacity();
     let mut router = Router::new(48_000, max_frames, sources.len(), config.buses).map_err(|e| e.to_string())?;
+    init();
     router.prepare_thread();
     let mut sinks = Vec::with_capacity(config.cables.len());
-    for (id, bus) in config.cables.into_iter().zip(config.output_buses) {
-        let feed = attach_live_to(id, LIVE_CAPACITY).map_err(|e| format!("Could not attach to cable {id}: {e}"))?;
-        sinks.push(Sink { feed, bus, active: false, drift: Drift::default(), previous_reader: 0, line: ReaderSample::default() });
+    for index in 0..config.cables.len() {
+        sinks.push(sinks::Sink::open(index, state)?);
     }
     let n_inputs = sources.len();
     let mut external = Vec::new();
-    for (i, (id, (_, bus))) in play_ids.into_iter().zip(config.playback).enumerate() {
-        external.push(playback::External::open(id, bus, Arc::clone(state), sinks.len() + i, max_frames, sources[0].capture.info().period)?);
+    for (i, id) in play_ids.into_iter().enumerate() {
+        external.push(playback::External::open(id, Arc::clone(state), sinks.len() + i, max_frames, sources[0].capture.info().period)?);
     }
     let handles: Vec<_> = sources.iter().map(|s| s.capture.event()).collect();
     let (master, rest) = sources.split_first_mut().unwrap();
@@ -338,7 +324,7 @@ fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Resul
         s.capture.start().map_err(|e| e.to_string())?;
     }
     state.running.store(true, Relaxed);
-    let _ = started.send(Ok(()));
+    let _ = started.send(Ok(edits::StreamFormat { max_frames, origins, targets: target_ids }));
     let mut last_master = Instant::now();
     while !state.stop.load(Relaxed) {
         // SAFETY: every handle belongs to a live, started Capture on this thread; count is checked at startup.
@@ -346,6 +332,7 @@ fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Resul
         if wake == WAIT_FAILED {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        edits.apply_pending(&mut router, &mut indices);
         for (i, ((source, (queue, _)), meter)) in rest.iter_mut().zip(&mut followers).zip(&state.inputs[1..]).enumerate() {
             if source.capture.info().exclusive && !event_ready(handles[i + 1], i + 1, wake) {
                 continue;
@@ -377,11 +364,11 @@ fn run(config: RouteConfig, state: &Arc<State>, started: &mpsc::SyncSender<Resul
                 *view = &buffer[..n];
             }
             router.process_stereo(&views[..n_inputs]).map_err(|e| e.to_string())?;
-            for (sink, meter) in sinks.iter_mut().zip(&state.outputs) {
-                sink.write(router.output(sink.bus).unwrap(), meter);
+            for ((sink, &bus), meter) in sinks.iter().zip(&indices).zip(&state.outputs) {
+                sink.write(router.output(bus).unwrap(), meter);
             }
-            for (target, meter) in external.iter_mut().zip(&state.outputs[sinks.len()..]) {
-                target.write(router.output(target.bus).unwrap(), meter);
+            for ((target, &bus), meter) in external.iter_mut().zip(&indices[sinks.len()..]).zip(&state.outputs[sinks.len()..]) {
+                target.write(router.output(bus).unwrap(), meter);
             }
             if master.capture.info().exclusive {
                 break;

@@ -18,11 +18,10 @@ pub(super) struct External {
     tx: Producer<Frame>,
     quit: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    pub bus: usize,
 }
 
 impl External {
-    pub fn open(id: String, bus: usize, state: Arc<State>, index: usize, max_input: usize, input_period: usize) -> Result<Self, String> {
+    pub fn open(id: String, state: Arc<State>, index: usize, max_input: usize, input_period: usize) -> Result<Self, String> {
         let capacity = (8 * max_input).max(8192);
         let (tx, rx) = RingBuffer::new(capacity);
         let (ready, wait) = mpsc::sync_channel(1);
@@ -53,7 +52,7 @@ impl External {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let mut external = Self { tx, quit, worker: Some(worker), bus };
+        let mut external = Self { tx, quit, worker: Some(worker) };
         if let Err(error) = wait.recv().unwrap_or_else(|_| Err("The playback worker ended during startup.".into())) {
             external.close();
             return Err(error);

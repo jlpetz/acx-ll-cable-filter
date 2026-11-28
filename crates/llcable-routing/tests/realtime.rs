@@ -46,3 +46,19 @@ fn dry_split_mix_and_sidechain_neither_allocate_nor_free_on_first_or_later_packe
     let after = CALLS.get();
     assert_eq!(after, before);
 }
+
+#[test]
+fn activating_or_refusing_a_graph_at_the_packet_boundary_neither_allocates_nor_frees() {
+    let graph = GraphSpec {
+        input_count: 1,
+        buses: vec![BusSpec { sends: vec![Send::unity(Tap::Input(0))], effects: vec![EffectSpec::Gain(0.5)] }],
+    };
+    let mut active = graph.build(48_000, 2).unwrap();
+    let mut next = graph.build(48_000, 2).unwrap();
+    let before = CALLS.get();
+    assert!(active.activate_edit(&mut next, &[(0, 0), (0, 0)]).is_err());
+    active.activate_edit(&mut next, &[(0, 0)]).unwrap();
+    active.process_stereo(&[&[[1., 0.], [0., 1.]]]).unwrap();
+    assert_eq!(CALLS.get(), before);
+    assert_eq!(active.output(0).unwrap(), [[0.5, 0.], [0., 0.5]]);
+}

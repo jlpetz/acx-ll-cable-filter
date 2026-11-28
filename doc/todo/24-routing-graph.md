@@ -15,6 +15,73 @@ and 0.16. The mixer's stage diagnostics read −9.9 dBFS in and −21.9 dBFS out
 
 On the recorded speech-and-fan fixture, RNNoise cut stationary fan level by 47.9 dB and Sonora Moderate by 14.8 dB. The aligned speech projection changed by −0.5 and −3.7 dB respectively. Wall-clock p99 on the dev VM was 39.8 and 9.3 µs per 128-frame callback. The [comparison example](../../crates/llcable-effects/examples/compare_noise.rs) reproduces the procedure. Real speech, double-talk, other noise types and physical-device timing remain important release checks.
 
+### Dry-branch timing on the dev box, 2026-11-29
+
+The [branch probe](../../crates/llcable-audio/examples/branch_probe.rs) wrote a six-second clip to VB-A and recorded the
+two native low-latency outputs in separate WASAPI clients. Each of the 288,000 stereo frames encoded its source position.
+A separate monitoring bus stamped the router's input before either destination ran. Every 1,009th frame was a timing
+marker (286 per clip). The receiving client stamped the whole packet after its read, on the same monotonic host clock.
+These are application receipt times. A 128-frame recording packet at 48 kHz spans 2.667 ms.
+
+All runs used 48 kHz, a 128-frame source playback period and 256-frame target fill, a 144-frame source capture period,
+128-frame destination readers, and 8,192-frame direct rings with 144-frame starting fill. Arrival times below are in milliseconds.
+
+| Pair, order | B chain | Router input to A median | p99 | Source submission to A median |
+| --- | --- | ---: | ---: | ---: |
+| 1, first | Empty | 4.524 | 7.053 | 60.779 |
+| 1, second | RNNoise | 5.085 | 7.714 | 65.363 |
+| 2, first | RNNoise | 6.079 | 8.734 | 66.180 |
+| 2, second | Empty | 4.082 | 7.064 | 63.500 |
+| 3, first | Empty | 6.099 | 8.698 | 68.254 |
+| 3, second | RNNoise | 5.607 | 8.675 | 72.318 |
+
+A delivered all 1,728,000 stereo frames bit-exact and in order. Dry B matched every frame in each of its three runs.
+Wet B delivered nonzero finite dual-mono output. Neither destination reported steady-state underruns or ring drops.
+The paired router-input-to-A median changes with B wet were +0.561, +1.997 and −0.492 ms. The largest individual A
+receipt was 9.215 ms. The measurements show no additional 10 ms hop on A. Each session started its readers independently,
+so these paired differences also include packet phase. The source-submission column includes the VB-A playback and capture path.
+
+In a second test, one running session kept both readers, the source and the direct rings open. It alternated B between an
+empty chain and RNNoise five times. Each two-second window began 300 ms after the change and contained 95 timing markers.
+
+| Pair | Router input to A median, dry / wet (ms) | p99, dry / wet (ms) | Source submission to A median, dry / wet (ms) |
+| --- | ---: | ---: | ---: |
+| 1 | 5.068 / 5.588 | 8.105 / 8.587 | 63.975 / 64.004 |
+| 2 | 6.092 / 5.592 | 7.646 / 8.147 | 63.974 / 63.934 |
+| 3 | 5.069 / 5.091 | 7.577 / 7.684 | 64.035 / 63.897 |
+
+With the same readers, the paired wet-minus-dry median changes from router input to A were +0.520, −0.500 and +0.022 ms.
+A reproduced all 687,744 source frames in sequence, including all five transitions. Its 682 marker arrivals peaked at
+8.587 ms from router input. B reproduced the exact stereo code in the three dry windows and delivered active, finite dual
+mono in each wet window. These packet-level figures are specific to the virtual endpoints and scheduling on the dev box.
+
+### Continuity through a destination edit and device cycle, 2026-11-29
+
+The same probe kept the source, dry A route and A recorder running while releasing B, changing its send gain from 0.25 to
+0.5, and resuming it. It then disabled B's Windows devnode, observed B go offline, re-enabled it and waited for automatic
+reattachment. A received all 219,136 source frames bit-exact and consecutive, including the device cycle. Its driver attach
+count stayed at 12. B's recording contained 38,256 exact frames at gain 0.25 before the edit, 38,528 silent frames while
+released, and 38,256 exact frames at gain 0.5 in each of the post-resume and post-reattachment samples.
+
+### Running the probes
+
+To reproduce, take the virtual source's recording and matching playback IDs from `noise-filter-cli devices`.
+With `$capture` and `$playback` holding those IDs, run the following commands on idle virtual endpoints.
+The last command temporarily disables and re-enables the virtual Windows device labelled B. Its duration argument
+and the `switch` duration argument limit the source run time. Both commands stop the source when their checks finish.
+
+```powershell
+cargo build --release -p llcable-audio --example branch_probe
+foreach ($mode in 'dry','rnnoise','rnnoise','dry','dry','rnnoise') {
+    & .\target\release\examples\branch_probe.exe $mode $capture $playback A B 6
+    if ($LASTEXITCODE) { throw "Probe failed in $mode" }
+}
+& .\target\release\examples\branch_probe.exe switch $capture $playback A B 25
+if ($LASTEXITCODE) { throw "Live switching probe failed" }
+cargo build --release -p nf-vmic --bin acx-ll-cable
+& .\target\release\examples\branch_probe.exe continuity $capture $playback A B 60 .\target\release\acx-ll-cable.exe
+```
+
 ## The owner's intent (2026-11-26)
 "Our app is a low latency driver for an audio cable with pluggable filters that can be added into the input/output
 pipeline of the cable. But if I want multiple pipelines off the same feed ..." and, on Voicemeeter (VB-Audio's mixer
@@ -57,11 +124,9 @@ route should also start with an empty chain. Forward each available packet on a 
 Schedule effect calls and their buffering only on branches that pass through those effects. A user can explicitly enable
 time alignment where branches meet. Device periods, ring headroom and any required clock adaptation still apply.
 
-Acceptance check for E1 and the [short-packet path](../dev/short-packet-path.md): split one stereo source to A and B.
-With empty chains, verify both outputs against the source and record A's marker arrival times. Enable RNNoise on B and
-repeat with the same device periods and headroom. A should keep its stereo samples and gain no 10 ms processing wait.
-An empty route should start no plugin worker. Today's app still assembles 480-frame blocks. A loaded CLAP effect's live
-bypass keeps its worker and delay. The packet-forwarding behaviour above is a target for the routing engine.
+The mixer's dry-branch acceptance check is recorded above. Empty chains forward each input packet and create no plugin
+worker. RNNoise assembles 480-frame hops on its branch. The single-chain app's separate [short-packet path](../dev/short-packet-path.md)
+has its own eligibility rules. A loaded CLAP effect's live bypass keeps its worker and delay.
 
 ## Clocks (the part that decides latency)
 - Our cables use the same QPC time base at the same nominal rate. Each reader starts independently and has its own

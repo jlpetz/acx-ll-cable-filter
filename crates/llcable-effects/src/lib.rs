@@ -5,6 +5,7 @@
 //! Construct and destroy effects off the audio callback. Call `router.prepare_thread()` on the thread where audio will run
 //! before starting the stream, since RNNoise's FFT scratch belongs to that thread.
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -30,6 +31,9 @@ pub use clap::{EffectInfo, Parameter, clap_voice, inspect_clap};
 
 trait VoiceModel: Send {
     fn prepare_thread(&mut self) {}
+    fn ready_on_thread(&self) -> bool {
+        true
+    }
     fn reference(&mut self, _key: Input<'_>, _packet_offset: usize, _span: Range<usize>) {}
     fn reading(&self) -> StageReading {
         StageReading::default()
@@ -98,6 +102,10 @@ impl PacketEffect for Voice {
         }
     }
 
+    fn ready_on_thread(&self) -> bool {
+        self.stages.iter().all(|stage| stage.model.ready_on_thread())
+    }
+
     fn append_compatible(&mut self, next: &mut dyn PacketEffect) -> bool {
         if let Some(next) = (next as &mut dyn std::any::Any).downcast_mut::<Self>() {
             self.stages.append(&mut next.stages);
@@ -137,10 +145,25 @@ struct Rnnoise {
     speech_probability: f32,
 }
 
+thread_local! {
+    static FFT_READY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Prepare the capture thread before starting a live-editable voice session. The FFT cache is per thread.
+pub fn prepare_voice_thread() {
+    if !FFT_READY.get() {
+        nf_stages::warm_up_fft_thread();
+        FFT_READY.set(true);
+    }
+}
+
 impl VoiceModel for Rnnoise {
     fn prepare_thread(&mut self) {
-        // This adapter never resets an active model, so no spare-state maker needs to run.
-        nf_stages::warm_up_fft_thread();
+        prepare_voice_thread();
+    }
+
+    fn ready_on_thread(&self) -> bool {
+        FFT_READY.get()
     }
 
     fn process(&mut self, input: &Block, out: &mut Block) {
@@ -239,6 +262,10 @@ struct StereoGate {
 }
 
 impl PacketEffect for StereoGate {
+    fn ready_on_thread(&self) -> bool {
+        true
+    }
+
     fn set_meter(&mut self, meter: &StageMeter) -> bool {
         self.meter = Some(meter.clone());
         true

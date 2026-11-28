@@ -90,6 +90,22 @@ fn input_level<'a>(app: &'a Mixer, id: &str) -> Option<&'a Level> {
 fn output_level<'a>(app: &'a Mixer, id: &str) -> Option<&'a Level> {
     app.channels.outputs.iter().position(|s| s == id).and_then(|i| app.status.as_ref()?.outputs.get(i))
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeedState {
+    Active,
+    Paused,
+    Offline,
+}
+
+fn feed_state(app: &Mixer, id: &str) -> FeedState {
+    if id.parse().ok().and_then(|c| app.cable_enabled(c)) == Some(false) {
+        return FeedState::Paused;
+    }
+    let offline = app.channels.outputs.iter().position(|s| s == id).and_then(|i| app.status.as_ref()?.outputs_offline.get(i));
+    if offline == Some(&true) { FeedState::Offline } else { FeedState::Active }
+}
+
 fn meter(app: &Mixer, label: &str, level: Option<&Level>, channels: u16) -> View {
     let Some(level) = level else { return View::empty() };
     let mode = match app.settings.meter_mode {
@@ -184,7 +200,14 @@ fn diagnostics(app: &Mixer, cx: &ViewContext<Mixer>) -> View {
         match diag {
             Some(Ok(d)) => {
                 let name = format!("LLCable-{}", c.label);
-                items.push(title(if d.attached { "Direct feed attached" } else { "Cable pass-through" }, 14.0));
+                let feed = if app.cable_enabled(c.id) == Some(false) {
+                    "Direct feed paused"
+                } else if d.attached {
+                    "Direct feed attached"
+                } else {
+                    "Cable pass-through"
+                };
+                items.push(title(feed, 14.0));
                 items.push(metrics::cable_properties(&name, d));
                 if let Some(losses) = app.monitor.losses(c.id) {
                     items.push(metrics::cable_losses(&name, d, losses));
@@ -223,11 +246,11 @@ fn route_diagnostics(app: &Mixer, inv: &Inventory, status: &llcable_audio::Route
     let mut running = vec![title("Live route diagnostics", 17.0), caption("Counts since this route started")];
     let inputs = app.channels.inputs.iter().zip(&status.inputs).map(|(id, level)| {
         let name = inv.sources.iter().find(|s| &s.id == id).map_or(id.as_str(), |s| s.label.as_str());
-        ("Input", name, level, false)
+        ("Input", name, level, FeedState::Active)
     });
-    let outputs = app.channels.outputs.iter().zip(&status.outputs).enumerate().map(|(i, (id, level))| {
+    let outputs = app.channels.outputs.iter().zip(&status.outputs).map(|(id, level)| {
         let name = inv.outputs.iter().find(|o| &o.id == id).map_or(id.as_str(), |o| o.name.as_str());
-        ("Output", name, level, status.outputs_offline.get(i).copied().unwrap_or(false))
+        ("Output", name, level, feed_state(app, id))
     });
     running.push(metrics::route_levels(&inputs.chain(outputs).collect::<Vec<_>>(), app.width));
     if !app.channels.meters.is_empty() {
@@ -472,20 +495,12 @@ fn mixer(app: &Mixer, inv: &Inventory, cx: &ViewContext<Mixer>) -> View {
         let active = app.settings.focused.as_ref() == Some(&id);
         let mix = app.settings.mixes.get(&id);
         let count = mix.map_or(0, |m| m.sends.len());
-        let offline = app
-            .channels
-            .outputs
-            .iter()
-            .position(|s| s == &id)
-            .and_then(|i| app.status.as_ref()?.outputs_offline.get(i))
-            .copied()
-            .unwrap_or(false);
-        let status = if offline {
-            issue("Device offline")
-        } else if mix.is_some_and(|m| m.muted) {
-            caption("Muted")
-        } else {
-            caption(format!("{count} connected {}", if count == 1 { "source" } else { "sources" }))
+        let feed = feed_state(app, &id);
+        let status = match feed {
+            FeedState::Paused => caption("Feed paused"),
+            FeedState::Offline => issue("Device offline"),
+            FeedState::Active if mix.is_some_and(|m| m.muted) => caption("Muted"),
+            FeedState::Active => caption(format!("{count} connected {}", if count == 1 { "source" } else { "sources" })),
         };
         let context = cx.sender();
         let context_id = id.clone();
@@ -502,10 +517,10 @@ fn mixer(app: &Mixer, inv: &Inventory, cx: &ViewContext<Mixer>) -> View {
             Button::new()
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .horizontal_content_alignment(HorizontalAlignment::Stretch)
-                .automation_name(if offline {
-                    format!("Select {name} destination mix, device offline")
-                } else {
-                    format!("Select {name} destination mix")
+                .automation_name(match feed {
+                    FeedState::Paused => format!("Select {name} destination mix, feed paused"),
+                    FeedState::Offline => format!("Select {name} destination mix, device offline"),
+                    FeedState::Active => format!("Select {name} destination mix"),
                 })
                 .style(if active { ButtonStyle::Accent } else { ButtonStyle::Default })
                 .on_click(cx.callback(move |()| Msg::Select(choose.clone())))
@@ -517,12 +532,28 @@ fn mixer(app: &Mixer, inv: &Inventory, cx: &ViewContext<Mixer>) -> View {
             let scope = Scope::Output(id.clone());
             let edit = scope.clone();
             let mute = id.clone();
-            right_pane.push(row(vec![
+            let mut actions = vec![
                 button(cx, "Output effects", app.scope.as_ref() == Some(&scope), true, move || Msg::Scope(edit.clone())),
                 button(cx, if mix.is_some_and(|m| m.muted) { "Unmute output" } else { "Mute output" }, false, !app.busy, move || {
                     Msg::Edit(Edit::Mute(mute.clone()))
                 }),
-            ]));
+            ];
+            if let Some(cable) = c.cable
+                && let Some(enabled) = app.cable_enabled(cable)
+            {
+                let available = !app.busy && app.status.as_ref().is_some_and(|s| s.running);
+                actions.push(
+                    button(cx, if enabled { "Pause feed" } else { "Resume feed" }, false, available, move || {
+                        Msg::CableEnabled(cable, !enabled)
+                    })
+                    .tooltip(if enabled {
+                        "Release this cable for Windows playback."
+                    } else {
+                        "Feed this mix to the cable again."
+                    }),
+                );
+            }
+            right_pane.push(row(actions));
             if app.scope.as_ref() == Some(&scope) {
                 right_pane.push(card(stage_stack(app, inv, cx, &scope, mix.map(|m| m.effects.as_slice()).unwrap_or_default())));
             }
@@ -648,7 +679,7 @@ pub fn view(app: &Mixer, cx: &ViewContext<Mixer>) -> View {
         } else if let Some(reason) = route_failure {
             issue(format!("Route stopped · {reason}"))
         } else if running && dirty {
-            caption("Audio running · Apply changes briefly restarts the routes")
+            caption("Audio running · Unapplied changes")
         } else if running {
             caption("Audio running")
         } else {

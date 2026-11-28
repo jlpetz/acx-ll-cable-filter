@@ -85,6 +85,10 @@ struct Equalizer {
 }
 
 impl PacketEffect for Equalizer {
+    fn ready_on_thread(&self) -> bool {
+        true
+    }
+
     fn required_sample_rate(&self) -> Option<u32> {
         Some(SAMPLE_RATE)
     }

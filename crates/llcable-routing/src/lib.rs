@@ -77,6 +77,12 @@ pub trait PacketEffect: std::marker::Send + std::any::Any {
     /// Prepare any thread-local scratch after moving this processor to its final thread, before entering real time.
     fn prepare_thread(&mut self) {}
 
+    /// True when this instance can start on the calling audio thread without further setup. Checked on live edits only.
+    /// Implementations must not allocate, block or initialise thread-local scratch in this query.
+    fn ready_on_thread(&self) -> bool {
+        false
+    }
+
     /// A block-based effect can retain the meter at its native hop boundary. Otherwise the router measures packet peaks.
     fn set_meter(&mut self, _meter: &StageMeter) -> bool {
         false
@@ -173,6 +179,9 @@ pub enum RoutingError {
     InputCount,
     UnequalFrames,
     TooManyFrames,
+    IncompatibleStream,
+    InvalidRetainedRack { old: usize, new: usize },
+    EffectNeedsThreadSetup { bus: usize },
 }
 
 impl fmt::Display for RoutingError {
@@ -187,6 +196,13 @@ impl fmt::Display for RoutingError {
             Self::InputCount => f.write_str("routing input count does not match the configured sources"),
             Self::UnequalFrames => f.write_str("routing inputs must have the same number of frames"),
             Self::TooManyFrames => f.write_str("routing packet exceeds the configured frame capacity"),
+            Self::IncompatibleStream => f.write_str("a live edit requires the same sample rate, input count and packet capacity"),
+            Self::InvalidRetainedRack { old, new } => {
+                write!(f, "cannot retain rack {old} on bus {new}: check bus indexes, uniqueness and sidechain keys")
+            }
+            Self::EffectNeedsThreadSetup { bus } => {
+                write!(f, "an effect on bus {bus} needs capture-thread setup. Stop and start audio to activate it")
+            }
         }
     }
 }
@@ -206,6 +222,14 @@ enum Processor {
 }
 
 impl Processor {
+    fn ready_on_thread(&self) -> bool {
+        match self {
+            Self::Custom(_, e) => e.ready_on_thread(),
+            Self::Observed(inner, _) => inner.ready_on_thread(),
+            _ => true,
+        }
+    }
+
     fn prepare_thread(&mut self) {
         match self {
             Self::Custom(_, e) => e.prepare_thread(),
@@ -242,10 +266,15 @@ struct ActiveBus {
     sends: Vec<SendMix>,
     effects: Vec<Processor>,
     packet: Vec<[f32; 2]>,
+    // A muted/no-op placeholder can declare the sidechain of a retained effect without compiling a processor.
+    keys: Vec<Tap>,
+    // Scratch for validating one-to-one live rack moves at the packet boundary.
+    retained: bool,
 }
 
 pub struct Router {
     buses: Vec<ActiveBus>,
+    sample_rate: u32,
     input_count: usize,
     max_frames: usize,
     frames: usize,
@@ -279,6 +308,7 @@ impl Router {
                     });
                 }
             }
+            let keys = spec.effects.iter().filter_map(Effect::key).collect();
             let mut effects = Vec::with_capacity(spec.effects.len());
             for effect in spec.effects {
                 let (mut effect, mut meter) = (effect, None);
@@ -331,9 +361,9 @@ impl Router {
             let mut packet = Vec::new();
             packet.try_reserve_exact(max_frames).map_err(|_| RoutingError::InvalidCapacity)?;
             packet.resize(max_frames, [0.0; 2]);
-            active.push(ActiveBus { sends, effects, packet });
+            active.push(ActiveBus { sends, effects, packet, keys, retained: false });
         }
-        Ok(Self { buses: active, input_count, max_frames, frames: 0 })
+        Ok(Self { buses: active, sample_rate, input_count, max_frames, frames: 0 })
     }
 
     /// Call on the host's processing thread before entering real time. Built-in routing effects need no preparation.
@@ -343,6 +373,40 @@ impl Router {
                 stage.prepare_thread();
             }
         }
+    }
+
+    /// Activate a replacement built for this stream at a packet boundary. Each `(old, new)` keeps the running rack and
+    /// uses the replacement bus's sends. The caller selects unchanged racks. A malformed mapping, changed sidechain
+    /// or new processor requiring thread setup refuses the whole edit. Destroy the displaced router on a control thread.
+    pub fn activate_edit(&mut self, replacement: &mut Router, retained: &[(usize, usize)]) -> Result<(), RoutingError> {
+        if self.sample_rate != replacement.sample_rate
+            || self.max_frames != replacement.max_frames
+            || self.input_count != replacement.input_count
+        {
+            return Err(RoutingError::IncompatibleStream);
+        }
+        for bus in self.buses.iter_mut().chain(&mut replacement.buses) {
+            bus.retained = false;
+        }
+        for &(old, new) in retained {
+            let error = RoutingError::InvalidRetainedRack { old, new };
+            let (Some(from), Some(to)) = (self.buses.get_mut(old), replacement.buses.get_mut(new)) else { return Err(error) };
+            if from.retained || to.retained || from.keys != to.keys {
+                return Err(error);
+            }
+            from.retained = true;
+            to.retained = true;
+        }
+        for (bus, b) in replacement.buses.iter().enumerate() {
+            if !b.retained && !b.effects.iter().all(Processor::ready_on_thread) {
+                return Err(RoutingError::EffectNeedsThreadSetup { bus });
+            }
+        }
+        for &(old, new) in retained {
+            std::mem::swap(&mut self.buses[old].effects, &mut replacement.buses[new].effects);
+        }
+        std::mem::swap(self, replacement);
+        Ok(())
     }
 
     /// Resolve a packet of borrowed inputs; previous outputs and processor states survive validation errors.

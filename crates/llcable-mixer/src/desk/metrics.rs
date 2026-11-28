@@ -3,7 +3,7 @@ use llcable_control::Diagnostics;
 use llcable_control::routing::StageReading;
 use windows_reactor::*;
 
-use super::{caption, col, title};
+use super::{FeedState, caption, col, title};
 
 fn count(n: u64) -> String {
     let mut text = n.to_string();
@@ -87,7 +87,7 @@ pub(super) fn cable_losses(cable: &str, d: &Diagnostics, losses: (u64, Option<u6
     table([GridLength::Star(1.2), GridLength::STAR, GridLength::STAR], rows)
 }
 
-pub(super) fn route_levels(channels: &[(&str, &str, &Level, bool)], width: f64) -> View {
+pub(super) fn route_levels(channels: &[(&str, &str, &Level, FeedState)], width: f64) -> View {
     if channels.is_empty() {
         return View::empty();
     }
@@ -96,11 +96,13 @@ pub(super) fn route_levels(channels: &[(&str, &str, &Level, bool)], width: f64) 
     let groups = channels.chunks(per_group).map(|group| {
         let names: Vec<_> = group.iter().map(|(role, name, _, _)| format!("{role} · {name}")).collect();
         let mut header = vec![heading("Frames")];
-        for ((_, _, _, offline), name) in group.iter().zip(&names) {
-            let cell = if *offline {
-                heading(format!("! {name} · Offline")).foreground(ThemeBrush::SystemCritical).automation_name(format!("{name}, offline"))
-            } else {
-                heading(name)
+        for ((_, _, _, state), name) in group.iter().zip(&names) {
+            let cell = match state {
+                FeedState::Active => heading(name),
+                FeedState::Paused => heading(format!("{name} · Paused")).automation_name(format!("{name}, feed paused")),
+                FeedState::Offline => heading(format!("! {name} · Offline"))
+                    .foreground(ThemeBrush::SystemCritical)
+                    .automation_name(format!("{name}, offline")),
             };
             header.push(cell.horizontal_alignment(HorizontalAlignment::Right));
         }

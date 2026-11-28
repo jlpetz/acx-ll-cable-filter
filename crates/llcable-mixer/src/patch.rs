@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -246,16 +247,39 @@ impl Inventory {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RackId {
+    Source(String, usize),       // Shared prefix ending at this boundary.
+    Send(String, String, usize), // Destination, source and occurrence among sends from that source.
+    Output(String),
+}
+
+#[derive(Clone, PartialEq)]
+struct RackEffects {
+    stages: Vec<(Stage, Option<Tap>)>,
+    muted: bool,
+}
+
+#[derive(Clone)]
+struct ActiveRack {
+    bus: usize,
+    effects: RackEffects,
+    meters: Range<usize>,
+}
+
+#[derive(Clone, Default)]
 pub struct Channels {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub meters: Vec<(String, StageMeter)>,
+    racks: BTreeMap<RackId, ActiveRack>,
 }
 
 pub struct Plan {
     pub config: RouteConfig,
     pub channels: Channels,
+    /// Move the compiled effects from the old bus to the new bus. The new bus always supplies its own sends.
+    pub retained: Vec<(usize, usize)>,
 }
 
 fn input_tap(inputs: &mut Vec<String>, published: &BTreeMap<CableId, usize>, id: &str, inventory: &Inventory) -> Result<Tap, String> {
@@ -331,50 +355,100 @@ fn ordered_outputs<'a>(settings: &Settings, inv: &'a Inventory) -> Result<Vec<&'
     Ok(sorted.into_iter().filter_map(|id| inv.outputs.iter().find(|o| o.id == id)).collect())
 }
 
-fn build_effects(
-    stages: &[Stage], offset: usize, input: &mut impl FnMut(&str) -> Result<Tap, String>, label: &str,
-    meters: &mut Vec<(String, StageMeter)>,
-) -> Result<Vec<Effect>, String> {
-    stages
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.enabled)
-        .map(|(index, stage)| {
-            let effect = match stage.kind {
-                Kind::Gain if (-60..=12).contains(&stage.db) => Effect::Gain(10_f32.powf(f32::from(stage.db) / 20.0)),
-                Kind::Equalizer => {
-                    let [low_db, mid_db, high_db] = stage.eq_db.map(f32::from);
-                    llcable_effects::equalizer(llcable_effects::EqSettings { low_db, mid_db, high_db })?
-                }
-                Kind::Rnnoise => llcable_effects::noise_reduction(),
-                Kind::Sonora => llcable_effects::sonora_noise_reduction()?,
-                Kind::Aec => llcable_effects::echo_cancellation(input(
-                    stage.key.as_deref().ok_or("Choose the captured playback reference for echo cancellation.")?,
-                )?)?,
-                Kind::Clap => {
-                    let p = stage.clap.as_ref().ok_or("Choose a CLAP file in the effect rack.")?;
-                    let params: Vec<_> = p.params.iter().map(|(&id, &v)| (id, v)).collect();
-                    llcable_effects::clap_voice(&p.path, Some(&p.info.id), &params)?
-                }
-                Kind::Gate => llcable_effects::gate(f32::from(stage.db))?,
-                Kind::Duck if (0..=60).contains(&stage.db) => Effect::Duck {
-                    key: input(stage.key.as_deref().ok_or("Choose a source for the ducking sidechain.")?)?,
-                    settings: Ducking { attenuation_db: f32::from(stage.db), ..Ducking::default() },
-                },
-                _ => return Err("The saved stage value is outside its range.".into()),
+fn build_effect(stage: &Stage, key: Option<Tap>) -> Result<Effect, String> {
+    match stage.kind {
+        Kind::Gain if (-60..=12).contains(&stage.db) => Ok(Effect::Gain(10_f32.powf(f32::from(stage.db) / 20.0))),
+        Kind::Equalizer => {
+            let [low_db, mid_db, high_db] = stage.eq_db.map(f32::from);
+            llcable_effects::equalizer(llcable_effects::EqSettings { low_db, mid_db, high_db })
+        }
+        Kind::Rnnoise => Ok(llcable_effects::noise_reduction()),
+        Kind::Sonora => llcable_effects::sonora_noise_reduction(),
+        Kind::Aec => llcable_effects::echo_cancellation(key.ok_or("Choose the captured playback reference for echo cancellation.")?),
+        Kind::Clap => {
+            let p = stage.clap.as_ref().ok_or("Choose a CLAP file in the effect rack.")?;
+            let params: Vec<_> = p.params.iter().map(|(&id, &v)| (id, v)).collect();
+            llcable_effects::clap_voice(&p.path, Some(&p.info.id), &params)
+        }
+        Kind::Gate => llcable_effects::gate(f32::from(stage.db)),
+        Kind::Duck if (0..=60).contains(&stage.db) => Ok(Effect::Duck {
+            key: key.ok_or("Choose a source for the ducking sidechain.")?,
+            settings: Ducking { attenuation_db: f32::from(stage.db), ..Ducking::default() },
+        }),
+        _ => Err("The saved stage value is outside its range.".into()),
+    }
+}
+
+struct PlannedBus {
+    id: RackId,
+    sends: Vec<AudioSend>,
+    effects: RackEffects,
+    labels: Vec<String>,
+}
+
+impl PlannedBus {
+    fn new(
+        id: RackId, sends: Vec<AudioSend>, stages: &[Stage], label: &str, offset: usize, muted: bool,
+        input: &mut impl FnMut(&str) -> Result<Tap, String>,
+    ) -> Result<Self, String> {
+        let mut labels = Vec::new();
+        let mut active = Vec::new();
+        for (index, stage) in stages.iter().enumerate().filter(|(_, stage)| stage.enabled) {
+            let key = if matches!(stage.kind, Kind::Duck | Kind::Aec) {
+                Some(input(stage.key.as_deref().ok_or("Choose a reference source for the effect.")?)?)
+            } else {
+                None
             };
-            let (effect, meter) = effect.observe();
-            meters.push((format!("{label} · {}. {}", offset + index + 1, stage.title()), meter));
-            Ok(effect)
-        })
-        .collect()
+            active.push((stage.clone(), key));
+            labels.push(format!("{label} · {}. {}", offset + index + 1, stage.title()));
+        }
+        Ok(Self { id, sends, effects: RackEffects { stages: active, muted }, labels })
+    }
+
+    fn compile(
+        self, bus: usize, previous: Option<&Channels>, channels: &mut Channels, retained: &mut Vec<(usize, usize)>,
+    ) -> Result<Bus, String> {
+        let start = channels.meters.len();
+        let mut effects = Vec::new();
+        if let Some(old) = previous
+            && let Some(rack) = old.racks.get(&self.id)
+            && rack.effects == self.effects
+        {
+            retained.push((rack.bus, bus));
+            // The live router owns these processors and their meters. Preserve their key edges for the endpoint feedback check.
+            for key in self.effects.stages.iter().filter_map(|(_, key)| *key) {
+                effects.push(Effect::Duck { key, settings: Ducking { attenuation_db: 0.0, ..Ducking::default() } });
+            }
+            channels.meters.extend(self.labels.into_iter().zip(old.meters[rack.meters.clone()].iter().map(|(_, meter)| meter.clone())));
+        } else {
+            for ((stage, key), label) in self.effects.stages.iter().zip(self.labels) {
+                let (effect, meter) = build_effect(stage, *key)?.observe();
+                effects.push(effect);
+                channels.meters.push((label, meter));
+            }
+            if self.effects.muted {
+                effects.push(Effect::Gain(0.0));
+            }
+        }
+        channels.racks.insert(self.id, ActiveRack { bus, effects: self.effects, meters: start..channels.meters.len() });
+        Ok(Bus { sends: self.sends, effects })
+    }
 }
 
 pub fn plan(settings: &Settings, inventory: &Inventory) -> Result<Plan, String> {
+    prepare(settings, inventory, None)
+}
+
+/// Reuse the active endpoint order (including the capture clock) and unchanged rack processors when the devices still match.
+/// A change of endpoint set produces a complete plan suitable for starting a new session.
+pub fn plan_reusing(settings: &Settings, inventory: &Inventory, previous: &Channels) -> Result<Plan, String> {
+    prepare(settings, inventory, Some(previous))
+}
+
+fn prepare(settings: &Settings, inventory: &Inventory, previous: Option<&Channels>) -> Result<Plan, String> {
     let mut inputs = Vec::new();
-    let mut cables = Vec::new();
     let mut buses = Vec::new();
-    let mut output_buses = Vec::new();
+    let mut outputs = Vec::new();
     let mut shared_buses: BTreeMap<&str, BTreeMap<usize, Tap>> = BTreeMap::new();
     let mut boundaries: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
     for send in settings.mixes.values().flat_map(|m| &m.sends) {
@@ -383,14 +457,12 @@ pub fn plan(settings: &Settings, inventory: &Inventory) -> Result<Plan, String> 
             boundaries.entry(&send.source).or_default().insert(depth);
         }
     }
-    let mut meters = Vec::new();
     let mut published = BTreeMap::new();
-    let mut playback = Vec::new();
     for out in ordered_outputs(settings, inventory)? {
         let mix = &settings.mixes[&out.id];
         let mut input = |key: &str| input_tap(&mut inputs, &published, key, inventory);
         let mut sends = Vec::new();
-        for send in &mix.sends {
+        for (send_index, send) in mix.sends.iter().enumerate() {
             if !(-60..=12).contains(&send.gain_db) || !(-100..=100).contains(&send.balance) {
                 return Err("The saved send gain or balance is outside its range.".into());
             }
@@ -404,11 +476,18 @@ pub fn plan(settings: &Settings, inventory: &Inventory) -> Result<Plan, String> 
                     if let Some(&tap) = taps.get(&end) {
                         from = tap;
                     } else {
-                        let effects =
-                            build_effects(&stages[previous..end], previous, &mut input, &inventory.label(&send.source), &mut meters)?;
-                        if !effects.is_empty() {
+                        let segment = &stages[previous..end];
+                        if segment.iter().any(|stage| stage.enabled) {
                             let bus = buses.len();
-                            buses.push(Bus { sends: vec![AudioSend::unity(from)], effects });
+                            buses.push(PlannedBus::new(
+                                RackId::Source(send.source.clone(), end),
+                                vec![AudioSend::unity(from)],
+                                segment,
+                                &inventory.label(&send.source),
+                                previous,
+                                false,
+                                &mut input,
+                            )?);
                             from = Tap::Bus(bus);
                         }
                         taps.insert(end, from);
@@ -417,36 +496,70 @@ pub fn plan(settings: &Settings, inventory: &Inventory) -> Result<Plan, String> 
                 }
             }
             if send.effects.iter().any(|stage| stage.enabled) {
-                let effects =
-                    build_effects(&send.effects, 0, &mut input, &format!("{} → {}", inventory.label(&send.source), out.name), &mut meters)?;
+                let occurrence = mix.sends[..send_index].iter().filter(|s| s.source == send.source).count();
                 let bus = buses.len();
-                buses.push(Bus { sends: vec![AudioSend::unity(from)], effects });
+                buses.push(PlannedBus::new(
+                    RackId::Send(out.id.clone(), send.source.clone(), occurrence),
+                    vec![AudioSend::unity(from)],
+                    &send.effects,
+                    &format!("{} → {}", inventory.label(&send.source), out.name),
+                    0,
+                    false,
+                    &mut input,
+                )?);
                 from = Tap::Bus(bus);
             }
             sends.push(AudioSend { from, gain: 10_f32.powf(f32::from(send.gain_db) / 20.0), pan: f32::from(send.balance) / 100.0 });
         }
-        let mut effects = build_effects(&mix.effects, 0, &mut input, &out.name, &mut meters)?;
-        if mix.muted {
-            effects.push(Effect::Gain(0.0));
-        }
+        let index = buses.len();
+        buses.push(PlannedBus::new(RackId::Output(out.id.clone()), sends, &mix.effects, &out.name, 0, mix.muted, &mut input)?);
         if let Some(cable) = out.cable {
-            published.insert(cable, buses.len());
-            cables.push(cable);
-            output_buses.push(buses.len());
-        } else if let Some(device) = out.id.strip_prefix("play:") {
-            playback.push((device.to_owned(), buses.len()));
+            published.insert(cable, index);
         }
-        buses.push(Bus { sends, effects });
+        outputs.push((out, index));
     }
-    if cables.is_empty() && playback.is_empty() {
+    if outputs.is_empty() {
         return Err("Select an output and add a source before starting audio.".into());
     }
-    let channels = Channels {
+    let previous = previous.filter(|old| {
+        old.inputs.len() == inputs.len()
+            && inputs.iter().all(|id| old.inputs.contains(id))
+            && old.outputs.len() == outputs.len()
+            && outputs.iter().all(|(out, _)| old.outputs.contains(&out.id))
+    });
+    if let Some(old) = previous {
+        let indices: Vec<_> = inputs.iter().map(|id| old.inputs.iter().position(|key| key == id).unwrap()).collect();
+        for b in &mut buses {
+            for from in b.sends.iter_mut().map(|s| &mut s.from).chain(b.effects.stages.iter_mut().filter_map(|(_, key)| key.as_mut())) {
+                if let Tap::Input(i) = from {
+                    *i = indices[*i];
+                }
+            }
+        }
+        inputs.clone_from(&old.inputs);
+        outputs.sort_by_cached_key(|(out, _)| old.outputs.iter().position(|id| id == &out.id).unwrap());
+    }
+    let mut cables = Vec::new();
+    let mut output_buses = Vec::new();
+    let mut playback = Vec::new();
+    for (out, bus) in outputs {
+        if let Some(cable) = out.cable {
+            cables.push(cable);
+            output_buses.push(bus);
+        } else {
+            let device = out.id.strip_prefix("play:").ok_or("A playback destination is missing its device selector.")?;
+            playback.push((device.to_owned(), bus));
+        }
+    }
+    let mut channels = Channels {
         inputs: inputs.clone(),
-        meters,
         outputs: cables.iter().map(ToString::to_string).chain(playback.iter().map(|(id, _)| format!("play:{id}"))).collect(),
+        ..Channels::default()
     };
-    Ok(Plan { config: RouteConfig { inputs, cables, buses, output_buses, playback }, channels })
+    let mut retained = Vec::new();
+    let buses =
+        buses.into_iter().enumerate().map(|(i, b)| b.compile(i, previous, &mut channels, &mut retained)).collect::<Result<_, _>>()?;
+    Ok(Plan { config: RouteConfig { inputs, cables, buses, output_buses, playback }, channels, retained })
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -508,6 +621,68 @@ mod tests {
     fn gain(db: i16) -> Stage {
         Stage { db, ..Stage::new(Kind::Gain) }
     }
+
+    #[test]
+    fn live_apply_keeps_the_shared_rack_and_the_other_outputs_processors_and_meter_handles() {
+        let inv = inventory();
+        let [edited, untouched] = [1, 2].map(|n| CableId(n).to_string());
+        let mut s = Settings::default();
+        s.toggle(&edited, "mic");
+        s.toggle(&untouched, "mic");
+        s.source_effects.insert("mic".into(), vec![gain(-3)]);
+        s.mixes.get_mut(&edited).unwrap().effects.push(gain(-6));
+        let mix = s.mixes.get_mut(&untouched).unwrap();
+        mix.sends[0].effects.push(gain(-9));
+        mix.effects.push(Stage { key: Some("other".into()), ..Stage::new(Kind::Duck) });
+        let old = plan(&s, &inv).unwrap();
+        let mut running = Router::new(48000, 128, 2, old.config.buses).unwrap();
+        let mix = s.mixes.get_mut(&edited).unwrap();
+        mix.sends[0].effects.push(gain(6));
+        mix.effects[0].db = -12;
+        let next = plan_reusing(&s, &inv, &old.channels).unwrap();
+        assert_eq!(next.retained, [(0, 0), (2, 3), (3, 4)]);
+        assert_eq!(next.config.buses[4].sends[0].from, Tap::Bus(3));
+        assert_eq!(next.config.buses[4].effects.iter().filter_map(Effect::key).collect::<Vec<_>>(), [Tap::Input(1)]);
+        // An update arriving while the old route is running reaches the new UI handles only for the retained racks.
+        running.process_stereo(&[&[[0.5, -0.25]; 5], &[[0.; 2]; 5]]).unwrap();
+        for (old_index, new_index) in [(0, 0), (2, 3), (3, 4)] {
+            let active = old.channels.meters[old_index].1.read();
+            assert!(active.input_peak.is_some());
+            assert_eq!(active, next.channels.meters[new_index].1.read());
+        }
+        assert!(next.channels.meters[1..3].iter().all(|(_, meter)| meter.read().input_peak.is_none()));
+    }
+
+    #[test]
+    fn a_live_plan_keeps_the_clock_and_rebuilds_racks_whose_sidechain_bus_moved() {
+        let inv = inventory();
+        let [a, b] = [1, 2].map(|n| CableId(n).to_string());
+        let mut s = Settings::default();
+        s.toggle(&a, "mic");
+        s.toggle(&b, "other");
+        s.mixes.get_mut(&b).unwrap().effects.push(Stage { key: Some("out1".into()), ..Stage::new(Kind::Duck) });
+        let old = plan(&s, &inv).unwrap();
+        assert_eq!(old.channels.inputs, ["mic", "other"]);
+        assert_eq!(old.config.buses[1].effects[0].key(), Some(Tap::Bus(0)));
+        s.toggle(&a, "other");
+        let mix = s.mixes.get_mut(&a).unwrap();
+        mix.sends.swap(0, 1);
+        mix.sends[0].effects.push(gain(6));
+        let next = plan_reusing(&s, &inv, &old.channels).unwrap();
+        assert_eq!(next.channels.inputs, old.channels.inputs);
+        assert_eq!(next.config.buses[0].sends[0].from, Tap::Input(1));
+        assert_eq!(next.config.buses[1].sends[1].from, Tap::Input(0));
+        assert_eq!(next.config.buses[2].effects[0].key(), Some(Tap::Bus(1)));
+        assert!(!next.retained.iter().any(|&(from, _)| from == 1));
+
+        s.toggle(&a, "other");
+        s.toggle(&b, "other");
+        let restart = plan_reusing(&s, &inv, &next.channels).unwrap();
+        assert!(restart.retained.is_empty());
+        assert_eq!(restart.channels.inputs, ["mic"]);
+        assert_eq!(restart.channels.outputs, [a]);
+    }
+
     #[test]
     fn dry_intermediate_and_end_share_only_requested_prefixes_and_follow_the_tapped_stage_through_edits() {
         let inv = inventory();

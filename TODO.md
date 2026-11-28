@@ -214,7 +214,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ### 19. [driver] Our own virtual mic
 **Priority**: High | **Status**: all installed cables are discoverable. A and B run independently with two outputs each. Both GUIs can select a direct target and v2 can feed several. Setup: `driver/README.md`.
 - Owner's criteria: latency and quality at least VB-CABLE's; controllable from inside the app; open source others can reuse.
-- Signing: attestation (EV certificate + Partner Center, or OSSign) for Windows 10/11 client; Server loads only HLK-signed, so the dev VM needs test signing. Test signing is out for users (BattlEye, Vanguard, FACEIT).
+- Microsoft documents attestation for testing and HLK/WHCP for retail Windows Update. Confirm the production signing path before public release (TODO 23). The dev VM uses test signing.
 - Base (study 2026-10-28): Microsoft's ACX AudioCodec sample (MS-PL), cut down, borrowing microsoft/low-latency-audio's (MIT) packet-size code and shared-buffer handling; SimpleAudioSample is the fallback. Drafts of a request to Microsoft are in the detail file, for the owner to post.
 - Dev box toolchain (owner, 2026-10-28): Visual Studio 2026 (C++, Spectre libraries, WDK extension), WDK and SDK 10.0.28000 (ACX 1.1, KMDF 1.35). VB-CABLE 3.3.1.7 loads on Server 2025.
 - The spike (the VM, 2026-11-20 to 22): checks 1-7 passed. float32 then 24-in-32 on both endpoints; the app-fed ring (`nf_vmic.h`, `crates/nf-vmic`) bit-exact into shared and exclusive recordings, two capture streams at once, a counted one-time skip at a reader handoff (the owner: keep it); hour soaks at 128 and 96 frames with no timer glitch; Driver Verifier clean after one fix to the sample's removal path (1a0353d). Open: forced PCM, mixed formats, physical Windows 11.
@@ -256,7 +256,7 @@ Phases: 0 offline (WAV in, WAV out), 1 live noise filter, 2 echo cancellation, 3
 ---
 
 ### 24. [engine] Routing graph: split and merge feeds (groundwork for a mixer)
-**Priority**: High | **Status**: reusable packet graph and live WinUI mixer built. Separate virtual recorders verified stereo fan-out at unity and quarter gain, a two-source sum and simultaneous external playback.
+**Priority**: High | **Status**: reusable packet graph and live WinUI mixer built. Verified stereo fan-out, two-source mixing, simultaneous external playback, live rack edits and per-cable pause and recovery. Dry A stayed bit-exact while B switched RNNoise five times and in a separate B device-disable test.
 - The graph runs shared stages once and splits, sums, balances and ducks native packets. Consecutive compatible speech stages share a 480-frame buffer. Direct branches keep the source clock. Independent WASAPI sinks have their own bounded queue.
 - The owner chose mono and stereo for the first routing implementation. Preserve left and right on stereo routes. Surround is a later feature.
 - The cables use the same QPC time base. A split can write each ring in one pass. Each reader keeps its own packet timing and headroom. External clocks need drift control and heavy stages get a worker with a deadline.

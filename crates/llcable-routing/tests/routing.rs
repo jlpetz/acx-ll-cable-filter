@@ -119,3 +119,81 @@ fn observed_gain_and_duck_report_their_own_signal_and_preserve_the_sidechain() {
     assert!((after.gain.unwrap() - 0.5).abs() < 1e-6);
     assert!((after.output_peak.unwrap() - 0.125).abs() < 1e-6);
 }
+
+struct CountPackets(u32);
+
+impl PacketEffect for CountPackets {
+    fn process(&mut self, stereo: &mut [[f32; 2]], _: Option<Input<'_>>) {
+        self.0 += 1;
+        for f in stereo {
+            f[0] += self.0 as f32;
+        }
+    }
+    // Uses the default live-activation refusal. A retained instance is already running on its prepared thread.
+}
+
+fn rack(input: usize, effects: Vec<Effect>) -> Bus {
+    Bus { sends: vec![Send::unity(Tap::Input(input))], effects }
+}
+
+#[test]
+fn hot_move_preserves_processor_history_and_meter_and_uses_the_new_sends() {
+    let (original, meter) = Effect::Custom(Box::new(CountPackets(0))).observe();
+    let mut active = Router::new(48_000, 3, 2, vec![rack(0, vec![original])]).unwrap();
+    let source_a = [[2., -3.]];
+    let source_b = [[8., -6.]];
+    let inputs = [&source_a[..], &source_b[..]];
+    active.prepare_thread();
+    active.process_stereo(&inputs).unwrap();
+    assert_eq!(active.output(0).unwrap(), [[3., -3.]]);
+
+    let placeholder = Effect::Custom(Box::new(CountPackets(100)));
+    let mut next = Router::new(48_000, 3, 2, vec![rack(1, vec![Effect::Gain(0.5)]), rack(1, vec![placeholder])]).unwrap();
+    active.activate_edit(&mut next, &[(0, 1)]).unwrap();
+    active.process_stereo(&inputs).unwrap();
+    assert_eq!(active.output(0).unwrap(), [[4., -3.]]);
+    assert_eq!(active.output(1).unwrap(), [[10., -6.]]);
+    assert_eq!(meter.read().output_peak, Some(10.));
+}
+
+#[test]
+fn late_thread_setup_refuses_the_whole_edit_before_any_rack_moves() {
+    let counter = |n| Effect::Custom(Box::new(CountPackets(n)));
+    let mut active = Router::new(48_000, 1, 1, vec![rack(0, vec![counter(0)])]).unwrap();
+    let mut next = Router::new(48_000, 1, 1, vec![rack(0, vec![Effect::Gain(2.)]), rack(0, vec![counter(99)])]).unwrap();
+    let input = [&[[1., 1.]][..]];
+    active.process_stereo(&input).unwrap();
+    assert_eq!(active.activate_edit(&mut next, &[(0, 0)]), Err(RoutingError::EffectNeedsThreadSetup { bus: 1 }));
+    active.process_stereo(&input).unwrap();
+    next.process_stereo(&input).unwrap();
+    assert_eq!(active.output(0).unwrap(), [[3., 1.]]);
+    assert_eq!(next.output(0).unwrap(), [[2., 2.]]);
+}
+
+#[test]
+fn malformed_rack_mappings_and_changed_keys_or_stream_format_leave_both_graphs_intact() {
+    let router = |rate, frames, count, gain, key| {
+        let settings = Ducking { attenuation_db: 0., ..Default::default() };
+        Router::new(rate, frames, count, vec![
+            rack(0, vec![Effect::Gain(gain)]),
+            rack(0, vec![Effect::Duck { key, settings }]),
+            rack(0, vec![]),
+        ])
+        .unwrap()
+    };
+    let mut active = router(48_000, 2, 2, 2., Tap::Input(0));
+    let mut next = router(48_000, 2, 2, 3., Tap::Input(1));
+    for bad in [(0, 3), (3, 0), (0, 2), (2, 0), (1, 1)] {
+        assert_eq!(active.activate_edit(&mut next, &[(0, 0), bad]), Err(RoutingError::InvalidRetainedRack { old: bad.0, new: bad.1 }));
+        for (r, expected_gain) in [(&mut active, 2.), (&mut next, 3.)] {
+            r.process_stereo(&[&[[1., -1.]], &[[0., 0.]]]).unwrap();
+            assert_eq!(r.output(0).unwrap(), [[expected_gain, -expected_gain]]);
+        }
+    }
+    // Move matching unkeyed racks after refusals, proving that the scratch flags from failed attempts are harmless.
+    active.activate_edit(&mut next, &[(0, 0)]).unwrap();
+    for (rate, frames, count) in [(44_100, 2, 2), (48_000, 1, 2), (48_000, 2, 1)] {
+        let mut incompatible = router(rate, frames, count, 1., Tap::Input(0));
+        assert_eq!(active.activate_edit(&mut incompatible, &[]), Err(RoutingError::IncompatibleStream));
+    }
+}
